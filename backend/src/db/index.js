@@ -1,0 +1,281 @@
+const { DatabaseSync } = require('node:sqlite');
+const path = require('path');
+const { mkdirSync } = require('fs');
+const bcrypt = require('bcryptjs');
+
+const DB_PATH = path.join(__dirname, '..', '..', 'data', 'perf_studio.db');
+mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const db = new DatabaseSync(DB_PATH);
+
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS organizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    slug TEXT NOT NULL UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    org_id INTEGER REFERENCES organizations(id),
+    role TEXT NOT NULL DEFAULT 'user',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    color TEXT DEFAULT '#1a6bff',
+    bg TEXT DEFAULT '#e8f0ff',
+    folder_path TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    json_content TEXT NOT NULL DEFAULT '[]',
+    source_type TEXT DEFAULT 'json',
+    source_content TEXT DEFAULT '',
+    tool_target TEXT DEFAULT 'jmeter',
+    generated_jmx TEXT DEFAULT '',
+    generated_k6 TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    metric TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    value TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'error',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS scripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'K6',
+    description TEXT DEFAULT '',
+    target TEXT DEFAULT '',
+    vusers INTEGER DEFAULT 50,
+    duration INTEGER DEFAULT 300,
+    rampup INTEGER DEFAULT 30,
+    status TEXT DEFAULT 'ready',
+    last_run DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS global_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS project_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL UNIQUE,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS test_suites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    test_type TEXT NOT NULL DEFAULT 'load',
+    collection_id INTEGER,
+    test_data_id INTEGER,
+    engine TEXT NOT NULL DEFAULT 'jmeter',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    jmx_path TEXT DEFAULT '',
+    js_path TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE SET NULL,
+    FOREIGN KEY (test_data_id) REFERENCES test_data_files(id) ON DELETE SET NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS test_data_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    columns TEXT NOT NULL DEFAULT '[]',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT 'openai',
+    api_key TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS execution_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    suite_id INTEGER REFERENCES test_suites(id) ON DELETE SET NULL,
+    engine TEXT,
+    status TEXT DEFAULT 'running',
+    result_dir TEXT,
+    report_path TEXT,
+    logs TEXT DEFAULT '[]',
+    started_at TEXT DEFAULT (datetime('now')),
+    finished_at TEXT
+  );
+`);
+
+// Migrate existing tables — each ALTER wrapped in try/catch for idempotency
+const migrations = [
+  "ALTER TABLE collections ADD COLUMN source_type TEXT DEFAULT 'json'",
+  "ALTER TABLE collections ADD COLUMN source_content TEXT DEFAULT ''",
+  "ALTER TABLE collections ADD COLUMN tool_target TEXT DEFAULT 'jmeter'",
+  "ALTER TABLE collections ADD COLUMN generated_jmx TEXT DEFAULT ''",
+  "ALTER TABLE collections ADD COLUMN generated_k6 TEXT DEFAULT ''",
+  "ALTER TABLE projects ADD COLUMN folder_path TEXT DEFAULT ''",
+];
+for (const sql of migrations) {
+  try { db.exec(sql); } catch (_) { /* column already exists */ }
+}
+
+const autoHealMigrations = [
+  'ALTER TABLE execution_runs ADD COLUMN auto_heal INTEGER DEFAULT 0',
+  'ALTER TABLE execution_runs ADD COLUMN heal_status TEXT DEFAULT NULL',
+  'ALTER TABLE execution_runs ADD COLUMN heal_run_id INTEGER DEFAULT NULL',
+  // Runtime params — stored so the healer can reproduce the exact original run
+  'ALTER TABLE execution_runs ADD COLUMN run_vusers INTEGER DEFAULT NULL',
+  'ALTER TABLE execution_runs ADD COLUMN run_rampup INTEGER DEFAULT NULL',
+  'ALTER TABLE execution_runs ADD COLUMN run_duration INTEGER DEFAULT NULL',
+  'ALTER TABLE execution_runs ADD COLUMN run_loops INTEGER DEFAULT NULL',
+  "ALTER TABLE execution_runs ADD COLUMN run_iter_mode TEXT DEFAULT NULL",
+  `CREATE TABLE IF NOT EXISTS auto_heal_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    diagnosis TEXT,
+    fix_applied TEXT,
+    fix_type TEXT,
+    new_run_id INTEGER,
+    result TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+];
+for (const sql of autoHealMigrations) {
+  try { db.exec(sql); } catch (_) {}
+}
+
+const alterStatements = [
+  'ALTER TABLE test_suites ADD COLUMN vusers INTEGER DEFAULT 50',
+  'ALTER TABLE test_suites ADD COLUMN rampup INTEGER DEFAULT 30',
+  'ALTER TABLE test_suites ADD COLUMN iter_mode TEXT DEFAULT \'duration\'',
+  'ALTER TABLE test_suites ADD COLUMN loops INTEGER DEFAULT 1',
+  'ALTER TABLE test_suites ADD COLUMN duration INTEGER DEFAULT 300',
+  "ALTER TABLE test_suites ADD COLUMN test_data_ids TEXT DEFAULT '[]'",
+  "ALTER TABLE collections ADD COLUMN environment TEXT DEFAULT ''",
+  "ALTER TABLE test_suites ADD COLUMN pre_run_data TEXT DEFAULT NULL",
+  "ALTER TABLE test_suites ADD COLUMN pre_run_collection_hash TEXT DEFAULT NULL",
+  "ALTER TABLE projects ADD COLUMN environment TEXT DEFAULT 'Default'",
+];
+for (const sql of alterStatements) {
+  try { db.exec(sql); } catch {}
+}
+
+// Add environments array to collections
+try { db.exec("ALTER TABLE collections ADD COLUMN environments TEXT DEFAULT '[]'"); } catch {}
+
+// Per-env configuration (each collection env has its own URL/config)
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS collection_env_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id INTEGER NOT NULL,
+    env TEXT NOT NULL,
+    config_json TEXT DEFAULT '{}',
+    UNIQUE(collection_id, env)
+  )`);
+} catch (_) {}
+// Add env to test_suites so scripts go to the right env subfolder
+try { db.exec("ALTER TABLE test_suites ADD COLUMN env TEXT DEFAULT ''"); } catch {}
+
+// Add model columns to ai_settings
+try { db.exec("ALTER TABLE ai_settings ADD COLUMN model TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ai_settings ADD COLUMN heal_model TEXT DEFAULT ''"); } catch {}
+
+// Add uuid column to projects (for directory naming)
+try { db.exec("ALTER TABLE projects ADD COLUMN uuid TEXT DEFAULT ''"); } catch {}
+// Add folder_path to collections
+try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
+
+// Org/role migrations for existing users
+const orgMigrations = [
+  "ALTER TABLE users ADD COLUMN org_id INTEGER REFERENCES organizations(id)",
+  "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'",
+  "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+];
+for (const sql of orgMigrations) {
+  try { db.exec(sql); } catch {}
+}
+
+// Alert / notification tables
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS alert_configs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL UNIQUE,
+      smtp_host TEXT DEFAULT '',
+      smtp_port INTEGER DEFAULT 587,
+      smtp_secure INTEGER DEFAULT 0,
+      smtp_user TEXT DEFAULT '',
+      smtp_pass TEXT DEFAULT '',
+      from_name TEXT DEFAULT 'Performance Studio',
+      from_email TEXT DEFAULT '',
+      enabled INTEGER DEFAULT 0,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS alert_recipients (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      project_id INTEGER,
+      name TEXT DEFAULT '',
+      email TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+} catch (_) {}
+
+// Seed super admin if not present
+const superAdmin = db.prepare("SELECT id FROM users WHERE role = 'super_admin'").get();
+if (!superAdmin) {
+  const hash = bcrypt.hashSync('Admin@123', 10);
+  db.prepare(`
+    INSERT INTO users (email, name, password_hash, role, status)
+    VALUES ('admin@perfstudio.com', 'Super Admin', ?, 'super_admin', 'active')
+  `).run(hash);
+  console.log('Super admin seeded: admin@perfstudio.com / Admin@123');
+}
+
+module.exports = db;

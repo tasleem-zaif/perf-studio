@@ -1,0 +1,88 @@
+version: '3.9'
+
+# ── PerfStudio — Docker Compose Configuration ─────────────────────────────────
+#
+# BEFORE FIRST RUN:
+#   1. Copy .env.example to .env  (or run docker-start.bat / setup.sh)
+#   2. Set HOST_PROJECTS_ROOT in .env to the ABSOLUTE path of ./projects
+#      on the HOST machine (see note below).
+#   3. Set JWT_SECRET to a random secret string.
+#   4. Run:  docker compose up --build -d
+#
+# HOST_PROJECTS_ROOT — Why it is needed:
+#   The backend container spawns JMeter/K6 containers via the Docker socket.
+#   Docker volume mounts (-v flag) always reference HOST paths, not container
+#   paths. This env var tells the backend the host-side absolute path so it
+#   can build correct -v arguments for test containers.
+#
+#   Windows example:  HOST_PROJECTS_ROOT=C:/Users/you/perf-studio/projects
+#   Linux/macOS:      HOST_PROJECTS_ROOT=/home/you/perf-studio/projects
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend — Node.js API ───────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: perfstudio-backend
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    volumes:
+      # SQLite database
+      - ./backend/data:/app/data
+      # All project files: scripts, configs, test data, results
+      - ./projects:/data/projects
+      # Project backups (ZIP archives)
+      - ./backups:/data/backups
+      # Docker socket — lets the backend spawn JMeter/K6 containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PORT: "3001"
+      NODE_ENV: "${NODE_ENV:-production}"
+      CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:${FRONTEND_PORT:-5173}}"
+
+      # Internal container paths (used for file I/O inside the backend container)
+      PROJECTS_ROOT: "/data/projects"
+      BACKUPS_ROOT: "/data/backups"
+
+      # Host machine paths (used for Docker -v volume mount arguments when
+      # spawning JMeter/K6 test containers via the Docker socket)
+      HOST_PROJECTS_ROOT: "${HOST_PROJECTS_ROOT}"
+      HOST_BACKUPS_ROOT: "${HOST_BACKUPS_ROOT:-}"
+
+      # Security
+      JWT_SECRET: "${JWT_SECRET:-CHANGE_ME_generate_a_random_secret_before_production}"
+
+      # Default Docker images for test execution (overrideable per-project in Config)
+      JMETER_DOCKER_IMAGE: "${JMETER_DOCKER_IMAGE:-justb4/jmeter:latest}"
+      K6_DOCKER_IMAGE: "${K6_DOCKER_IMAGE:-grafana/k6:latest}"
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Frontend — React + Nginx ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: perfstudio-frontend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ── Named volumes (optional — used if you prefer managed volumes over bind mounts)
+# Uncomment and replace bind mounts above if you want Docker to manage storage.
+# volumes:
+#   ps_data: {}
+#   ps_projects: {}
+#   ps_backups: {}

@@ -1,0 +1,1555 @@
+{
+  "info": {
+    "_postman_id": "be60cc32-e684-4505-9fa5-a1d0efefc983",
+    "name": "Thunder_TS",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "42394013"
+  },
+  "item": [
+    {
+      "name": "Sim Consolidated Data Usage",
+      "item": [
+        {
+          "name": "Daily",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1MDIyMDQyMjYyOSwidXNlcklkIjoxMTd9.y9RW95NIP76U79MJXgLOo-OIdTrZ13ar_8Kf9Kqnr6yB59v2aXntfOTsPT3jy7o8yNfYIzwP2zfMUWotU7ZLWw",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJzZWtoYXJfb3BjbyIsImFjY291bnRJZCI6MTcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY3MDQ5MjUxMzg4MCwidXNlcklkIjo2Mn0.ogO9RIsXO_L1GeiYw4UAHGFGStqg7Oaz7DrE2rpibislcmX6veyYdKyw6Nbd75UPlBD4m64c1oL1Z_r8G_UwGw"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n    \"startDate\":\"2025-06-01\",\r\n    \"endDate\":\"2025-06-18\",\r\n    \"limit\":\"40\",\r\n    \"offset\":\"0\",\r\n    \"accountId\":\"\",\r\n    \"imsi\":\"724058609119641\",\r\n    \"type\":\"daily\"\r\n}\r\n",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "https://10.221.89.88/ts/api/sim/Data/Usage",
+              "protocol": "https",
+              "host": [
+                "10",
+                "221",
+                "89",
+                "88"
+              ],
+              "path": [
+                "ts",
+                "api",
+                "sim",
+                "Data",
+                "Usage"
+              ],
+              "query": [
+                {
+                  "key": "imsi",
+                  "value": "724058609119641",
+                  "disabled": true
+                },
+                {
+                  "key": "startDate",
+                  "value": "2025-11-25",
+                  "disabled": true
+                },
+                {
+                  "key": "endDate",
+                  "value": "2025-12-07",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "40",
+                  "disabled": true
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "disabled": true
+                },
+                {
+                  "key": "type",
+                  "value": "daily",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Hourly",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1MDE0ODEyMzA5NCwidXNlcklkIjoxMTd9.I4YBP-2UDVto1g79Rg04I_Xd9Cb7TrEyHV1QfhY9rH0FB2ArBg8DsVx12IH7TFOPMuX6N9qdO10Ul30ElbADcw",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJzZWtoYXJfb3BjbyIsImFjY291bnRJZCI6MTcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY3MDQ5MjUxMzg4MCwidXNlcklkIjo2Mn0.ogO9RIsXO_L1GeiYw4UAHGFGStqg7Oaz7DrE2rpibislcmX6veyYdKyw6Nbd75UPlBD4m64c1oL1Z_r8G_UwGw"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n    \"startDate\":\"2025-05-16 00:00:00\",\r\n    \"endDate\":\"2025-05-16 23:00:00\",\r\n    \"limit\":\"40\",\r\n    \"offset\":\"0\",\r\n    \"imsi\":\"724058609119641\",\r\n    \"type\":\"hourly\"\r\n}\r\n",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "http://10.221.89.88/ts/api/sim/Data/Usage",
+              "protocol": "http",
+              "host": [
+                "10",
+                "221",
+                "89",
+                "88"
+              ],
+              "path": [
+                "ts",
+                "api",
+                "sim",
+                "Data",
+                "Usage"
+              ],
+              "query": [
+                {
+                  "key": "imsi",
+                  "value": "891177601311121",
+                  "disabled": true
+                },
+                {
+                  "key": "startDate",
+                  "value": "2022-12-08 04:00:00",
+                  "disabled": true
+                },
+                {
+                  "key": "endDate",
+                  "value": "2022-12-08 08:59:59",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "40",
+                  "disabled": true
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "disabled": true
+                },
+                {
+                  "key": "type",
+                  "value": "hourly",
+                  "disabled": true
+                },
+                {
+                  "key": "accountId",
+                  "value": "1",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Yearly",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJzZWtoYXJfb3BjbyIsImFjY291bnRJZCI6MTcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY3MDQ5MjUxMzg4MCwidXNlcklkIjo2Mn0.ogO9RIsXO_L1GeiYw4UAHGFGStqg7Oaz7DrE2rpibislcmX6veyYdKyw6Nbd75UPlBD4m64c1oL1Z_r8G_UwGw"
+              }
+            ],
+            "url": {
+              "raw": "http://10.221.86.70:8019/gcapi/sim/Data/Usage?imsi=891177601311121&startDate=2021&endDate=2021&limit=40&offset=0&type=yearly",
+              "protocol": "http",
+              "host": [
+                "10",
+                "221",
+                "86",
+                "70"
+              ],
+              "port": "8019",
+              "path": [
+                "gcapi",
+                "sim",
+                "Data",
+                "Usage"
+              ],
+              "query": [
+                {
+                  "key": "imsi",
+                  "value": "891177601311121"
+                },
+                {
+                  "key": "startDate",
+                  "value": "2021"
+                },
+                {
+                  "key": "endDate",
+                  "value": "2021"
+                },
+                {
+                  "key": "limit",
+                  "value": "40"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                },
+                {
+                  "key": "type",
+                  "value": "yearly"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Monthly",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJzZWtoYXJfb3BjbyIsImFjY291bnRJZCI6MTcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY3MDQ5MjUxMzg4MCwidXNlcklkIjo2Mn0.ogO9RIsXO_L1GeiYw4UAHGFGStqg7Oaz7DrE2rpibislcmX6veyYdKyw6Nbd75UPlBD4m64c1oL1Z_r8G_UwGw"
+              }
+            ],
+            "url": {
+              "raw": "http://10.221.86.70:8019/gcapi/sim/Data/Usage?imsi=891177601311121&startDate=2022-11&endDate=2022-11&limit=40&offset=0&type=monthly",
+              "protocol": "http",
+              "host": [
+                "10",
+                "221",
+                "86",
+                "70"
+              ],
+              "port": "8019",
+              "path": [
+                "gcapi",
+                "sim",
+                "Data",
+                "Usage"
+              ],
+              "query": [
+                {
+                  "key": "imsi",
+                  "value": "891177601311121"
+                },
+                {
+                  "key": "startDate",
+                  "value": "2022-11"
+                },
+                {
+                  "key": "endDate",
+                  "value": "2022-11"
+                },
+                {
+                  "key": "limit",
+                  "value": "40"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                },
+                {
+                  "key": "type",
+                  "value": "monthly"
+                }
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "gcapi/auth",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NTE0NDY4OTM3NywidXNlcklkIjoxMTd9.art4YyVk3h3MXLpHfwWs5yFtUJwkrD9jrG7bcDDXxl3ALsj1oiakoIxNNi5RA0grOKPZ8cv4MwHALcndNXZ5aw",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUxMDEyNTMyNTMsInVzZXJJZCI6OTZ9.rRdJH00UOBG5Y9ySYoRwmSWaRYMtkWCgYm4h_7dpYe-MpKkZhdBQmL9YwfnYazi1jE67zXZvANixg91TcUY7bQ"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"username\": \"Claro Brazil\",\r\n    \"password\": \"Admin@123\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/auth",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "auth"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.90.84:8020/gcapi/auth' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUxMDEyNTMyNTMsInVzZXJJZCI6OTZ9.rRdJH00UOBG5Y9ySYoRwmSWaRYMtkWCgYm4h_7dpYe-MpKkZhdBQmL9YwfnYazi1jE67zXZvANixg91TcUY7bQ' \\\r\n--data-raw '{\r\n    \"username\": \"gtadmin\",\r\n    \"password\": \"Gtadmin@123\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "service/device/plan",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDgzMDQ0NTYzNCwidXNlcklkIjoxMTd9.pY2AsKnU97twudpgbSgqUPLt-yWlc03ORCx9ervotTf-_NphdUgD4IcjhP4YeiIKWRuA2I42LA5GApoDyHaHdg",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUxMDEyNTMyNTMsInVzZXJJZCI6OTZ9.rRdJH00UOBG5Y9ySYoRwmSWaRYMtkWCgYm4h_7dpYe-MpKkZhdBQmL9YwfnYazi1jE67zXZvANixg91TcUY7bQ"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"username\": \"Claro Brazil\",\r\n    \"password\": \"Admin@123\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/get/service/device/plan/id/3129",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "get",
+            "service",
+            "device",
+            "plan",
+            "id",
+            "3129"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.89.84:8020/gcapi/auth' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUxMDEyNTMyNTMsInVzZXJJZCI6OTZ9.rRdJH00UOBG5Y9ySYoRwmSWaRYMtkWCgYm4h_7dpYe-MpKkZhdBQmL9YwfnYazi1jE67zXZvANixg91TcUY7bQ' \\\r\n--data-raw '{\r\n    \"username\": \"Claro Brazil\",\r\n    \"password\": \"Admin@123\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/sim/dataSessionCount",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJtYW5pc2hhcGkxNEF1ZyIsImFjY291bnRJZCI6MjcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY5MjAxNzg3MTk5OSwidXNlcklkIjoxNTl9.0M_WOLcoU9y_UhETxNCKcFjTeECYqYa8s0IhbmqXl8P-SDelDBYLo4IeBZKhG48UpkLLJ0eDnVf0pzxR7MpNWw"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"imsi\": \"\",\r\n    \"startDate\": \"2025-08-01\",\r\n    \"endDate\": \"2025-08-05\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/sim/dataSessionCount",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "sim",
+            "dataSessionCount"
+          ],
+          "query": [
+            {
+              "key": "imsi",
+              "value": "724058374273732",
+              "disabled": true
+            },
+            {
+              "key": "startDate",
+              "value": "2025-04-01",
+              "disabled": true
+            },
+            {
+              "key": "endDate",
+              "value": "2025-06-17",
+              "disabled": true
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://amxacpp02.airlinq.com:8443/gcapi/sim/dataSessionCount' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJtYW5pc2hhcGkxNEF1ZyIsImFjY291bnRJZCI6MjcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY5MjAxNzg3MTk5OSwidXNlcklkIjoxNTl9.0M_WOLcoU9y_UhETxNCKcFjTeECYqYa8s0IhbmqXl8P-SDelDBYLo4IeBZKhG48UpkLLJ0eDnVf0pzxR7MpNWw' \\\r\n--header 'Content-Type: application/json' \\\r\n--data '{\r\n    \"imsi\": \"334020410733503\",\r\n    \"startDate\": \"2023-06-01\",\r\n    \"endDate\": \"2023-06-30\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/simUplink/usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1Mzg0NzczNzQyNSwidXNlcklkIjoxMTd9.60gXEOdekKwodezscCOc3W7NB_YBcKtWxd5MQAMqrOqsWuUTMeepP5oc1tUX9S7kgcsQEkeVpuBOfYoVJ9QYug",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"startDate\": \"2025-06-16\",\r\n    \"endDate\": \"2025-06-16\",\r\n    \"imsi\": \"724058609119641\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/simUplink/usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "simUplink",
+            "usage"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://amxacpp02.airlinq.com:8443/gcapi/simUplink/usage' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJtYW5pc2hhcGkxNEF1ZyIsImFjY291bnRJZCI6MjcsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTY5MjAxNzg3MTk5OSwidXNlcklkIjoxNTl9.0M_WOLcoU9y_UhETxNCKcFjTeECYqYa8s0IhbmqXl8P-SDelDBYLo4IeBZKhG48UpkLLJ0eDnVf0pzxR7MpNWw' \\\r\n--header 'Content-Type: application/json' \\\r\n--data '{\r\n    \"startDate\": \"2023-06-01\",\r\n    \"endDate\": \"2023-06-30\",\r\n    \"imsi\": \"334020414625922\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/simDownlink/usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          },
+          {
+            "key": "Language",
+            "value": "en"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"startDate\": \"2025-08-01\",\r\n    \"endDate\": \"2025-08-05\",\r\n    \"imsi\": \"728300109763861\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/simDownlink/usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "simDownlink",
+            "usage"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/simDownlink/usage' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJBcGlfVXNlcjI4MDIyMyIsImFjY291bnRJZCI6MjE2OSwiYXVkaWVuY2UiOiJ3ZWIiLCJjcmVhdGVkIjoxNjk0Njg0OTQ2OTY3LCJ1c2VySWQiOjc4fQ.oL9GlQI_Ml5T6zD85ckDr7bVzMqd9CeuG1iankXADbpEyaoS2MvikLh0PzE1152FAr2N-ZwxcujH7clIzTVGEA' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--header 'Language: en' \\\r\n--data '{\r\n    \"startDate\": \"2023-08-20\",\r\n    \"endDate\": \"2023-08-22\",\r\n    \"imsi\": \"891383777499631\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/sim/Voice/usages",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": " {\r\n    \"account_id\":\"3505\",\r\n    \"search_criteria\":\"source\",\r\n    \"source_msisdn\":\"551791083309\",\r\n    \"from\":\"2025-05-01\",\r\n    \"to\":\"2025-07-03\",\r\n    \"view_criteria\":\"DAY\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/sim/Voice/usages",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "sim",
+            "Voice",
+            "usages"
+          ],
+          "query": [
+            {
+              "key": "account_id",
+              "value": "2168",
+              "disabled": true
+            },
+            {
+              "key": "search_criteria",
+              "value": "",
+              "disabled": true
+            },
+            {
+              "key": "source_msisdn",
+              "value": "",
+              "disabled": true
+            },
+            {
+              "key": "call_type",
+              "value": "",
+              "disabled": true
+            },
+            {
+              "key": "from",
+              "value": "2023-07-05 00 00 00",
+              "disabled": true
+            },
+            {
+              "key": "view_criteria",
+              "value": "HOUR",
+              "disabled": true
+            },
+            {
+              "key": "to",
+              "value": "2023-07-05%2020%3A00%3A00",
+              "disabled": true
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request POST 'https://10.221.86.77:8020/gcapi/sim/Voice/usages?account_id=2168&search_criteria=&source_msisdn=&call_type=&from=2023-07-05%2014%3A00%3A00&view_criteria=HOUR&to=2023-07-05%2020%3A00%3A00' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/sim/SMS/Usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg"
+          },
+          {
+            "key": "Cookie",
+            "value": "accountId=2; UTCminutes=330; userId=2; X-Requested-With=XMLHttpRequest; Authorization=eyJhbGciOiJIUzUxMiJ9.eyJhY2NvdW50SWQiOjIsInN1YiI6InN1cGVyYWRtaW4iLCJhdWRpZW5jZSI6IndlYiIsInVzZXJOYW1lIjoic3VwZXJhZG1pbiIsImV4cCI6MTY1ODgzMjk5NywidXNlcklkIjoyLCJpYXQiOjE2NTg4MzIzOTd9.IVc-uJCo8mfM15Q4k96TVh1Fh__tLIEbAX-gT-DaXmcp1EK6KMm4r4eiY3LnO9rxuazw3e-waYJ-1oYbyvKIRw; SameSite=none; SameSite=none"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n\t\"account_id\" : \"3498\",\r\n\t\"source_msisdn\":\"551796526343\",\r\n\t\"search_criteria\":\"source\",\r\n\t\"sms_type\":\"MO\",\r\n\t\"from\":\"2025-05-01\",\r\n    \"to\":\"2025-07-03\",\r\n    \"view_criteria\":\"DAY\"\r\n}\r\n\r\n",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/sim/SMS/Usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "sim",
+            "SMS",
+            "Usage"
+          ],
+          "query": [
+            {
+              "key": "account_id",
+              "value": "3498",
+              "disabled": true
+            },
+            {
+              "key": "source_msisdn",
+              "value": "551790472022",
+              "disabled": true
+            },
+            {
+              "key": "search_criteria",
+              "value": "source",
+              "disabled": true
+            },
+            {
+              "key": "from",
+              "value": "2023-11-09 00:00",
+              "disabled": true
+            },
+            {
+              "key": "to",
+              "value": "2023-11-09",
+              "disabled": true
+            },
+            {
+              "key": "view_criteria",
+              "value": "DAY",
+              "disabled": true
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request POST 'https://10.221.86.77:8020/gcapi/sim/SMS/Usage?account_id=2168&search_criteria=&source_msisdn=&sms_type=&from=2023-02-05%2003%3A00%3A00&view_criteria=HOUR&to=2023-02-05%2006%3A00%3A00' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhcGl1c2VyMDEwNjIzIiwiYWNjb3VudElkIjoyMTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2OTUwMjEzMzcwNzYsInVzZXJJZCI6OTZ9.I-elgflqRVhDML2lg8OWCaGBVbmIXSp3df2o85MadAM7lpiijUTFpFjPfQ_S3rGFZ0o_Ka1CtE2ZO8YLH8EvPg' \\\r\n--header 'Cookie: accountId=2; UTCminutes=330; userId=2; X-Requested-With=XMLHttpRequest; Authorization=eyJhbGciOiJIUzUxMiJ9.eyJhY2NvdW50SWQiOjIsInN1YiI6InN1cGVyYWRtaW4iLCJhdWRpZW5jZSI6IndlYiIsInVzZXJOYW1lIjoic3VwZXJhZG1pbiIsImV4cCI6MTY1ODgzMjk5NywidXNlcklkIjoyLCJpYXQiOjE2NTg4MzIzOTd9.IVc-uJCo8mfM15Q4k96TVh1Fh__tLIEbAX-gT-DaXmcp1EK6KMm4r4eiY3LnO9rxuazw3e-waYJ-1oYbyvKIRw; SameSite=none; SameSite=none'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/device/dataUsage",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NTY2NTc5MjM1NywidXNlcklkIjoxMTd9.4zTSEpTP72MVmw9uHQOoImV4mLWQjroaLj4OyrjoU1LpND5Q_DL7PcsthBZpjuR1aVlVYdQ6D6OPHRO9l3h3yQ",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/device/dataUsage?imsi=724053115450102&fromDate=2025-08-18 00:00&toDate=2025-08-18 23:00",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "device",
+            "dataUsage"
+          ],
+          "query": [
+            {
+              "key": "imsi",
+              "value": "724053115450102"
+            },
+            {
+              "key": "fromDate",
+              "value": "2025-08-18 00:00"
+            },
+            {
+              "key": "toDate",
+              "value": "2025-08-18 23:00"
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'http://localhost:8080/gcapi/device/dataUsage?imsi=234206210060005&fromDate=2018-09-01%2000%3A00&toDate=2018-10-10%2000%3A00' \\\r\n--header 'Authorization: Bearer {{token}}' \\\r\n--header 'Accept: application/json' \\\r\n--header 'Content-Type: application/json'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/session/wise/data/usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDI4NjY3NTEwMSwidXNlcklkIjoxMTR9.QqiPhG70MwrMnh8VjqrS1ILlEOm0RQ7PZrpBZm16tXux-Fq59pyypzSGIt73lHavvBKVTfAWiX25jRtwKkBKqA"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"startDate\": \"2025-06-11\",\r\n    \"endDate\": \"2025-06-18\",\r\n    \"limit\": \"1\",\r\n    \"offset\": \"1\",\r\n    \"imsi\": \"722020605015406\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/session/wise/data/usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "session",
+            "wise",
+            "data",
+            "usage"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/session/wise/data/usage' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDI4NjY3NTEwMSwidXNlcklkIjoxMTR9.QqiPhG70MwrMnh8VjqrS1ILlEOm0RQ7PZrpBZm16tXux-Fq59pyypzSGIt73lHavvBKVTfAWiX25jRtwKkBKqA' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--data '{\r\n    \"imsi\": \"724051810266121\",\r\n    \"startDate\": \"2023-10-10\",\r\n    \"endDate\": \"2023-10-10\",\r\n    \"limit\": \"20\",\r\n    \"offset\": \"0\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/consumed/usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDg5Mjk0NDE3MSwidXNlcklkIjoxMTd9.8NT-QoOhmgcDfgT-rr0qj3bEgLM8cV4yMrFuOUc8_5hLVmP-Pib_6bxsS7koYUefyDBfvdbrU6Vb8URNc9Uk5Q",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJBcGlfVXNlcjI4MDIyMyIsImFjY291bnRJZCI6MjE2OSwiYXVkaWVuY2UiOiJ3ZWIiLCJjcmVhdGVkIjoxNjk0MTU3MjM3NzA1LCJ1c2VySWQiOjc4fQ.p_lTGgolsUQO6WHf2YIApCP6NqddNQTE6mzghT-WH_ripRiDFVwuyQdhAgKN5Xs7TL9enK2D4FEMko1y1dPUfg"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          },
+          {
+            "key": "Language",
+            "value": "en"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"imsis\": \"724054462479912\",\r\n    \"offset\": \"0\",\r\n    \"limit\": \"100\",\r\n    \"startTime\":\"2025-07-01 00:00:10\",\r\n    \"stopTime\":\"2025-07-03 23:42:10\"\r\n}\r\n",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/consumed/usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "consumed",
+            "usage"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/consumed/usage' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJBcGlfVXNlcjI4MDIyMyIsImFjY291bnRJZCI6MjE2OSwiYXVkaWVuY2UiOiJ3ZWIiLCJjcmVhdGVkIjoxNjk0MTU3MjM3NzA1LCJ1c2VySWQiOjc4fQ.p_lTGgolsUQO6WHf2YIApCP6NqddNQTE6mzghT-WH_ripRiDFVwuyQdhAgKN5Xs7TL9enK2D4FEMko1y1dPUfg' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--header 'Language: en' \\\r\n--data '{\r\n    \"imsis\": \"890083821686244\",\r\n    \"offset\": \"0\",\r\n    \"limit\": \"20\",\r\n    \"startTime\": \"2023-03-13 15:42:10\",\r\n    \"stopTime\": \"2023-03-13 20:42:10\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/billing/detailed/usage",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDU0MjMxMTY1MiwidXNlcklkIjoxMTd9.8qmirSlioiM17k--a7EZi06Xv2eriCyazmhiho2cgdnZDFzwmazhbIxxDydAC4VrR8d30Qlsjq4HfIRlnuHtsw",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDI4NjY3NTEwMSwidXNlcklkIjoxMTR9.QqiPhG70MwrMnh8VjqrS1ILlEOm0RQ7PZrpBZm16tXux-Fq59pyypzSGIt73lHavvBKVTfAWiX25jRtwKkBKqA"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none"
+          },
+          {
+            "key": "Language",
+            "value": "en"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"imsi\": \"728300109763861\",\r\n    \"serviceType\": \"sms\",\r\n    \"offset\": \"0\",\r\n    \"limit\": \"50\",\r\n    \"fromDate\": \"2025-08-02\",\r\n    \"toDate\": \"2025-08-03\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/billing/detailed/usage",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "billing",
+            "detailed",
+            "usage"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/billing/detailed/usage' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDI4NjY3NTEwMSwidXNlcklkIjoxMTR9.QqiPhG70MwrMnh8VjqrS1ILlEOm0RQ7PZrpBZm16tXux-Fq59pyypzSGIt73lHavvBKVTfAWiX25jRtwKkBKqA' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none' \\\r\n--header 'Language: en' \\\r\n--data '{\r\n    \"imsi\": \"724051810266121\",\r\n    \"serviceType\": \"data\",\r\n    \"offset\": \"20\",\r\n    \"limit\": \"50\",\r\n    \"fromDate\": \"2023-10-15\",\r\n    \"toDate\": \"2023-10-15\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/sim/bundleDetails",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDQ0OTg5MjgzMSwidXNlcklkIjoxMTd9.ir7rueV-CZjdpRLDr61lyPCRG9_yat4r1eUyV0spVjDUmrxYruoA5EMdd4fyTnJlfvbykls85HsR2qH7C36OGA",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDQ1MzE5MzU5MSwidXNlcklkIjoxMTR9.YY7XXObbQ9A1eOAQjmz8nJ2To0XvYTMLp7GsaEjQqQxqkjKsPylL08uYZNoI9TB90Sx7UShNMrwSz9BtnJ-_bg"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n     \"imsis\": \"728300109763853\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/sim/bundleDetails",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "sim",
+            "bundleDetails"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/sim/bundleDetails' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluX3VzZXIiLCJhY2NvdW50SWQiOjEsImF1ZGllbmNlIjoid2ViIiwiY3JlYXRlZCI6MTcwMDQ1MzE5MzU5MSwidXNlcklkIjoxMTR9.YY7XXObbQ9A1eOAQjmz8nJ2To0XvYTMLp7GsaEjQqQxqkjKsPylL08uYZNoI9TB90Sx7UShNMrwSz9BtnJ-_bg' \\\r\n--header 'Content-Type: application/json' \\\r\n--data '{\r\n    \"imsi\": \"729781091797990,724051810266029,724051810266028\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/device/sessionInfo",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJUZWxjZWwiLCJhY2NvdW50SWQiOjMxMjcsImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NTUwOTkzMTA5MywidXNlcklkIjoxMTZ9.bi0OaQYkHwcZLpaRMJNs03ibpbw_HGVcC9u5Y7p2hf7YBuVza9iqz_HV4euA9Ps6x7Por6hfPSkyBAOgcd00sw",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MDM4MjU0MDAzNzEsInVzZXJJZCI6MX0.IE453lHBLUxRnw2IpTW4gcWNHwFY33UVYBYPT8HkTk78XmQYz9PBGSP6OHHDLBYFFEuGqsSY2TbUTrk08nGRLg"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/device/sessionInfo?imsi=334020513183903",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "device",
+            "sessionInfo"
+          ],
+          "query": [
+            {
+              "key": "imsi",
+              "value": "334020513183903"
+            },
+            {
+              "key": "iccid",
+              "value": "887638637271349103",
+              "disabled": true
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://aoneaircontrolqe.airlinq.com:8030/gcapi/device/sessionInfo?iccid=36605237041915366' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MDM4MjU0MDAzNzEsInVzZXJJZCI6MX0.IE453lHBLUxRnw2IpTW4gcWNHwFY33UVYBYPT8HkTk78XmQYz9PBGSP6OHHDLBYFFEuGqsSY2TbUTrk08nGRLg' \\\r\n--header 'Cookie: SameSite=none'"
+      },
+      "response": []
+    },
+    {
+      "name": "gcapi/sim/replacement",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1MjU2NTQ0NTc1NywidXNlcklkIjoxMTd9.dwiBucuBiDeFFyDAIWTlftgHv7vK4zp4nYvpAH3A3PlSd-NoKr-Vk6Mo3xcBonQ6Gfd2DMB78-84NKFb1eW3Ww",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJFbnRlcnByaXNlMV9FYyIsImFjY291bnRJZCI6MzM4NCwiYXVkaWVuY2UiOiJ3ZWIiLCJjcmVhdGVkIjoxNzQ1Mzg2OTkxODM4LCJ1c2VySWQiOjY5N30.y8308uStu0P_7UpGqeyCJKdWOBPeTCKi0KEEUBgMuyBttRqW4x4rE61UpI1QnQgEZKHy9Ntur7PKHbQuPfchFA"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"IMSI1\": \"728300109284364\",\r\n    \"IMSI2\": \"724058609119925\"\r\n}\t",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/sim/replacement",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "sim",
+            "replacement"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/sim/replacement' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJFbnRlcnByaXNlMV9FYyIsImFjY291bnRJZCI6MzM4NCwiYXVkaWVuY2UiOiJ3ZWIiLCJjcmVhdGVkIjoxNzQ1Mzg2OTkxODM4LCJ1c2VySWQiOjY5N30.y8308uStu0P_7UpGqeyCJKdWOBPeTCKi0KEEUBgMuyBttRqW4x4rE61UpI1QnQgEZKHy9Ntur7PKHbQuPfchFA' \\\r\n--data '{\r\n    \"IMSI1\": \"740000109244244\",\r\n    \"IMSI2\": \"740000109244236\"\r\n}\t'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/esim/operation",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "*/*"
+          },
+          {
+            "key": "Accept-Language",
+            "value": "en-US,en;q=0.9"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJ0ZXN0NDdfYW14MTIzIiwiYWNjb3VudElkIjoyOTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MzM5ODMwMzk1MzAsInVzZXJJZCI6NjgwfQ.qLdGCB7Y6KGFGFLj9XSwsQXS6s7v9HSn1zvLmXtRPCNyi2dp3FOsJ2zyh7y6-RAhaqBQaEBiVpCynuX0Bo9bUg"
+          },
+          {
+            "key": "Connection",
+            "value": "keep-alive"
+          },
+          {
+            "key": "Language",
+            "value": "en"
+          },
+          {
+            "key": "Referer",
+            "value": "https://192.168.1.26:2041/"
+          },
+          {
+            "key": "Sec-Fetch-Dest",
+            "value": "empty"
+          },
+          {
+            "key": "Sec-Fetch-Mode",
+            "value": "cors"
+          },
+          {
+            "key": "Sec-Fetch-Site",
+            "value": "cross-site"
+          },
+          {
+            "key": "User-Agent",
+            "value": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "X-Requested-With",
+            "value": "XMLHttpRequest"
+          },
+          {
+            "key": "accountId",
+            "value": "2432"
+          },
+          {
+            "key": "sec-ch-ua",
+            "value": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""
+          },
+          {
+            "key": "sec-ch-ua-mobile",
+            "value": "?0"
+          },
+          {
+            "key": "sec-ch-ua-platform",
+            "value": "\"Linux\""
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"changeProfileState\": \"downloadAndActivateAndEnableAndDelete\",\r\n    \"accountId\": \"3024\",\r\n    \"servicePlanId\": \"2093\",\r\n    \"devicePlanId\": \"2988\",\r\n    \"eid\":\"53000000000000000827530617479104\",\r\n    \"countryId\":\"1\",\r\n    \"targetState\": \"Activated\",\r\n    \"iccid\" :\"8937685200109007961\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.86.77:8020/gcapi/esim/operation",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "86",
+            "77"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "esim",
+            "operation"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://10.221.86.77:8020/gcapi/esim/operation' \\\r\n--header 'Accept: */*' \\\r\n--header 'Accept-Language: en-US,en;q=0.9' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJ0ZXN0NDdfYW14MTIzIiwiYWNjb3VudElkIjoyOTY4LCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MzM5ODMwMzk1MzAsInVzZXJJZCI6NjgwfQ.qLdGCB7Y6KGFGFLj9XSwsQXS6s7v9HSn1zvLmXtRPCNyi2dp3FOsJ2zyh7y6-RAhaqBQaEBiVpCynuX0Bo9bUg' \\\r\n--header 'Connection: keep-alive' \\\r\n--header 'Language: en' \\\r\n--header 'Referer: https://192.168.1.26:2041/' \\\r\n--header 'Sec-Fetch-Dest: empty' \\\r\n--header 'Sec-Fetch-Mode: cors' \\\r\n--header 'Sec-Fetch-Site: cross-site' \\\r\n--header 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' \\\r\n--header 'X-Requested-With: XMLHttpRequest' \\\r\n--header 'accountId: 2432' \\\r\n--header 'sec-ch-ua: \"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"' \\\r\n--header 'sec-ch-ua-mobile: ?0' \\\r\n--header 'sec-ch-ua-platform: \"Linux\"' \\\r\n--header 'Content-Type: application/json' \\\r\n--data '{\r\n    \"changeProfileState\": \"downloadAndActivateAndEnableAndDelete\",\r\n    \"accountId\": \"3024\",\r\n    \"servicePlanId\": \"2093\",\r\n    \"devicePlanId\": \"2988\",\r\n    \"eid\":\"53000000000000000827530617479104\",\r\n    \"countryId\":\"1\",\r\n    \"targetState\": \"Activated\",\r\n    \"iccid\" :\"8937685200109007961\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/device/sessionHistory",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJUZWxjZWwiLCJhY2NvdW50SWQiOjMxMjcsImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NTUwOTkzMTA5MywidXNlcklkIjoxMTZ9.bi0OaQYkHwcZLpaRMJNs03ibpbw_HGVcC9u5Y7p2hf7YBuVza9iqz_HV4euA9Ps6x7Por6hfPSkyBAOgcd00sw",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none; SameSite=none; SameSite=none; JSESSIONID=8E4E10B4E3BD61369D6C2661543B7530; SameSite=none"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MDQ0MzE5OTczMDgsInVzZXJJZCI6MX0.1JLn9paaiWgkqDwHhfeKAtcS50lu68134QM9k3AZejpkRVInP7XaHeTCmWO8F9yBj_jh2WMX9tBL602HeDpRZQ"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "\r\n{\r\n \"imsi\":\"724053660479632\",\r\n \"fromDate\":\"2025-01-01 00:00\",\r\n \"toDate\":\"2025-06-30 00:00\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.88/ts/api/ext/device/sessionHistory?imsi=724053645350323&fromDate=2025-01-01 00:00&toDate=2025-06-30 00:00",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "88"
+          ],
+          "path": [
+            "ts",
+            "api",
+            "ext",
+            "device",
+            "sessionHistory"
+          ],
+          "query": [
+            {
+              "key": "imsi",
+              "value": "724053645350323"
+            },
+            {
+              "key": "fromDate",
+              "value": "2025-01-01 00:00"
+            },
+            {
+              "key": "toDate",
+              "value": "2025-06-30 00:00"
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://aoneaircontrolqe.airlinq.com:8030/gcapi/device/sessionHistory?imsi=232011234323237&fromDate=2023-11-21%2000%3A00&toDate=2023-11-22%2023%3A59' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none; SameSite=none; SameSite=none; JSESSIONID=8E4E10B4E3BD61369D6C2661543B7530; SameSite=none' \\\r\n--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE3MDQ0MzE5OTczMDgsInVzZXJJZCI6MX0.1JLn9paaiWgkqDwHhfeKAtcS50lu68134QM9k3AZejpkRVInP7XaHeTCmWO8F9yBj_jh2WMX9tBL602HeDpRZQ'"
+      },
+      "response": []
+    },
+    {
+      "name": "http://10.221.90.82:8181/backend/st/json/UserRequest?imsi=334021000000073&msisdn=700000000173&OCStoken=OCS1404805067123456000000&network=334020&origin=gmksa&type=Data&ratType=900",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "x-ocs-ip",
+            "value": "10.221.90.83"
+          }
+        ],
+        "url": {
+          "raw": "http://10.221.90.82:8181/backend/st/json/UserRequest?imsi=334021110112290&msisdn=527531535530&OCStoken=OCS1404805067123456000000&network=334020&origin=gmksa&type=Data&ratType=900",
+          "protocol": "http",
+          "host": [
+            "10",
+            "221",
+            "90",
+            "82"
+          ],
+          "port": "8181",
+          "path": [
+            "backend",
+            "st",
+            "json",
+            "UserRequest"
+          ],
+          "query": [
+            {
+              "key": "imsi",
+              "value": "334021110112290"
+            },
+            {
+              "key": "msisdn",
+              "value": "527531535530"
+            },
+            {
+              "key": "OCStoken",
+              "value": "OCS1404805067123456000000"
+            },
+            {
+              "key": "network",
+              "value": "334020"
+            },
+            {
+              "key": "origin",
+              "value": "gmksa"
+            },
+            {
+              "key": "type",
+              "value": "Data"
+            },
+            {
+              "key": "ratType",
+              "value": "900"
+            }
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request POST 'http://10.221.90.82:8181/backend/st/json/UserRequest?imsi=334021000000073&msisdn=700000000173&OCStoken=OCS1404805067123456000000&network=334020&origin=gmksa&type=Data&ratType=900' \\\n--header 'x-ocs-ip: 10.221.90.83' \\\n--data ''"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/apn/operation",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDkzNjI3MTgzNCwidXNlcklkIjoxMTd9.NfLUinARKa9f9AvnmGBn1C4NdfMhzq53MVlKOHJNxv4PRYIXF7VgFK8dvg3hSc33L26DgpEnwkeOBHWo24yCOg",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2NzI4NDgwMzU0MTIsInVzZXJJZCI6MX0.471cwNtNX1OSg3_8s_-_8sxxz6zzhdZCk5E64bJq9BypWCFHM2GCt2EcrlMexQHJR_yRt8HrNNFdAvXE9Q5v6Q"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Cookie",
+            "value": "SameSite=none; SameSite=none; SameSite=none; SameSite=none"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"imsi\": \"724055448174596\",\r\n    \"apnIds\": \"820,821\",\r\n    \"actionType\": \"unassign_apn\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/apn/operation",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "apn",
+            "operation"
+          ]
+        },
+        "description": "Generated from cURL: curl --location 'https://cc.amx.claroconnect.com:8443/gcapi/apn/operation' \\\r\n--header 'Authorization: eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJndGFkbWluIiwiYWNjb3VudElkIjoxLCJhdWRpZW5jZSI6IndlYiIsImNyZWF0ZWQiOjE2NzI4NDgwMzU0MTIsInVzZXJJZCI6MX0.471cwNtNX1OSg3_8s_-_8sxxz6zzhdZCk5E64bJq9BypWCFHM2GCt2EcrlMexQHJR_yRt8HrNNFdAvXE9Q5v6Q' \\\r\n--header 'Content-Type: application/json' \\\r\n--header 'Cookie: SameSite=none; SameSite=none; SameSite=none; SameSite=none' \\\r\n--data '{\r\n    \"imsi\": \"334020116724001\",\r\n    \"apnIds\": \"219\",\r\n    \"actionType\": \"assign_apn\"\r\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "/gcapi/sim/reset",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJDbGFybyBCcmF6aWwiLCJhY2NvdW50SWQiOjMxMjksImF1ZGllbmNlIjoiYXBpIiwiY3JlYXRlZCI6MTc1NDk3OTY3MzQzNSwidXNlcklkIjoxMTd9.6bRFoJeqMXhIjqcMW8ucvFQzP0be_jV97l3BFajoUaAatPwK234Dp2u0RB6zeg-0y4Az3OpTeycpoxHDK3FYeg",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"imsi\": \"890083821551213\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://10.221.89.84:8020/gcapi/sim/reset",
+          "protocol": "https",
+          "host": [
+            "10",
+            "221",
+            "89",
+            "84"
+          ],
+          "port": "8020",
+          "path": [
+            "gcapi",
+            "sim",
+            "reset"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --globoff --request GET 'https://{hostip}:{hostport}/gcapi/sim/reset' \\\r\n--header 'Content-Type: application/json' \\\r\n--data '{\r\n    \"imsi\": \"890083821551213\"\r\n}'"
+      },
+      "response": []
+    }
+  ]
+}

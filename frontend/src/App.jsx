@@ -1,0 +1,466 @@
+import { useState, useEffect } from 'react';
+import { projectDirName, collectionDirName, collectionPathLabel } from './utils/displayName';
+import api from './api';
+import Auth from './components/Auth';
+import Sidebar from './components/Sidebar';
+import CustomSelect from './components/CustomSelect';
+import Modal from './components/Modal';
+import ConfirmModal from './components/ConfirmModal';
+import Toast from './components/Toast';
+import ErrorBoundary from './components/ErrorBoundary';
+import { useConfirm } from './hooks/useConfirm';
+import { ToastProvider, useToast } from './hooks/useToast';
+import Dashboard from './pages/Dashboard';
+import ProjectHome from './pages/ProjectHome';
+import Collections from './pages/Collections';
+import Rules from './pages/Rules';
+import Runner from './pages/Runner';
+import TestSuites from './pages/TestSuites';
+import TestData from './pages/TestData';
+import Config from './pages/Config';
+import Settings from './pages/Settings';
+import Profile from './pages/Profile';
+import Alerts from './pages/Alerts';
+import Reports from './pages/Reports';
+import Analytics from './pages/Analytics';
+
+const PAGE_TITLES = {
+  dashboard: 'Dashboard',
+  'project-home': null,
+  collections: 'API Source',
+  rules: 'Rule Engine',
+  runner: 'Test Execution Engine',
+  'test-suites': 'Test Plans',
+  'test-data': 'Test Data',
+  config: 'Configuration',
+  'settings-users': 'User Management',
+  'settings-appearance': 'Appearance',
+  'settings-ai': 'AI Configuration',
+  'ai-config':   'AI Configuration',
+  profile: 'My Profile',
+  reports: 'JMeter Report',
+  analytics: 'Analytics',
+  alerts: 'Alert Configuration',
+};
+
+const TOP_TABS = [
+  { id: 'dashboard',  icon: 'ti-layout-dashboard', label: 'Dashboard' },
+  { id: 'projects',   icon: 'ti-folder',            label: 'Projects' },
+  { id: 'settings',   icon: 'ti-adjustments',        label: 'Settings' },
+  { id: 'profile',    icon: 'ti-user',               label: 'Profile' },
+];
+
+function tabFromPage(p) {
+  if (p === 'dashboard') return 'dashboard';
+  if (p === 'runner') return 'projects';    // runner now lives inside collection context
+  if (p.startsWith('settings')) return 'settings';
+  return 'projects';
+}
+
+// Renders children only after first visit; hides (not unmounts) when inactive.
+// This preserves all component state — useState, refs, timers, SSE readers — when navigating away.
+function KeepAlive({ active, everVisited, children }) {
+  if (!everVisited) return null;                     // not yet visited — don't mount
+  // display:contents when active = wrapper is invisible to layout (no extra box).
+  // display:none when inactive = entire subtree removed from painting + layout
+  // but React keeps the component tree alive, preserving all useState/refs/timers.
+  return <div style={{ display: active ? 'contents' : 'none' }}>{children}</div>;
+}
+
+export default function App() {
+  return <ToastProvider><AppInner /></ToastProvider>;
+}
+
+function AppInner() {
+  const [user, setUser] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [activeProject, setActiveProject] = useState(null);
+  const [activeCollection, setActiveCollection] = useState(null); // selected collection within project
+  const [activeEnv, setActiveEnv] = useState(null);              // selected environment within collection
+  const [page, setPage] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [newProjectModal, setNewProjectModal] = useState(false);
+  const [npForm, setNpForm] = useState({ name: '', description: '' });
+  const [npSaving, setNpSaving] = useState(false);
+  const [editProjectModal, setEditProjectModal] = useState(false);
+  const [epForm, setEpForm] = useState({ id: null, name: '', description: '' });
+  const [epSaving, setEpSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [collectionModalTrigger, setCollectionModalTrigger] = useState(0);
+  const [ruleModalTrigger, setRuleModalTrigger] = useState(0);
+  const [testSuiteModalTrigger, setTestSuiteModalTrigger] = useState(0);
+  const [testDataUploadTrigger, setTestDataUploadTrigger] = useState(0);
+  const [generateDataTrigger, setGenerateDataTrigger] = useState(0);
+  const [theme, setTheme] = useState(() => localStorage.getItem('ps_theme') || 'quarks');
+  // Track which pages have been mounted at least once so KeepAlive can preserve their state.
+  const [everVisited, setEverVisited] = useState(() => new Set(['dashboard']));
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
+  const { toast } = useToast();
+
+  function markVisited(p) {
+    setEverVisited(prev => {
+      if (prev.has(p)) return prev;
+      const next = new Set(prev);
+      next.add(p);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('ps_theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const token = localStorage.getItem('ps_token');
+    if (!token) { setLoading(false); return; }
+    api.get('/auth/me').then(({ data }) => {
+      setUser(data.user);
+      loadProjects();
+    }).catch(() => {
+      localStorage.removeItem('ps_token');
+      setLoading(false);
+    });
+  }, []);
+
+  async function loadProjects() {
+    const { data } = await api.get('/projects');
+    const ps = data.projects;
+    for (const p of ps) {
+      try {
+        const [cols, rules] = await Promise.all([
+          api.get(`/projects/${p.id}/collections`),
+          api.get(`/projects/${p.id}/rules`),
+        ]);
+        p.collections = cols.data.collections;
+        p.rules = rules.data.rules;
+      } catch {
+        p.collections = [];
+        p.rules = [];
+      }
+    }
+    setProjects(ps);
+    setLoading(false);
+    return ps;
+  }
+
+  async function refreshProject() {
+    const id = activeProject?.id;
+    if (!id) return;
+    const [projRes, cols, rules] = await Promise.all([
+      api.get('/projects'),
+      api.get(`/projects/${id}/collections`),
+      api.get(`/projects/${id}/rules`),
+    ]);
+    const proj = projRes.data.projects.find(p => p.id === id);
+    if (!proj) return;
+    proj.collections = cols.data.collections;
+    proj.rules = rules.data.rules;
+    setProjects(prev => prev.map(p => p.id === id ? proj : p));
+    setActiveProject(proj);
+  }
+
+  function openNewProject() { setNpForm({ name: '', description: '' }); setNewProjectModal(true); }
+
+  function openAddCollection() {
+    markVisited('collections');
+    setPage('collections');
+    setActiveTab('projects');
+    setCollectionModalTrigger(n => n + 1);
+  }
+
+
+  function openEditProject(p) {
+    setEpForm({ id: p.id, name: p.name, description: p.description || '' });
+    setEditProjectModal(true);
+  }
+
+  async function editProject() {
+    if (!epForm.name.trim()) return toast('Project name is required', 'warn');
+    setEpSaving(true);
+    const { data } = await api.put(`/projects/${epForm.id}`, { name: epForm.name, description: epForm.description });
+    const updated = data.project;
+    setProjects(prev => prev.map(p => p.id === updated.id ? { ...p, ...updated } : p));
+    if (activeProject?.id === updated.id) setActiveProject(prev => ({ ...prev, ...updated }));
+    setEditProjectModal(false);
+    setEpSaving(false);
+    toast('Project updated', 'success');
+  }
+
+  function nav(p) {
+    markVisited(p);
+    setPage(p);
+    setActiveTab(tabFromPage(p));
+    // Reset modal triggers so re-navigating to a page never auto-opens its form
+    setCollectionModalTrigger(0);
+    setRuleModalTrigger(0);
+    setTestSuiteModalTrigger(0);
+    setTestDataUploadTrigger(0);
+    setGenerateDataTrigger(0);
+  }
+
+  function changeTab(tab) {
+    setActiveTab(tab);
+    let target;
+    if (tab === 'dashboard')  target = 'dashboard';
+    else if (tab === 'execution') target = 'runner';
+    else if (tab === 'settings') {
+      const isAdmin = user?.role === 'super_admin' || user?.role === 'org_admin';
+      target = isAdmin ? 'settings-users' : 'settings-appearance';
+    }
+    else if (tab === 'projects') target = 'dashboard';
+    else if (tab === 'profile')  target = 'profile';
+    if (target) { markVisited(target); setPage(target); }
+  }
+
+  function selectProject(id) {
+    const p = projects.find(pr => pr.id === id);
+    setActiveProject(p);
+    setActiveCollection(null);
+    setActiveEnv(null);
+    setActiveTab('projects');
+    markVisited('project-home');
+    setPage('project-home');
+  }
+
+  function selectCollection(collection, env, targetPage) {
+    // Support old 2-arg calls: selectCollection(col, page)
+    if (typeof env === 'string' && !targetPage && !['QA','Staging','UAT','Production','Development','Default'].includes(env)) {
+      targetPage = env;
+      env = null;
+    }
+    setActiveCollection(collection);
+    setActiveEnv(env || null);
+    const dest = targetPage || 'test-suites';
+    markVisited(dest);
+    setPage(dest);
+    setActiveTab('projects');
+    setCollectionModalTrigger(0);
+  }
+
+  async function createProject() {
+    if (!npForm.name.trim()) return toast('Project name is required', 'warn');
+    setNpSaving(true);
+    const { data } = await api.post('/projects', npForm);
+    const p = data.project;
+    p.collections = []; p.rules = [];
+    setProjects(prev => [p, ...prev]);
+    setNewProjectModal(false);
+    setNpForm({ name: '', description: '' });
+    setNpSaving(false);
+    setActiveProject(p);
+    markVisited('project-home');
+    nav('project-home');
+  }
+
+  async function deleteProject(id) {
+    const proj = projects.find(p => p.id === id);
+    const ok = await confirm(
+      `Delete "${proj?.name || 'this project'}"? All associated data will be removed. A backup ZIP will be saved to your backups folder in the background.`,
+      'Delete Project'
+    );
+    if (!ok) return;
+    try {
+      await api.delete(`/projects/${id}`);
+      setProjects(prev => prev.filter(p => p.id !== id));
+      if (activeProject?.id === id) { setActiveProject(null); setActiveCollection(null); nav('dashboard'); }
+      toast(`Project "${proj?.name}" deleted. Backup running in background.`, 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to delete project', 'error');
+    }
+  }
+
+  function handleLogin(u) {
+    setUser(u);
+    loadProjects().then(ps => { if (ps.length) setActiveProject(ps[0]); });
+  }
+
+  function logout() {
+    localStorage.removeItem('ps_token');
+    setUser(null); setProjects([]); setActiveProject(null);
+    setPage('dashboard'); setActiveTab('dashboard');
+    setEverVisited(new Set(['dashboard']));
+  }
+
+  function renderTopbarActions() {
+    switch (page) {
+      case 'dashboard':
+        return user?.role !== 'super_admin'
+          ? <button className="btn-primary" onClick={openNewProject}><i className="ti ti-plus" /> New Project</button>
+          : null;
+      case 'project-home':
+        return activeProject ? (
+          <>
+            <button className="btn-secondary btn-sm" onClick={() => nav('collections')}><i className="ti ti-braces" /> API Source</button>
+            <button className="btn-secondary btn-sm" onClick={() => nav('rules')}><i className="ti ti-adjustments-horizontal" /> Rules</button>
+            <button className="btn-secondary btn-sm" onClick={() => nav('test-suites')}><i className="ti ti-test-pipe" /> Test Plans</button>
+            <button className="btn-primary btn-sm" onClick={() => nav('runner')}><i className="ti ti-player-play" /> Run Tests</button>
+          </>
+        ) : null;
+      case 'collections':
+        return <button className="btn-primary" onClick={() => setCollectionModalTrigger(n => n + 1)}><i className="ti ti-plus" /> Add API Source</button>;
+      case 'rules':
+        return <button className="btn-primary" onClick={() => setRuleModalTrigger(n => n + 1)}><i className="ti ti-plus" /> Add Rule</button>;
+      case 'test-suites':
+        return <button className="btn-primary" onClick={() => setTestSuiteModalTrigger(n => n + 1)}><i className="ti ti-plus" /> New Test Plan</button>;
+      case 'test-data':
+        return (
+          <>
+            <button className="btn-secondary" onClick={() => setGenerateDataTrigger(n => n + 1)}><i className="ti ti-wand" /> Generate Data</button>
+            <button className="btn-primary" onClick={() => setTestDataUploadTrigger(n => n + 1)}><i className="ti ti-upload" /> Upload File</button>
+          </>
+        );
+      default:
+        return null;
+    }
+  }
+
+  const pageTitle = page === 'project-home'
+    ? (projectDirName(activeProject) || 'Project')
+    : page === 'runner' && activeCollection && activeEnv
+      ? `Run Tests — ${collectionDirName(activeCollection)} / ${activeEnv}`
+      : (PAGE_TITLES[page] || page);
+  const sharedProps = { onNav: nav, onProjectUpdated: refreshProject, collection: activeCollection, env: activeEnv };
+
+  if (loading) return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--color-body, #1e1f22)' }}>
+      <div style={{ color: 'var(--color-text-primary, #bcbec4)', fontSize: '15px', display: 'flex', gap: '10px', alignItems: 'center' }}>
+        <span className="spinner" /> Loading Performance Studio...
+      </div>
+    </div>
+  );
+
+  if (!user) return <Auth onLogin={handleLogin} />;
+
+  return (
+    <div>
+      {/* Banner */}
+      <div className="app-banner">
+        <img
+          src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
+          alt="QTSolv"
+          style={{ height: '40px', width: 'auto', objectFit: 'contain', position: 'absolute', left: '18px', zIndex: 1 }}
+        />
+        <i className="ti ti-activity-heartbeat app-banner-icon" />
+        <span className="app-banner-title">AI-Powered Performance Test Studio</span>
+      </div>
+
+      <Sidebar
+        user={user}
+        projects={projects}
+        activeProject={activeProject}
+        activeCollection={activeCollection}
+        activeEnv={activeEnv}
+        page={page}
+        activeTab={activeTab}
+        onNav={nav}
+        onSelectProject={selectProject}
+        onSelectCollection={selectCollection}
+        onNewProject={openNewProject}
+        onAddCollection={openAddCollection}
+        onLogout={logout}
+        onTabChange={changeTab}
+      />
+
+      <div className="main">
+        <div className="topbar">
+          <div className="topbar-title">{pageTitle}</div>
+          <div className="topbar-actions">{renderTopbarActions()}</div>
+        </div>
+
+        <KeepAlive active={page === 'dashboard'}    everVisited={everVisited.has('dashboard')}>
+          <Dashboard projects={projects} user={user} onSelectProject={selectProject} onDeleteProject={deleteProject} onNewProject={openNewProject} onEditProject={openEditProject} />
+        </KeepAlive>
+        <KeepAlive active={page === 'project-home'}  everVisited={everVisited.has('project-home')}>
+          <ProjectHome project={activeProject} onNav={nav} onDeleteProject={deleteProject} onEditProject={openEditProject} />
+        </KeepAlive>
+        <KeepAlive active={page === 'collections'}   everVisited={everVisited.has('collections')}>
+          <Collections project={activeProject} {...sharedProps} openModalTrigger={collectionModalTrigger} />
+        </KeepAlive>
+        <KeepAlive active={page === 'rules'}         everVisited={everVisited.has('rules')}>
+          <Rules project={activeProject} {...sharedProps} openModalTrigger={ruleModalTrigger} />
+        </KeepAlive>
+        <KeepAlive active={page === 'test-suites'}   everVisited={everVisited.has('test-suites')}>
+          <TestSuites project={activeProject} {...sharedProps} openModalTrigger={testSuiteModalTrigger} />
+        </KeepAlive>
+        <KeepAlive active={page === 'test-data'}     everVisited={everVisited.has('test-data')}>
+          <TestData project={activeProject} {...sharedProps} uploadTrigger={testDataUploadTrigger} generateTrigger={generateDataTrigger} />
+        </KeepAlive>
+        <KeepAlive active={page === 'config'}        everVisited={everVisited.has('config')}>
+          {/* key forces remount when env changes so all state (sysChecks, docker) resets cleanly */}
+          <Config key={`config-${activeProject?.id}-${activeCollection?.id}-${activeEnv}`} project={activeProject} collection={activeCollection} env={activeEnv} />
+        </KeepAlive>
+        <KeepAlive active={page.startsWith('settings')} everVisited={[...everVisited].some(p => p.startsWith('settings'))}>
+          <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} />
+        </KeepAlive>
+        <KeepAlive active={page === 'ai-config'} everVisited={everVisited.has('ai-config')}>
+          <Settings page="settings-ai" theme={theme} onThemeChange={setTheme} user={user} />
+        </KeepAlive>
+        <KeepAlive active={page === 'alerts'} everVisited={everVisited.has('alerts')}>
+          <Alerts project={activeProject} collection={activeCollection} env={activeEnv} />
+        </KeepAlive>
+        <KeepAlive active={page === 'profile'}       everVisited={everVisited.has('profile')}>
+          <Profile user={user} onUserUpdated={u => setUser(u)} />
+        </KeepAlive>
+        <KeepAlive active={page === 'runner'}        everVisited={everVisited.has('runner')}>
+          <ErrorBoundary><Runner projects={projects} activeProject={activeProject} activeCollection={activeCollection} activeEnv={activeEnv} onNav={nav} /></ErrorBoundary>
+        </KeepAlive>
+        <KeepAlive active={page === 'reports'}       everVisited={everVisited.has('reports')}>
+          <Reports project={activeProject} collection={activeCollection} env={activeEnv} />
+        </KeepAlive>
+        <KeepAlive active={page === 'analytics'}     everVisited={everVisited.has('analytics')}>
+          <Analytics project={activeProject} collection={activeCollection} />
+        </KeepAlive>
+
+        <footer className="app-footer">
+          &copy; Quarks Technosoft PVT. LTD. All rights reserved.
+        </footer>
+      </div>
+
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      <Toast />
+
+      {editProjectModal && (
+        <Modal onClose={() => setEditProjectModal(false)}>
+          <div className="modal-hdr">
+            <div className="modal-title">Edit Project</div>
+            <button className="btn-icon" onClick={() => setEditProjectModal(false)}><i className="ti ti-x" /></button>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Project Name</label>
+            <input type="text" value={epForm.name} onChange={e => setEpForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Checkout API Suite" autoFocus />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Description</label>
+            <input type="text" value={epForm.description} onChange={e => setEpForm(f => ({ ...f, description: e.target.value }))} placeholder="What are you testing?" />
+          </div>
+          <div className="modal-footer">
+            <button className="btn-secondary" onClick={() => setEditProjectModal(false)}>Cancel</button>
+            <button className="btn-primary" onClick={editProject} disabled={epSaving}>{epSaving && <span className="spinner" />}Save Changes</button>
+          </div>
+        </Modal>
+      )}
+
+      {newProjectModal && (
+        <Modal onClose={() => setNewProjectModal(false)}>
+          <div className="modal-hdr">
+            <div className="modal-title">New Project</div>
+            <button className="btn-icon" onClick={() => setNewProjectModal(false)}><i className="ti ti-x" /></button>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Project Name</label>
+            <input type="text" value={npForm.name} onChange={e => setNpForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Checkout API Suite" autoFocus />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Description</label>
+            <input type="text" value={npForm.description} onChange={e => setNpForm(f => ({ ...f, description: e.target.value }))} placeholder="What are you testing?" />
+          </div>
+          <div className="modal-footer">
+            <button className="btn-secondary" onClick={() => setNewProjectModal(false)}>Cancel</button>
+            <button className="btn-primary" onClick={createProject} disabled={npSaving}>{npSaving && <span className="spinner" />}Create Project</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}

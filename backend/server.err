@@ -1,0 +1,19 @@
+node:_http_outgoing:793
+    throw new ERR_HTTP_HEADERS_SENT('remove');
+    ^
+
+Error [ERR_HTTP_HEADERS_SENT]: Cannot remove headers after they are sent to the client
+    at ServerResponse.removeHeader (node:_http_outgoing:793:11)
+    at write (C:\Users\Tasleem\perf-studio\backend\node_modules\finalhandler\index.js:287:9)
+    at AsyncResource.runInAsyncScope (node:async_hooks:226:14)
+    at listener (C:\Users\Tasleem\perf-studio\backend\node_modules\on-finished\index.js:170:15)
+    at onFinish (C:\Users\Tasleem\perf-studio\backend\node_modules\on-finished\index.js:101:5)
+    at callback (C:\Users\Tasleem\perf-studio\backend\node_modules\ee-first\index.js:55:10)
+    at IncomingMessage.onevent (C:\Users\Tasleem\perf-studio\backend\node_modules\ee-first\index.js:93:5)
+    at IncomingMessage.emit (node:events:509:20)
+    at endReadableNT (node:internal/streams/readable:1729:12)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  code: 'ERR_HTTP_HEADERS_SENT'
+}
+
+Node.js v25.9.0

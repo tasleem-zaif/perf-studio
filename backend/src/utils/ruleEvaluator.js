@@ -1,0 +1,146 @@
+/**
+ * Evaluates a completed JMeter run against the project's Rule Engine definitions.
+ *
+ * Rules are stored with:
+ *   metric   – "Response Time" | "Error Rate" | "P90" | "P95" | "Throughput" | "Avg Response Time"
+ *   operator – ">" | "<" | ">=" | "<="
+ *   value    – numeric string threshold
+ *   unit     – "ms" | "%" | "req/s"
+ *   severity – "error" | "warn"
+ *
+ * Returns { passed, violations }
+ *   passed     – true when no *error*-severity rule is breached
+ *   violations – array of { rule, actual, label } for every breached rule
+ */
+
+const fs   = require('fs');
+const db   = require('../db');
+
+// ── Parse JTL and compute aggregate metrics ───────────────────────────────────
+function parseJtlMetrics(jtlPath) {
+  if (!jtlPath || !fs.existsSync(jtlPath)) return null;
+
+  const lines   = fs.readFileSync(jtlPath, 'utf8').trim().split('\n').filter(Boolean);
+  if (lines.length < 2) return null;
+
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+  const idx = {
+    elapsed:    headers.indexOf('elapsed'),
+    success:    headers.indexOf('success'),
+    latency:    headers.indexOf('latency'),
+    timeStamp:  headers.indexOf('timeStamp'),
+  };
+
+  const elapsed = [];
+  let pass = 0, fail = 0, minTs = Infinity, maxTs = -Infinity;
+
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(',');
+    const e  = parseInt((parts[idx.elapsed]   || '0').replace(/^"|"$/g, '')) || 0;
+    const ok = (parts[idx.success] || '').replace(/^"|"$/g, '').trim() === 'true';
+    const ts = parseInt((parts[idx.timeStamp] || '0').replace(/^"|"$/g, '')) || 0;
+
+    elapsed.push(e);
+    ok ? pass++ : fail++;
+    if (ts < minTs) minTs = ts;
+    if (ts > maxTs) maxTs = ts;
+  }
+
+  if (!elapsed.length) return null;
+
+  const total       = elapsed.length;
+  const sorted      = [...elapsed].sort((a, b) => a - b);
+  const pct = p     => sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
+  const avgRt       = elapsed.reduce((a, b) => a + b, 0) / total;
+  const durationSec = minTs < maxTs ? (maxTs - minTs) / 1000 : 1;
+
+  return {
+    total,
+    pass,
+    fail,
+    error_rate:       (fail / total) * 100,          // %
+    avg_response_time: avgRt,                         // ms
+    p90:              pct(90),                        // ms
+    p95:              pct(95),                        // ms
+    throughput:       total / durationSec,            // req/s
+  };
+}
+
+// ── Map rule metric name → computed metric key ─────────────────────────────────
+const METRIC_MAP = {
+  'response time':      'avg_response_time',
+  'avg response time':  'avg_response_time',
+  'average response time': 'avg_response_time',
+  'error rate':         'error_rate',
+  'p90':                'p90',
+  'p95':                'p95',
+  'throughput':         'throughput',
+  'tps':                'throughput',
+};
+
+function metricKey(ruleName) {
+  return METRIC_MAP[(ruleName || '').toLowerCase().trim()] || null;
+}
+
+function compare(actual, op, threshold) {
+  switch (op) {
+    case '>':  return actual >  threshold;
+    case '>=': return actual >= threshold;
+    case '<':  return actual <  threshold;
+    case '<=': return actual <= threshold;
+    case '==':
+    case '=':  return actual === threshold;
+    default:   return false;
+  }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Evaluates a JTL file against all rules defined for projectId.
+ * @param {number|string} projectId
+ * @param {string}        jtlPath   – absolute path to results.jtl
+ * @returns {{ passed: boolean, violations: Array, metrics: object|null, noRules: boolean }}
+ */
+function evaluateRules(projectId, jtlPath) {
+  const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
+
+  if (!rules || rules.length === 0) {
+    // No rules defined — pass/fail determined by raw JTL fail count only
+    return { passed: null, violations: [], metrics: null, noRules: true };
+  }
+
+  const metrics = parseJtlMetrics(jtlPath);
+  if (!metrics) {
+    // Can't parse JTL — no verdict
+    return { passed: null, violations: [], metrics: null, noRules: false };
+  }
+
+  const violations = [];
+
+  for (const rule of rules) {
+    const key = metricKey(rule.metric);
+    if (!key) continue;                       // unknown metric — skip
+
+    const actual    = metrics[key];
+    const threshold = parseFloat(rule.value);
+    if (isNaN(threshold)) continue;
+
+    const breached = compare(actual, rule.operator, threshold);
+    if (breached) {
+      violations.push({
+        rule,
+        actual: parseFloat(actual.toFixed(2)),
+        label: `${rule.metric} ${rule.operator} ${rule.value}${rule.unit} (actual: ${actual.toFixed(2)}${rule.unit})`,
+      });
+    }
+  }
+
+  // Run "passes" when no error-severity rule is violated
+  const errorViolations = violations.filter(v => v.rule.severity === 'error');
+  const passed = errorViolations.length === 0;
+
+  return { passed, violations, metrics, noRules: false };
+}
+
+module.exports = { evaluateRules, parseJtlMetrics };

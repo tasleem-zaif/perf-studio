@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+frontend/dist/
+frontend/.vite/
+
+# Environment & secrets
+.env
+.env.local
+.env.production
+*.env
+
+# Database (user data — not committed)
+backend/data/
+backend/database.sqlite
+backend/*.db
+
+# Project files (user uploads, results — not committed)
+projects/
+backups/
+
+# Logs
+*.log
+frontend.log
+frontend.err
+jmeter.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test output
+*.jtl
+test-results/
+
+# Temp files
+*.tmp
+*.bak
+backend/src/utils/test_*.js
