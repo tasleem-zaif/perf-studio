@@ -5,7 +5,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 FROM node:18-alpine
 
-# wget is used by the health-check probe; curl for optional diagnostics
+# wget for health-check, curl for diagnostics
 RUN apk add --no-cache wget curl
 
 WORKDIR /app
@@ -16,10 +16,17 @@ RUN npm install --omit=dev
 
 # Copy application source
 COPY src/ ./src/
+COPY docker-entrypoint.sh ./
+RUN chmod +x ./docker-entrypoint.sh
 
-# Ensure all required data directories exist at startup
+# Ensure data directories exist
 RUN mkdir -p /app/data /data/projects /data/backups
+
+# ── Security: run as non-root user ──────────────────────────────────────────
+RUN addgroup -S perfstudio && adduser -S -G perfstudio -u 1001 perfstudio
+RUN chown -R perfstudio:perfstudio /app /data
+USER perfstudio
 
 EXPOSE 3001
 
-CMD ["node", "src/index.js"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
