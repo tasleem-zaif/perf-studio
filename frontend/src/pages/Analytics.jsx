@@ -943,7 +943,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   }
 
   if (!project) return (
-    <div className="page" style={{ background: D.pageBg, minHeight: '130vh', color: D.textPri }}>
+    <div className="page" style={{ background: D.pageBg, color: D.textPri }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
       <div className="empty" style={{ color: D.textSec }}>
         <i className="ti ti-folder-off" style={{ color: D.textTer }} />
@@ -956,7 +956,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const runNum = selectedRun?.result_dir?.match(/Run_(\d+)/)?.[1];
 
   return (
-    <div className="page fade-in" style={{ background: D.pageBg, minHeight: '130vh', color: D.textPri }}>
+    <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
       {/* Run selector bar */}
       <div style={{ display:'flex', alignItems:'flex-end', gap:12, marginBottom:16, flexWrap:'wrap' }}>

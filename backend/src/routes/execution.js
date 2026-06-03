@@ -676,7 +676,21 @@ router.post('/run', auth, async (req, res) => {
 
   const projectFolderPath = project.folder_path || getProjectPath(project.name, project.id);
   const runNumber = getNextRunNumber(project_id);
-  const resultDir = path.join(projectFolderPath, 'results', `Run_${runNumber}`);
+
+  // Results go into collection/env/results/Run_X/ — tracked per environment in git
+  let resultDir;
+  if (suite.collection_id && suite.env && projectFolderPath) {
+    try {
+      const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      if (suiteCol) {
+        const { getCollectionPath } = require('../utils/projectFolders');
+        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suiteCol.id, suite.env);
+        resultDir = path.join(envPath, 'results', `Run_${runNumber}`);
+      }
+    } catch (_) {}
+  }
+  // Fallback to project-level results
+  if (!resultDir) resultDir = path.join(projectFolderPath, 'results', `Run_${runNumber}`);
   fs.mkdirSync(resultDir, { recursive: true });
   log('info', `  Result dir : ${resultDir}`);
   log('info', `  Run #      : ${runNumber}`);
@@ -985,6 +999,30 @@ router.post('/run', auth, async (req, res) => {
 
     db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=datetime('now') WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, runId);
+
+    // ── Auto-zip JMeter HTML report into results folder ───────────────────────
+    if (engine === 'jmeter' && reportPath && fs.existsSync(path.dirname(reportPath))) {
+      setImmediate(async () => {
+        try {
+          const reportDir = path.dirname(reportPath);
+          const runNum    = (resultDir.match(/Run_(\d+)/) || [])[1] || runId;
+          const zipPath   = path.join(resultDir, `JMeter_Report_Run_${runNum}.zip`);
+          const { ZipArchive } = require('archiver');
+          await new Promise((resolve, reject) => {
+            const output  = fs.createWriteStream(zipPath);
+            const archive = new ZipArchive({ zlib: { level: 6 } });
+            output.on('close', resolve);
+            archive.on('error', reject);
+            archive.pipe(output);
+            archive.directory(reportDir, false);
+            archive.finalize();
+          });
+          log('info', `  Report ZIP : ${zipPath}`);
+        } catch (e) {
+          console.error('[Execution] Failed to zip JMeter report:', e.message);
+        }
+      });
+    }
 
     // Trigger auto healer only when rules say the run actually failed
     const shouldHeal = auto_heal && finalStatus === 'failed';
@@ -1577,8 +1615,22 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
     duration_s: parseFloat(totalDuration.toFixed(1)),
   };
 
+  const pdfFilename = `${suiteName}_Run${runNum}_Analytics.pdf`;
+
+  // Save PDF to results folder on disk
+  if (run.result_dir && fs.existsSync(run.result_dir)) {
+    try {
+      const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+      const pdfPath = path.join(run.result_dir, pdfFilename);
+      await generateAnalyticsPdfToFile({ summary, by_api, timeline, errors, meta }, runNum, pdfPath);
+    } catch (e) {
+      console.error('[Execution] Failed to save analytics PDF to results:', e.message);
+    }
+  }
+
+  // Stream PDF to browser for download
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${suiteName}_Run${runNum}_Analytics.pdf"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${pdfFilename}"`);
   await generateAnalyticsPdf({ summary, by_api, timeline, errors, meta }, runNum, res);
 });
 

@@ -197,6 +197,11 @@ function AppInner() {
     markVisited(p);
     setPage(p);
     setActiveTab(tabFromPage(p));
+    // Scroll main content area back to top — rAF ensures it runs after KeepAlive
+    // switches display:none → display:contents and browser restores scroll position
+    requestAnimationFrame(() => {
+      document.querySelector('.main')?.scrollTo({ top: 0, behavior: 'instant' });
+    });
     // Reset modal triggers so re-navigating to a page never auto-opens its form
     setCollectionModalTrigger(0);
     setRuleModalTrigger(0);
@@ -227,6 +232,7 @@ function AppInner() {
     setActiveTab('projects');
     markVisited('project-home');
     setPage('project-home');
+    document.querySelector('.main')?.scrollTo({ top: 0, behavior: 'instant' });
   }
 
   function selectCollection(collection, env, targetPage) {
@@ -240,6 +246,7 @@ function AppInner() {
     const dest = targetPage || 'test-suites';
     markVisited(dest);
     setPage(dest);
+    document.querySelector('.main')?.scrollTo({ top: 0, behavior: 'instant' });
     setActiveTab('projects');
     setCollectionModalTrigger(0);
   }
