@@ -1,6 +1,6 @@
 # 🚀 Performance Studio
 
-**AI-Powered Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, and real-time analytics.
+**AI-Powered Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, real-time analytics, Git integration, and team collaboration.
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/tasleemzaif/perf-studio-backend)](https://hub.docker.com/r/tasleemzaif/perf-studio-backend)
 [![Build](https://github.com/tasleem-zaif/perf-studio/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/tasleem-zaif/perf-studio/actions)
@@ -16,7 +16,7 @@ curl -O https://raw.githubusercontent.com/tasleem-zaif/perf-studio/main/.env.exa
 
 # 2. Configure environment
 cp .env.example .env
-# Edit .env — set HOST_PROJECTS_ROOT and JWT_SECRET
+# Edit .env — set HOST_PROJECTS_ROOT, JWT_SECRET, FRONTEND_URL
 
 # 3. Launch (pulls images from Docker Hub automatically)
 docker compose up -d
@@ -25,7 +25,7 @@ docker compose up -d
 open http://localhost:5173
 ```
 
-**Default credentials:** `admin@perfstudio.com` / `Admin@123`
+**Default Super Admin credentials:** `admin@perfstudio.com` / `Admin@123`
 
 ---
 
@@ -34,23 +34,54 @@ open http://localhost:5173
 | Feature | Description |
 |---|---|
 | 🤖 **AI Script Generation** | Converts API collections (Postman/Swagger/cURL) to JMX/K6 scripts via GPT-4o or Claude |
-| 🔧 **Auto Healer** | Detects test failures, diagnoses root cause with AI, fixes the script, re-runs (up to 3 attempts) |
+| 🔧 **Auto Healer** | Detects test failures, diagnoses root cause with AI, fixes the script, re-runs automatically |
 | 🌍 **Multi-Environment** | QA / Staging / UAT each have isolated test data, configs, scripts, and results |
-| 📊 **Real-time Analytics** | 7-section analytics dashboard: Summary, Performance, Transactions, Trends, Resources, Errors, Logs |
+| 📊 **Real-time Analytics** | Live dashboards: response time, throughput, error rate, percentiles |
 | 🐳 **Docker Execution** | JMeter and K6 run in isolated Docker containers — no local install needed |
-| 📧 **Email Alerts** | Post-run emails with PDF analytics report and environment-specific results |
-| 🔒 **Security** | AES-256-CBC encrypted API keys, JWT auth, non-root Docker containers |
+| 📧 **Email Alerts** | Post-run emails with analytics and auto-healer results |
+| 🌿 **Git Integration** | Per-project Git with branch-per-user workflow, PR management, GitHub sync |
+| 👥 **Team Collaboration** | Org-based invite system, role-based access (Super Admin / Org Admin / User) |
+| 🔑 **Password Recovery** | Self-service forgot password via email + admin override |
+| 🔒 **Security** | AES-256-CBC encrypted secrets, JWT auth, role-based guards on all routes |
+
+---
+
+## 👥 User Roles
+
+| Role | Capabilities |
+|---|---|
+| **Super Admin** | Create organizations, invite Org Admins, configure SMTP |
+| **Org Admin** | Create projects, invite team members, configure AI/Git, merge PRs, run tests |
+| **Regular User** | Upload test data, configure envs, create test plans, push to own branch, raise PRs |
+
+---
+
+## 🌿 Git Integration
+
+Each project can be connected to a GitHub/GitLab repository:
+
+```
+GitHub Repo
+└── Project_Name/          ← visible subfolder on GitHub
+    ├── Collection_Name/
+    │   ├── QA/
+    │   │   ├── testData/
+    │   │   ├── script/
+    │   │   ├── results/
+    │   │   └── config/
+    │   └── UAT/
+    └── README.md
+```
+
+**Branch strategy:**
+- `main` — Org Admin branch (direct push)
+- `users/<name>` — per-user branches (PR required to merge)
 
 ---
 
 ## 🏗 Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full system diagrams including:
-- System component graph
-- Multi-environment isolation model
-- AI script generation flow
-- Test execution sequence
-- Security model
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full system diagrams.
 
 ---
 
@@ -64,14 +95,12 @@ git clone https://github.com/tasleem-zaif/perf-studio.git
 cd perf-studio
 
 # Backend
-cd backend
-npm install
-node src/index.js     # runs on :3001
+cd backend && npm install
+node src/index.js       # runs on :3001
 
 # Frontend (new terminal)
-cd frontend
-npm install
-npm run dev           # runs on :5173
+cd frontend && npm install
+npm run dev             # runs on :5173
 ```
 
 ---
@@ -84,8 +113,8 @@ npm run dev           # runs on :5173
 | Frontend | `tasleemzaif/perf-studio-frontend:latest` |
 
 ```bash
-docker pull tasleemzaif/perf-studio-backend:latest
-docker pull tasleemzaif/perf-studio-frontend:latest
+# Pull latest
+docker compose pull && docker compose up -d
 ```
 
 ---
@@ -96,7 +125,9 @@ docker pull tasleemzaif/perf-studio-frontend:latest
 |---|---|---|
 | `JWT_SECRET` | ✅ | Random 32+ char string for token signing |
 | `HOST_PROJECTS_ROOT` | ✅ | Absolute path to `./projects/` on host machine |
-| `ENCRYPTION_KEY` | ⚠️ Optional | AES key for encrypting API keys in DB |
+| `FRONTEND_URL` | ✅ | Public URL of the frontend (used in invite/reset emails) |
+| `CORS_ORIGIN` | ✅ | Allowed CORS origin (same as FRONTEND_URL in production) |
+| `ENCRYPTION_KEY` | Optional | AES key for encrypting API keys in DB |
 | `BACKEND_PORT` | Optional | Backend port (default: 3001) |
 | `FRONTEND_PORT` | Optional | Frontend port (default: 5173) |
 | `JMETER_DOCKER_IMAGE` | Optional | JMeter image (default: justb4/jmeter:latest) |
@@ -109,8 +140,16 @@ docker pull tasleemzaif/perf-studio-frontend:latest
 ```
 perf-studio/
 ├── backend/           Node.js Express API
+│   └── src/
+│       ├── routes/    auth, projects, collections, git, invites, ...
+│       ├── utils/     AI, email, encryption, project folders
+│       └── db/        SQLite schema + migrations
 ├── frontend/          React + Vite → Nginx
+│   └── src/
+│       ├── components/ Sidebar, Auth, EnvBar, GitPanel, ...
+│       └── pages/      Dashboard, TestData, Config, Settings, ...
 ├── projects/          Per-project data (gitignored)
+├── backups/           Project backup ZIPs (gitignored)
 ├── docs/              Architecture documentation
 ├── .github/workflows/ GitHub Actions CI/CD
 ├── docker-compose.yml
@@ -124,7 +163,6 @@ perf-studio/
 Every push to `main` automatically:
 1. Builds Docker images for backend and frontend
 2. Pushes to Docker Hub with `latest` tag
-3. Tags releases with semantic version (`v1.0`, `v1.1`, etc.)
 
 ---
 

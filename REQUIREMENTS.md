@@ -1,8 +1,5 @@
 # PerfStudio — System Requirements
 
-All checks below are automatically verified by the built-in **System Requirements** checker
-(`Configuration → System Requirements → Run Check`) when the application is running.
-
 ---
 
 ## Required — Must be installed before first run
@@ -18,109 +15,64 @@ All checks below are automatically verified by the built-in **System Requirement
   ```
   sudo usermod -aG docker $USER && newgrp docker
   ```
-- **Docker socket** `/var/run/docker.sock` must be readable/writable by the process
-  (handled automatically on Windows via Docker Desktop named pipe).
 
 ### 2. Docker Compose v2
 - **Version:** 2.0 or later (bundled with Docker Desktop)
-- **Why:** Used by `docker-start.bat` / `setup.sh` to orchestrate backend + frontend
-  containers.
-- **Note:** Docker Compose v1 (`docker-compose` binary) also works but v2 (`docker compose`
-  plugin) is recommended.
+- **Why:** Used to orchestrate backend + frontend containers.
 
 ---
 
 ## Required — Configuration before deployment
 
 ### 3. `.env` file (project root)
-Copy `backend/.env.example` to `.env` next to `docker-compose.yml` and fill in:
+Copy `.env.example` to `.env` and fill in:
 
 | Variable | Required | Description |
 |---|---|---|
-| `JWT_SECRET` | **Yes** | Random secret for JWT tokens. Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
-| `HOST_PROJECTS_ROOT` | **Yes (Docker mode)** | Absolute path to `./projects/` on the HOST machine. Used for Docker `-v` volume mounts when spawning JMeter/K6 containers. See `.env.example` for examples. |
-| `HOST_BACKUPS_ROOT` | No | Absolute path to `./backups/` on the HOST machine. Defaults to not set (backups still work in dev mode). |
-| `CORS_ORIGIN` | No | Frontend origin. Default: `http://localhost:5173` |
-| `JMETER_DOCKER_IMAGE` | No | Default: `justb4/jmeter:latest` |
-| `K6_DOCKER_IMAGE` | No | Default: `grafana/k6:latest` |
-
-### 4. File system write permissions
-The following directories must be writable by the backend process / container:
-
-| Path | Purpose |
-|---|---|
-| `projects/` | Test scripts (.jmx, .js), config files, test data (CSV), execution results |
-| `backups/` | ZIP backups created when projects are deleted |
-| `backend/data/` | SQLite database (`perf_studio.db`) |
+| `JWT_SECRET` | **Yes** | Random secret — `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
+| `HOST_PROJECTS_ROOT` | **Yes** | Absolute path on HOST to the `./projects/` folder |
+| `FRONTEND_URL` | **Yes** | Public URL of the app (e.g. `http://192.168.1.10:5173`) — used in invite/reset emails |
+| `CORS_ORIGIN` | **Yes** | Same as FRONTEND_URL |
+| `ENCRYPTION_KEY` | Optional | 32-char hex string for AES encryption of API keys |
 
 ---
 
-## Required for dev mode (running without Docker Compose)
+## Optional — For full functionality
 
-### 5. Node.js v18 or later
-- **Why:** Backend and frontend dev server (Vite) run directly on Node.js.
-- **Install:** https://nodejs.org/
+### 4. AI Script Generation
+- **OpenAI API Key** with GPT-4o access — https://platform.openai.com/api-keys
+- **OR Anthropic Claude API Key** — https://console.anthropic.com
+- Configured per-project inside the app: Project → AI Configuration
 
----
+### 5. SMTP for Invite & Alert Emails
+- Any SMTP server (Gmail recommended)
+- For Gmail: enable 2FA → generate App Password → https://myaccount.google.com/apppasswords
+- Configured in app: Settings → SMTP Configuration
 
-## Required at test execution time
-
-### 6. JMeter Docker image — `justb4/jmeter:latest`
-- **When pulled:** Once, before first JMeter test run.
-- **How:** `Configuration → Docker Engine → Test Tool Images → Pull` or:
-  ```
-  docker pull justb4/jmeter:latest
-  ```
-- **Size:** ~500 MB
-
-### 7. K6 Docker image — `grafana/k6:latest`
-- **When pulled:** Once, before first K6 test run.
-- **How:** `Configuration → Docker Engine → Test Tool Images → Pull` or:
-  ```
-  docker pull grafana/k6:latest
-  ```
-- **Size:** ~60 MB
+### 6. Git Integration (optional)
+- A **GitHub** (or GitLab) account
+- A **Personal Access Token (PAT)** with `repo` scope
+- An empty private GitHub repository per project
+- Configured in app: Project → Git → Settings
 
 ---
 
-## Recommended minimums
+## Network Requirements
 
-| Resource | Minimum | Recommended |
+| Port | Service | Direction |
 |---|---|---|
-| Disk space | 5 GB | 20 GB (Docker images + test results) |
-| RAM | 4 GB | 8 GB |
-| CPU | 2 cores | 4+ cores |
-| Internet | Required for first pull | Can work offline after images cached |
+| 5173 | Frontend UI | Inbound from browsers |
+| 3001 | Backend API | Internal (proxied by frontend) |
+| 443/80 | SMTP + AI APIs | Outbound from server |
 
 ---
 
-## Ports used
+## Hardware Recommendations
 
-| Port | Service | Configurable via |
-|---|---|---|
-| `3001` | Backend API | `BACKEND_PORT` in `.env` |
-| `5173` | Frontend (dev) / Nginx (Docker) | `FRONTEND_PORT` in `.env` |
+| Load | RAM | CPU | Disk |
+|---|---|---|---|
+| Development / Demo | 8 GB | 4 cores | 20 GB |
+| Small team (2–5 users) | 16 GB | 4 cores | 50 GB |
+| Production (10+ users) | 32 GB | 8 cores | 100 GB |
 
----
-
-## Network permissions
-
-- **Outbound HTTPS** to `hub.docker.com` — required to pull Docker images.
-- **Outbound HTTP/HTTPS** to target system under test — required to run pre-run API calls.
-- No inbound firewall rules needed for local use.
-
----
-
-## Quick-start checklist
-
-```
-[ ] Docker Desktop installed and running
-[ ] Copied backend/.env.example to .env (project root)
-[ ] Set JWT_SECRET in .env
-[ ] Set HOST_PROJECTS_ROOT in .env (absolute path to ./projects on host)
-[ ] Run: docker-start.bat   (Windows)
-         ./setup.sh          (Linux/macOS)
-[ ] Open http://localhost:5173
-[ ] Go to Configuration → System Requirements → Run Check
-[ ] Pull JMeter and K6 images in Configuration → Docker Engine
-```
+> Results and JMeter HTML reports can be large. Allocate disk generously.

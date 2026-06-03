@@ -14,7 +14,8 @@ graph TB
         Routes["Route Handlers"]
         AI["AI Engine\n(OpenAI / Claude)"]
         Healer["Auto Healer"]
-        Email["Email Alerts\n(Nodemailer)"]
+        Email["Email / Invites\n(Nodemailer)"]
+        Git["Git Engine\n(simple-git)"]
         Enc["Encryption\n(AES-256-CBC)"]
     end
 
@@ -32,6 +33,7 @@ graph TB
         GPT["OpenAI GPT-4o"]
         Claude["Anthropic Claude"]
         SMTP["SMTP Server\n(Gmail / Outlook)"]
+        GitHub["GitHub / GitLab API\n(Octokit)"]
     end
 
     UI -->|"REST + SSE"| API
@@ -48,176 +50,180 @@ graph TB
     Healer --> AI
     Healer -->|"re-run"| JMeter
     Routes --> Email --> SMTP
-    Routes --> Enc
+    Routes --> Git --> GitHub
 ```
 
-## Data Model
+---
 
-```mermaid
-erDiagram
-    organizations ||--o{ users : "has"
-    users ||--o{ projects : "owns"
-    projects ||--o{ collections : "has"
-    projects ||--o{ rules : "has"
-    projects ||--o{ project_config : "has"
-    collections ||--o{ test_suites : "linked to"
-    collections ||--o{ test_data_files : "has"
-    collections ||--o{ collection_env_config : "per env"
-    test_suites ||--o{ execution_runs : "generates"
-    execution_runs ||--o{ auto_heal_logs : "may have"
-    users ||--o{ ai_settings : "configures"
-    users ||--o{ alert_configs : "configures"
-    users ||--o{ alert_recipients : "has"
-    users ||--o{ global_config : "has"
+## Multi-Environment Isolation
 
-    organizations { int id; string name; string slug }
-    users { int id; string email; string name; string role; int org_id }
-    projects { int id; string name; int user_id; string uuid; string folder_path }
-    collections { int id; string name; int project_id; string environments; string json_content }
-    collection_env_config { int id; int collection_id; string env; string config_json }
-    test_suites { int id; string name; int collection_id; string env; string engine }
-    execution_runs { int id; int suite_id; string status; string result_dir }
+```
+projects/
+└── Project_Name_workspace/          ← git repo root
+    ├── .git/                         ← git history
+    ├── .gitignore
+    └── Project_Name/                 ← visible subfolder on GitHub
+        ├── Collection_Name_ID/       ← per API source
+        │   ├── QA/
+        │   │   ├── testData/         ← env-specific CSV files
+        │   │   ├── script/           ← generated JMX/JS scripts
+        │   │   ├── results/          ← test run output
+        │   │   └── config/           ← URL + port config JSON
+        │   ├── Staging/
+        │   └── UAT/
+        └── README.md
 ```
 
-## Multi-Environment Architecture
+Each environment is **strictly isolated** — test data, configs, scripts and results are tagged
+by `collection_id + env` in the database so switching envs never shows data from another env.
 
-```mermaid
-graph LR
-    subgraph Collection["API Collection"]
-        QA["QA Environment\nqa-api.company.com"]
-        Staging["Staging\nstaging-api.company.com"]
-        UAT["UAT\nuat-api.company.com"]
-    end
+---
 
-    subgraph QA_Data["QA Data"]
-        QA_TD["testData/"]
-        QA_SC["script/"]
-        QA_RS["results/"]
-        QA_CF["config/config.json"]
-    end
+## Role-Based Access Model
 
-    subgraph Staging_Data["Staging Data"]
-        ST_TD["testData/"]
-        ST_SC["script/"]
-        ST_RS["results/"]
-        ST_CF["config/config.json"]
-    end
+```
+Super Admin
+  ├── Create organizations
+  ├── Invite Org Admins (assigns them to an org)
+  └── Configure platform SMTP
 
-    QA --> QA_Data
-    Staging --> Staging_Data
-    UAT --> UAT_Data
+Org Admin (per organization)
+  ├── Create projects
+  ├── Invite regular users → assign to projects
+  ├── Configure AI (GPT-4o / Claude)
+  ├── Set up Git integration (PAT, remote URL)
+  ├── Push to main branch directly
+  ├── Merge PRs from team members
+  └── Reset user passwords
 
-    subgraph UAT_Data["UAT Data"]
-        UA_TD["testData/"]
-        UA_SC["script/"]
-    end
+Regular User (assigned to specific projects)
+  ├── Upload test data (env-specific)
+  ├── Configure environment URLs
+  ├── Create & run test plans
+  ├── Push to users/<name> branch
+  └── Raise pull requests to main
 ```
 
-## Test Execution Flow
+---
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant Frontend
-    participant Backend
-    participant Docker
-    participant AI
+## Git Integration Architecture
 
-    User->>Frontend: Click Run Test (QA)
-    Frontend->>Backend: POST /execution/run {suite_id, env}
-    Backend->>Backend: Load env config (qa-api.com)
-    Backend->>Backend: Patch JMX with env URLs
-    Backend->>Docker: docker run justb4/jmeter -n -t script.jmx
-    Docker-->>Backend: SSE log stream
-    Backend-->>Frontend: Real-time logs
-    Docker->>Backend: results.jtl
-    Backend->>Backend: Evaluate rules
-    alt Rules violated
-        Backend->>AI: Diagnose failure
-        AI-->>Backend: Fixed JMX
-        Backend->>Docker: Re-run (attempt 1/3)
-    end
-    Backend->>Backend: Generate analytics
-    Backend->>Backend: Send alert email (PDF)
-    Backend-->>Frontend: Test complete
 ```
+PerfStudio Server
+  └── /data/projects/
+       └── Project_workspace/     ← local git repo (git root)
+           ├── .git/
+           └── Project_Name/      ← project files tracked by git
+
+GitHub Remote Repo
+  └── Project_Name/               ← matches local workspace subfolder
+      └── Collection/
+          └── QA/
+              ├── testData/
+              ├── script/
+              └── config/
+
+Branch Strategy:
+  main                ← Org Admin (direct push, no PR required)
+  users/alice         ← Regular user Alice (PR required to merge)
+  users/bob           ← Regular user Bob  (PR required to merge)
+```
+
+**PR lifecycle:**
+1. User commits → pushes to `users/<name>`
+2. User creates PR in PerfStudio (optionally synced to GitHub via Octokit)
+3. Org Admin reviews in PerfStudio → clicks Merge
+4. PerfStudio: `git merge --no-ff --allow-unrelated-histories` → push to `main`
+5. PR status updated to `merged` in local DB + GitHub
+
+---
 
 ## AI Script Generation Flow
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant Frontend
-    participant Backend
-    participant AI_Model
-
-    User->>Frontend: Click Generate Script (QA)
-    Frontend->>Backend: POST /test-suites/:id/generate
-    Backend->>Backend: Load collection endpoints
-    Backend->>Backend: Load env config (URLs)
-    Backend->>Backend: Load test data files
-    Backend->>Backend: Load rules
-    Backend->>AI_Model: System + User prompt
-    note over AI_Model: GPT-4o or Claude Sonnet\ngenerates JMX/K6 script
-    AI_Model-->>Backend: Raw JMX/JS script
-    Backend->>Backend: Validate (sampler count check)
-    Backend->>Backend: Write to collection/QA/script/
-    Backend->>Backend: Update config.json
-    Backend-->>Frontend: Script ready
 ```
+User clicks "Generate Script"
+        ↓
+Backend reads:
+  - Collection endpoints (from JSON/Postman/Swagger source)
+  - Project config (threads, ramp-up, duration)
+  - Env-specific URLs
+  - Test data file columns (for CSV parameterization)
+  - Pre-run response data (for correlation extraction)
+  - Performance rules (for thresholds)
+        ↓
+System prompt + user prompt assembled
+        ↓
+OpenAI GPT-4o or Claude API call
+        ↓
+Raw JMX or JS returned
+        ↓
+Written to: projects/<project>/<collection>/<env>/script/<name>.jmx
+        ↓
+Script path saved in test_suites.jmx_path
+```
+
+---
+
+## Test Execution Sequence
+
+```
+User clicks "Run Test"
+        ↓
+Backend: docker run -v <project_path>:/data justb4/jmeter -n -t /data/script.jmx
+        ↓ (real-time)
+SSE stream → Frontend (log lines, progress)
+        ↓
+Test completes
+        ↓
+If FAILED → Auto Healer
+  - Reads error log
+  - Calls AI: "Fix this JMX script given these errors"
+  - Writes fixed script
+  - Re-runs (up to 3 attempts)
+  - Sends alert email after successful correction
+        ↓
+If PASSED
+  - Results saved to /data/results/
+  - Email alert sent with analytics
+  - JMeter HTML report generated
+```
+
+---
+
+## Database Schema (SQLite)
+
+| Table | Purpose |
+|---|---|
+| `users` | All users (super_admin / org_admin / user) |
+| `organizations` | Organizations managed by Super Admin |
+| `projects` | Test projects (owned by org_admin) |
+| `collections` | API sources per project |
+| `rules` | Performance assertion rules per project |
+| `test_suites` | Test plans (collection + env + script path) |
+| `test_data_files` | CSV test data (tagged by collection_id + env) |
+| `collection_env_config` | Per-env URL/port configuration |
+| `global_config` | Global defaults |
+| `project_config` | Project-level config overrides |
+| `ai_settings` | AI provider + model selection per user |
+| `alert_configs` | SMTP configuration per user |
+| `alert_recipients` | Email recipients per project |
+| `invites` | Invite tokens (pending / accepted / expired) |
+| `password_resets` | Password reset tokens (30-min expiry) |
+| `git_configs` | Git remote URL, PAT, workspace path per project |
+| `git_prs` | Pull requests (local DB + optional GitHub PR URL) |
+| `git_commits` | Commit log per project |
+
+---
 
 ## Security Model
 
-```mermaid
-graph TB
-    Request["HTTP Request"]
-    JWT["JWT Middleware\n(validate token)"]
-    Ownership["Ownership Check\n(user owns project?)"]
-    Handler["Route Handler"]
-    Enc["AES-256-CBC\n(API keys, SMTP passwords)"]
-    NonRoot["Non-root Docker user\n(uid 1001)"]
-
-    Request --> JWT
-    JWT -->|valid| Ownership
-    JWT -->|invalid| 401
-    Ownership -->|owns| Handler
-    Ownership -->|not owner| 403
-    Handler --> Enc
-    Handler --> NonRoot
-```
-
-## Directory Structure
-
-```
-perf-studio/
-├── backend/                    ← Node.js Express API
-│   ├── src/
-│   │   ├── db/index.js         ← SQLite schema + migrations
-│   │   ├── routes/             ← API route handlers
-│   │   ├── middleware/         ← Auth, validation
-│   │   └── utils/              ← AI, email, encryption, JMX patching
-│   ├── Dockerfile
-│   └── docker-entrypoint.sh
-├── frontend/                   ← React + Vite → Nginx
-│   ├── src/
-│   │   ├── components/         ← Shared UI components
-│   │   ├── pages/              ← Page components
-│   │   └── utils/              ← Display helpers
-│   ├── Dockerfile
-│   └── nginx.conf
-├── projects/                   ← Per-project data (gitignored)
-│   └── ProjectName_ID_UUID/
-│       └── CollectionName_ID/
-│           ├── QA/             ← QA environment (fully isolated)
-│           │   ├── testData/
-│           │   ├── script/
-│           │   ├── results/
-│           │   └── config/config.json
-│           └── Staging/        ← Staging environment
-├── docs/
-│   └── ARCHITECTURE.md
-├── .github/workflows/
-│   └── docker-publish.yml      ← Auto-build on push to main
-├── docker-compose.yml
-└── .env.example
-```
+| Concern | Implementation |
+|---|---|
+| Authentication | JWT (HS256, 14-day expiry) |
+| API Keys / PATs | AES-256-CBC encrypted in SQLite |
+| SMTP Passwords | AES-256-CBC encrypted in SQLite |
+| Password hashing | bcrypt (10 rounds) |
+| Route authorization | `auth` middleware on all routes; role checks per operation |
+| Git push auth | PAT injected into HTTPS URL at runtime, never stored in `.git/config` |
+| Docker | Non-root user in containers; read-only source mounts |
+| CORS | Strict origin whitelist via `CORS_ORIGIN` env var |
