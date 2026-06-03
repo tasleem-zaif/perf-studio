@@ -89,7 +89,7 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
   const runNum = selected?.result_dir?.match(/Run_(\d+)/)?.[1];
 
   return (
-    <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)', gap: 0 }}>
+    <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view JMeter reports" />
 
       {/* Controls bar */}
@@ -196,7 +196,7 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
       )}
 
       {selectedId && selected?.report_url && (
-        <div style={{ flex: 1, border: '1px solid var(--color-border)', borderRadius: '10px', overflow: 'hidden', background: '#fff' }}>
+        <div style={{ border: '1px solid var(--color-border)', borderRadius: '10px', overflow: 'hidden', background: '#fff', height: '72vh' }}>
           <iframe
             key={selected.report_url}
             src={selected.report_url}
