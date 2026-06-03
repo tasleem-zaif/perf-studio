@@ -202,6 +202,21 @@ function UserManagementPanel({ user, projects = [] }) {
     }
   }
 
+  async function resetUserPassword(userId, userName) {
+    const newPass = window.prompt(`Set a new temporary password for "${userName}" (min 8 characters):`);
+    if (!newPass) return;
+    if (newPass.length < 8) { toast('Password must be at least 8 characters', 'error'); return; }
+    setActionLoading(a => ({ ...a, [`reset_${userId}`]: true }));
+    try {
+      await api.post(`/admin/users/${userId}/reset-password`, { new_password: newPass });
+      toast(`Password for ${userName} reset successfully. Share the new password with them.`, 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Reset failed', 'error');
+    } finally {
+      setActionLoading(a => ({ ...a, [`reset_${userId}`]: false }));
+    }
+  }
+
   async function removeUser(userId) {
     const u = users.find(x => x.id === userId);
     const ok = await confirm(
@@ -485,6 +500,13 @@ function UserManagementPanel({ user, projects = [] }) {
                 {ROLE_LABELS[u.role]}
               </span>
               <StatusBadge status={u.status} />
+              <button className="btn-secondary btn-sm" title="Reset password"
+                onClick={() => resetUserPassword(u.id, u.name)}
+                disabled={!!actionLoading[`reset_${u.id}`]}>
+                {actionLoading[`reset_${u.id}`]
+                  ? <span className="spinner" />
+                  : <i className="ti ti-key" />}
+              </button>
               <button className="btn-secondary btn-sm" onClick={() => removeUser(u.id)} style={{ color: 'var(--danger)' }}>
                 <i className="ti ti-trash" />
               </button>

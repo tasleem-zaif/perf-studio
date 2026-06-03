@@ -11,6 +11,8 @@ app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 app.use(express.json());
 
 app.use('/api/auth',                                   require('./routes/auth'));
+app.use('/api/auth',                                   require('./routes/passwordReset'));
+app.use('/api/admin',                                  require('./routes/passwordReset'));
 app.use('/api/orgs',                                   require('./routes/orgs'));
 app.use('/api/admin',                                  require('./routes/admin'));
 app.use('/api/projects',                               require('./routes/projects'));

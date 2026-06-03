@@ -112,6 +112,9 @@ router.delete('/:id', async (req, res) => {
     }
     if (!project) return res.status(404).json({ error: 'Not found' });
 
+    // Capture git config BEFORE deleting from DB — CASCADE will delete it
+    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
+
     // Delete from DB immediately and respond — git cleanup + folder backup run in background
     db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
     resetSequence('projects');
@@ -121,7 +124,7 @@ router.delete('/:id', async (req, res) => {
     setImmediate(async () => {
       try {
         // ── Git cleanup: remove project folder from GitHub repo ──────────────
-        const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
+        // (gitCfg captured above before DB cascade-delete)
         if (gitCfg?.is_initialized && gitCfg?.git_root && fs.existsSync(gitCfg.git_root)) {
           try {
             const simpleGit = require('simple-git');
@@ -167,8 +170,14 @@ router.delete('/:id', async (req, res) => {
           }
         }
 
-        // Backup and delete the project data folder
-        await backupAndDeleteProjectFolder(project.folder_path, project.name, project.id);
+        // ── Backup: use workspace root if git was initialized, else project folder ──
+        // Workspace root contains .git + project subfolder = complete backup
+        const backupPath = (gitCfg?.git_root && fs.existsSync(gitCfg.git_root))
+          ? gitCfg.git_root          // git workspace (already cleaned of project subfolder above)
+          : project.folder_path;    // fallback: plain project folder (no git)
+
+        await backupAndDeleteProjectFolder(backupPath, project.name, project.id);
+        console.log(`[Projects] Backup created for "${project.name}"`);
       } catch (e) {
         console.error('[Projects] Backup/delete folder failed:', e.message);
       }

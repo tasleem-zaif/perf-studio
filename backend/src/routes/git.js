@@ -235,20 +235,31 @@ ${proj.name}/
       if (!fs.existsSync(gitkeep)) fs.writeFileSync(gitkeep, '');
     }
 
-    // 1. Project-level config dir (inside workspace subfolder)
-    mkKeep(path.join(gitProjectPath, 'config'));
-
-    // 2. Build collection/env structure from DB
+    // 1. Build collection/env structure from DB — only real data, no placeholders
     const collections = db.prepare(
       'SELECT * FROM collections WHERE project_id = ?'
     ).all(req.params.projectId);
 
-    if (collections.length === 0) {
-      mkKeep(path.join(gitProjectPath, '_collections_placeholder', 'QA', 'testData'));
-      mkKeep(path.join(gitProjectPath, '_collections_placeholder', 'QA', 'scripts'));
-      mkKeep(path.join(gitProjectPath, '_collections_placeholder', 'QA', 'results'));
-      mkKeep(path.join(gitProjectPath, '_collections_placeholder', 'QA', 'config'));
-    } else {
+    // Remove stale folders created by earlier incorrect code
+    ['_collections_placeholder', 'config'].forEach(sf => {
+      const p = path.join(gitProjectPath, sf);
+      if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+    });
+
+    // Remove stale 'scripts' (plural) dirs — app uses 'script' (singular) for generated files
+    function removeStaleScriptsDir(dir) {
+      if (!fs.existsSync(dir)) return;
+      fs.readdirSync(dir).forEach(entry => {
+        const full = path.join(dir, entry);
+        if (fs.statSync(full).isDirectory()) {
+          if (entry === 'scripts') fs.rmSync(full, { recursive: true, force: true });
+          else removeStaleScriptsDir(full);
+        }
+      });
+    }
+    removeStaleScriptsDir(gitProjectPath);
+
+    if (collections.length > 0) {
       for (const col of collections) {
         const colFolderName = `${col.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_${col.id}`;
         let envs = [];
@@ -258,7 +269,7 @@ ${proj.name}/
         for (const env of envs) {
           const base = path.join(gitProjectPath, colFolderName, env);
           mkKeep(path.join(base, 'testData'));
-          mkKeep(path.join(base, 'scripts'));
+          mkKeep(path.join(base, 'script'));   // singular — matches app's script generation path
           mkKeep(path.join(base, 'results'));
           mkKeep(path.join(base, 'config'));
         }
@@ -298,8 +309,12 @@ ${proj.name}/
       await git.commit('Initial commit: PerfStudio project structure');
     }
 
-    // Push main
-    await git.push(['--set-upstream', 'origin', 'main', '--force']);
+    // Push main — never force push (respects branch protection rules)
+    // If remote main exists, pull first to avoid rejected pushes
+    try {
+      await git.pull('origin', 'main', { '--rebase': 'false', '--allow-unrelated-histories': null }).catch(() => {});
+    } catch (_) {}
+    await git.push(['--set-upstream', 'origin', 'main']);
 
     // Mark as initialized and save git_root (workspace directory)
     db.prepare('UPDATE git_configs SET is_initialized=1, git_root=? WHERE project_id=?')
@@ -457,9 +472,46 @@ router.post('/pull', async (req, res) => {
     const branch = getBranchForUser(caller, proj);
 
     await git.remote(['set-url', 'origin', remoteWithAuth]);
-    await git.pull('origin', branch, { '--rebase': 'false' });
 
-    res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
+    // Check if the user's branch exists on the remote
+    let remoteBranches = [];
+    try {
+      const lsRemote = await git.listRemote(['--heads', 'origin']);
+      remoteBranches = lsRemote.split('\n')
+        .map(l => l.replace(/.*refs\/heads\//, '').trim())
+        .filter(Boolean);
+    } catch (_) {}
+
+    const branchExistsOnRemote = remoteBranches.includes(branch);
+
+    if (branchExistsOnRemote) {
+      // Branch exists on remote — pull directly from it
+      await git.checkout(branch).catch(() => git.checkout(['-b', branch, `origin/${branch}`]));
+      await git.pull('origin', branch, { '--rebase': 'false' });
+      res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
+    } else {
+      // Branch doesn't exist on remote yet:
+      // 1. Fetch latest main from remote
+      // 2. Create local branch from main (or sync if it already exists locally)
+      // 3. Push the branch to remote immediately — so it exists for future pulls
+      await git.fetch('origin', 'main');
+
+      const localBranches = await git.branchLocal();
+      if (!localBranches.all.includes(branch)) {
+        await git.checkout(['-b', branch, 'origin/main']);
+      } else {
+        await git.checkout(branch);
+        await git.merge(['origin/main', '--no-edit']).catch(() => {});
+      }
+
+      // Auto-push to create the remote branch so future pulls work seamlessly
+      await git.push(['--set-upstream', 'origin', branch]);
+
+      res.json({
+        ok: true,
+        message: `Branch "${branch}" created from main and pushed to remote. You're all set — future pulls will work normally.`,
+      });
+    }
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -608,7 +660,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
     await git.pull('origin', 'main', { '--rebase': 'false' });
 
     // Merge feature branch
-    await git.merge([`origin/${pr.from_branch}`, '--no-ff', '-m', `Merge PR: ${pr.title}`]);
+    await git.merge([`origin/${pr.from_branch}`, '--no-ff', '--allow-unrelated-histories', '-m', `Merge PR: ${pr.title}`]);
 
     // Push merged main
     await git.push('origin', 'main');
@@ -641,6 +693,69 @@ router.put('/prs/:prId/close', (req, res) => {
 
   db.prepare("UPDATE git_prs SET status='closed' WHERE id=?").run(pr.id);
   res.json({ ok: true });
+});
+
+// ── PUT /prs/:prId/mark-merged — admin marks PR merged (when merged outside PerfStudio) ──
+
+router.put('/prs/:prId/mark-merged', (req, res) => {
+  const caller = getCaller(req.userId);
+  if (!['org_admin', 'super_admin'].includes(caller.role)) {
+    return res.status(403).json({ error: 'Only org admins can mark PRs as merged.' });
+  }
+  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
+    .get(req.params.prId, req.params.projectId);
+  if (!pr) return res.status(404).json({ error: 'PR not found.' });
+
+  db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
+  res.json({ ok: true });
+});
+
+// ── POST /prs/sync — sync all open PR statuses from GitHub ───────────────────
+
+router.post('/prs/sync', async (req, res) => {
+  const proj = getProject(req.userId, req.params.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  const cfg = getGitConfig(req.params.projectId);
+  if (!cfg?.auth_token) return res.json({ ok: true, synced: 0, message: 'No GitHub token configured.' });
+
+  const openPrs = db.prepare(
+    "SELECT * FROM git_prs WHERE project_id = ? AND status = 'open' AND remote_pr_url != ''"
+  ).all(req.params.projectId);
+
+  if (!openPrs.length) return res.json({ ok: true, synced: 0, message: 'No open PRs to sync.' });
+
+  let synced = 0;
+  try {
+    const token = cfg.auth_token ? require('../utils/encryption').decrypt(cfg.auth_token) : '';
+    const octokit = new Octokit({ auth: token });
+    const match = cfg.remote_url.match(/github\.com[:/](.+?)\/(.+?)(?:\.git)?$/);
+    if (!match) return res.json({ ok: true, synced: 0, message: 'Could not parse GitHub repo URL.' });
+    const [, owner, repo] = match;
+
+    for (const pr of openPrs) {
+      try {
+        // Extract PR number from URL: https://github.com/owner/repo/pull/123
+        const prNumMatch = pr.remote_pr_url.match(/\/pull\/(\d+)$/);
+        if (!prNumMatch) continue;
+        const prNumber = parseInt(prNumMatch[1]);
+
+        const { data } = await octokit.pulls.get({ owner, repo, pull_number: prNumber });
+        let newStatus = null;
+        if (data.state === 'closed' && data.merged) newStatus = 'merged';
+        else if (data.state === 'closed') newStatus = 'closed';
+
+        if (newStatus) {
+          db.prepare("UPDATE git_prs SET status=? WHERE id=?").run(newStatus, pr.id);
+          synced++;
+        }
+      } catch (_) {}
+    }
+  } catch (e) {
+    console.error('[Git] PR sync error:', e.message);
+  }
+
+  res.json({ ok: true, synced, message: synced > 0 ? `Synced ${synced} PR(s) from GitHub.` : 'All PRs already up to date.' });
 });
 
 module.exports = router;

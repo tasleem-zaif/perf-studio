@@ -25,6 +25,8 @@ import Alerts from './pages/Alerts';
 import Reports from './pages/Reports';
 import Analytics from './pages/Analytics';
 import GitPanel from './pages/GitPanel';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 
 const PAGE_TITLES = {
   dashboard: 'Dashboard',
@@ -351,6 +353,17 @@ function AppInner() {
   const inviteMatch = window.location.pathname.match(/^\/accept-invite\/([a-f0-9]{32,128})$/i);
   if (inviteMatch && !user) {
     return <AcceptInvite token={inviteMatch[1]} onLogin={handleLogin} />;
+  }
+
+  // Forgot password page
+  if (window.location.pathname === '/forgot-password') {
+    return <ForgotPassword />;
+  }
+
+  // Reset password page (e.g. /reset-password/abc123)
+  const resetMatch = window.location.pathname.match(/^\/reset-password\/([a-f0-9]{32,128})$/i);
+  if (resetMatch) {
+    return <ResetPassword token={resetMatch[1]} />;
   }
 
   if (!user) return <Auth onLogin={handleLogin} />;

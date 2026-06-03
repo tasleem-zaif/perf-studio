@@ -81,6 +81,30 @@ export default function GitPanel({ project, user }) {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  // Refresh git status only (faster than full loadAll)
+  async function refreshStatus() {
+    if (!pid) return;
+    setLoadingStatus(true);
+    try {
+      const { data } = await api.get(`/projects/${pid}/git/status`);
+      setStatus(data);
+    } catch (e) {
+      console.error('Git status refresh error:', e.message);
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function refreshPrs() {
+    if (!pid) return;
+    try {
+      const { data } = await api.get(`/projects/${pid}/git/prs`);
+      setPrs(data.prs || []);
+    } catch (e) {
+      console.error('Git PRs refresh error:', e.message);
+    }
+  }
+
   // ── Save config ──
   async function saveConfig(e) {
     e.preventDefault();
@@ -172,6 +196,28 @@ export default function GitPanel({ project, user }) {
     } catch (err) {
       toast(err.response?.data?.error || 'PR creation failed', 'error');
     } finally { setCreatingPr(false); }
+  }
+
+  // ── Sync PRs from GitHub ──
+  async function syncPRsFromGitHub() {
+    try {
+      const { data } = await api.post(`/projects/${pid}/git/prs/sync`);
+      toast(data.message, 'success');
+      refreshPrs();
+    } catch (err) {
+      toast(err.response?.data?.error || 'Sync failed', 'error');
+    }
+  }
+
+  // ── Mark PR as merged manually ──
+  async function markMerged(prId) {
+    try {
+      await api.put(`/projects/${pid}/git/prs/${prId}/mark-merged`);
+      toast('PR marked as merged', 'success');
+      refreshPrs();
+    } catch (err) {
+      toast(err.response?.data?.error || 'Failed', 'error');
+    }
   }
 
   // ── Merge PR ──
@@ -269,7 +315,11 @@ export default function GitPanel({ project, user }) {
       {/* Tabs */}
       <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--color-border-secondary)', marginBottom: 20 }}>
         {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)}
+          <button key={t.id} onClick={() => {
+            setTab(t.id);
+            if (t.id === 'changes') refreshStatus();
+            if (t.id === 'prs') refreshPrs();
+          }}
             style={{ padding: '7px 14px', border: 'none', background: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13, fontWeight: tab === t.id ? 700 : 500, color: tab === t.id ? 'var(--accent)' : 'var(--color-text-secondary)', borderBottom: tab === t.id ? '2px solid var(--accent)' : '2px solid transparent', marginBottom: -1, display: 'flex', alignItems: 'center', gap: 6 }}>
             <i className={`ti ${t.icon}`} style={{ fontSize: 14 }}/>{t.label}
             {t.badge ? <span style={{ background: '#ef4444', color: '#fff', borderRadius: 10, padding: '0 6px', fontSize: 10, fontWeight: 700 }}>{t.badge}</span> : null}
@@ -357,7 +407,15 @@ export default function GitPanel({ project, user }) {
       {tab === 'changes' && initialized && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <div className="card" style={{ padding: 20 }}>
-            <div style={{ fontWeight: 700, marginBottom: 14 }}>Working Changes</div>
+            <div style={{ fontWeight: 700, marginBottom: 14, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>Working Changes</span>
+              <button className="btn-secondary btn-sm" onClick={refreshStatus} disabled={loadingStatus}
+                title="Refresh to see latest file changes">
+                {loadingStatus
+                  ? <><span className="spinner" style={{ width: 12, height: 12 }} />Refreshing…</>
+                  : <><i className="ti ti-refresh" />Refresh</>}
+              </button>
+            </div>
             {status?.is_clean ? (
               <div style={{ color: 'var(--color-text-tertiary)', fontSize: 13, textAlign: 'center', padding: 20 }}>
                 <i className="ti ti-circle-check" style={{ fontSize: 32, color: '#22c55e', display: 'block', marginBottom: 8 }}/>
@@ -427,6 +485,15 @@ export default function GitPanel({ project, user }) {
       {/* ── PULL REQUESTS TAB ── */}
       {tab === 'prs' && (
         <div>
+          {/* Sync button — always visible for admins */}
+          {isAdmin && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+              <button className="btn-secondary btn-sm" onClick={syncPRsFromGitHub}
+                title="Sync PR statuses from GitHub (for PRs merged directly on GitHub)">
+                <i className="ti ti-refresh" /> Sync from GitHub
+              </button>
+            </div>
+          )}
           {prs.length === 0 ? (
             <div className="empty">
               <i className="ti ti-git-pull-request"/>
@@ -461,6 +528,13 @@ export default function GitPanel({ project, user }) {
                       {isAdmin && (
                         <button className="btn-primary btn-sm" onClick={() => mergePR(pr.id)} disabled={mergingPr === pr.id}>
                           {mergingPr === pr.id ? <><span className="spinner"/>Merging…</> : <><i className="ti ti-git-merge"/>Merge</>}
+                        </button>
+                      )}
+                      {isAdmin && (
+                        <button className="btn-secondary btn-sm" style={{ color: '#22c55e', fontSize: 11 }}
+                          onClick={() => markMerged(pr.id)}
+                          title="Mark as merged — use when PR was merged directly on GitHub">
+                          <i className="ti ti-check"/>Merged on GitHub
                         </button>
                       )}
                       <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={() => closePR(pr.id)}>

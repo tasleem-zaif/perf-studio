@@ -125,14 +125,22 @@ export default function Auth({ onLogin }) {
                 <input type="email" placeholder="you@company.com" value={email}
                   onChange={e => setEmail(e.target.value)} required autoFocus />
               </div>
-              <div className="form-group">
+              <div className="form-group" style={{ marginBottom: 4 }}>
                 <label className="form-label">Password</label>
                 <input type="password" placeholder="Password" value={password}
                   onChange={e => setPassword(e.target.value)} required />
               </div>
 
+              {/* Forgot password link */}
+              <div style={{ textAlign: 'right', marginBottom: 16 }}>
+                <a href="/forgot-password"
+                  style={{ fontSize: 12, color: '#22c55e', textDecoration: 'none', fontWeight: 500 }}>
+                  Forgot password?
+                </a>
+              </div>
+
               <button className="btn-primary"
-                style={{ width: '100%', justifyContent: 'center', marginTop: 8, height: 44, fontSize: 15, borderRadius: 10 }}
+                style={{ width: '100%', justifyContent: 'center', marginTop: 0, height: 44, fontSize: 15, borderRadius: 10 }}
                 disabled={loading}>
                 {loading && <span className="spinner" />}
                 Sign in

@@ -232,6 +232,17 @@ try { db.exec("ALTER TABLE ai_settings ADD COLUMN heal_model TEXT DEFAULT ''"); 
 // Add uuid column to projects (for directory naming)
 try { db.exec("ALTER TABLE projects ADD COLUMN uuid TEXT DEFAULT ''"); } catch {}
 
+// ── Password Reset ───────────────────────────────────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS password_resets (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL,
+  token      TEXT NOT NULL UNIQUE,
+  expires_at DATETIME NOT NULL,
+  used       INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+)`);
+
 // ── Git Integration ──────────────────────────────────────────────────────────
 db.exec(`CREATE TABLE IF NOT EXISTS git_configs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
