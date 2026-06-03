@@ -451,7 +451,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
           <i className="ti ti-test-pipe" />
           <div className="empty-title">No test plans yet</div>
           <div className="empty-sub">Create a test plan to generate JMeter or K6 scripts</div>
-          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { setForm({ ...DEFAULT_FORM, collection_id: collection?.id ? String(collection.id) : '', env: env || '' }); setError(''); setModal('add'); }}>New Test Plan</button>
+          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { setForm({ ...DEFAULT_FORM, collection_id: collection?.id ? String(collection.id) : '', env: env || '' }); setError(''); loadTestDataFiles(); setModal('add'); }}>New Test Plan</button>
         </div>
       )}
 
@@ -495,7 +495,14 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
               </CustomSelect>
             </div>
             <div className="form-group">
-              <label className="form-label">Test Data (CSV) <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>— select multiple</span></label>
+              <label className="form-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>Test Data (CSV) <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>— select multiple</span></span>
+                <button type="button" onClick={loadTestDataFiles}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: 11, display: 'flex', alignItems: 'center', gap: 3, padding: '0 2px' }}
+                  title="Refresh file list">
+                  <i className="ti ti-refresh" style={{ fontSize: 12 }} /> Refresh
+                </button>
+              </label>
               <div style={{ border: '1px solid var(--color-border, #3a3c42)', borderRadius: '6px', maxHeight: '110px', overflowY: 'auto', padding: '4px 2px', background: 'var(--color-background)' }}>
                 {testDataFiles.length === 0
                   ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No CSV files uploaded</div>
