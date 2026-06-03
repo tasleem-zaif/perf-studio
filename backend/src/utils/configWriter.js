@@ -34,13 +34,24 @@ function writeJson(filePath, data) {
 function writeCollectionEnvConfig(collectionId, env) {
   try {
     const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
-    if (!col?.folder_path) return;
+    if (!col) return;
 
     const envName = env || col.environment || 'Default';
-    const envPath = path.join(col.folder_path, envName);
 
-    // Project
+    // Derive env path from the PROJECT's current folder_path (always up to date)
+    // rather than col.folder_path which may point to a stale location after git workspace moves
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
+    let envPath;
+    if (project?.folder_path) {
+      const colSafeName = `${col.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_${col.id}`;
+      envPath = path.join(project.folder_path, colSafeName, envName);
+    } else if (col.folder_path) {
+      envPath = path.join(col.folder_path, envName);
+    } else {
+      return; // no path available
+    }
+
+    // Project already fetched above for path derivation
 
     // endpoint count only — full endpoints not stored in config.json
     let endpointCount = 0;

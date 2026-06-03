@@ -1,6 +1,6 @@
 const router = require('express').Router({ mergeParams: true });
-const db = require('../db');
-const auth = require('../middleware/auth');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
 const resetSequence = require('../utils/resetSequence');
 const { updateProjectCollectionConfigs } = require('../utils/configWriter');
