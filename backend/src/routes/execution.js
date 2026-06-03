@@ -771,6 +771,33 @@ router.post('/run', auth, async (req, res) => {
       if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
       if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
 
+      // ── Pass environment URL config so JMX ${PROTOCOL}/${URL}/${PORT} resolve ──
+      try {
+        const suiteEnv = suite.env || '';
+        const colId    = suite.collection_id;
+        if (colId && suiteEnv) {
+          const envCfgRow = db.prepare(
+            'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
+          ).get(colId, suiteEnv);
+          if (envCfgRow?.config_json) {
+            const envCfg = JSON.parse(envCfgRow.config_json);
+            const firstUrl = (envCfg.urls || [])[0];
+            if (firstUrl?.url) {
+              args.push(`-JPROTOCOL=${firstUrl.protocol || 'https'}`);
+              args.push(`-JURL=${firstUrl.url}`);
+              args.push(`-JPORT=${firstUrl.port || (firstUrl.protocol === 'http' ? '80' : '443')}`);
+              log('info', `  Env config : ${firstUrl.protocol || 'https'}://${firstUrl.url}:${firstUrl.port || ''}`);
+            } else {
+              log('warn', `  ⚠ No URL configured for ${suiteEnv} env. Set it in Configuration → ${suiteEnv}.`);
+            }
+          } else {
+            log('warn', `  ⚠ No env config found for collection ${colId} / ${suiteEnv}. Set URLs in Configuration.`);
+          }
+        }
+      } catch (urlErr) {
+        log('warn', `  ⚠ Could not load env URL config: ${urlErr.message}`);
+      }
+
     } else if (engine === 'k6') {
       const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
       const dockerScriptDir = toHostPath(path.dirname(scriptPath));
@@ -924,11 +951,22 @@ router.post('/run', auth, async (req, res) => {
     log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
     // ── Rule Engine verdict ────────────────────────────────────────────────────
-    // Evaluate project rules against the JTL to get the authoritative pass/fail.
-    // If rules are defined, they override the raw fail count for status AND auto-heal decisions.
     let finalStatus = 'completed';
     let ruleViolations = [];
-    if (jtlPath && fs.existsSync(jtlPath)) {
+
+    // Zero requests = test completely failed to execute (missing URL, script error, etc.)
+    // Treat as failure regardless of rules — no point evaluating rules against empty data.
+    const rowCount = jtlPath && fs.existsSync(jtlPath)
+      ? Math.max(0, fs.readFileSync(jtlPath, 'utf8').trim().split('\n').length - 1)
+      : 0;
+
+    if (rowCount === 0) {
+      finalStatus = 'failed';
+      log('err', '');
+      log('err', '  ✘  TEST FAILED — 0 requests were executed.');
+      log('err', '     Likely cause: target URL not configured for this environment.');
+      log('err', '     Fix: Configuration → select env → add target URL → Save Config.');
+    } else if (jtlPath && fs.existsSync(jtlPath)) {
       const ruleResult = evaluateRules(project_id, jtlPath);
       if (!ruleResult.noRules) {
         ruleViolations = ruleResult.violations || [];
@@ -945,7 +983,6 @@ router.post('/run', auth, async (req, res) => {
           log('ok', '  ✔  RULE ENGINE — All performance thresholds passed');
         }
       } else if (fail > 0) {
-        // No rules — raw fail count decides
         finalStatus = 'failed';
       }
     }
