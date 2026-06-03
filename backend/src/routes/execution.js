@@ -726,25 +726,45 @@ router.post('/run', auth, async (req, res) => {
       const dockerResultDir  = toHostPath(resultDir);
       const scriptName       = path.basename(patchedJmx);
 
-      // Mount testData dir so CSV files referenced in the JMX are accessible inside the container.
-      // Rewrite any absolute host paths in the patched JMX to the container path /jmeter/testdata/
-      const testDataHostDir  = toHostPath(path.join(projectFolderPath, 'testData'));
-      const testDataExists   = fs.existsSync(path.join(projectFolderPath, 'testData'));
+      // Mount testData dir — use collection/env/testData (where files actually live)
+      // Fall back to project/testData for legacy scripts
+      let testDataHostDir, testDataExists;
+      const suiteCollection = suite.collection_id
+        ? db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+        : null;
+      const suiteEnvName = suite.env || '';
+
+      if (suiteCollection && suiteEnvName && projectFolderPath) {
+        const { getCollectionPath } = require('../utils/projectFolders');
+        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteCollection.id, suiteEnvName);
+        const envTestDataDir = path.join(envPath, 'testData');
+        if (fs.existsSync(envTestDataDir)) {
+          testDataHostDir = toHostPath(envTestDataDir);
+          testDataExists  = true;
+        }
+      }
+      // Fallback: project-root testData (legacy)
+      if (!testDataExists) {
+        testDataHostDir = toHostPath(path.join(projectFolderPath, 'testData'));
+        testDataExists  = fs.existsSync(path.join(projectFolderPath, 'testData'));
+      }
       if (testDataExists) {
         let jmxContent = fs.readFileSync(patchedJmx, 'utf8');
-        // Replace any absolute host path pointing into the testData folder with the container mount path
-        const escapedHostDir = testDataHostDir.replace(/\\/g, '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // Replace ALL absolute testData paths in the JMX with the container mount point /jmeter/testdata/
+        // This handles paths like: C:\...\QA\testData\  or  C:/..../QA/testData/
         jmxContent = jmxContent.replace(
-          new RegExp(escapedHostDir.replace(/\//g, '[/\\\\]') + '[/\\\\]?', 'gi'),
+          /[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi,
           '/jmeter/testdata/'
         );
-        // Also handle Windows backslash variant of the original path
-        const winHostDir = path.join(projectFolderPath, 'testData').replace(/\\/g, '\\\\');
+        // Also handle Unix-style absolute paths (Linux/Mac or Docker paths)
         jmxContent = jmxContent.replace(
-          new RegExp(winHostDir.replace(/\\/g, '\\\\') + '\\\\?', 'gi'),
+          /\/[^\s<"]*\/testData\/?/gi,
           '/jmeter/testdata/'
         );
+
         fs.writeFileSync(patchedJmx, jmxContent, 'utf8');
+        log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
       }
 
       log('info', `  JMeter img : ${jmeterImage}`);
@@ -771,32 +791,8 @@ router.post('/run', auth, async (req, res) => {
       if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
       if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
 
-      // ── Pass environment URL config so JMX ${PROTOCOL}/${URL}/${PORT} resolve ──
-      try {
-        const suiteEnv = suite.env || '';
-        const colId    = suite.collection_id;
-        if (colId && suiteEnv) {
-          const envCfgRow = db.prepare(
-            'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
-          ).get(colId, suiteEnv);
-          if (envCfgRow?.config_json) {
-            const envCfg = JSON.parse(envCfgRow.config_json);
-            const firstUrl = (envCfg.urls || [])[0];
-            if (firstUrl?.url) {
-              args.push(`-JPROTOCOL=${firstUrl.protocol || 'https'}`);
-              args.push(`-JURL=${firstUrl.url}`);
-              args.push(`-JPORT=${firstUrl.port || (firstUrl.protocol === 'http' ? '80' : '443')}`);
-              log('info', `  Env config : ${firstUrl.protocol || 'https'}://${firstUrl.url}:${firstUrl.port || ''}`);
-            } else {
-              log('warn', `  ⚠ No URL configured for ${suiteEnv} env. Set it in Configuration → ${suiteEnv}.`);
-            }
-          } else {
-            log('warn', `  ⚠ No env config found for collection ${colId} / ${suiteEnv}. Set URLs in Configuration.`);
-          }
-        }
-      } catch (urlErr) {
-        log('warn', `  ⚠ Could not load env URL config: ${urlErr.message}`);
-      }
+      // NOTE: PROTOCOL/SERVER/PORT are baked into JMX User Defined Variables at generation time.
+      // Runtime only controls execution params (threads, ramp-up, duration/loops).
 
     } else if (engine === 'k6') {
       const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
