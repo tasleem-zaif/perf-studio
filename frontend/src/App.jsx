@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { projectDirName, collectionDirName, collectionPathLabel } from './utils/displayName';
+import AcceptInvite from './pages/AcceptInvite';
 import api from './api';
 import Auth from './components/Auth';
 import Sidebar from './components/Sidebar';
@@ -23,6 +24,7 @@ import Profile from './pages/Profile';
 import Alerts from './pages/Alerts';
 import Reports from './pages/Reports';
 import Analytics from './pages/Analytics';
+import GitPanel from './pages/GitPanel';
 
 const PAGE_TITLES = {
   dashboard: 'Dashboard',
@@ -35,8 +37,10 @@ const PAGE_TITLES = {
   config: 'Configuration',
   'settings-users': 'User Management',
   'settings-appearance': 'Appearance',
-  'settings-ai': 'AI Configuration',
-  'ai-config':   'AI Configuration',
+  'settings-ai':   'AI Configuration',
+  'ai-config':     'AI Configuration',
+  'git':           'Git Integration',
+  'settings-smtp': 'SMTP Configuration',
   profile: 'My Profile',
   reports: 'JMeter Report',
   analytics: 'Analytics',
@@ -285,7 +289,7 @@ function AppInner() {
   function renderTopbarActions() {
     switch (page) {
       case 'dashboard':
-        return user?.role !== 'super_admin'
+        return user?.role === 'org_admin'
           ? <button className="btn-primary" onClick={openNewProject}><i className="ti ti-plus" /> New Project</button>
           : null;
       case 'project-home':
@@ -315,12 +319,25 @@ function AppInner() {
     }
   }
 
+  // Pages where the user picks an env via the selector bar (not rules — that's global)
+  const ENV_PAGES = new Set(['test-data', 'config', 'test-suites', 'alerts', 'runner', 'analytics', 'reports']);
+
+  // Derive envs list from the active collection
+  const collectionEnvs = (() => {
+    if (!activeCollection) return [];
+    let e = [];
+    try { e = JSON.parse(activeCollection.environments || '[]'); } catch {}
+    if (!e.length && activeCollection.environment) e = [activeCollection.environment];
+    if (!e.length) e = ['Default'];
+    return e;
+  })();
+
   const pageTitle = page === 'project-home'
     ? (projectDirName(activeProject) || 'Project')
     : page === 'runner' && activeCollection && activeEnv
       ? `Run Tests — ${collectionDirName(activeCollection)} / ${activeEnv}`
       : (PAGE_TITLES[page] || page);
-  const sharedProps = { onNav: nav, onProjectUpdated: refreshProject, collection: activeCollection, env: activeEnv };
+  const sharedProps = { onNav: nav, onProjectUpdated: refreshProject, collection: activeCollection, env: activeEnv, envs: collectionEnvs, onEnvChange: setActiveEnv };
 
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--color-body, #1e1f22)' }}>
@@ -329,6 +346,12 @@ function AppInner() {
       </div>
     </div>
   );
+
+  // Handle invite token in URL (e.g. /accept-invite/abc123)
+  const inviteMatch = window.location.pathname.match(/^\/accept-invite\/([a-f0-9]{32,128})$/i);
+  if (inviteMatch && !user) {
+    return <AcceptInvite token={inviteMatch[1]} onLogin={handleLogin} />;
+  }
 
   if (!user) return <Auth onLogin={handleLogin} />;
 
@@ -369,10 +392,15 @@ function AppInner() {
         </div>
 
         <KeepAlive active={page === 'dashboard'}    everVisited={everVisited.has('dashboard')}>
-          <Dashboard projects={projects} user={user} onSelectProject={selectProject} onDeleteProject={deleteProject} onNewProject={openNewProject} onEditProject={openEditProject} />
+          <Dashboard projects={projects} user={user} onSelectProject={selectProject}
+            onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
+            onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
+            onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
         </KeepAlive>
         <KeepAlive active={page === 'project-home'}  everVisited={everVisited.has('project-home')}>
-          <ProjectHome project={activeProject} onNav={nav} onDeleteProject={deleteProject} onEditProject={openEditProject} />
+          <ProjectHome project={activeProject} onNav={nav}
+            onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
+            onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
         </KeepAlive>
         <KeepAlive active={page === 'collections'}   everVisited={everVisited.has('collections')}>
           <Collections project={activeProject} {...sharedProps} openModalTrigger={collectionModalTrigger} />
@@ -388,16 +416,16 @@ function AppInner() {
         </KeepAlive>
         <KeepAlive active={page === 'config'}        everVisited={everVisited.has('config')}>
           {/* key forces remount when env changes so all state (sysChecks, docker) resets cleanly */}
-          <Config key={`config-${activeProject?.id}-${activeCollection?.id}-${activeEnv}`} project={activeProject} collection={activeCollection} env={activeEnv} />
+          <Config key={`config-${activeProject?.id}-${activeCollection?.id}-${activeEnv}`} project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
         </KeepAlive>
         <KeepAlive active={page.startsWith('settings')} everVisited={[...everVisited].some(p => p.startsWith('settings'))}>
-          <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} />
+          <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} projects={projects} />
         </KeepAlive>
         <KeepAlive active={page === 'ai-config'} everVisited={everVisited.has('ai-config')}>
           <Settings page="settings-ai" theme={theme} onThemeChange={setTheme} user={user} />
         </KeepAlive>
         <KeepAlive active={page === 'alerts'} everVisited={everVisited.has('alerts')}>
-          <Alerts project={activeProject} collection={activeCollection} env={activeEnv} />
+          <Alerts project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
         </KeepAlive>
         <KeepAlive active={page === 'profile'}       everVisited={everVisited.has('profile')}>
           <Profile user={user} onUserUpdated={u => setUser(u)} />
@@ -406,10 +434,13 @@ function AppInner() {
           <ErrorBoundary><Runner projects={projects} activeProject={activeProject} activeCollection={activeCollection} activeEnv={activeEnv} onNav={nav} /></ErrorBoundary>
         </KeepAlive>
         <KeepAlive active={page === 'reports'}       everVisited={everVisited.has('reports')}>
-          <Reports project={activeProject} collection={activeCollection} env={activeEnv} />
+          <Reports project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
         </KeepAlive>
         <KeepAlive active={page === 'analytics'}     everVisited={everVisited.has('analytics')}>
-          <Analytics project={activeProject} collection={activeCollection} />
+          <Analytics project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
+        </KeepAlive>
+        <KeepAlive active={page === 'git'}           everVisited={everVisited.has('git')}>
+          <GitPanel project={activeProject} user={user} />
         </KeepAlive>
 
         <footer className="app-footer">

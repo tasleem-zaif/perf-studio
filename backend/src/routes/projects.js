@@ -1,6 +1,8 @@
 const router = require('express').Router();
-const db = require('../db');
-const auth = require('../middleware/auth');
+const path   = require('path');
+const fs     = require('fs');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
 const resetSequence = require('../utils/resetSequence');
 const { writeProjectSnapshot } = require('../utils/configWriter');
 const { ensureProjectFolders, deleteProjectFolder, backupAndDeleteProjectFolder } = require('../utils/projectFolders');
@@ -35,6 +37,16 @@ router.get('/', (req, res) => {
       WHERE u.org_id = ?
       ORDER BY p.created_at DESC
     `).all(caller.org_id);
+  } else if (caller.role === 'user') {
+    // Regular users see only projects explicitly assigned to them
+    projects = db.prepare(`
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      FROM projects p
+      JOIN project_assignments pa ON pa.project_id = p.id AND pa.user_id = ?
+      JOIN users u ON p.user_id = u.id
+      LEFT JOIN organizations o ON u.org_id = o.id
+      ORDER BY p.created_at DESC
+    `).all(req.userId);
   } else {
     projects = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC').all(req.userId);
   }
@@ -43,6 +55,8 @@ router.get('/', (req, res) => {
 });
 
 router.post('/', (req, res) => {
+  const caller = getCaller(req.userId);
+  if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot create projects. Contact your org admin.' });
   const { name, description } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   const count = db.prepare('SELECT COUNT(*) as n FROM projects WHERE user_id = ?').get(req.userId).n;
@@ -67,6 +81,7 @@ router.post('/', (req, res) => {
 
 router.put('/:id', (req, res) => {
   const caller = getCaller(req.userId);
+  if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot edit projects.' });
   const project = caller.role === 'super_admin'
     ? db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
     : db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
@@ -82,6 +97,7 @@ router.put('/:id', (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const caller = getCaller(req.userId);
+    if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot delete projects.' });
     let project;
     if (caller.role === 'super_admin') {
       project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
@@ -96,14 +112,62 @@ router.delete('/:id', async (req, res) => {
     }
     if (!project) return res.status(404).json({ error: 'Not found' });
 
-    // Delete from DB immediately and respond — backup/folder cleanup runs in background
+    // Delete from DB immediately and respond — git cleanup + folder backup run in background
     db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
     resetSequence('projects');
     res.json({ ok: true });
 
-    // Background: zip project folder to backups/ then delete it
+    // Background: push project removal to GitHub (if git initialized), then backup + delete
     setImmediate(async () => {
       try {
+        // ── Git cleanup: remove project folder from GitHub repo ──────────────
+        const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
+        if (gitCfg?.is_initialized && gitCfg?.git_root && fs.existsSync(gitCfg.git_root)) {
+          try {
+            const simpleGit = require('simple-git');
+            const { decrypt } = require('../utils/encryption');
+            const git = simpleGit(gitCfg.git_root);
+
+            const token = gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '';
+            // Rebuild remote URL with auth token
+            const u = new URL(gitCfg.remote_url);
+            if (token) { u.username = gitCfg.username || token; u.password = token; }
+            const remoteWithAuth = u.toString();
+
+            await git.addConfig('user.name', gitCfg.username || 'PerfStudio');
+            await git.addConfig('user.email', gitCfg.email || 'noreply@perfstudio.com');
+            await git.checkout('main');
+            await git.pull('origin', 'main', { '--rebase': 'false' }).catch(() => {});
+
+            // Remove the project subfolder from git tracking
+            const projectSubfolder = path.basename(project.folder_path);
+            await git.rm(['-r', '--cached', '--ignore-unmatch', projectSubfolder]).catch(() => {});
+
+            // Also remove the folder physically from workspace
+            const projInWorkspace = path.join(gitCfg.git_root, projectSubfolder);
+            if (fs.existsSync(projInWorkspace)) {
+              fs.rmSync(projInWorkspace, { recursive: true, force: true });
+            }
+
+            // Commit the removal
+            const status = await git.status();
+            if (!status.isClean()) {
+              await git.add('.');
+              await git.commit(`Remove project: ${project.name}`);
+              await git.remote(['set-url', 'origin', remoteWithAuth]);
+              await git.push('origin', 'main');
+              console.log(`[Git] Project "${project.name}" removed from GitHub.`);
+            }
+
+            // Delete the entire workspace folder
+            fs.rmSync(gitCfg.git_root, { recursive: true, force: true });
+            console.log(`[Git] Workspace deleted: ${gitCfg.git_root}`);
+          } catch (gitErr) {
+            console.error('[Git] Failed to remove project from repo:', gitErr.message);
+          }
+        }
+
+        // Backup and delete the project data folder
         await backupAndDeleteProjectFolder(project.folder_path, project.name, project.id);
       } catch (e) {
         console.error('[Projects] Backup/delete folder failed:', e.message);

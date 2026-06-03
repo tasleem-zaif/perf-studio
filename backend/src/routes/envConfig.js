@@ -26,19 +26,21 @@ router.get('/:env', (req, res) => {
     'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
   ).get(collectionId, env);
 
-  // Merge: global → project → env-specific (env wins)
+  // Strict env isolation: each env only sees what was explicitly saved for it.
+  // UAT never inherits QA URLs. Empty = this env has no config yet.
+  const envCfg = row ? JSON.parse(row.config_json || '{}') : null;
+
+  // Global + project kept for execution-time merging inside the test runner only
   const globalRow  = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const projectRow = db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
   const globalCfg  = globalRow  ? JSON.parse(globalRow.config_json  || '{}') : {};
   const projectCfg = projectRow ? JSON.parse(projectRow.config_json || '{}') : {};
-  const envCfg     = row        ? JSON.parse(row.config_json         || '{}') : null;
 
   res.json({
     global:  globalCfg,
     project: projectCfg,
-    env:     envCfg,
-    // Effective = what actually gets used (env overrides project overrides global)
-    effective: {
+    env:     envCfg,       // null = no config saved for this env yet → show empty state in UI
+    effective: {           // used by test runner at execution time
       ...globalCfg,
       ...projectCfg,
       ...(envCfg || {}),

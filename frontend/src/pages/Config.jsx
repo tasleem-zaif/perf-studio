@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
+import EnvBar from '../components/EnvBar';
 
 const BLANK_URL = { protocol: 'https', url: '', port: '443' };
 function normalizeConfig(raw) {
@@ -160,7 +161,7 @@ function CollapsibleSection({ title, icon, iconColor, open, onToggle, children, 
   );
 }
 
-export default function Config({ project, collection, env }) {
+export default function Config({ project, collection, env, envs, onEnvChange }) {
   const { toast } = useToast();
   const [globalCfg, setGlobalCfg]   = useState({ urls: [{ ...BLANK_URL }] });
   const [projectCfg, setProjectCfg] = useState({ urls: [{ ...BLANK_URL }] });
@@ -489,6 +490,7 @@ export default function Config({ project, collection, env }) {
 
   return (
     <div className="page fade-in">
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to configure server settings" />
       <div className="section-hdr" style={{ marginBottom: '4px' }}>
         <div className="section-title"><i className="ti ti-settings-2" style={{ marginRight: '8px', color: 'var(--accent)' }} />Configuration</div>
       </div>
@@ -496,21 +498,8 @@ export default function Config({ project, collection, env }) {
         Base URLs are auto-populated from your API source collections and stored as JMeter User Defined Variables.
       </div>
 
-      {/* System Requirements */}
-      <CollapsibleSection
-        title="System Requirements"
-        icon="ti-checkup-list"
-        iconColor={sysOverall === 'ok' ? '#22c55e' : sysOverall === 'fail' ? 'var(--danger)' : sysOverall === 'warn' ? 'var(--warn)' : 'var(--accent)'}
-        open={open.sysCheck}
-        onToggle={() => setOpen(o => ({ ...o, sysCheck: !o.sysCheck }))}
-        badge={
-          sysRunning ? 'Checking…' :
-          sysOverall === 'ok'   ? 'All OK' :
-          sysOverall === 'warn' ? `${sysChecks.filter(c => c.status !== 'ok').length} warnings` :
-          sysOverall === 'fail' ? `${sysChecks.filter(c => c.status === 'fail').length} failed` :
-          undefined
-        }
-      >
+      {/* System Requirements removed — use Docker Engine section below */}
+      {null && <CollapsibleSection title="" open={false} onToggle={() => {}}>
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
           Verifies all dependencies, permissions, and configuration needed to run PerfStudio and execute tests.
         </div>
@@ -629,7 +618,7 @@ export default function Config({ project, collection, env }) {
             })}
           </div>
         )}
-      </CollapsibleSection>
+      </CollapsibleSection>}
 
       {/* Docker Engine */}
       <CollapsibleSection

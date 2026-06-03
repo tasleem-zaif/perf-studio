@@ -9,18 +9,33 @@ router.use(auth);
 // ── SMTP Config ───────────────────────────────────────────────────────────────
 
 router.get('/config', (req, res) => {
-  const row = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(req.userId);
+  let row = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(req.userId);
+
+  // If user has no config, return super admin's config (without password) as default
+  if (!row || !row.smtp_host) {
+    const superAdmin = db.prepare("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1").get();
+    if (superAdmin && superAdmin.id !== req.userId) {
+      const superRow = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(superAdmin.id);
+      if (superRow?.smtp_host) {
+        return res.json({
+          config: {
+            ...superRow,
+            smtp_pass: '',        // never send password to other users
+            inherited_from_super_admin: true,
+          }
+        });
+      }
+    }
+  }
+
   if (!row) return res.json({ config: null });
-  // Never return raw password
   res.json({ config: { ...row, smtp_pass: row.smtp_pass ? '••••••••' : '' } });
 });
 
 router.put('/config', (req, res) => {
-  const { smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass, from_name, from_email, enabled } = req.body;
+  const { smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass, from_name, from_email } = req.body;
   const existing = db.prepare('SELECT id, smtp_pass FROM alert_configs WHERE user_id = ?').get(req.userId);
 
-  // Keep old password if placeholder sent
-  // Keep old encrypted pass if placeholder sent; otherwise encrypt the new one
   const finalPass = (smtp_pass && smtp_pass !== '••••••••')
     ? encrypt(smtp_pass)
     : (existing?.smtp_pass || '');
@@ -28,15 +43,15 @@ router.put('/config', (req, res) => {
   if (existing) {
     db.prepare(`
       UPDATE alert_configs SET smtp_host=?, smtp_port=?, smtp_secure=?, smtp_user=?,
-        smtp_pass=?, from_name=?, from_email=?, enabled=? WHERE user_id=?
+        smtp_pass=?, from_name=?, from_email=?, enabled=1 WHERE user_id=?
     `).run(smtp_host||'', Number(smtp_port)||587, smtp_secure?1:0, smtp_user||'',
-           finalPass, from_name||'Performance Studio', from_email||'', enabled?1:0, req.userId);
+           finalPass, from_name||'Performance Studio', from_email||'', req.userId);
   } else {
     db.prepare(`
       INSERT INTO alert_configs (user_id, smtp_host, smtp_port, smtp_secure, smtp_user,
-        smtp_pass, from_name, from_email, enabled) VALUES (?,?,?,?,?,?,?,?,?)
+        smtp_pass, from_name, from_email, enabled) VALUES (?,?,?,?,?,?,?,?,1)
     `).run(req.userId, smtp_host||'', Number(smtp_port)||587, smtp_secure?1:0, smtp_user||'',
-           finalPass, from_name||'Performance Studio', from_email||'', enabled?1:0);
+           finalPass, from_name||'Performance Studio', from_email||'');
   }
   res.json({ ok: true });
 });

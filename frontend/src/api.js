@@ -12,8 +12,13 @@ api.interceptors.response.use(
   res => res,
   err => {
     if (err.response?.status === 401) {
-      localStorage.removeItem('ps_token');
-      window.location.reload();
+      // Only force-reload when a session token already exists (i.e. it expired).
+      // If there is no token the 401 is a failed login attempt — let the
+      // calling code handle it and show an inline error message instead.
+      if (localStorage.getItem('ps_token')) {
+        localStorage.removeItem('ps_token');
+        window.location.reload();
+      }
     }
     return Promise.reject(err);
   }

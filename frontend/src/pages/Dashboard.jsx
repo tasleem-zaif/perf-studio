@@ -18,15 +18,28 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
         onClick={() => onSelectProject(p.id)}
         style={{
           display: 'flex', alignItems: 'center', gap: '14px',
-          padding: '11px 16px',
+          padding: '12px 16px',
           background: 'var(--color-background-primary)',
           border: '1px solid var(--color-border-secondary)',
+          borderLeft: '3px solid transparent',
           borderRadius: '8px',
           cursor: 'pointer',
-          transition: 'background .12s',
+          transition: 'background .15s, border-color .15s, box-shadow .15s, transform .15s',
         }}
-        onMouseEnter={e => e.currentTarget.style.background = 'var(--color-background-hover)'}
-        onMouseLeave={e => e.currentTarget.style.background = 'var(--color-background-primary)'}
+        onMouseEnter={e => {
+          e.currentTarget.style.background = 'rgba(34,197,94,0.04)';
+          e.currentTarget.style.borderColor = 'rgba(34,197,94,0.35)';
+          e.currentTarget.style.borderLeftColor = '#22c55e';
+          e.currentTarget.style.boxShadow = '0 4px 16px rgba(34,197,94,0.10)';
+          e.currentTarget.style.transform = 'translateY(-1px)';
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.background = 'var(--color-background-primary)';
+          e.currentTarget.style.borderColor = 'var(--color-border-secondary)';
+          e.currentTarget.style.borderLeftColor = 'transparent';
+          e.currentTarget.style.boxShadow = 'none';
+          e.currentTarget.style.transform = 'translateY(0)';
+        }}
       >
         {/* Folder icon */}
         <div style={{ width: 34, height: 34, borderRadius: 7, background: p.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
@@ -66,23 +79,27 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
           Created {p.created_at?.slice(0, 10)}
         </div>
 
-        {/* Edit */}
-        <button
-          className="btn-secondary btn-sm"
-          style={{ flexShrink: 0 }}
-          onClick={e => { e.stopPropagation(); onEditProject(p); }}
-        >
-          <i className="ti ti-pencil" />
-        </button>
+        {/* Edit — org_admin only */}
+        {onEditProject && (
+          <button
+            className="btn-secondary btn-sm"
+            style={{ flexShrink: 0 }}
+            onClick={e => { e.stopPropagation(); onEditProject(p); }}
+          >
+            <i className="ti ti-pencil" />
+          </button>
+        )}
 
-        {/* Delete */}
-        <button
-          className="btn-secondary btn-sm"
-          style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)', flexShrink: 0 }}
-          onClick={e => { e.stopPropagation(); onDeleteProject(p.id); }}
-        >
-          <i className="ti ti-trash" />
-        </button>
+        {/* Delete — org_admin only */}
+        {onDeleteProject && (
+          <button
+            className="btn-secondary btn-sm"
+            style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)', flexShrink: 0 }}
+            onClick={e => { e.stopPropagation(); onDeleteProject(p.id); }}
+          >
+            <i className="ti ti-trash" />
+          </button>
+        )}
       </div>
     );
   }
@@ -126,7 +143,7 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
             <i className="ti ti-folder" />
             <div className="empty-title">No projects yet</div>
             <div className="empty-sub">Create your first project to get started</div>
-            {!isSuperAdmin && <button className="btn-primary" style={{ marginTop: '16px' }} onClick={onNewProject}>New Project</button>}
+            {user?.role === 'org_admin' && <button className="btn-primary" style={{ marginTop: '16px' }} onClick={onNewProject}>New Project</button>}
           </div>
         </>
       ) : (

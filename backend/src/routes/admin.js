@@ -69,7 +69,20 @@ router.delete('/users/:id', auth, requireAdmin, (req, res) => {
     }
   }
 
+  // Clean up ALL references to this user before deleting
+  // (several tables have NOT NULL or no-CASCADE FK constraints)
+  db.prepare("DELETE FROM invites WHERE invited_by = ?").run(req.params.id);
+  db.prepare("DELETE FROM alert_configs WHERE user_id = ?").run(req.params.id);
+  db.prepare("DELETE FROM alert_recipients WHERE user_id = ?").run(req.params.id);
+  db.prepare("DELETE FROM project_assignments WHERE user_id = ?").run(req.params.id);
+  db.prepare("DELETE FROM git_commits WHERE user_id = ?").run(req.params.id);
+  try { db.prepare("UPDATE git_prs SET created_by = NULL WHERE created_by = ?").run(req.params.id); } catch {}
+
+  // Now safe to delete the user
   db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+
+  // Also expire any pending invites SENT TO this user's email
+  db.prepare("UPDATE invites SET status='expired' WHERE email=?").run(target.email);
   res.json({ ok: true });
 });
 

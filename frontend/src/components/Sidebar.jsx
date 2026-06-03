@@ -1,263 +1,242 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { projectDirName, collectionDirName } from '../utils/displayName';
 
-/* ── Shared atoms ─────────────────────────────────────────────────────────── */
+/* ── Icon / color config per feature key ──────────────────────────────── */
+const IC = {
+  dashboard:             { icon: 'ti-layout-dashboard',       bg: '#dcfce7', color: '#16a34a', sub: 'Overview & metrics' },
+  projects:              { icon: 'ti-folder-open',            bg: '#dbeafe', color: '#2563eb', sub: 'Manage test projects' },
+  'ai-config':           { icon: 'ti-brain',                  bg: '#fef3c7', color: '#d97706', sub: 'Script generation AI' },
+  settings:              { icon: 'ti-adjustments',            bg: '#f1f5f9', color: '#475569', sub: 'System configuration' },
+  'settings-smtp':       { icon: 'ti-mail-cog',               bg: '#fef9c3', color: '#ca8a04', sub: 'Email config' },
+  'settings-users':      { icon: 'ti-users',                  bg: '#dbeafe', color: '#2563eb', sub: 'Users & orgs' },
+  'settings-appearance': { icon: 'ti-palette',                bg: '#ede9fe', color: '#7c3aed', sub: 'Themes & display' },
+  profile:               { icon: 'ti-user-circle',            bg: '#cffafe', color: '#0891b2', sub: 'My account' },
+  logout:                { icon: 'ti-logout',                 bg: '#fee2e2', color: '#dc2626', sub: 'Sign out' },
+  /* col step keys */
+  'test-data':           { icon: 'ti-table',                  bg: '#ede9fe', color: '#7c3aed' },
+  rules:                 { icon: 'ti-adjustments-horizontal', bg: '#ffedd5', color: '#ea580c' },
+  config:                { icon: 'ti-settings-2',             bg: '#f1f5f9', color: '#475569' },
+  'test-suites':         { icon: 'ti-test-pipe',              bg: '#e0e7ff', color: '#4338ca' },
+  alerts:                { icon: 'ti-bell-ringing',           bg: '#fee2e2', color: '#dc2626' },
+  runner:                { icon: 'ti-player-play',            bg: '#dcfce7', color: '#16a34a' },
+  analytics:             { icon: 'ti-chart-dots-3',           bg: '#dbeafe', color: '#2563eb' },
+  reports:               { icon: 'ti-chart-bar',              bg: '#e0e7ff', color: '#4338ca' },
+  /* generic */
+  _project:              { icon: 'ti-folder',                 bg: '#eff6ff', color: '#1d4ed8' },
+  _collection:           { icon: 'ti-braces',                 bg: '#f0fdfa', color: '#0d9488' },
+  _env:                  { icon: 'ti-server',                 bg: '#f0fdf4', color: '#166534' },
+};
 
-/** Top-level expandable group (Dashboard, Projects, Execution…) */
-function NavGroup({ icon, label, children, badge, defaultOpen = false, forceOpen }) {
-  const [open, setOpen] = useState(defaultOpen);
-  useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
+const COL_STEPS = [
+  { id: 'test-data',   label: 'Test Data' },
+  { id: 'rules',       label: 'Rule Engine' },
+  { id: 'config',      label: 'Configuration' },
+  { id: 'test-suites', label: 'Test Plans' },
+  { id: 'alerts',      label: 'Alerts' },
+  { id: 'runner',      label: 'Run Test' },
+  { id: 'analytics',   label: 'Analytics' },
+  { id: 'reports',     label: 'JMeter Report' },
+];
+
+/* ── Size tiers (0=top-level … 4=deepest step) ────────────────────────── */
+const SZ = [
+  { iw: 40, ir: 10, ifs: 20, tfs: 14, fw: 600, gap: 10, py: 7, px: 10, showSub: true  },
+  { iw: 32, ir: 8,  ifs: 16, tfs: 13, fw: 600, gap: 9,  py: 5, px: 9,  showSub: false },
+  { iw: 26, ir: 7,  ifs: 13, tfs: 12, fw: 600, gap: 8,  py: 5, px: 7,  showSub: false },
+  { iw: 22, ir: 6,  ifs: 12, tfs: 12, fw: 500, gap: 7,  py: 4, px: 6,  showSub: false },
+  { iw: 20, ir: 5,  ifs: 11, tfs: 11, fw: 500, gap: 6,  py: 4, px: 6,  showSub: false },
+];
+
+/* ── CardBtn — universal card nav button ──────────────────────────────── */
+function CardBtn({ iconKey, iconBg, iconColor, iconName, label, sub, badge, active, onClick, depth = 0, chevronOpen }) {
+  const ic = IC[iconKey] || {};
+  const s  = SZ[Math.min(depth, SZ.length - 1)];
+
+  const bg  = iconBg    || ic.bg    || '#f1f5f9';
+  const clr = iconColor || ic.color || '#64748b';
+  const icn = iconName  || ic.icon  || 'ti-circle';
+  const subtitle = sub !== undefined ? sub : ic.sub;
 
   return (
-    <div>
-      {/* Header row */}
-      <div
-        className="nav-item"
-        onClick={() => setOpen(o => !o)}
-        style={{ fontWeight: 600 }}
-      >
-        <i className={`ti ${icon}`} style={{ fontSize: '17px', flexShrink: 0 }} />
-        <span style={{ flex: 1, wordBreak: 'break-word' }}>
-          {label}
-        </span>
-        {badge != null && (
-          <span style={{
-            fontSize: '10px', fontWeight: 700, flexShrink: 0,
-            background: 'rgba(0,0,0,0.20)', color: '#fff',
-            borderRadius: '10px', padding: '1px 6px',
-          }}>
-            {badge}
-          </span>
-        )}
-        <i
-          className={`ti ${open ? 'ti-chevron-up' : 'ti-chevron-down'}`}
-          style={{ fontSize: '12px', flexShrink: 0, opacity: 0.7 }}
-        />
+    <button className={`nav-card${active ? ' active' : ''}`} onClick={onClick}
+      style={{ padding: `${s.py}px ${s.px}px`, gap: s.gap }}>
+
+      {/* Colored icon box */}
+      <div style={{
+        width: s.iw, height: s.iw, borderRadius: s.ir,
+        background: bg, color: clr,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flexShrink: 0, fontSize: s.ifs,
+      }}>
+        <i className={`ti ${icn}`} />
       </div>
 
-      {/* Children — indented with vertical connector line */}
-      {open && (
-        <div style={{ position: 'relative' }}>
-          {/* Vertical connector line */}
-          <div style={{
-            position: 'absolute', left: '26px', top: 0, bottom: 0,
-            width: '1px', background: 'rgba(255,255,255,0.20)',
-            pointerEvents: 'none',
-          }} />
-          {children}
+      {/* Label + subtitle */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontSize: s.tfs, fontWeight: s.fw, color: '#0f172a',
+          lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
+          {label}
         </div>
-      )}
-    </div>
-  );
-}
+        {s.showSub && subtitle && (
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {subtitle}
+          </div>
+        )}
+      </div>
 
-/** Leaf item with bullet dot on the connector line */
-function NavLeaf({ icon, label, active, onClick, depth = 1 }) {
-  const leftPad = 14 + depth * 18;
-  return (
-    <button
-      className={`nav-step${active ? ' active' : ''}`}
-      onClick={onClick}
-      style={{ paddingLeft: `${leftPad}px`, position: 'relative' }}
-    >
-      {/* Bullet on the line */}
-      <span style={{
-        position: 'absolute', left: '23px', top: '50%', transform: 'translateY(-50%)',
-        width: '7px', height: '7px', borderRadius: '50%',
-        background: active ? '#fff' : 'rgba(255,255,255,0.45)',
-        flexShrink: 0,
-      }} />
-      {icon
-        ? <i className={`ti ${icon}`} style={{ fontSize: '14px', flexShrink: 0 }} />
-        : <span style={{ width: '14px', flexShrink: 0 }} />
-      }
-      <span style={{ wordBreak: 'break-word' }}>
-        {label}
-      </span>
+      {/* Badge */}
+      {badge != null && (
+        <span style={{
+          fontSize: 10, fontWeight: 700,
+          background: active ? 'rgba(34,197,94,0.15)' : '#e2e8f0',
+          color: active ? '#16a34a' : '#64748b',
+          borderRadius: 12, padding: '2px 7px', flexShrink: 0,
+        }}>
+          {badge}
+        </span>
+      )}
+
+      {/* Chevron */}
+      {chevronOpen !== undefined && (
+        <i className={`ti ${chevronOpen ? 'ti-chevron-up' : 'ti-chevron-down'}`}
+          style={{ fontSize: 10, color: '#94a3b8', flexShrink: 0, marginLeft: 2 }} />
+      )}
     </button>
   );
 }
 
-/** Section divider label */
-function Divider() {
-  return <div style={{ height: '1px', background: 'rgba(255,255,255,0.12)', margin: '4px 0' }} />;
+/* ── ChildGroup — indented container with a left connector line ────────── */
+function ChildGroup({ children, ml = 20, borderColor = '#e2e8f0' }) {
+  return (
+    <div style={{
+      marginLeft: ml,
+      paddingLeft: 10,
+      borderLeft: `2px solid ${borderColor}`,
+      marginTop: 1,
+      marginBottom: 2,
+    }}>
+      {children}
+    </div>
+  );
 }
 
-/* ── Constants ─────────────────────────────────────────────────────────────── */
+/* ── Divider ─────────────────────────────────────────────────────────── */
+function Divider() {
+  return <div className="sidebar-divider" />;
+}
 
-const COL_STEPS = [
-  { id: 'test-data',   icon: 'ti-table',                  label: 'Test Data' },
-  { id: 'rules',       icon: 'ti-adjustments-horizontal', label: 'Rule Engine' },
-  { id: 'config',      icon: 'ti-settings-2',             label: 'Configuration' },
-  { id: 'test-suites', icon: 'ti-test-pipe',              label: 'Test Plans' },
-  { id: 'alerts',      icon: 'ti-bell-ringing',           label: 'Alerts' },
-  { id: 'runner',      icon: 'ti-player-play',            label: 'Run Test' },
-  { id: 'analytics',   icon: 'ti-chart-dots-3',           label: 'Analytics' },
-  { id: 'reports',     icon: 'ti-chart-bar',              label: 'JMeter Report' },
-];
-
-/* ── Collection item with per-env sub-trees ─────────────────────────────── */
-
-function CollectionItem({ col, activeCollection, activeEnv, page, onSelectCollection, isColOpen, toggleCol }) {
+/* ── CollectionItem — flat: features directly under collection ────────── */
+function CollectionItem({ col, activeCollection, activeEnv, page, onSelectCollection }) {
   const [open, setOpen] = useState(false);
-  const [expandedEnvs, setExpandedEnvs] = useState({});
-
   const isActiveCol = activeCollection?.id === col.id;
-  const isEnvOpen   = env => expandedEnvs[env] !== false;
-  const toggleEnv   = env => setExpandedEnvs(p => ({ ...p, [env]: !isEnvOpen(env) }));
 
-  // Parse environments array (support both new multi-env and legacy single-env)
   let envs = [];
   try { envs = JSON.parse(col.environments || '[]'); } catch {}
   if (!envs.length && col.environment) envs = [col.environment];
   if (!envs.length) envs = ['Default'];
 
+  const firstEnv = envs[0] || null;
+
+  // Collection header is active if we are on any of its feature pages
+  const colActive = isActiveCol && (page === 'collections' || COL_STEPS.some(s => s.id === page));
+
   useEffect(() => { if (isActiveCol) setOpen(true); }, [isActiveCol]);
 
   return (
     <div>
-      {/* Collection header — click: navigate to detail + toggle */}
-      <button
-        className={`nav-step${isActiveCol && page === 'collections' ? ' active' : ''}`}
-        onClick={() => { onSelectCollection(col, null, 'collections'); setOpen(o => !o); }}
-        style={{ width: '100%', paddingLeft: '44px', fontWeight: 600, justifyContent: 'space-between', position: 'relative' }}
-      >
-        <span style={{
-          position: 'absolute', left: '23px',
-          width: '7px', height: '7px', borderRadius: '50%',
-          background: isActiveCol ? '#fff' : 'rgba(255,255,255,0.40)',
-        }} />
-        <span style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
-          <i className="ti ti-braces" style={{ fontSize: '13px', flexShrink: 0 }} />
-          <span style={{ wordBreak: 'break-word' }}>{collectionDirName(col)}</span>
-        </span>
-        <i className={`ti ${open ? 'ti-chevron-up' : 'ti-chevron-down'}`}
-          style={{ fontSize: '11px', flexShrink: 0, opacity: 0.7, marginLeft: '6px' }} />
-      </button>
+      {/* Collection header — env names shown as subtitle */}
+      <CardBtn
+        iconKey="_collection"
+        label={collectionDirName(col)}
+        sub={envs.join(' · ')}
+        active={colActive}
+        depth={2}
+        chevronOpen={open}
+        onClick={() => { onSelectCollection(col, firstEnv, 'collections'); setOpen(o => !o); }}
+      />
 
-      {/* Environments */}
-      {open && envs.map(env => {
-        const isActiveEnv = isActiveCol && activeEnv === env;
-        const envOpen = isEnvOpen(env);
-        return (
-          <div key={env}>
-            {/* Env row — click: expand/collapse ONLY (no navigation) */}
-            <button
-              className={`nav-step${isActiveEnv ? ' active' : ''}`}
-              onClick={() => toggleEnv(env)}
-              style={{ width: '100%', paddingLeft: '60px', fontWeight: 600, justifyContent: 'space-between', position: 'relative' }}
-            >
-              <span style={{
-                position: 'absolute', left: '39px', top: '50%', transform: 'translateY(-50%)',
-                width: '6px', height: '6px', borderRadius: '50%',
-                background: isActiveEnv ? '#fff' : 'rgba(255,255,255,0.35)',
-              }} />
-              <span style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1 }}>
-                <i className="ti ti-server" style={{ fontSize: '12px', flexShrink: 0 }} />
-                <span style={{ wordBreak: 'break-word' }}>{env}</span>
-              </span>
-              <i className={`ti ${envOpen ? 'ti-chevron-up' : 'ti-chevron-down'}`}
-                style={{ fontSize: '10px', flexShrink: 0, opacity: 0.6, marginLeft: '4px' }} />
-            </button>
-
-            {/* Sub-items per env */}
-            {envOpen && (
-              <div style={{ position: 'relative' }}>
-                <div style={{
-                  position: 'absolute', left: '56px', top: 0, bottom: 0,
-                  width: '1px', background: 'rgba(255,255,255,0.15)',
-                }} />
-                {COL_STEPS.map(step => (
-                  <button
-                    key={step.id}
-                    className={`nav-step${isActiveEnv && page === step.id ? ' active' : ''}`}
-                    onClick={() => onSelectCollection(col, env, step.id)}
-                    style={{ paddingLeft: '78px', position: 'relative' }}
-                  >
-                    <span style={{
-                      position: 'absolute', left: '53px', top: '50%', transform: 'translateY(-50%)',
-                      width: '5px', height: '5px', borderRadius: '50%',
-                      background: (isActiveEnv && page === step.id) ? '#fff' : 'rgba(255,255,255,0.30)',
-                    }} />
-                    <i className={`ti ${step.icon}`} style={{ fontSize: '13px', flexShrink: 0 }} />
-                    {step.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-/* ── Project item ────────────────────────────────────────────────────────── */
-
-function ProjectItem({
-  p, isActiveProj, activeCollection, activeEnv, page, collections,
-  onSelectProject, onSelectCollection, onAddCollection, onNav,
-}) {
-  const [open, setOpen] = useState(isActiveProj);
-
-  useEffect(() => { if (isActiveProj) setOpen(true); }, [isActiveProj]);
-
-  return (
-    <div>
-      {/* Project row */}
-      <button
-        className={`nav-step${isActiveProj && page === 'project-home' ? ' active' : ''}`}
-        onClick={() => { onSelectProject(p.id); setOpen(o => !o); }}
-        style={{ width: '100%', paddingLeft: '32px', fontWeight: 600, justifyContent: 'space-between', position: 'relative' }}
-      >
-        <span style={{
-          position: 'absolute', left: '23px',
-          width: '7px', height: '7px', borderRadius: '50%',
-          background: isActiveProj ? '#fff' : 'rgba(255,255,255,0.40)',
-        }} />
-        <span style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
-          <i className="ti ti-folder" style={{ fontSize: '14px', flexShrink: 0 }} />
-          <span style={{ wordBreak: 'break-word' }}>{projectDirName(p)}</span>
-        </span>
-        <i className={`ti ${open ? 'ti-chevron-up' : 'ti-chevron-down'}`}
-          style={{ fontSize: '11px', flexShrink: 0, opacity: 0.7, marginLeft: '6px' }} />
-      </button>
-
-      {open && isActiveProj && (
-        <>
-          {/* AI Configuration */}
-          <NavLeaf icon="ti-brain" label="AI Configuration"
-            active={page === 'ai-config'} onClick={() => onNav('ai-config')} depth={2} />
-
-          {/* Collections — each with its env sub-trees */}
-          {collections.length === 0 && (
-            <div style={{ padding: '6px 14px 6px 44px', fontSize: '13px', color: '#fff', fontStyle: 'italic' }}>
-              No API sources yet
-            </div>
-          )}
-          {collections.map(col => (
-            <CollectionItem
-              key={col.id}
-              col={col}
-              activeCollection={activeCollection}
-              activeEnv={activeEnv}
-              page={page}
-              onSelectCollection={onSelectCollection}
+      {/* Feature steps directly — no env nesting */}
+      {open && (
+        <ChildGroup ml={18} borderColor="#d1fae5">
+          {COL_STEPS.map(step => (
+            <CardBtn key={step.id}
+              iconKey={step.id}
+              label={step.label}
+              active={isActiveCol && page === step.id}
+              depth={3}
+              onClick={() => onSelectCollection(col, firstEnv, step.id)}
             />
           ))}
-
-          <button className="nav-item" onClick={onAddCollection}
-            style={{ paddingLeft: '44px', fontSize: '13px', fontWeight: 500, color: '#fff' }}>
-            <i className="ti ti-plus" style={{ fontSize: '14px' }} /> Add API Source
-          </button>
-        </>
+        </ChildGroup>
       )}
     </div>
   );
 }
 
-/* ── Main component ──────────────────────────────────────────────────────── */
+/* ── ProjectItem ─────────────────────────────────────────────────────── */
+function ProjectItem({ p, isActiveProj, activeCollection, activeEnv, page, collections, onSelectProject, onSelectCollection, onAddCollection, onNav }) {
+  const [open, setOpen] = useState(isActiveProj);
+  useEffect(() => { if (isActiveProj) setOpen(true); }, [isActiveProj]);
 
+  return (
+    <div>
+      <CardBtn
+        iconKey="_project"
+        label={projectDirName(p)}
+        active={isActiveProj && page === 'project-home'}
+        depth={1}
+        chevronOpen={open}
+        onClick={() => { onSelectProject(p.id); setOpen(o => !o); }}
+      />
+
+      {open && isActiveProj && (
+        <ChildGroup ml={20} borderColor="#bfdbfe">
+          {/* AI Configuration */}
+          <CardBtn iconKey="ai-config" label="AI Configuration"
+            active={page === 'ai-config'} depth={2}
+            onClick={() => onNav('ai-config')} />
+
+          {/* Git Integration */}
+          <CardBtn
+            iconBg="#f0fdf4" iconColor="#22c55e" iconName="ti-git-branch"
+            label="Git" depth={2}
+            active={page === 'git'}
+            onClick={() => onNav('git')} />
+
+          {/* Collections */}
+          {collections.length === 0 && (
+            <div style={{ padding: '4px 6px 4px 8px', fontSize: 11, color: '#94a3b8', fontStyle: 'italic' }}>
+              No API sources yet
+            </div>
+          )}
+          {collections.map(col => (
+            <CollectionItem key={col.id} col={col}
+              activeCollection={activeCollection} activeEnv={activeEnv}
+              page={page} onSelectCollection={onSelectCollection} />
+          ))}
+
+          {/* Add API Source */}
+          <button className="nav-card" onClick={onAddCollection}
+            style={{ padding: '4px 7px', gap: 6, opacity: 0.75 }}>
+            <div style={{
+              width: 22, height: 22, borderRadius: 6,
+              background: '#f0fdf4', color: '#22c55e',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              flexShrink: 0, fontSize: 12, border: '1.5px dashed #22c55e',
+            }}>
+              <i className="ti ti-plus" />
+            </div>
+            <span style={{ fontSize: 12, color: '#475569', fontWeight: 500 }}>Add API Source</span>
+          </button>
+        </ChildGroup>
+      )}
+    </div>
+  );
+}
+
+/* ── Main Sidebar ────────────────────────────────────────────────────── */
 export default function Sidebar({
   user, projects, activeProject, activeCollection, activeEnv,
   page, activeTab,
@@ -266,18 +245,16 @@ export default function Sidebar({
   const initials = user?.name?.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase() || '?';
   const isAdmin  = user?.role === 'super_admin' || user?.role === 'org_admin';
 
-  // ── Resizable sidebar ────────────────────────────────────────────────────
-  const MIN_W = 200;
-  const MAX_W = 520;
+  /* ── Resizable sidebar ──────────────────────────────────────────── */
+  const MIN_W = 200, MAX_W = 520;
   const [sidebarW, setSidebarW] = useState(() => {
     const saved = localStorage.getItem('ps_sidebar_width');
-    return saved ? Math.max(MIN_W, Math.min(MAX_W, Number(saved))) : 248;
+    return saved ? Math.max(MIN_W, Math.min(MAX_W, Number(saved))) : 256;
   });
   const dragging = useRef(false);
   const startX   = useRef(0);
   const startW   = useRef(0);
 
-  // Sync width to CSS variable so `.main` margin updates too
   useEffect(() => {
     document.documentElement.style.setProperty('--sidebar', `${sidebarW}px`);
     localStorage.setItem('ps_sidebar_width', String(sidebarW));
@@ -287,132 +264,159 @@ export default function Sidebar({
     dragging.current = true;
     startX.current   = e.clientX;
     startW.current   = sidebarW;
-    document.body.style.cursor    = 'col-resize';
+    document.body.style.cursor     = 'col-resize';
     document.body.style.userSelect = 'none';
   }, [sidebarW]);
 
   useEffect(() => {
     const onMove = (e) => {
       if (!dragging.current) return;
-      const delta = e.clientX - startX.current;
-      const newW  = Math.max(MIN_W, Math.min(MAX_W, startW.current + delta));
+      const newW = Math.max(MIN_W, Math.min(MAX_W, startW.current + (e.clientX - startX.current)));
       setSidebarW(newW);
     };
     const onUp = () => {
       dragging.current = false;
-      document.body.style.cursor    = '';
+      document.body.style.cursor     = '';
       document.body.style.userSelect = '';
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, []);
+
+  /* Expand state */
+  const [projectsOpen, setProjectsOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const collections = activeProject?.collections || [];
 
+  /*
+   * Active flags for group headers:
+   * - Parent highlights ONLY when the current page belongs to it.
+   * - Opening/closing a group does NOT trigger highlight by itself.
+   */
+  const SETTINGS_PAGES = ['settings-smtp', 'settings-users', 'settings-appearance'];
+  const PROJECT_PAGES  = ['project-home', 'ai-config', 'git', 'collections',
+                          'test-data', 'rules', 'config', 'test-suites',
+                          'alerts', 'runner', 'analytics', 'reports'];
+
+  const settingsActive = SETTINGS_PAGES.includes(page);
+  const projectsActive = PROJECT_PAGES.includes(page);
+
   return (
     <div className="sidebar" style={{ width: `${sidebarW}px` }}>
+
       {/* Drag-resize handle */}
-      <div
-        onMouseDown={onMouseDown}
-        style={{
-          position: 'absolute', top: 0, right: 0, bottom: 0, width: '5px',
-          cursor: 'col-resize', zIndex: 20,
-          background: 'transparent',
-          transition: 'background .15s',
-        }}
-        onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.20)'}
-        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-        title="Drag to resize sidebar"
-      />
+      <div className="sidebar-resize-handle" onMouseDown={onMouseDown}
+        title="Drag to resize sidebar" />
 
       {/* ── Logo ─────────────────────────────────────────── */}
       <div className="sidebar-logo">
         <div className="sidebar-logo-icon">P</div>
         <div>
           <div className="sidebar-logo-text">Performance Studio</div>
-          <div style={{ fontSize: '10px', color: '#fff', marginTop: '1px' }}>
-            AI-Powered Performance Testing
+          <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>
+            AI-Powered Testing
           </div>
         </div>
       </div>
 
-      {/* ── Nav tree ─────────────────────────────────────── */}
-      <div className="sidebar-scroll" style={{ paddingBottom: '8px' }}>
+      {/* ── Navigation ───────────────────────────────────── */}
+      <div className="sidebar-scroll">
 
         {/* Dashboard */}
-        <button className={`nav-item${page === 'dashboard' ? ' active' : ''}`}
-          onClick={() => onNav('dashboard')} style={{ fontWeight: 600 }}>
-          <i className="ti ti-layout-dashboard" />
-          Dashboard
-        </button>
+        <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
+          active={page === 'dashboard'} depth={0}
+          onClick={() => onNav('dashboard')} />
 
         <Divider />
 
-        {/* Projects */}
-        <NavGroup icon="ti-folder" label="Projects" badge={projects.length} defaultOpen={true}>
-          {projects.map(p => (
-            <ProjectItem
-              key={p.id}
-              p={p}
-              isActiveProj={activeProject?.id === p.id}
-              activeCollection={activeCollection}
-              activeEnv={activeEnv}
-              page={page}
-              collections={activeProject?.id === p.id ? collections : []}
-              onSelectProject={onSelectProject}
-              onSelectCollection={onSelectCollection}
-              onAddCollection={onAddCollection}
-              onNav={onNav}
-            />
-          ))}
-          {/* New Project */}
-          <button className="nav-item" onClick={onNewProject}
-            style={{ paddingLeft: '32px', fontSize: '12.5px', fontWeight: 500, color: '#fff' }}>
-            <i className="ti ti-plus" style={{ fontSize: '14px' }} /> New Project
-          </button>
-        </NavGroup>
+        {/* Projects group header */}
+        <CardBtn iconKey="projects" label="Projects" sub="Manage test projects"
+          badge={projects.length} depth={0}
+          active={projectsActive}
+          chevronOpen={projectsOpen}
+          onClick={() => setProjectsOpen(o => !o)} />
+
+        {projectsOpen && (
+          <ChildGroup ml={20} borderColor="#bfdbfe">
+            {projects.map(p => (
+              <ProjectItem key={p.id} p={p}
+                isActiveProj={activeProject?.id === p.id}
+                activeCollection={activeCollection}
+                activeEnv={activeEnv}
+                page={page}
+                collections={activeProject?.id === p.id ? collections : []}
+                onSelectProject={onSelectProject}
+                onSelectCollection={onSelectCollection}
+                onAddCollection={onAddCollection}
+                onNav={onNav}
+              />
+            ))}
+
+            {/* New Project — only org_admin can create projects */}
+            {(user?.role === 'org_admin') && (
+              <button className="nav-card" onClick={onNewProject}
+                style={{ padding: '4px 8px', gap: 7, opacity: 0.75 }}>
+                <div style={{
+                  width: 24, height: 24, borderRadius: 6,
+                  background: '#f0fdf4', color: '#22c55e',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  flexShrink: 0, fontSize: 13, border: '1.5px dashed #22c55e',
+                }}>
+                  <i className="ti ti-plus" />
+                </div>
+                <span style={{ fontSize: 12, color: '#475569', fontWeight: 500 }}>New Project</span>
+              </button>
+            )}
+          </ChildGroup>
+        )}
 
         <Divider />
 
-        <Divider />
+        {/* Settings group header */}
+        <CardBtn iconKey="settings" label="Settings" sub="System configuration"
+          depth={0}
+          active={settingsActive}
+          chevronOpen={settingsOpen}
+          onClick={() => setSettingsOpen(o => !o)} />
 
-        {/* Settings */}
-        <NavGroup icon="ti-adjustments" label="Settings" defaultOpen={false}>
-          {isAdmin && (
-            <NavLeaf icon="ti-users" label="User Management"
-              active={page === 'settings-users'} onClick={() => onNav('settings-users')} />
-          )}
-          <NavLeaf icon="ti-palette" label="Appearance"
-            active={page === 'settings-appearance'} onClick={() => onNav('settings-appearance')} />
-        </NavGroup>
+        {settingsOpen && (
+          <ChildGroup ml={20} borderColor="#e2e8f0">
+            {(user?.role === 'super_admin' || user?.role === 'org_admin') && (
+              <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
+                active={page === 'settings-smtp'} depth={1}
+                onClick={() => onNav('settings-smtp')} />
+            )}
+            {isAdmin && (
+              <CardBtn iconKey="settings-users" label="User Management"
+                active={page === 'settings-users'} depth={1}
+                onClick={() => onNav('settings-users')} />
+            )}
+            <CardBtn iconKey="settings-appearance" label="Appearance"
+              active={page === 'settings-appearance'} depth={1}
+              onClick={() => onNav('settings-appearance')} />
+          </ChildGroup>
+        )}
 
         <Divider />
 
         {/* Profile */}
-        <button className={`nav-item${page === 'profile' ? ' active' : ''}`}
-          onClick={() => onNav('profile')} style={{ fontWeight: 600 }}>
-          <i className="ti ti-user" />
-          My Profile
-        </button>
+        <CardBtn iconKey="profile" label="My Profile" sub="My account"
+          active={page === 'profile'} depth={0}
+          onClick={() => onNav('profile')} />
 
         {/* Logout */}
-        <button className="nav-item" onClick={onLogout}
-          style={{ fontWeight: 600, color: '#fff' }}>
-          <i className="ti ti-logout" />
-          Logout
-        </button>
+        <CardBtn iconKey="logout" label="Logout" sub="Sign out"
+          depth={0} onClick={onLogout} />
 
       </div>
 
-      {/* ── Footer ─────────────────────────────────────────── */}
+      {/* ── Footer ───────────────────────────────────────── */}
       <div className="sidebar-footer">
         <div className="user-pill">
           <div className="avatar">{initials}</div>
-          <div style={{ overflow: 'hidden' }}>
+          <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
             <div className="user-name">{user?.name}</div>
             <div className="user-role">
               {user?.org_name || (user?.role === 'super_admin' ? 'Super Admin' : user?.email)}
@@ -420,6 +424,7 @@ export default function Sidebar({
           </div>
         </div>
       </div>
+
     </div>
   );
 }

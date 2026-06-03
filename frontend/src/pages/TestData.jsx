@@ -3,6 +3,7 @@ import * as XLSX from 'xlsx';
 import api from '../api';
 import ConfirmModal from '../components/ConfirmModal';
 import Modal from '../components/Modal';
+import EnvBar from '../components/EnvBar';
 import { useConfirm } from '../hooks/useConfirm';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
@@ -86,7 +87,7 @@ const DEFAULT_GEN = { filename: 'test_data', extension: '.csv', numRows: 10, col
 
 // ─── Component ────────────────────────────────────────────────────────────
 
-export default function TestData({ project, collection, env, onNav, onProjectUpdated, uploadTrigger, generateTrigger }) {
+export default function TestData({ project, collection, env, envs, onEnvChange, onNav, onProjectUpdated, uploadTrigger, generateTrigger }) {
   const [files, setFiles] = useState([]);
   const [editing, setEditing] = useState(null);
   const [dirty, setDirty] = useState(false);
@@ -292,6 +293,9 @@ export default function TestData({ project, collection, env, onNav, onProjectUpd
         <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
         <span><i className="ti ti-table" style={{ fontSize: '12px', marginRight: '4px' }} />Test Data</span>
       </div>
+
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange}
+        hint="Select environment to view or upload test data files" />
 
       {uploading && (
         <div style={{ padding: '10px 14px', background: '#e8f0ff', borderRadius: '8px', marginBottom: '16px', fontSize: '13px' }}>

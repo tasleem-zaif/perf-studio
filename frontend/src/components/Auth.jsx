@@ -1,193 +1,163 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import api from '../api';
-import CustomSelect from './CustomSelect';
+
+/* ── Feature highlights shown on the left branding panel ── */
+const FEATURES = [
+  {
+    title: 'AI Script Generation',
+    desc: 'Generate Load Test scripts using AI.',
+  },
+  {
+    title: 'Auto-Healing Tests',
+    desc: 'AI detects script failures, fixes the script and re-runs.',
+  },
+  {
+    title: 'Real-time Analytics',
+    desc: 'Live dashboards for application performance.',
+  },
+  {
+    title: 'Multi-Environment Support',
+    desc: 'Work seamlessly with multiple environments.',
+  },
+  {
+    title: 'Team Collaboration',
+    desc: 'Organization based user invitations and role-based project access.',
+  },
+];
 
 export default function Auth({ onLogin }) {
-  const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
-  const [name, setName] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState('');
-  const [orgId, setOrgId] = useState('');
-  const [orgName, setOrgName] = useState('');
-  const [createNewOrg, setCreateNewOrg] = useState(false);
-  const [orgs, setOrgs] = useState([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [pending, setPending] = useState(false);
-
-  useEffect(() => {
-    if (mode === 'register') {
-      api.get('/orgs').then(({ data }) => setOrgs(data.orgs)).catch(() => {});
-    }
-  }, [mode]);
-
-  function switchMode(m) {
-    setMode(m);
-    setError('');
-    setPending(false);
-    setRole('');
-    setOrgId('');
-    setOrgName('');
-    setCreateNewOrg(false);
-  }
-
-  function handleOrgSelect(value) {
-    if (value === '__new__') {
-      setOrgId('');
-      setOrgName('');
-      setCreateNewOrg(true);
-    } else {
-      setOrgId(value);
-      setOrgName('');
-      setCreateNewOrg(false);
-    }
-  }
 
   async function submit(e) {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
+    e.preventDefault(); setError(''); setLoading(true);
     try {
-      if (mode === 'login') {
-        const { data } = await api.post('/auth/login', { email, password });
-        localStorage.setItem('ps_token', data.token);
-        onLogin(data.user);
-      } else {
-        await api.post('/auth/register', {
-          email, name, password, role,
-          org_id: orgId || undefined,
-          org_name: orgName || undefined,
-        });
-        setPending(true);
-      }
+      const { data } = await api.post('/auth/login', { email, password });
+      localStorage.setItem('ps_token', data.token);
+      onLogin(data.user);
     } catch (err) {
       setError(err.response?.data?.error || 'Something went wrong');
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   }
-
-  if (pending) {
-    return (
-      <div id="auth-screen">
-        <div className="auth-card">
-          <div className="auth-logo">
-            <div className="auth-logo-icon">P</div>
-            <div>
-              <div className="auth-logo-text">Performance Studio</div>
-              <div className="auth-logo-sub">Performance Testing Platform</div>
-            </div>
-          </div>
-          <div style={{ textAlign: 'center', padding: '24px 0 8px' }}>
-            <i className="ti ti-clock" style={{ fontSize: '48px', color: 'var(--accent)', display: 'block', marginBottom: '16px' }} />
-            <div className="auth-title" style={{ marginBottom: '10px' }}>Registration Submitted</div>
-            <div className="auth-sub" style={{ marginBottom: '24px', lineHeight: '1.6' }}>
-              Your account is pending approval.{' '}
-              {role === 'org_admin'
-                ? 'The super admin will review and approve your organization admin request.'
-                : 'Your organization admin will review and approve your request.'}
-            </div>
-            <button className="btn-secondary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => switchMode('login')}>
-              Back to Sign In
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const orgSelectValue = createNewOrg ? '__new__' : (orgId || '');
 
   return (
-    <div id="auth-screen">
-      <div className="auth-card">
-        <div className="auth-logo">
-          <div className="auth-logo-icon">P</div>
-          <div>
-            <div className="auth-logo-text">Performance Studio</div>
-            <div className="auth-logo-sub">Performance Testing Platform</div>
-          </div>
-        </div>
-        <div className="auth-title">{mode === 'login' ? 'Welcome back' : 'Create account'}</div>
-        <div className="auth-sub">
-          {mode === 'login' ? 'Sign in to manage your performance tests' : 'Start your performance testing journey'}
-        </div>
-        {error && <div className="auth-error">{error}</div>}
-        <form onSubmit={submit}>
-          {mode === 'register' && (
-            <div className="form-group">
-              <label className="form-label">Full Name</label>
-              <input type="text" placeholder="Your name" value={name} onChange={e => setName(e.target.value)} required />
+    <div id="auth-screen" style={{ alignItems: 'stretch', padding: 0 }}>
+      <div className="auth-split">
+
+        {/* ── LEFT — Branding & Features ── */}
+        <div className="auth-left">
+          {/* Logo */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 }}>
+            <img
+              src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
+              alt="Quarks"
+              style={{ height: 36, width: 'auto' }}
+            />
+            <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.15)' }} />
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Performance Studio</div>
+              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>by Quarks Technosoft</div>
             </div>
-          )}
-          <div className="form-group">
-            <label className="form-label">Email</label>
-            <input type="email" placeholder="you@company.com" value={email} onChange={e => setEmail(e.target.value)} required />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Password</label>
-            <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} required />
           </div>
 
-          {mode === 'register' && (
-            <>
+          {/* Headline */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#fff', lineHeight: 1.25, letterSpacing: '-0.3px' }}>
+              AI-Powered<br />
+              <span style={{ color: '#22c55e' }}>Performance Testing</span><br />
+              Platform
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.55)', marginBottom: 24, lineHeight: 1.6, maxWidth: 380 }}>
+            Generate, execute, and auto-heal load tests for any API — powered by AI.
+            From script creation to analytics, all in one place.
+          </div>
+
+          {/* Feature list — compact */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, flex: 1 }}>
+            {FEATURES.map(f => (
+              <div key={f.title} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                <div style={{
+                  width: 22, height: 22, borderRadius: '50%',
+                  background: 'rgba(34,197,94,0.15)', flexShrink: 0, marginTop: 1,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}>
+                  <i className="ti ti-check" style={{ fontSize: 13, color: '#22c55e', fontWeight: 700 }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#fff', marginBottom: 1 }}>{f.title}</div>
+                  <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', lineHeight: 1.5 }}>{f.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Bottom tagline */}
+          <div style={{
+            paddingTop: 20,
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.1)' }} />
+            <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', whiteSpace: 'nowrap' }}>
+              Trusted by QA &amp; Performance Engineers
+            </span>
+            <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.1)' }} />
+          </div>
+        </div>
+
+        {/* ── RIGHT — Login Form ── */}
+        <div className="auth-right">
+          <div className="auth-card" style={{ border: 'none', boxShadow: 'none', background: 'transparent', width: '100%', maxWidth: 400, padding: '36px 36px 0 36px' }}>
+
+            {/* Form header */}
+            <div style={{ marginBottom: 32 }}>
+              <div className="auth-title" style={{ fontSize: 24, marginBottom: 6 }}>Sign in</div>
+              <div className="auth-sub" style={{ fontSize: 13 }}>Sign in to manage your performance tests</div>
+            </div>
+
+            {error && <div className="auth-error" style={{ marginBottom: 16 }}>{error}</div>}
+
+            <form onSubmit={submit}>
               <div className="form-group">
-                <label className="form-label">Role</label>
-                <CustomSelect value={role} onChange={e => { setRole(e.target.value); setOrgId(''); setOrgName(''); setCreateNewOrg(false); }}>
-                  <option value="">Select a role...</option>
-                  <option value="org_admin">Organization Admin</option>
-                  <option value="user">Regular User</option>
-                </CustomSelect>
+                <label className="form-label">Email</label>
+                <input type="email" placeholder="you@company.com" value={email}
+                  onChange={e => setEmail(e.target.value)} required autoFocus />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Password</label>
+                <input type="password" placeholder="Password" value={password}
+                  onChange={e => setPassword(e.target.value)} required />
               </div>
 
-              {/* Organization picker — both roles */}
-              {(role === 'org_admin' || role === 'user') && (
-                <div className="form-group">
-                  <label className="form-label">Organization</label>
-                  <CustomSelect value={orgSelectValue} onChange={e => handleOrgSelect(e.target.value)}>
-                    <option value="">Select an organization...</option>
-                    {orgs.map(o => <option key={o.id} value={String(o.id)}>{o.name}</option>)}
-                    {role === 'org_admin' && (
-                      <option value="__new__">＋ Create new organization...</option>
-                    )}
-                  </CustomSelect>
+              <button className="btn-primary"
+                style={{ width: '100%', justifyContent: 'center', marginTop: 8, height: 44, fontSize: 15, borderRadius: 10 }}
+                disabled={loading}>
+                {loading && <span className="spinner" />}
+                Sign in
+              </button>
+            </form>
 
-                  {/* New org name input — only when "Create new" is chosen */}
-                  {role === 'org_admin' && createNewOrg && (
-                    <input
-                      type="text"
-                      style={{ marginTop: '8px' }}
-                      placeholder="New organization name"
-                      value={orgName}
-                      onChange={e => setOrgName(e.target.value)}
-                      required
-                      autoFocus
-                    />
-                  )}
-
-                  {orgs.length === 0 && role === 'user' && (
-                    <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '4px' }}>
-                      No organizations available yet. Ask your admin to register first.
-                    </div>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-
-          <button className="btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '8px' }} disabled={loading}>
-            {loading && <span className="spinner" />}
-            {mode === 'login' ? 'Sign in' : 'Submit Registration'}
-          </button>
-        </form>
-        <div className="auth-switch">
-          {mode === 'login' ? (
-            <>Don't have an account? <button onClick={() => switchMode('register')}>Register</button></>
-          ) : (
-            <>Already have an account? <button onClick={() => switchMode('login')}>Sign in</button></>
-          )}
+            {/* Invite notice instead of register link */}
+            <div style={{
+              marginTop: 24, padding: '12px 16px',
+              background: 'rgba(34,197,94,0.06)',
+              border: '1px solid rgba(34,197,94,0.18)',
+              borderRadius: 10, textAlign: 'center',
+            }}>
+              <i className="ti ti-mail" style={{ color: '#22c55e', marginRight: 6, fontSize: 14 }} />
+              <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.6 }}>
+                Don't have an account?{' '}
+                <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>
+                  Get an invite from your administrator
+                </span>{' '}
+                to access the application.
+              </span>
+            </div>
+          </div>
         </div>
+
       </div>
     </div>
   );

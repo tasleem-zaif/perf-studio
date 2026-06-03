@@ -5,6 +5,7 @@ import { useConfirm } from '../hooks/useConfirm';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
 import api from '../api';
+import EnvBar from '../components/EnvBar';
 
 const TEST_TYPES = [
   { value: 'load',      label: 'Load Test',      desc: 'Constant virtual users — baseline performance', icon: 'ti-chart-line', color: 'var(--accent)' },
@@ -25,7 +26,7 @@ function simpleHash(str) {
   return hash.toString();
 }
 
-export default function TestSuites({ project, collection, env, onNav, onProjectUpdated, openModalTrigger }) {
+export default function TestSuites({ project, collection, env, envs, onEnvChange, onNav, onProjectUpdated, openModalTrigger }) {
   const [suites, setSuites] = useState([]);
   const [modal, setModal] = useState(null);
   const [form, setForm] = useState(DEFAULT_FORM);
@@ -53,8 +54,19 @@ export default function TestSuites({ project, collection, env, onNav, onProjectU
   async function loadTestDataFiles() {
     if (!project) return;
     try {
-      const { data } = await api.get(`/projects/${project.id}/test-data`);
-      setTestDataFiles(data.files || []);
+      // Filter by collection + env so only files for the current env appear in the dropdown
+      const params = collection?.id
+        ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
+        : '';
+      const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
+      // Deduplicate by original_name (safety net against legacy duplicate records)
+      const seen = new Set();
+      const unique = (data.files || []).filter(f => {
+        if (seen.has(f.original_name)) return false;
+        seen.add(f.original_name);
+        return true;
+      });
+      setTestDataFiles(unique);
     } catch (e) {
       console.error('Failed to load test data files:', e.response?.data || e.message);
     }
@@ -71,15 +83,15 @@ export default function TestSuites({ project, collection, env, onNav, onProjectU
   }, [openModalTrigger]);
 
   async function loadSuites() {
-    const { data } = await api.get(`/projects/${project.id}/test-suites`);
-    // Filter by active collection + env
+    // Pass collection+env to backend for server-side isolation
+    const params = collection?.id
+      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
+      : '';
+    const { data } = await api.get(`/projects/${project.id}/test-suites${params}`);
     let suites = data.suites || [];
-    if (collection?.id) {
-      suites = suites.filter(s => String(s.collection_id) === String(collection.id));
-    }
     if (env) {
-      // Strict: only show suites tagged to this env. No cross-env bleed.
-      suites = suites.filter(s => s.env === env);
+      // Client-side safety net: exclude suites with wrong env tag
+      suites = suites.filter(s => !s.env || s.env === env);
     }
     setSuites(suites);
     // Restore persisted pre-run data so logs survive page refresh
@@ -98,8 +110,15 @@ export default function TestSuites({ project, collection, env, onNav, onProjectU
     if (!form.name.trim()) return setError('Name required');
     setSaving(true); setError('');
     try {
-      if (modal === 'add') await api.post(`/projects/${project.id}/test-suites`, form);
-      else await api.put(`/projects/${project.id}/test-suites/${modal.id}`, form);
+      // Always stamp collection_id + env from current context so the
+      // suite is properly tagged and appears when loadSuites() filters by them
+      const payload = {
+        ...form,
+        collection_id: form.collection_id || (collection?.id ? String(collection.id) : ''),
+        env: form.env || env || '',
+      };
+      if (modal === 'add') await api.post(`/projects/${project.id}/test-suites`, payload);
+      else await api.put(`/projects/${project.id}/test-suites/${modal.id}`, payload);
       await loadSuites();
       setModal(null);
     } catch (e) {
@@ -202,6 +221,7 @@ export default function TestSuites({ project, collection, env, onNav, onProjectU
         <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
         <span><i className="ti ti-test-pipe" style={{ fontSize: '12px', marginRight: '4px' }} />Test Plans</span>
       </div>
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view or create test plans" />
 
       <div className="section-hdr">
         <div className="section-title"><i className="ti ti-test-pipe" style={{ marginRight: '8px', color: 'var(--accent)' }} />Test Plans <span className="badge tag-gray">{suites.length}</span></div>
@@ -431,7 +451,7 @@ export default function TestSuites({ project, collection, env, onNav, onProjectU
           <i className="ti ti-test-pipe" />
           <div className="empty-title">No test plans yet</div>
           <div className="empty-sub">Create a test plan to generate JMeter or K6 scripts</div>
-          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { setForm(DEFAULT_FORM); setError(''); setModal('add'); }}>New Test Plan</button>
+          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { setForm({ ...DEFAULT_FORM, collection_id: collection?.id ? String(collection.id) : '', env: env || '' }); setError(''); setModal('add'); }}>New Test Plan</button>
         </div>
       )}
 

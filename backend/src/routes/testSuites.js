@@ -25,7 +25,20 @@ router.use(auth);
 
 router.get('/', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const suites = db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+  const { collection_id, env } = req.query;
+  let suites;
+  if (collection_id && env) {
+    // Strict env isolation: only return suites explicitly tagged to this collection+env
+    suites = db.prepare(
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id, env);
+  } else if (collection_id) {
+    suites = db.prepare(
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id);
+  } else {
+    suites = db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+  }
   res.json({ suites });
 });
 

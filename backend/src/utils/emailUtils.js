@@ -227,7 +227,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
 async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, reportDir) {
   try {
     const cfg = getAlertConfig(userId);
-    if (!cfg || !cfg.enabled || !cfg.smtp_host || !cfg.from_email) return;
+    if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
 
     const recipients = getRecipients(userId, projectId);
     if (!recipients.length) return;

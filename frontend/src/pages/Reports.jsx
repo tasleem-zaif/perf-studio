@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
 import CustomSelect from '../components/CustomSelect';
+import EnvBar from '../components/EnvBar';
 
 async function downloadReportZip(runId, runNum) {
   const token = localStorage.getItem('ps_token');
@@ -45,7 +46,7 @@ function StatusBadge({ status }) {
   );
 }
 
-export default function Reports({ project, collection, env }) {
+export default function Reports({ project, collection, env, envs, onEnvChange }) {
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -89,6 +90,7 @@ export default function Reports({ project, collection, env }) {
 
   return (
     <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)', gap: 0 }}>
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view JMeter reports" />
 
       {/* Controls bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>

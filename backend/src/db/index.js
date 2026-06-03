@@ -221,12 +221,60 @@ try {
 // Add env to test_suites so scripts go to the right env subfolder
 try { db.exec("ALTER TABLE test_suites ADD COLUMN env TEXT DEFAULT ''"); } catch {}
 
+// Env isolation for test data files — tag each file to its collection + env
+try { db.exec("ALTER TABLE test_data_files ADD COLUMN collection_id INTEGER"); } catch {}
+try { db.exec("ALTER TABLE test_data_files ADD COLUMN env TEXT DEFAULT ''"); } catch {}
+
 // Add model columns to ai_settings
 try { db.exec("ALTER TABLE ai_settings ADD COLUMN model TEXT DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE ai_settings ADD COLUMN heal_model TEXT DEFAULT ''"); } catch {}
 
 // Add uuid column to projects (for directory naming)
 try { db.exec("ALTER TABLE projects ADD COLUMN uuid TEXT DEFAULT ''"); } catch {}
+
+// ── Git Integration ──────────────────────────────────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS git_configs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL UNIQUE,
+  provider    TEXT    DEFAULT 'github',
+  remote_url  TEXT    DEFAULT '',
+  username    TEXT    DEFAULT '',
+  email       TEXT    DEFAULT '',
+  auth_token  TEXT    DEFAULT '',
+  git_root    TEXT    DEFAULT '',  -- workspace dir where .git lives (parent of project subfolder)
+  is_initialized INTEGER DEFAULT 0,
+  created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+try { db.exec("ALTER TABLE git_configs ADD COLUMN git_root TEXT DEFAULT ''"); } catch {}
+
+db.exec(`CREATE TABLE IF NOT EXISTS git_prs (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id   INTEGER NOT NULL,
+  pr_number    INTEGER,
+  title        TEXT    NOT NULL,
+  description  TEXT    DEFAULT '',
+  from_branch  TEXT    NOT NULL,
+  to_branch    TEXT    DEFAULT 'main',
+  created_by   INTEGER NOT NULL,
+  status       TEXT    DEFAULT 'open',
+  remote_pr_url TEXT   DEFAULT '',
+  created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by) REFERENCES users(id)
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS git_commits (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL,
+  user_id     INTEGER NOT NULL,
+  branch      TEXT    NOT NULL,
+  message     TEXT    NOT NULL,
+  hash        TEXT    DEFAULT '',
+  pushed      INTEGER DEFAULT 0,
+  created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 
@@ -263,6 +311,35 @@ try {
       name TEXT DEFAULT '',
       email TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+} catch (_) {}
+
+// ── Invite system ─────────────────────────────────────────────────────────────
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS invites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      name TEXT DEFAULT '',
+      role TEXT NOT NULL,             -- 'org_admin' | 'user'
+      org_id INTEGER,                 -- target org (required for 'user')
+      invited_by INTEGER NOT NULL,    -- user id of inviter
+      token TEXT NOT NULL UNIQUE,     -- secure random token
+      status TEXT DEFAULT 'pending',  -- 'pending' | 'accepted' | 'expired'
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (invited_by) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS project_assignments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      assigned_by INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(project_id, user_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id)    REFERENCES users(id)    ON DELETE CASCADE
     );
   `);
 } catch (_) {}

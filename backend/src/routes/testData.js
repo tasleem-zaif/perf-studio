@@ -68,32 +68,32 @@ router.use(auth);
 
 router.get('/', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const colId  = req.query.collection_id;
+  const colId   = req.query.collection_id;
   const envName = req.query.env;
   let files;
-  if (colId) {
-    const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
-    if (col && col.folder_path || (col && require('../utils/projectFolders').PROJECTS_ROOT)) {
-      const proj = db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
-      const basePath = proj?.folder_path || '';
-      let filterPath;
-      if (envName && basePath) {
-        // Filter to specific env folder
-        const { getCollectionPath } = require('../utils/projectFolders');
-        filterPath = getCollectionPath(basePath, col.name, col.id, envName).replace(/\\/g, '/');
-      } else if (col.folder_path) {
-        // Filter to all files under the collection folder (all envs)
-        filterPath = col.folder_path.replace(/\\/g, '/');
+  if (colId && envName) {
+    // Strict env isolation: filter by collection_id + env DB columns
+    files = db.prepare(
+      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, colId, envName);
+    // Fallback: include files without DB tags but with matching path (legacy files uploaded before tagging)
+    if (!files.length) {
+      const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+      if (col) {
+        const proj = db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
+        const basePath = proj?.folder_path || '';
+        if (basePath) {
+          const { getCollectionPath } = require('../utils/projectFolders');
+          const filterPath = getCollectionPath(basePath, col.name, col.id, envName).replace(/\\/g, '/');
+          files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND (collection_id IS NULL OR collection_id = 0) ORDER BY created_at DESC').all(req.params.projectId)
+            .filter(f => f.path && f.path.replace(/\\/g, '/').startsWith(filterPath));
+        }
       }
-      if (filterPath) {
-        files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId)
-          .filter(f => f.path && f.path.replace(/\\/g, '/').startsWith(filterPath));
-      } else {
-        files = [];
-      }
-    } else {
-      files = [];
     }
+  } else if (colId) {
+    files = db.prepare(
+      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, colId);
   } else {
     files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
   }
@@ -126,15 +126,18 @@ router.post('/', upload.single('csv'), (req, res) => {
     ).get(req.params.projectId, req.file.originalname, `${destDir}/%`);
 
     let fileId;
+    const colId   = req.query.collection_id || req.body?.collection_id || null;
+    const envName = req.query.env || req.body?.env || '';
+
     if (existing) {
       db.prepare(
-        'UPDATE test_data_files SET filename=?, path=?, columns=? WHERE id=?'
-      ).run(req.file.filename, req.file.path, JSON.stringify(headers), existing.id);
+        'UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?'
+      ).run(req.file.filename, req.file.path, JSON.stringify(headers), colId, envName, existing.id);
       fileId = existing.id;
     } else {
       const result = db.prepare(
-        'INSERT INTO test_data_files (project_id, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?)'
-      ).run(req.params.projectId, req.file.filename, req.file.originalname, req.file.path, JSON.stringify(headers));
+        'INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(req.params.projectId, colId, envName, req.file.filename, req.file.originalname, req.file.path, JSON.stringify(headers));
       fileId = result.lastInsertRowid;
     }
 

@@ -7,6 +7,7 @@ import {
 import { Bar, Line, Doughnut } from 'react-chartjs-2';
 import api from '../api';
 import CustomSelect from '../components/CustomSelect';
+import EnvBar from '../components/EnvBar';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Title, Tooltip, Legend, Filler);
 
@@ -864,7 +865,7 @@ function LogsTab({ data }) {
 }
 
 // ── main component ────────────────────────────────────────────────────────────
-export default function Analytics({ project, collection, env }) {
+export default function Analytics({ project, collection, env, envs, onEnvChange }) {
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState('');
   const [data, setData] = useState(null);
@@ -943,6 +944,7 @@ export default function Analytics({ project, collection, env }) {
 
   if (!project) return (
     <div className="page" style={{ background: D.pageBg, minHeight: '130vh', color: D.textPri }}>
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
       <div className="empty" style={{ color: D.textSec }}>
         <i className="ti ti-folder-off" style={{ color: D.textTer }} />
         <div className="empty-title" style={{ color: D.textSec }}>Select a project first</div>
@@ -955,6 +957,7 @@ export default function Analytics({ project, collection, env }) {
 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, minHeight: '130vh', color: D.textPri }}>
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
       {/* Run selector bar */}
       <div style={{ display:'flex', alignItems:'flex-end', gap:12, marginBottom:16, flexWrap:'wrap' }}>
         <div style={{ flex:1, minWidth:240 }}>
