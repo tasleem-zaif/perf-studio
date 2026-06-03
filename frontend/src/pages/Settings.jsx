@@ -636,7 +636,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
   );
 }
 
-function AIConfigPanel() {
+function AIConfigPanel({ user }) {
   const [provider,   setProvider]   = useState('openai');
   const [model,      setModel]      = useState('');
   const [healModel,  setHealModel]  = useState('');
@@ -683,14 +683,40 @@ function AIConfigPanel() {
   const effectiveModel  = model      || DEFAULT_MODEL[provider] || '';
   const effectiveHeal   = healModel  || DEFAULT_MODEL[provider] || '';
 
+  const isRegularUser = user?.role === 'user';
+
   return (
     <div className="page fade-in" style={{ maxWidth: '560px' }}>
+
+      {/* Read-only notice for regular users */}
+      {isRegularUser && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '12px 16px', marginBottom: 20,
+          background: 'rgba(245,158,11,0.08)',
+          border: '1px solid rgba(245,158,11,0.3)',
+          borderRadius: 8,
+        }}>
+          <i className="ti ti-info-circle" style={{ color: '#f59e0b', fontSize: 18, flexShrink: 0 }} />
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#f59e0b', marginBottom: 2 }}>
+              View only — AI Configuration is managed by your Org Admin
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              Please contact your administrator to change the AI provider or API key.
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
-        Configure separate AI models for script generation and auto-healing. Both use the same provider and API key.
+        {isRegularUser
+          ? 'AI models configured by your Org Admin for this organization.'
+          : 'Configure separate AI models for script generation and auto-healing. Both use the same provider and API key.'}
       </div>
 
-      {error && <div className="auth-error" style={{ marginBottom: '16px' }}>{error}</div>}
-      {saved && (
+      {!isRegularUser && error && <div className="auth-error" style={{ marginBottom: '16px' }}>{error}</div>}
+      {!isRegularUser && saved && (
         <div style={{ marginBottom: '16px', padding: '10px 14px', background: 'rgba(95,201,120,0.12)', border: '1px solid rgba(95,201,120,0.3)', borderRadius: 'var(--border-radius-md)', fontSize: '13px', color: '#5fc978' }}>
           <i className="ti ti-circle-check" style={{ marginRight: '6px' }} />Settings saved successfully.
         </div>
@@ -699,7 +725,7 @@ function AIConfigPanel() {
       {/* Provider */}
       <div className="form-group">
         <label className="form-label">AI Provider</label>
-        <CustomSelect value={provider} onChange={e => handleProviderChange(e.target.value)}>
+        <CustomSelect value={provider} onChange={e => !isRegularUser && handleProviderChange(e.target.value)} disabled={isRegularUser}>
           {PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
         </CustomSelect>
       </div>
@@ -711,8 +737,9 @@ function AIConfigPanel() {
         title="Script Generation Model"
         subtitle="Used when generating JMX / K6 scripts from your API collections"
         value={effectiveModel}
-        onChange={setModel}
+        onChange={isRegularUser ? () => {} : setModel}
         models={providerModels}
+        disabled={isRegularUser}
       />
 
       {/* Auto healer model */}
@@ -722,12 +749,13 @@ function AIConfigPanel() {
         title="Auto Healer Model"
         subtitle="Used when diagnosing and fixing failed test runs (reasoning-heavy — use a smarter model)"
         value={effectiveHeal}
-        onChange={setHealModel}
+        onChange={isRegularUser ? () => {} : setHealModel}
         models={providerModels}
+        disabled={isRegularUser}
       />
 
-      {/* API Key */}
-      <div className="form-group">
+      {/* API Key — hidden for regular users */}
+      {!isRegularUser && <div className="form-group">
         <label className="form-label">
           API Key
           {provider === 'openai' && (
@@ -749,12 +777,14 @@ function AIConfigPanel() {
           onChange={e => setApiKey(e.target.value)}
           placeholder={keySet ? '••••••••••••  (key saved — enter new key to update)' : provider === 'openai' ? 'sk-...' : 'sk-ant-...'}
         />
-      </div>
+      </div>}
 
-      <button className="btn-primary" onClick={save} disabled={saving} style={{ marginTop: '4px' }}>
-        {saving && <span className="spinner" />}
-        <i className="ti ti-device-floppy" />Save Settings
-      </button>
+      {!isRegularUser && (
+        <button className="btn-primary" onClick={save} disabled={saving} style={{ marginTop: '4px' }}>
+          {saving && <span className="spinner" />}
+          <i className="ti ti-device-floppy" />Save Settings
+        </button>
+      )}
 
       {/* Recommendation hint */}
       <div style={{
@@ -962,7 +992,7 @@ function SMTPConfigPanel({ currentUser }) {
 export default function Settings({ page, theme, onThemeChange, user, projects }) {
   if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
   if (page === 'settings-appearance') return <AppearancePanel theme={theme} onThemeChange={onThemeChange} />;
-  if (page === 'settings-ai') return <AIConfigPanel />;
+  if (page === 'settings-ai') return <AIConfigPanel user={user} />;
   if (page === 'settings-smtp') return <SMTPConfigPanel currentUser={user} />;
   return null;
 }
