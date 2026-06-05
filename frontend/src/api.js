@@ -5,6 +5,9 @@ const api = axios.create({ baseURL: '/api' });
 api.interceptors.request.use(cfg => {
   const token = localStorage.getItem('ps_token');
   if (token) cfg.headers.Authorization = `Bearer ${token}`;
+  // Prevent browser from serving stale 304 cached responses
+  cfg.headers['Cache-Control'] = 'no-cache';
+  cfg.headers['Pragma'] = 'no-cache';
   return cfg;
 });
 

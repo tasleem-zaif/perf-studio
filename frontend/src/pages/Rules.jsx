@@ -57,14 +57,6 @@ export default function Rules({ project, collection, onNav, onProjectUpdated, op
   const p = project;
   return (
     <div className="page fade-in">
-      <div className="breadcrumb">
-        <a onClick={() => onNav('dashboard')}><i className="ti ti-layout-dashboard" style={{ fontSize: '12px', marginRight: '4px' }} />Dashboard</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <a onClick={() => onNav('project-home')}><i className="ti ti-folder" style={{ fontSize: '12px', marginRight: '4px' }} />{p.name}</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <span><i className="ti ti-adjustments-horizontal" style={{ fontSize: '12px', marginRight: '4px' }} />Rule Engine</span>
-      </div>
-
       <div style={{ marginBottom: '16px', padding: '14px 16px', background: 'var(--color-background-secondary)', borderRadius: 'var(--border-radius-md)', borderLeft: '3px solid var(--accent)' }}>
         <div style={{ fontSize: '13px', fontWeight: 500, marginBottom: '4px' }}><i className="ti ti-adjustments-horizontal" style={{ marginRight: '7px', color: 'var(--accent)' }} />Performance Configuration Rules</div>
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>Define thresholds and constraints for your collections. Rules are applied during script generation to set pass/fail criteria.</div>

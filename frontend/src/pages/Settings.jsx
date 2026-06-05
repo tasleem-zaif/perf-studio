@@ -32,26 +32,6 @@ const MODELS = {
 
 const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-4-5' };
 
-const THEMES = [
-  {
-    value: 'intellij',
-    label: 'IntelliJ Dark',
-    desc: 'Professional dark IDE look',
-    swatch: 'linear-gradient(135deg, #2b2d30 50%, #4e9eff 50%)',
-  },
-  {
-    value: 'qtsolv',
-    label: 'Quarks Dark',
-    desc: 'Professional dark theme with green accent',
-    swatch: 'linear-gradient(135deg, #383a3e 50%, #49CC3D 50%)',
-  },
-  {
-    value: 'quarks',
-    label: 'Quarks Light',
-    desc: 'Light grey background with green accent',
-    swatch: 'linear-gradient(135deg, #E7EAF1 50%, #2ea82a 50%)',
-  },
-];
 
 const ROLE_LABELS = { super_admin: 'Super Admin', org_admin: 'Org Admin', user: 'User' };
 const STATUS_LABELS = { active: 'Active', pending: 'Pending', rejected: 'Rejected' };
@@ -582,32 +562,8 @@ function UserManagementPanel({ user, projects = [] }) {
   );
 }
 
-function AppearancePanel({ theme, onThemeChange }) {
-  return (
-    <div className="page fade-in">
-      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
-        Choose a UI theme. Your preference is saved in the browser.
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', maxWidth: '560px' }}>
-        {THEMES.map(t => (
-          <button
-            key={t.value}
-            className={`theme-btn${theme === t.value ? ' active' : ''}`}
-            onClick={() => onThemeChange(t.value)}
-          >
-            <div className="theme-swatch" style={{ background: t.swatch, width: '32px', height: '32px', borderRadius: '6px', border: '1px solid var(--color-border-secondary)' }} />
-            <div>
-              <div style={{ fontWeight: 600, fontSize: '13px' }}>{t.label}</div>
-              <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginTop: '1px' }}>{t.desc}</div>
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
 
-function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor }) {
+function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor, disabled = false }) {
   const selected = models.find(m => m.value === value);
   return (
     <div style={{
@@ -615,6 +571,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
       background: 'var(--color-background-secondary)',
       border: '1px solid var(--color-border-secondary)',
       borderRadius: 'var(--border-radius-md)',
+      opacity: disabled ? 0.7 : 1,
     }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '10px' }}>
         <i className={`ti ${icon}`} style={{ fontSize: '16px', color: iconColor, marginTop: '1px', flexShrink: 0 }} />
@@ -623,7 +580,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
           <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '1px' }}>{subtitle}</div>
         </div>
       </div>
-      <CustomSelect value={value} onChange={e => onChange(e.target.value)}>
+      <CustomSelect value={value} onChange={e => !disabled && onChange(e.target.value)} disabled={disabled}>
         {models.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
       </CustomSelect>
       {selected && (
@@ -786,25 +743,6 @@ function AIConfigPanel({ user }) {
         </button>
       )}
 
-      {/* Recommendation hint */}
-      <div style={{
-        marginTop: '18px', padding: '12px 14px',
-        background: 'var(--color-background-secondary)',
-        border: '1px solid var(--color-border-secondary)',
-        borderRadius: 'var(--border-radius-md)', fontSize: '12px',
-        color: 'var(--color-text-secondary)', lineHeight: 1.7,
-      }}>
-        <div style={{ fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <i className="ti ti-bulb" style={{ color: 'var(--accent)' }} /> Recommended combination
-        </div>
-        {provider === 'openai' ? <>
-          <div><i className="ti ti-code" style={{ marginRight: '5px', color: 'var(--accent)' }} /><strong>Script:</strong> GPT-4o — accurate XML/JS generation, good context understanding</div>
-          <div><i className="ti ti-first-aid-kit" style={{ marginRight: '5px', color: '#f59e0b' }} /><strong>Healer:</strong> o3 Mini — step-by-step reasoning to find root cause in complex failures</div>
-        </> : <>
-          <div><i className="ti ti-code" style={{ marginRight: '5px', color: 'var(--accent)' }} /><strong>Script:</strong> Claude Sonnet 4.5 — fast, accurate script generation</div>
-          <div><i className="ti ti-first-aid-kit" style={{ marginRight: '5px', color: '#f59e0b' }} /><strong>Healer:</strong> Claude Opus 4.5 — deepest reasoning for diagnosing complex failures</div>
-        </>}
-      </div>
     </div>
   );
 }
@@ -991,7 +929,6 @@ function SMTPConfigPanel({ currentUser }) {
 
 export default function Settings({ page, theme, onThemeChange, user, projects }) {
   if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
-  if (page === 'settings-appearance') return <AppearancePanel theme={theme} onThemeChange={onThemeChange} />;
   if (page === 'settings-ai') return <AIConfigPanel user={user} />;
   if (page === 'settings-smtp') return <SMTPConfigPanel currentUser={user} />;
   return null;

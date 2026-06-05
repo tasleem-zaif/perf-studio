@@ -105,7 +105,8 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const firstUploadRender = useRef(true);
   const firstGenRender = useRef(true);
 
-  useEffect(() => { if (project) loadFiles(); }, [project?.id, collection?.id, env]);
+  // Fetch ALL files once — no env filter, display env badges inline
+  useEffect(() => { if (project) loadFiles(); }, [project?.id]);
 
 
   useEffect(() => {
@@ -119,8 +120,8 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   }, [generateTrigger]);
 
   async function loadFiles() {
-    const params = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
-    const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
+    // Fetch ALL files — no env/collection filter
+    const { data } = await api.get(`/projects/${project.id}/test-data`);
     setFiles(data.files || []);
   }
 
@@ -133,8 +134,7 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
     try {
       const fd = new FormData();
       fd.append('csv', file);
-      const params = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
-      await api.post(`/projects/${project.id}/test-data${params}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      await api.post(`/projects/${project.id}/test-data`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
       await loadFiles();
     } catch (err) {
       toast(err.response?.data?.error || 'Upload failed', 'error');
@@ -285,14 +285,6 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   return (
     <div className="page fade-in">
       <input ref={fileInputRef} type="file" accept=".csv,.txt,.xlsx,.xls" style={{ display: 'none' }} onChange={handleUpload} />
-
-      <div className="breadcrumb">
-        <a onClick={() => onNav('dashboard')}><i className="ti ti-layout-dashboard" style={{ fontSize: '12px', marginRight: '4px' }} />Dashboard</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <a onClick={() => onNav('project-home')}><i className="ti ti-folder" style={{ fontSize: '12px', marginRight: '4px' }} />{project.name}</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <span><i className="ti ti-table" style={{ fontSize: '12px', marginRight: '4px' }} />Test Data</span>
-      </div>
 
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange}
         hint="Select environment to view or upload test data files" />
