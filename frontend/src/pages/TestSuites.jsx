@@ -26,7 +26,7 @@ function simpleHash(str) {
   return hash.toString();
 }
 
-export default function TestSuites({ project, collection, env, envs, onEnvChange, onNav, onProjectUpdated, openModalTrigger }) {
+export default function TestSuites({ project, collection, env, envs, onEnvChange, onNav, onProjectUpdated, openModalTrigger, onAfterSave }) {
   const [suites, setSuites] = useState([]);
   const [modal, setModal] = useState(null);
   const [form, setForm] = useState(DEFAULT_FORM);
@@ -44,27 +44,23 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
 
+  // Fetch ALL suites and ALL test-data files in one call each — no env filter
   useEffect(() => {
     if (project) {
       loadSuites();
       loadTestDataFiles();
     }
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
 
   async function loadTestDataFiles() {
     if (!project) return;
     try {
-      // Filter by collection + env so only files for the current env appear in the dropdown
-      const params = collection?.id
-        ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
-        : '';
-      const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
-      // Deduplicate by original_name (safety net against legacy duplicate records)
+      const { data } = await api.get(`/projects/${project.id}/test-data`);
+      // Deduplicate by original_name
       const seen = new Set();
       const unique = (data.files || []).filter(f => {
         if (seen.has(f.original_name)) return false;
-        seen.add(f.original_name);
-        return true;
+        seen.add(f.original_name); return true;
       });
       setTestDataFiles(unique);
     } catch (e) {
@@ -83,17 +79,9 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   }, [openModalTrigger]);
 
   async function loadSuites() {
-    // Pass collection+env to backend for server-side isolation
-    const params = collection?.id
-      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
-      : '';
-    const { data } = await api.get(`/projects/${project.id}/test-suites${params}`);
-    let suites = data.suites || [];
-    if (env) {
-      // Client-side safety net: exclude suites with wrong env tag
-      suites = suites.filter(s => !s.env || s.env === env);
-    }
-    setSuites(suites);
+    // Fetch ALL suites — no env/collection filter — backend returns full list with env tags
+    const { data } = await api.get(`/projects/${project.id}/test-suites`);
+    setSuites(data.suites || []);
     // Restore persisted pre-run data so logs survive page refresh
     const restored = {};
     for (const s of suites) {
@@ -121,6 +109,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       else await api.put(`/projects/${project.id}/test-suites/${modal.id}`, payload);
       await loadSuites();
       setModal(null);
+      if (onAfterSave) onAfterSave(); // notify parent (e.g. to show JMeter Report in sidebar)
     } catch (e) {
       setError(e.response?.data?.error || 'Save failed');
     } finally { setSaving(false); }
@@ -214,13 +203,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   return (
     <div className="page fade-in">
       <a ref={dlRef} style={{ display: 'none' }} />
-      <div className="breadcrumb">
-        <a onClick={() => onNav('dashboard')}><i className="ti ti-layout-dashboard" style={{ fontSize: '12px', marginRight: '4px' }} />Dashboard</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <a onClick={() => onNav('project-home')}><i className="ti ti-folder" style={{ fontSize: '12px', marginRight: '4px' }} />{project.name}</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <span><i className="ti ti-test-pipe" style={{ fontSize: '12px', marginRight: '4px' }} />Test Plans</span>
-      </div>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view or create test plans" />
 
       <div className="section-hdr">

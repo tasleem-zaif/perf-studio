@@ -295,7 +295,7 @@ export default function Sidebar({
    * - Parent highlights ONLY when the current page belongs to it.
    * - Opening/closing a group does NOT trigger highlight by itself.
    */
-  const SETTINGS_PAGES = ['settings-smtp', 'settings-users', 'settings-appearance'];
+  const SETTINGS_PAGES = ['settings-smtp', 'settings-users'];
   const PROJECT_PAGES  = ['project-home', 'ai-config', 'git', 'collections',
                           'test-data', 'rules', 'config', 'test-suites',
                           'alerts', 'runner', 'analytics', 'reports'];
@@ -324,53 +324,10 @@ export default function Sidebar({
       {/* ── Navigation ───────────────────────────────────── */}
       <div className="sidebar-scroll">
 
-        {/* Dashboard */}
+        {/* Dashboard — clicking here shows the projects overview page */}
         <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
           active={page === 'dashboard'} depth={0}
           onClick={() => onNav('dashboard')} />
-
-        <Divider />
-
-        {/* Projects group header */}
-        <CardBtn iconKey="projects" label="Projects" sub="Manage test projects"
-          badge={projects.length} depth={0}
-          active={projectsActive}
-          chevronOpen={projectsOpen}
-          onClick={() => setProjectsOpen(o => !o)} />
-
-        {projectsOpen && (
-          <ChildGroup ml={20} borderColor="#bfdbfe">
-            {projects.map(p => (
-              <ProjectItem key={p.id} p={p}
-                isActiveProj={activeProject?.id === p.id}
-                activeCollection={activeCollection}
-                activeEnv={activeEnv}
-                page={page}
-                collections={activeProject?.id === p.id ? collections : []}
-                onSelectProject={onSelectProject}
-                onSelectCollection={onSelectCollection}
-                onAddCollection={onAddCollection}
-                onNav={onNav}
-              />
-            ))}
-
-            {/* New Project — only org_admin can create projects */}
-            {(user?.role === 'org_admin') && (
-              <button className="nav-card" onClick={onNewProject}
-                style={{ padding: '4px 8px', gap: 7, opacity: 0.75 }}>
-                <div style={{
-                  width: 24, height: 24, borderRadius: 6,
-                  background: '#f0fdf4', color: '#22c55e',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  flexShrink: 0, fontSize: 13, border: '1.5px dashed #22c55e',
-                }}>
-                  <i className="ti ti-plus" />
-                </div>
-                <span style={{ fontSize: 12, color: '#475569', fontWeight: 500 }}>New Project</span>
-              </button>
-            )}
-          </ChildGroup>
-        )}
 
         <Divider />
 
@@ -393,37 +350,15 @@ export default function Sidebar({
                 active={page === 'settings-users'} depth={1}
                 onClick={() => onNav('settings-users')} />
             )}
-            <CardBtn iconKey="settings-appearance" label="Appearance"
-              active={page === 'settings-appearance'} depth={1}
-              onClick={() => onNav('settings-appearance')} />
           </ChildGroup>
         )}
 
         <Divider />
 
-        {/* Profile */}
-        <CardBtn iconKey="profile" label="My Profile" sub="My account"
-          active={page === 'profile'} depth={0}
-          onClick={() => onNav('profile')} />
-
-        {/* Logout */}
-        <CardBtn iconKey="logout" label="Logout" sub="Sign out"
-          depth={0} onClick={onLogout} />
+        {/* Profile and Logout moved to banner top-right */}
 
       </div>
 
-      {/* ── Footer ───────────────────────────────────────── */}
-      <div className="sidebar-footer">
-        <div className="user-pill">
-          <div className="avatar">{initials}</div>
-          <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
-            <div className="user-name">{user?.name}</div>
-            <div className="user-role">
-              {user?.org_name || (user?.role === 'super_admin' ? 'Super Admin' : user?.email)}
-            </div>
-          </div>
-        </div>
-      </div>
 
     </div>
   );

@@ -1,16 +1,62 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import api from '../api';
 import { projectDirName } from '../utils/displayName';
 
-export default function Dashboard({ projects, user, onSelectProject, onDeleteProject, onNewProject, onEditProject }) {
+export default function Dashboard({ projects: propProjects, user, onSelectProject, onDeleteProject, onNewProject, onEditProject, onProjectsLoaded }) {
   const isSuperAdmin = user?.role === 'super_admin';
   const isOrgAdmin   = user?.role === 'org_admin';
 
-  const totalCollections = projects.reduce((a, p) => a + (p.collections?.length || 0), 0);
-  const totalRules       = projects.reduce((a, p) => a + (p.rules?.length || 0), 0);
+  const [projects, setProjects] = useState(propProjects || []);
+  const [stats,    setStats]    = useState({});
+  const [loading,  setLoading]  = useState(true);
 
-  const orgCount = isSuperAdmin
-    ? [...new Set(projects.map(p => p.org_name).filter(Boolean))].length
-    : null;
+  // Keep local projects in sync if parent refreshes the list
+  useEffect(() => { if (propProjects?.length) setProjects(propProjects); }, [propProjects]);
+
+  function fetchStats() {
+    setLoading(true);
+    // Projects already supplied by App.jsx — only fetch the 4 feature counts
+    Promise.all([
+      api.get('/collections'),
+      api.get('/rules'),
+      api.get('/test-plans'),
+      api.get('/test-data'),
+    ])
+      .then(([colRes, ruleRes, planRes, dataRes]) => {
+        const collections = colRes.data.collections  || [];
+        const rules       = ruleRes.data.rules        || [];
+        const testPlans   = planRes.data.test_plans   || [];
+        const testData    = dataRes.data.test_data    || [];
+
+        // Derive per-project counts from the feature responses
+        const colCount  = collections.reduce((m, c) => { m[c.project_id] = (m[c.project_id] || 0) + 1; return m; }, {});
+        const ruleCount = rules.reduce((m, r) => { m[r.project_id] = (m[r.project_id] || 0) + 1; return m; }, {});
+
+        setProjects(prev => prev.map(p => ({
+          ...p,
+          collection_count: colCount[p.id]  || 0,
+          rule_count:       ruleCount[p.id] || 0,
+        })));
+
+        const ps = propProjects || [];
+        const orgCount = [...new Set(ps.map(p => p.org_name).filter(Boolean))].length;
+
+        setStats({
+          total_projects:    ps.length,
+          total_collections: collections.length,
+          total_rules:       rules.length,
+          total_test_plans:  testPlans.length,
+          total_test_data:   testData.length,
+          total_orgs:        orgCount,
+        });
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { fetchStats(); }, [propProjects?.length]);
+
+  const orgCount = isSuperAdmin ? (stats.total_orgs || 0) : null;
 
   function ProjectRow({ p }) {
     return (
@@ -66,12 +112,12 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
 
         {/* API sources */}
         <span className="tag tag-gray" style={{ flexShrink: 0 }}>
-          <i className="ti ti-braces" style={{ fontSize: '11px' }} /> {p.collections?.length || 0} API sources
+          <i className="ti ti-braces" style={{ fontSize: '11px' }} /> {p.collection_count ?? p.collections?.length ?? 0} API sources
         </span>
 
         {/* Rules */}
         <span className="tag tag-gray" style={{ flexShrink: 0 }}>
-          <i className="ti ti-adjustments-horizontal" style={{ fontSize: '11px' }} /> {p.rules?.length || 0} rules
+          <i className="ti ti-adjustments-horizontal" style={{ fontSize: '11px' }} /> {p.rule_count ?? p.rules?.length ?? 0} rules
         </span>
 
         {/* Created date */}
@@ -105,9 +151,16 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
   }
 
 
+
+  if (loading) return (
+    <div className="page fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 240, gap: 10, color: 'var(--color-text-secondary)' }}>
+      <span className="spinner" /> Loading dashboard...
+    </div>
+  );
+
   return (
     <div className="page fade-in">
-      {/* Top stats */}
+      {/* Top stats — all from a single API call */}
       <div className="stats-row">
         {isSuperAdmin && (
           <div className="stat-card">
@@ -118,18 +171,28 @@ export default function Dashboard({ projects, user, onSelectProject, onDeletePro
         )}
         <div className="stat-card">
           <div className="stat-label"><i className="ti ti-folder" style={{ marginRight: '4px' }} />Projects</div>
-          <div className="stat-val">{projects.length}</div>
+          <div className="stat-val">{stats.total_projects ?? 0}</div>
           <div className="stat-sub">{isSuperAdmin ? 'All organizations' : isOrgAdmin ? 'Your organization' : 'Active'}</div>
         </div>
         <div className="stat-card">
           <div className="stat-label"><i className="ti ti-braces" style={{ marginRight: '4px' }} />API Sources</div>
-          <div className="stat-val">{totalCollections}</div>
+          <div className="stat-val">{stats.total_collections ?? 0}</div>
           <div className="stat-sub">Across all projects</div>
         </div>
         <div className="stat-card">
           <div className="stat-label"><i className="ti ti-adjustments-horizontal" style={{ marginRight: '4px' }} />Rules</div>
-          <div className="stat-val">{totalRules}</div>
+          <div className="stat-val">{stats.total_rules ?? 0}</div>
           <div className="stat-sub">Performance configs</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label"><i className="ti ti-test-pipe" style={{ marginRight: '4px' }} />Test Plans</div>
+          <div className="stat-val">{stats.total_test_plans ?? 0}</div>
+          <div className="stat-sub">Generated scripts</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label"><i className="ti ti-table" style={{ marginRight: '4px' }} />Test Data</div>
+          <div className="stat-val">{stats.total_test_data ?? 0}</div>
+          <div className="stat-sub">CSV datasets</div>
         </div>
       </div>
 

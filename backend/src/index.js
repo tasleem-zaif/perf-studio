@@ -15,6 +15,8 @@ app.use('/api/auth',                                   require('./routes/passwor
 app.use('/api/admin',                                  require('./routes/passwordReset'));
 app.use('/api/orgs',                                   require('./routes/orgs'));
 app.use('/api/admin',                                  require('./routes/admin'));
+app.use('/api/dashboard',                              require('./routes/dashboard'));
+app.use('/api',                                        require('./routes/summary'));
 app.use('/api/projects',                               require('./routes/projects'));
 app.use('/api/projects/:projectId/collections',        require('./routes/collections'));
 app.use('/api/projects/:projectId/rules',              require('./routes/rules'));
@@ -31,6 +33,7 @@ app.use('/api/execution',                              require('./routes/executi
 app.use('/api/alerts',                                 require('./routes/alerts'));
 app.use('/api/invites',                                require('./routes/invites'));
 app.use('/api/projects/:projectId/git',              require('./routes/git'));
+app.use('/api/projects/:projectId/pipelines',        require('./routes/pipelines'));
 
 // Serve generated project files (scripts, test data) for download
 const { PROJECTS_ROOT } = require('./utils/projectFolders');

@@ -117,15 +117,6 @@ export default function Collections({ project, collection: activeCollection, onN
 
   return (
     <div className="page fade-in">
-      <div className="breadcrumb">
-        <a onClick={() => onNav('dashboard')}><i className="ti ti-layout-dashboard" style={{ fontSize: '12px', marginRight: '4px' }} />Dashboard</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <a onClick={() => onNav('project-home')}><i className="ti ti-folder" style={{ fontSize: '12px', marginRight: '4px' }} />{p.name}</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <span><i className="ti ti-braces" style={{ fontSize: '12px', marginRight: '4px' }} />API Source</span>
-      </div>
-
-
       {/* All API Sources — always shown in card format */}
       {p.collections?.length > 0 && (
         <div className="section-hdr">

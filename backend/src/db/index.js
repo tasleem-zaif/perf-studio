@@ -286,6 +286,44 @@ db.exec(`CREATE TABLE IF NOT EXISTS git_commits (
   created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 )`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS user_git_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  project_id INTEGER NOT NULL,
+  branch_name TEXT NOT NULL DEFAULT '',
+  author_name TEXT NOT NULL DEFAULT '',
+  author_email TEXT NOT NULL DEFAULT '',
+  auth_token TEXT NOT NULL DEFAULT '',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, project_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS pipeline_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  steps TEXT NOT NULL DEFAULT '[]',
+  stop_on_failure INTEGER DEFAULT 1,
+  environment TEXT DEFAULT '',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pipeline_id INTEGER NOT NULL,
+  project_id INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending',
+  steps_result TEXT DEFAULT '[]',
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  FOREIGN KEY (pipeline_id) REFERENCES pipeline_configs(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 
