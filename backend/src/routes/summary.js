@@ -11,7 +11,9 @@ const router = require('express').Router();
 const db     = require('../db');
 const auth   = require('../middleware/auth');
 
-router.use(auth);
+// NOTE: auth is applied per-route below — NOT globally here.
+// A global router.use(auth) would intercept ALL /api/* requests including
+// public routes like /api/invites/validate/:token.
 
 /**
  * Returns a sub-query string + params array that resolves to the set of
@@ -40,7 +42,7 @@ function accessibleProjects(userId) {
 }
 
 /* ── GET /api/collections ───────────────────────────────────────────────── */
-router.get('/collections', (req, res) => {
+router.get('/collections', auth, (req, res) => {
   try {
     const { sub, params } = accessibleProjects(req.userId);
     const collections = db.prepare(`
@@ -61,7 +63,7 @@ router.get('/collections', (req, res) => {
 });
 
 /* ── GET /api/rules ─────────────────────────────────────────────────────── */
-router.get('/rules', (req, res) => {
+router.get('/rules', auth, (req, res) => {
   try {
     const { sub, params } = accessibleProjects(req.userId);
     const rules = db.prepare(`
@@ -82,7 +84,7 @@ router.get('/rules', (req, res) => {
 });
 
 /* ── GET /api/test-plans ────────────────────────────────────────────────── */
-router.get('/test-plans', (req, res) => {
+router.get('/test-plans', auth, (req, res) => {
   try {
     const { sub, params } = accessibleProjects(req.userId);
     const testPlans = db.prepare(`
@@ -103,7 +105,7 @@ router.get('/test-plans', (req, res) => {
 });
 
 /* ── GET /api/test-data ─────────────────────────────────────────────────── */
-router.get('/test-data', (req, res) => {
+router.get('/test-data', auth, (req, res) => {
   try {
     const { sub, params } = accessibleProjects(req.userId);
     const files = db.prepare(`

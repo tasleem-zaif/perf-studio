@@ -60,8 +60,20 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     }
   }, [activeCollection?.id, activeEnv]);  // activeEnv changing triggers reset
 
-  // Derived: collections that have generated suites
-  const collections = activeProject?.collections || [];
+  // Fetch collections directly — don't rely on parent prop which may not be loaded yet
+  const [collections, setCollections] = useState(activeProject?.collections || []);
+  useEffect(() => {
+    if (!activeProject?.id) return;
+    // Use prop if already populated, otherwise fetch fresh
+    if (activeProject.collections?.length) {
+      setCollections(activeProject.collections);
+    } else {
+      api.get(`/projects/${activeProject.id}/collections`)
+        .then(({ data }) => setCollections(data.collections || []))
+        .catch(() => {});
+    }
+  }, [activeProject?.id]);
+
   const collectionsWithSuites = collections.filter(c =>
     suites.some(s => String(s.collection_id) === String(c.id))
   );
@@ -83,13 +95,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     );
   })();
 
-  // Derived: suites for selected collection AND selected environment — strict match
-  // When env is selected: only show suites tagged to that exact env
-  // Untagged suites (s.env empty) are NOT shown to prevent cross-env bleed
+  // Derived: suites for selected collection AND selected environment
+  // Shows suites matching the selected env OR suites with no env tag (untagged = available for all envs)
   const suitesForSelection = suites.filter(s => {
     if (String(s.collection_id) !== String(selectedCollectionId)) return false;
-    if (!selectedEnv) return true;          // no env filter — show all for this collection
-    return s.env === selectedEnv;           // strict: must match selected env
+    if (!selectedEnv) return true;                           // no env filter — show all
+    return !s.env || s.env === selectedEnv;                  // match env OR untagged
   });
 
   // Reset env + suite when collection changes

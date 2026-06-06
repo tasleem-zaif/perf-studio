@@ -810,7 +810,6 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         </div>
         {saved === 'project' && <div style={{ marginBottom: '12px', padding: '8px 12px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px', fontSize: '12px', color: '#22c55e' }}>Project config saved.</div>}
         <UrlsEditor cfg={projectCfg} setCfg={setProjectCfg} />
-        {!collection && <LoadParamsEditor cfg={projectCfg} setCfg={setProjectCfg} />}
         <div style={{ marginTop: '16px', display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
           <button className="btn-primary" onClick={saveProject} disabled={!project || saving === 'project'}>
             {saving === 'project' && <span className="spinner" />}Save Project Config

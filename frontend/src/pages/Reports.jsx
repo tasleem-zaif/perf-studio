@@ -63,9 +63,9 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
         if (collection?.id) {
           filtered = filtered.filter(r => String(r.collection_id) === String(collection.id));
         }
-        // Strict env filter — no cross-env bleed
+        // Soft env filter — show runs for this env OR untagged runs
         if (env) {
-          filtered = filtered.filter(r => r.suite_env === env);
+          filtered = filtered.filter(r => !r.suite_env || r.suite_env === env);
         }
         setRuns(filtered);
       })
@@ -173,6 +173,14 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
           <i className="ti ti-chart-bar" style={{ fontSize: '40px', color: 'var(--color-text-tertiary)', marginBottom: '10px' }} />
           <div className="empty-title">Select a run to view its report</div>
           <div className="empty-desc">JMeter HTML reports are displayed inline. k6 runs produce JSON output only.</div>
+        </div>
+      )}
+
+      {selectedId && !selected && (
+        <div className="empty" style={{ flex: 1 }}>
+          <i className="ti ti-refresh" style={{ fontSize: '36px', color: 'var(--warn)', marginBottom: '10px' }} />
+          <div className="empty-title">Run not found</div>
+          <div className="empty-desc">The selected run may have been filtered out. Try clearing the environment filter.</div>
         </div>
       )}
 

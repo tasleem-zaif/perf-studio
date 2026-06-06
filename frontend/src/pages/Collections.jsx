@@ -30,6 +30,14 @@ export default function Collections({ project, collection: activeCollection, onN
   const [modal, setModal] = useState(null);
   const [viewModal, setViewModal] = useState(null);
   const [endpointsExpanded, setEndpointsExpanded] = useState(true);
+  // Fetch collections directly — don't rely solely on project.collections prop
+  const [ownCollections, setOwnCollections] = useState(project?.collections || []);
+  useEffect(() => {
+    if (!project?.id) return;
+    api.get(`/projects/${project.id}/collections`)
+      .then(({ data }) => setOwnCollections(data.collections || []))
+      .catch(() => {});
+  }, [project?.id]);
   const [form, setForm] = useState(DEFAULT_FORM);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -91,6 +99,8 @@ export default function Collections({ project, collection: activeCollection, onN
         await api.put(`/projects/${project.id}/collections/${modal.id}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
       }
       await onProjectUpdated();
+      // Refresh our local list
+      api.get(`/projects/${project.id}/collections`).then(({ data }) => setOwnCollections(data.collections || [])).catch(() => {});
       setModal(null); setSelectedFile(null); setParsedCurl(null);
     } catch (e) {
       setError(e.response?.data?.error || 'Save failed');
@@ -105,6 +115,7 @@ export default function Collections({ project, collection: activeCollection, onN
     );
     if (!ok) return;
     await api.delete(`/projects/${project.id}/collections/${id}`);
+    api.get(`/projects/${project.id}/collections`).then(({ data }) => setOwnCollections(data.collections || [])).catch(() => {});
     onProjectUpdated();
   }
 
@@ -113,7 +124,7 @@ export default function Collections({ project, collection: activeCollection, onN
   }
 
   const sourceInfo = v => SOURCE_TYPES.find(s => s.value === v);
-  const p = project;
+  const p = { ...project, collections: ownCollections };
 
   return (
     <div className="page fade-in">

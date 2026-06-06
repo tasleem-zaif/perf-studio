@@ -4,10 +4,14 @@ const path      = require('path');
 const puppeteer = require('puppeteer');
 
 // inline Chart.js UMD so the HTML has zero external dependencies
-const CHARTJS_SRC = fs.readFileSync(
+// Try backend node_modules first (Docker), fall back to frontend node_modules (dev)
+const CHARTJS_PATHS = [
+  path.join(__dirname, '../../node_modules/chart.js/dist/chart.umd.min.js'),
   path.join(__dirname, '../../../frontend/node_modules/chart.js/dist/chart.umd.min.js'),
-  'utf8'
-);
+];
+const chartJsPath = CHARTJS_PATHS.find(p => fs.existsSync(p));
+if (!chartJsPath) throw new Error('chart.js not found. Run: npm install chart.js in backend/');
+const CHARTJS_SRC = fs.readFileSync(chartJsPath, 'utf8');
 
 // ── formatters ────────────────────────────────────────────────────────────────
 function fmt(ms) {

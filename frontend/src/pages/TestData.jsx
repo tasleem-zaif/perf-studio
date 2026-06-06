@@ -104,14 +104,24 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const [addColConfig, setAddColConfig] = useState({ name: '', dataType: 'Text', length: '', prefix: '', postfix: '', defaultValue: '' });
   const firstUploadRender = useRef(true);
   const firstGenRender = useRef(true);
+  const [showUploadEnvModal, setShowUploadEnvModal] = useState(false);
+  const [uploadEnv, setUploadEnv] = useState('');
+  const [uploadCollectionId, setUploadCollectionId] = useState('');
+  const [ownCollections, setOwnCollections] = useState(project?.collections || []);
 
-  // Fetch ALL files once — no env filter, display env badges inline
-  useEffect(() => { if (project) loadFiles(); }, [project?.id]);
-
+  // Load files filtered by collection + env (one call per env change) + collections for modal
+  useEffect(() => {
+    if (project) {
+      loadFiles();
+      api.get(`/projects/${project.id}/collections`)
+        .then(r => setOwnCollections(r.data.collections || []))
+        .catch(() => {});
+    }
+  }, [project?.id, collection?.id, env]);
 
   useEffect(() => {
     if (firstUploadRender.current) { firstUploadRender.current = false; return; }
-    if (uploadTrigger > 0) fileInputRef.current?.click();
+    if (uploadTrigger > 0) setShowUploadEnvModal(true); // show env picker before file input
   }, [uploadTrigger]);
 
   useEffect(() => {
@@ -120,8 +130,11 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   }, [generateTrigger]);
 
   async function loadFiles() {
-    // Fetch ALL files — no env/collection filter
-    const { data } = await api.get(`/projects/${project.id}/test-data`);
+    // Filter by collection + env — shows only files for current context
+    const params = collection?.id
+      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
+      : '';
+    const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
     setFiles(data.files || []);
   }
 
@@ -134,7 +147,13 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
     try {
       const fd = new FormData();
       fd.append('csv', file);
-      await api.post(`/projects/${project.id}/test-data`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      // Include env + collection if selected in the env picker modal
+      const params = new URLSearchParams();
+      if (uploadEnv)          params.set('env', uploadEnv);
+      if (uploadCollectionId) params.set('collection_id', uploadCollectionId);
+      const qs = params.toString() ? `?${params.toString()}` : '';
+      await api.post(`/projects/${project.id}/test-data${qs}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      setUploadEnv(''); setUploadCollectionId('');
       await loadFiles();
     } catch (err) {
       toast(err.response?.data?.error || 'Upload failed', 'error');
@@ -463,6 +482,46 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
           </Modal>
         );
       })()}
+
+      {/* ─── Upload: env + collection picker ─── */}
+      {showUploadEnvModal && (
+        <Modal onClose={() => setShowUploadEnvModal(false)} style={{ width: '420px' }}>
+          <div className="modal-hdr">
+            <div className="modal-title"><i className="ti ti-upload" style={{ marginRight: 8, color: 'var(--accent)' }} />Upload Test Data</div>
+            <button className="btn-icon" onClick={() => setShowUploadEnvModal(false)}><i className="ti ti-x" /></button>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Collection <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(optional)</span></label>
+            <select value={uploadCollectionId} onChange={e => { setUploadCollectionId(e.target.value); setUploadEnv(''); }}
+              style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
+              <option value="">— No collection —</option>
+              {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Environment <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(optional)</span></label>
+            {(() => {
+              const col = ownCollections.find(c => String(c.id) === String(uploadCollectionId));
+              let envOpts = [];
+              try { envOpts = JSON.parse(col?.environments || '[]'); } catch {}
+              if (!envOpts.length && col?.environment) envOpts = [col.environment];
+              return (
+                <select value={uploadEnv} onChange={e => setUploadEnv(e.target.value)}
+                  style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
+                  <option value="">— All environments —</option>
+                  {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
+                </select>
+              );
+            })()}
+          </div>
+          <div className="modal-footer">
+            <button className="btn-secondary" onClick={() => setShowUploadEnvModal(false)}>Cancel</button>
+            <button className="btn-primary" onClick={() => { setShowUploadEnvModal(false); fileInputRef.current?.click(); }}>
+              <i className="ti ti-upload" /> Choose File
+            </button>
+          </div>
+        </Modal>
+      )}
 
       {/* ─── Generate Data modal ─── */}
       {showGenModal && (
