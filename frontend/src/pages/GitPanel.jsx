@@ -95,7 +95,7 @@ function parseStatusFiles(status) {
   return files;
 }
 
-export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false }) {
+export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false, drawerWidth = 700 }) {
   const { toast } = useToast();
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
   const pid = project?.id;
@@ -1069,7 +1069,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
         return (
           <div style={{
-            position: 'fixed', top: 0, left: 700, right: 0, bottom: 0,
+            position: 'fixed', top: 0, left: drawerWidth, right: 0, bottom: 0,
             zIndex: 52, background: '#ffffff',
             display: 'flex', flexDirection: 'column',
             borderLeft: '1px solid #d1d9e0',

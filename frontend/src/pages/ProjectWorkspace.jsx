@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import api from '../api';
 import Settings    from './Settings';
 import GitPanel    from './GitPanel';
@@ -66,6 +66,38 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
   const [testSuitesModalTrig,   setTestSuitesModalTrig]   = useState(0);
   const [configTab,             setConfigTab]             = useState('environment'); // 'environment' | 'ai' | 'pipeline'
   const [gitDrawerOpen,         setGitDrawerOpen]         = useState(false);
+  const [drawerWidth,           setDrawerWidth]           = useState(700);
+  const isResizing   = useRef(false);
+  const resizeStartX = useRef(0);
+  const resizeStartW = useRef(700);
+
+  const onResizeMove = useCallback((e) => {
+    if (!isResizing.current) return;
+    const delta    = e.clientX - resizeStartX.current;
+    const newWidth = Math.min(Math.max(resizeStartW.current + delta, 360), window.innerWidth - 320);
+    setDrawerWidth(newWidth);
+  }, []);
+
+  const onResizeEnd = useCallback(() => {
+    if (!isResizing.current) return;
+    isResizing.current = false;
+    document.body.style.userSelect   = '';
+    document.body.style.cursor       = '';
+    document.removeEventListener('mousemove', onResizeMove);
+    document.removeEventListener('mouseup',   onResizeEnd);
+  }, [onResizeMove]);
+
+  const onResizeStart = useCallback((e) => {
+    e.preventDefault();
+    isResizing.current  = true;
+    resizeStartX.current = e.clientX;
+    resizeStartW.current = drawerWidth;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor     = 'col-resize';
+    document.addEventListener('mousemove', onResizeMove);
+    document.addEventListener('mouseup',   onResizeEnd);
+  }, [drawerWidth, onResizeMove, onResizeEnd]);
+
   const collections = project?.collections || [];
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
 
@@ -378,13 +410,21 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
           {/* ── Git Drawer — slides in from left, covers screen ── */}
           {gitDrawerOpen && (
             <>
-              {/* Backdrop */}
+              {/* Backdrop — only covers area to the right of the drawer */}
               <div onClick={() => setGitDrawerOpen(false)}
                 style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.4)', zIndex: 50, transition: 'opacity .2s' }} />
-              {/* Git drawer panel — fixed width */}
-              <div style={{ position: 'fixed', top: 0, left: 0, bottom: 0, width: 700, maxWidth: '95vw', background: '#fff', zIndex: 51, boxShadow: '4px 0 32px rgba(0,0,0,0.15)', display: 'flex', flexDirection: 'column' }}>
+
+              {/* Git drawer panel — resizable */}
+              <div style={{
+                position: 'fixed', top: 0, left: 0, bottom: 0,
+                width: drawerWidth, maxWidth: '95vw',
+                background: '#fff', zIndex: 51,
+                boxShadow: '4px 0 32px rgba(0,0,0,0.15)',
+                display: 'flex', flexDirection: 'column',
+                overflow: 'hidden',
+              }}>
                 {/* Drawer header */}
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid #e2e8f0', background: '#fff', position: 'sticky', top: 0, zIndex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid #e2e8f0', background: '#fff', flexShrink: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <div style={{ width: 34, height: 34, borderRadius: 9, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                       <i className="ti ti-git-branch" style={{ color: '#16a34a', fontSize: 18 }} />
@@ -399,10 +439,24 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
                     <i className="ti ti-x" />
                   </button>
                 </div>
+
                 {/* GitPanel inside drawer — workflow tabs only */}
-                <div style={{ flex: 1, overflowY: 'auto' }}>
-                  <GitPanel project={project} user={user} workflowOnly={true} />
+                <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+                  <GitPanel project={project} user={user} workflowOnly={true} drawerWidth={drawerWidth} />
                 </div>
+
+                {/* ── Resize handle — drag right edge to resize ── */}
+                <div
+                  onMouseDown={onResizeStart}
+                  title="Drag to resize"
+                  style={{
+                    position: 'absolute', top: 0, right: 0, bottom: 0,
+                    width: 5, cursor: 'col-resize', zIndex: 10,
+                    background: 'transparent', transition: 'background .15s',
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.35)'}
+                  onMouseLeave={e => { if (!isResizing.current) e.currentTarget.style.background = 'transparent'; }}
+                />
               </div>
             </>
           )}
