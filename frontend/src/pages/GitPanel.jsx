@@ -1,4 +1,5 @@
 ﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 
@@ -512,6 +513,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
   );
 
   return (
+    <>
     <div className="page fade-in">
 
       {/* ── Status bar ────────────────────────────────────────────────────── */}
@@ -745,61 +747,70 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
             </button>
           </div>
 
-          <Section title="Changed Files" subtitle={`${statusFiles.length} file${statusFiles.length!==1?'s':''} · Branch: ${currentBranch}`}
-            extra={selectedFiles.size > 0 ? (
-              <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
-                style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
-                onMouseEnter={e=>e.currentTarget.style.opacity='.85'} onMouseLeave={e=>e.currentTarget.style.opacity='1'}>
-                {discarding?<span className="spinner"/>:<i className="ti ti-trash"/>} Discard {selectedFiles.size} file{selectedFiles.size!==1?'s':''}
-              </button>
-            ) : null}
-          >
+          {/* ── Changed Files card ── */}
+          <div style={{ background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,marginBottom:16,overflow:'hidden' }}>
+            {/* Card header */}
+            <div style={{ display:'flex',alignItems:'center',justifyContent:'space-between',padding:'14px 16px',borderBottom:'1px solid #f1f5f9' }}>
+              <div>
+                <div style={{ fontSize:14,fontWeight:700,color:'#0f172a' }}>Changed Files</div>
+                <div style={{ fontSize:12,color:'#64748b',marginTop:2 }}>{statusFiles.length} file{statusFiles.length!==1?'s':''} · Branch: {currentBranch}</div>
+              </div>
+              {selectedFiles.size > 0 && (
+                <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
+                  style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',flexShrink:0 }}>
+                  {discarding ? <span className="spinner"/> : <i className="ti ti-trash"/>} Discard ({selectedFiles.size})
+                </button>
+              )}
+            </div>
+
             {statusFiles.length === 0 ? (
-              <div style={{ textAlign:'center',padding:'24px',color:'#94a3b8',fontSize:13 }}>
-                <i className="ti ti-circle-check" style={{ fontSize:24,display:'block',marginBottom:6 }}/>
+              <div style={{ textAlign:'center',padding:'32px 24px',color:'#94a3b8',fontSize:13 }}>
+                <i className="ti ti-circle-check" style={{ fontSize:28,display:'block',marginBottom:8,color:'#22c55e' }}/>
                 Working tree is clean — nothing to commit
               </div>
             ) : (
               <>
-                <div style={{ display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderBottom:'1px solid #f1f5f9',marginBottom:4,width:'100%',boxSizing:'border-box' }}>
-                  <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer',flexShrink:0 }}/>
-                  <span style={{ fontSize:12,color:'#64748b',flex:1 }}>Select all ({statusFiles.length})</span>
+                {/* Select-all row */}
+                <div style={{ display:'flex',alignItems:'center',gap:10,padding:'7px 16px',borderBottom:'1px solid #f1f5f9',background:'#f8fafc' }}>
+                  <input type="checkbox" checked={selectedFiles.size===statusFiles.length} onChange={toggleAll} style={{ cursor:'pointer',flexShrink:0,width:15,height:15 }}/>
+                  <span style={{ fontSize:12,color:'#64748b' }}>Select all ({statusFiles.length} files)</span>
                 </div>
+
+                {/* File rows */}
                 {statusFiles.map((f, i) => {
                   const ft = FILE_TYPE[f.type] || FILE_TYPE['?'];
                   const isSelected = selectedFiles.has(f.path);
                   const isActive = diffFile === f.path;
+                  const parts = f.path.split('/');
+                  const fileName = parts[parts.length - 1];
+                  const dirPath = parts.slice(0, -1).join('/');
                   return (
-                    <div key={i}>
-                      <div style={{ display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:6,background:isActive?'#f0fdf4':'transparent',cursor:'pointer' }}
+                    <div key={i} style={{ borderBottom: i < statusFiles.length - 1 ? '1px solid #f1f5f9' : 'none' }}>
+                      <div style={{ display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:isActive?'#f0fdf4':'transparent',minWidth:0,cursor:'pointer' }}
+                        onClick={() => viewDiff(f.path)}
                         onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
-                        onMouseLeave={e=>{ if(!isActive) e.currentTarget.style.background='transparent'; }}>
-                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer',flexShrink:0 }}/>
+                        onMouseLeave={e=>{ e.currentTarget.style.background=isActive?'#f0fdf4':'transparent'; }}>
+                        {/* Checkbox */}
+                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer',flexShrink:0,width:15,height:15 }}/>
+                        {/* Status badge */}
                         <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700,flexShrink:0 }} title={ft.title}>{ft.label}</span>
-                        <span style={{ flex:1,fontFamily:'monospace',fontSize:12,color:'#374151',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }} onClick={() => viewDiff(f.path)} title={f.path}>{f.path}</span>
-                        <div style={{ display:'flex',gap:4,flexShrink:0 }}>
-                          <button onClick={() => viewDiff(f.path)} style={{ background:'none',border:'1px solid #e2e8f0',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#64748b' }}>
-                            {isActive ? 'Hide' : 'Diff'}
-                          </button>
-                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }}>
-                            <i className="ti ti-trash" style={{ fontSize:11 }}/>
-                          </button>
+                        {/* Filename */}
+                        <div style={{ flex:1,minWidth:0 }}>
+                          <div style={{ fontSize:13,fontWeight:isActive?600:500,color:isActive?'#15803d':'#1e293b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }} title={f.path}>{fileName}</div>
+                          {dirPath && <div style={{ fontSize:11,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{dirPath}</div>}
                         </div>
+                        {/* Discard button */}
+                        <button onClick={e => { e.stopPropagation(); discardFiles([f.path]); }} disabled={discarding}
+                          style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'3px 7px',fontSize:11,color:'#ef4444',flexShrink:0 }}>
+                          <i className="ti ti-trash" style={{ fontSize:11 }}/>
+                        </button>
                       </div>
-                      {isActive && (
-                        <div style={{ margin:'4px 0 4px 38px',borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
-                          <div style={{ background:'#1e293b',padding:'6px 12px',fontSize:11,color:'#94a3b8',fontFamily:'monospace' }}>{f.path}</div>
-                          <div style={{ background:'#0f172a',padding:'10px 14px',maxHeight:300,overflowY:'auto' }}>
-                            {loadingDiff ? <div style={{ color:'#64748b',fontSize:12,fontFamily:'monospace' }}>Loading…</div> : renderDiff(diffContent)}
-                          </div>
-                        </div>
-                      )}
                     </div>
                   );
                 })}
               </>
             )}
-          </Section>
+          </div>
 
           <Section title="Commit & Push" subtitle={`Committing to: ${currentBranch}`}>
             <div className="form-group">
@@ -997,5 +1008,101 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
         </div>
       )}
     </div>
+
+    {/* ══════════════════════════════════════════════════════════════════════
+        WINDOW 2 — Diff viewer panel (portal, renders to the right of the drawer)
+    ══════════════════════════════════════════════════════════════════════ */}
+    {diffFile && createPortal(
+      <div style={{
+        position: 'fixed', top: 0, left: 700, right: 0, bottom: 0,
+        zIndex: 52, background: '#fff',
+        display: 'flex', flexDirection: 'column',
+        boxShadow: 'inset 1px 0 0 #e2e8f0',
+        animation: 'slideInRight .18s ease',
+      }}>
+        {/* Header */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '0 16px', height: 56, flexShrink: 0,
+          borderBottom: '1px solid #e2e8f0', background: '#fff',
+        }}>
+          {/* Status badge */}
+          {(() => {
+            const ft = FILE_TYPE[statusFiles.find(f => f.path === diffFile)?.type] || FILE_TYPE['?'];
+            return (
+              <span style={{ width: 22, height: 22, borderRadius: 5, background: ft.bg, color: ft.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 }} title={ft.title}>{ft.label}</span>
+            );
+          })()}
+          {/* Filename */}
+          <span style={{ flex: 1, minWidth: 0, fontFamily: 'monospace', fontSize: 13, fontWeight: 600, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={diffFile}>
+            {diffFile}
+          </span>
+          {/* Type label */}
+          {(() => {
+            const fileType = statusFiles.find(f => f.path === diffFile)?.type;
+            const label = fileType === '?' ? 'untracked' : fileType === 'M' ? 'modified' : fileType === 'A' ? 'added' : fileType === 'D' ? 'deleted' : 'changed';
+            const colors = { untracked: ['#ede9fe','#7c3aed'], modified: ['#fef3c7','#b45309'], added: ['#dcfce7','#16a34a'], deleted: ['#fee2e2','#dc2626'], changed: ['#dbeafe','#1d4ed8'] };
+            const [bg, color] = colors[label] || colors.changed;
+            return <span style={{ padding: '3px 10px', borderRadius: 20, fontSize: 11, fontWeight: 700, background: bg, color, flexShrink: 0 }}>{label}</span>;
+          })()}
+          {/* Close */}
+          <button onClick={() => { setDiffFile(null); setDiffContent(''); }}
+            style={{ width: 28, height: 28, border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', flexShrink: 0 }}>
+            <i className="ti ti-x" style={{ fontSize: 14 }}/>
+          </button>
+        </div>
+
+        {/* New-file notice */}
+        {statusFiles.find(f => f.path === diffFile)?.type === '?' && (
+          <div style={{ padding: '8px 16px', background: '#f0fdf4', borderBottom: '1px solid #bbf7d0', fontSize: 12, color: '#15803d', flexShrink: 0 }}>
+            New file — entire content shown as additions (no previous version in git history)
+          </div>
+        )}
+
+        {/* Diff body */}
+        <div style={{ flex: 1, overflowY: 'auto', background: '#0d1117' }}>
+          {loadingDiff ? (
+            <div style={{ padding: '32px 24px', color: '#64748b', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8, background: '#0d1117' }}>
+              <span className="spinner" style={{ borderTopColor: '#4ade80' }}/> Loading diff…
+            </div>
+          ) : diffContent ? (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: '"Fira Mono", "Cascadia Code", Consolas, monospace', fontSize: 12 }}>
+              <tbody>
+                {(() => {
+                  let lineNum = 0;
+                  return (diffContent || '').split('\n').map((line, i) => {
+                    const isAdd  = line.startsWith('+') && !line.startsWith('+++');
+                    const isDel  = line.startsWith('-') && !line.startsWith('---');
+                    const isHunk = line.startsWith('@@');
+                    const isMeta = line.startsWith('diff') || line.startsWith('index') || line.startsWith('---') || line.startsWith('+++');
+                    if (!isDel && !isHunk && !isMeta) lineNum++;
+                    const bg    = isAdd ? 'rgba(63,185,80,0.15)' : isDel ? 'rgba(248,81,73,0.15)' : isHunk ? 'rgba(88,166,255,0.1)' : 'transparent';
+                    const color = isAdd ? '#3fb950' : isDel ? '#f85149' : isHunk ? '#79c0ff' : isMeta ? '#8b949e' : '#e6edf3';
+                    const sign  = isAdd ? '+' : isDel ? '-' : ' ';
+                    const text  = (isAdd || isDel) ? line.slice(1) : line;
+                    return (
+                      <tr key={i} style={{ background: bg }}>
+                        <td style={{ width: 52, paddingRight: 12, paddingLeft: 16, color: '#484f58', textAlign: 'right', userSelect: 'none', fontSize: 11, lineHeight: '20px', borderRight: '1px solid #21262d', fontVariantNumeric: 'tabular-nums' }}>
+                          {!isDel && !isHunk && !isMeta ? lineNum : ''}
+                        </td>
+                        <td style={{ width: 20, paddingLeft: 10, color: isAdd ? '#3fb950' : isDel ? '#f85149' : '#484f58', fontWeight: 700, lineHeight: '20px', userSelect: 'none', fontSize: 13 }}>{sign === ' ' ? '' : sign}</td>
+                        <td style={{ padding: '0 16px 0 4px', color, whiteSpace: 'pre-wrap', wordBreak: 'break-all', lineHeight: '20px' }}>{text}</td>
+                      </tr>
+                    );
+                  });
+                })()}
+              </tbody>
+            </table>
+          ) : (
+            <div style={{ padding: '40px 24px', textAlign: 'center', color: '#484f58', fontSize: 13 }}>
+              <i className="ti ti-file-diff" style={{ fontSize: 36, display: 'block', marginBottom: 10, color: '#30363d' }}/>
+              No diff available for this file
+            </div>
+          )}
+        </div>
+      </div>,
+      document.body
+    )}
+    </>
   );
 }
