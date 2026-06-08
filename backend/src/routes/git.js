@@ -555,6 +555,30 @@ router.get('/status', async (req, res) => {
     const git = gitInstance(gitDir);
     const status = await git.status();
     const branch = status.current;
+
+    // Get line-level additions/deletions for tracked changed files
+    let totalAdded = 0, totalDeleted = 0;
+    try {
+      // --numstat gives: <added>\t<deleted>\t<file> for each changed tracked file
+      const numstatTracked = await git.raw(['diff', 'HEAD', '--numstat']);
+      for (const line of numstatTracked.trim().split('\n').filter(Boolean)) {
+        const [a, d] = line.split('\t');
+        if (!isNaN(parseInt(a))) totalAdded   += parseInt(a);
+        if (!isNaN(parseInt(d))) totalDeleted += parseInt(d);
+      }
+    } catch {}
+
+    // Count lines in untracked files as additions (they are entirely new)
+    for (const uf of status.not_added) {
+      try {
+        const absPath = path.join(gitDir, uf);
+        if (fs.existsSync(absPath)) {
+          const content = fs.readFileSync(absPath, 'utf8');
+          totalAdded += content.split('\n').length;
+        }
+      } catch {}
+    }
+
     res.json({
       initialized: true,
       branch,
@@ -565,6 +589,8 @@ router.get('/status', async (req, res) => {
       is_clean: status.isClean(),
       ahead: status.ahead,
       behind: status.behind,
+      additions: totalAdded,
+      deletions: totalDeleted,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1167,12 +1193,11 @@ router.get('/diff', async (req, res) => {
     // If diff is still empty the file is untracked — read full content and
     // format every line as an addition so the viewer shows the whole file.
     if (!diff) {
-      const absPath = path.join(gitDir, filePath);
+      const absPath = path.resolve(gitDir, filePath);
       if (fs.existsSync(absPath)) {
         isNewFile = true;
         const content = fs.readFileSync(absPath, 'utf8');
         const lines = content.split('\n');
-        // Build pseudo-diff: all lines as additions (0-based line numbers in hunk)
         const header = [
           `diff --git a/${filePath} b/${filePath}`,
           `new file mode 100644`,

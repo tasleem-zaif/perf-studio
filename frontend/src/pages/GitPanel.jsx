@@ -521,19 +521,55 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
       {/* ── Status bar ────────────────────────────────────────────────────── */}
       {initialized && (
-        <div style={{ display:'flex',alignItems:'center',gap:12,padding:'10px 16px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:10,marginBottom:16,fontSize:13 }}>
-          <i className="ti ti-git-branch" style={{ color:'#16a34a',fontSize:16 }} />
-          <span style={{ color:'#15803d',fontWeight:600 }}>Branch: {currentBranch}</span>
-          <span style={{ color:'#94a3b8' }}>·</span>
-          {statusFiles.length > 0
-            ? <span style={{ color:'#b45309',fontWeight:600 }}>{statusFiles.length} changed file{statusFiles.length!==1?'s':''}</span>
-            : <span style={{ color:'#16a34a' }}>Working tree clean</span>}
-          {openPrs > 0 && <><span style={{ color:'#94a3b8' }}>·</span><span style={{ color:'#1d4ed8' }}>{openPrs} open PR{openPrs>1?'s':''}</span></>}
-          {status?.ahead > 0 && <span style={{ color:'#7c3aed' }}>↑{status.ahead} ahead</span>}
-          {status?.behind > 0 && <span style={{ color:'#ea580c' }}>↓{status.behind} behind</span>}
-          <button onClick={loadAll} style={{ marginLeft:'auto',background:'none',border:'none',cursor:'pointer',color:'#64748b',fontSize:12,display:'flex',alignItems:'center',gap:4 }}>
-            <i className="ti ti-refresh"/> Refresh
-          </button>
+        <div style={{ marginBottom:16, borderRadius:10, border:'1px solid #e2e8f0', overflow:'hidden', background:'#fff' }}>
+          {/* Row 1 — branch + refresh */}
+          <div style={{ display:'flex', alignItems:'center', gap:10, padding:'9px 14px', background:'#f8fafc', borderBottom:'1px solid #f1f5f9' }}>
+            <i className="ti ti-git-branch" style={{ color:'#16a34a', fontSize:15, flexShrink:0 }}/>
+            <span style={{ fontWeight:700, color:'#0f172a', fontSize:13 }}>{currentBranch}</span>
+            {status?.ahead > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#7c3aed',background:'#ede9fe',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-arrow-up" style={{ fontSize:10 }}/>{status.ahead} ahead
+              </span>
+            )}
+            {status?.behind > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#ea580c',background:'#ffedd5',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-arrow-down" style={{ fontSize:10 }}/>{status.behind} behind
+              </span>
+            )}
+            {openPrs > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#1d4ed8',background:'#dbeafe',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-git-pull-request" style={{ fontSize:10 }}/>{openPrs} PR{openPrs>1?'s':''}
+              </span>
+            )}
+            <button onClick={loadAll} style={{ marginLeft:'auto',background:'none',border:'none',cursor:'pointer',color:'#64748b',fontSize:12,display:'flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:6 }}
+              onMouseEnter={e=>e.currentTarget.style.background='#f1f5f9'}
+              onMouseLeave={e=>e.currentTarget.style.background='none'}>
+              <i className="ti ti-refresh" style={{ fontSize:13 }}/> Refresh
+            </button>
+          </div>
+          {/* Row 2 — files changed + additions + deletions */}
+          <div style={{ display:'flex', alignItems:'center', gap:16, padding:'8px 14px' }}>
+            {statusFiles.length > 0 ? (
+              <>
+                <span style={{ display:'flex',alignItems:'center',gap:5,fontSize:12,color:'#374151' }}>
+                  <i className="ti ti-files" style={{ fontSize:13,color:'#64748b' }}/>
+                  <strong style={{ color:'#0f172a' }}>{statusFiles.length}</strong>
+                  <span style={{ color:'#64748b' }}>changed file{statusFiles.length!==1?'s':''}</span>
+                </span>
+                <span style={{ color:'#e2e8f0' }}>|</span>
+                <span style={{ display:'flex',alignItems:'center',gap:4,fontSize:12,fontWeight:700,color:'#16a34a' }}>
+                  <span style={{ fontSize:14,lineHeight:1 }}>+</span>{status?.additions ?? 0} additions
+                </span>
+                <span style={{ display:'flex',alignItems:'center',gap:4,fontSize:12,fontWeight:700,color:'#dc2626' }}>
+                  <span style={{ fontSize:14,lineHeight:1 }}>−</span>{status?.deletions ?? 0} deletions
+                </span>
+              </>
+            ) : (
+              <span style={{ display:'flex',alignItems:'center',gap:6,fontSize:12,color:'#16a34a' }}>
+                <i className="ti ti-circle-check" style={{ fontSize:14 }}/> Working tree clean
+              </span>
+            )}
+          </div>
         </div>
       )}
 
