@@ -134,6 +134,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
   const [diffFile,      setDiffFile]      = useState(null);
   const [diffContent,   setDiffContent]   = useState('');
   const [loadingDiff,   setLoadingDiff]   = useState(false);
+  const [isNewFile,     setIsNewFile]     = useState(false);
   const [discarding,    setDiscarding]    = useState(false);
   const [fetching,      setFetching]      = useState(false);
   const [syncing,       setSyncing]       = useState(false);
@@ -308,13 +309,15 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── File diff ─────────────────────────────────────────────────────────────
   async function viewDiff(filePath) {
-    if (diffFile === filePath) { setDiffFile(null); setDiffContent(''); return; }
+    if (diffFile === filePath) { setDiffFile(null); setDiffContent(''); setIsNewFile(false); return; }
     setDiffFile(filePath);
+    setIsNewFile(false);
     setLoadingDiff(true);
     try {
       const { data } = await api.get(`/projects/${pid}/git/diff?path=${encodeURIComponent(filePath)}`);
       setDiffContent(data.diff || '');
-    } catch { setDiffContent(''); }
+      setIsNewFile(!!data.isNewFile);
+    } catch { setDiffContent(''); setIsNewFile(false); }
     finally { setLoadingDiff(false); }
   }
 
@@ -1053,39 +1056,65 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
         </div>
 
         {/* New-file notice */}
-        {statusFiles.find(f => f.path === diffFile)?.type === '?' && (
-          <div style={{ padding: '8px 16px', background: '#f0fdf4', borderBottom: '1px solid #bbf7d0', fontSize: 12, color: '#15803d', flexShrink: 0 }}>
-            New file — entire content shown as additions (no previous version in git history)
+        {isNewFile && (
+          <div style={{ padding: '9px 16px', background: '#f0fdf4', borderBottom: '1px solid #bbf7d0', fontSize: 12, color: '#15803d', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <i className="ti ti-file-plus" style={{ fontSize: 14 }}/>
+            New File — Entire content shown as additions (No previous version in git history)
           </div>
         )}
 
         {/* Diff body */}
         <div style={{ flex: 1, overflowY: 'auto', background: '#0d1117' }}>
           {loadingDiff ? (
-            <div style={{ padding: '32px 24px', color: '#64748b', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8, background: '#0d1117' }}>
-              <span className="spinner" style={{ borderTopColor: '#4ade80' }}/> Loading diff…
+            <div style={{ padding: '32px 24px', color: '#4ade80', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="spinner" style={{ borderTopColor: '#4ade80' }}/> Loading…
             </div>
           ) : diffContent ? (
             <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: '"Fira Mono", "Cascadia Code", Consolas, monospace', fontSize: 12 }}>
               <tbody>
                 {(() => {
                   let lineNum = 0;
-                  return (diffContent || '').split('\n').map((line, i) => {
+                  // Parse all diff lines; skip pure meta header lines for new-file view
+                  const allLines = (diffContent || '').split('\n');
+                  return allLines.map((line, i) => {
                     const isAdd  = line.startsWith('+') && !line.startsWith('+++');
                     const isDel  = line.startsWith('-') && !line.startsWith('---');
                     const isHunk = line.startsWith('@@');
-                    const isMeta = line.startsWith('diff') || line.startsWith('index') || line.startsWith('---') || line.startsWith('+++');
-                    if (!isDel && !isHunk && !isMeta) lineNum++;
-                    const bg    = isAdd ? 'rgba(63,185,80,0.15)' : isDel ? 'rgba(248,81,73,0.15)' : isHunk ? 'rgba(88,166,255,0.1)' : 'transparent';
-                    const color = isAdd ? '#3fb950' : isDel ? '#f85149' : isHunk ? '#79c0ff' : isMeta ? '#8b949e' : '#e6edf3';
-                    const sign  = isAdd ? '+' : isDel ? '-' : ' ';
+                    const isMeta = line.startsWith('diff --git') || line.startsWith('new file') ||
+                                   line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ');
+
+                    // Hide meta header lines — they clutter the content view
+                    if (isMeta) return null;
+
+                    if (!isDel && !isHunk) lineNum++;
+
+                    // Hunk header row (@@ ... @@) — render as a separator bar
+                    if (isHunk) {
+                      return (
+                        <tr key={i} style={{ background: 'rgba(88,166,255,0.08)' }}>
+                          <td style={{ width: 52, borderRight: '1px solid #21262d', userSelect: 'none' }}/>
+                          <td style={{ width: 20 }}/>
+                          <td style={{ padding: '2px 16px 2px 4px', color: '#79c0ff', fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre' }}>{line}</td>
+                        </tr>
+                      );
+                    }
+
+                    const bg    = isAdd ? 'rgba(63,185,80,0.15)' : isDel ? 'rgba(248,81,73,0.15)' : 'transparent';
+                    const color = isAdd ? '#3fb950' : isDel ? '#f85149' : '#e6edf3';
+                    const sign  = isAdd ? '+' : isDel ? '-' : '';
                     const text  = (isAdd || isDel) ? line.slice(1) : line;
+
                     return (
                       <tr key={i} style={{ background: bg }}>
-                        <td style={{ width: 52, paddingRight: 12, paddingLeft: 16, color: '#484f58', textAlign: 'right', userSelect: 'none', fontSize: 11, lineHeight: '20px', borderRight: '1px solid #21262d', fontVariantNumeric: 'tabular-nums' }}>
-                          {!isDel && !isHunk && !isMeta ? lineNum : ''}
+                        {/* Line number */}
+                        <td style={{ width: 52, paddingRight: 12, paddingLeft: 16, color: '#484f58', textAlign: 'right', userSelect: 'none', fontSize: 11, lineHeight: '20px', borderRight: '1px solid #21262d', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                          {lineNum}
                         </td>
-                        <td style={{ width: 20, paddingLeft: 10, color: isAdd ? '#3fb950' : isDel ? '#f85149' : '#484f58', fontWeight: 700, lineHeight: '20px', userSelect: 'none', fontSize: 13 }}>{sign === ' ' ? '' : sign}</td>
+                        {/* +/- sign */}
+                        <td style={{ width: 20, paddingLeft: 10, paddingRight: 4, color: isAdd ? '#3fb950' : isDel ? '#f85149' : 'transparent', fontWeight: 700, lineHeight: '20px', userSelect: 'none', fontSize: 13, flexShrink: 0 }}>
+                          {sign}
+                        </td>
+                        {/* Code */}
                         <td style={{ padding: '0 16px 0 4px', color, whiteSpace: 'pre-wrap', wordBreak: 'break-all', lineHeight: '20px' }}>{text}</td>
                       </tr>
                     );
@@ -1096,7 +1125,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
           ) : (
             <div style={{ padding: '40px 24px', textAlign: 'center', color: '#484f58', fontSize: 13 }}>
               <i className="ti ti-file-diff" style={{ fontSize: 36, display: 'block', marginBottom: 10, color: '#30363d' }}/>
-              No diff available for this file
+              No content available for this file
             </div>
           )}
         </div>

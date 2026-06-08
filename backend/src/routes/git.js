@@ -1154,13 +1154,37 @@ router.get('/diff', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
+
+    // Try to get a real git diff first (works for tracked/staged files)
     let diff = '';
+    let isNewFile = false;
     try {
       diff = await git.diff(['HEAD', '--', filePath]);
       if (!diff) diff = await git.diff(['--cached', '--', filePath]);
       if (!diff) diff = await git.diff(['--', filePath]);
     } catch {}
-    res.json({ diff, path: filePath });
+
+    // If diff is still empty the file is untracked — read full content and
+    // format every line as an addition so the viewer shows the whole file.
+    if (!diff) {
+      const absPath = path.join(gitDir, filePath);
+      if (fs.existsSync(absPath)) {
+        isNewFile = true;
+        const content = fs.readFileSync(absPath, 'utf8');
+        const lines = content.split('\n');
+        // Build a pseudo-diff header + all lines as additions
+        const header = [
+          `diff --git a/${filePath} b/${filePath}`,
+          `new file mode 100644`,
+          `--- /dev/null`,
+          `+++ b/${filePath}`,
+          `@@ -0,0 +1,${lines.length} @@`,
+        ].join('\n');
+        diff = header + '\n' + lines.map(l => '+' + l).join('\n');
+      }
+    }
+
+    res.json({ diff, path: filePath, isNewFile });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
