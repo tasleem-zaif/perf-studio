@@ -15,6 +15,11 @@ const storage = multer.diskStorage({
     if (!proj) return cb(new Error('Project not found'));
     if (!proj.folder_path) return cb(new Error('git_not_initialized: Git repository not initialized. Go to Configuration → Git to initialize the repository first.'));
 
+    const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+    const callerUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const userProjPath = getUserProjectPath(req.userId, callerUser?.role, proj.name);
+    if (!userProjPath) return cb(new Error('Git repository not initialized.'));
+
     // If a collection_id is provided, store inside collection/env/testData/
     const colId = req.query.collection_id || req.body?.collection_id;
     const envName = req.query.env || req.body?.env;
@@ -35,23 +40,14 @@ const storage = multer.diskStorage({
         }
 
         // Ensure the env folder exists
-        const { ensureCollectionFolders, getCollectionPath } = require('../utils/projectFolders');
-        const basePath = proj.folder_path || '';
-        if (basePath) {
-          const envFolderPath = getCollectionPath(basePath, col.name, col.id, targetEnv);
-          require('fs').mkdirSync(path.join(envFolderPath, 'testData'), { recursive: true });
-          return cb(null, path.join(envFolderPath, 'testData'));
-        }
+        const envFolderPath = getCollectionPath(userProjPath, col.name, targetEnv);
+        require('fs').mkdirSync(path.join(envFolderPath, 'testData'), { recursive: true });
+        return cb(null, path.join(envFolderPath, 'testData'));
       }
     }
 
     // Fallback: project-level testData folder
-    let folderPath = proj.folder_path;
-    if (!folderPath) {
-      folderPath = ensureProjectFolders(proj.name, proj.id, proj.uuid || proj.environment);
-      db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, proj.id);
-    }
-    const dest = path.join(folderPath, 'testData');
+    const dest = path.join(userProjPath, 'testData');
     require('fs').mkdirSync(dest, { recursive: true });
     cb(null, dest);
   },
@@ -85,7 +81,7 @@ router.get('/', (req, res) => {
         const basePath = proj?.folder_path || '';
         if (basePath) {
           const { getCollectionPath } = require('../utils/projectFolders');
-          const filterPath = getCollectionPath(basePath, col.name, col.id, envName).replace(/\\/g, '/');
+          const filterPath = getCollectionPath(basePath, col.name, envName).replace(/\\/g, '/');
           files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND (collection_id IS NULL OR collection_id = 0) ORDER BY created_at DESC').all(req.params.projectId)
             .filter(f => f.path && f.path.replace(/\\/g, '/').startsWith(filterPath));
         }

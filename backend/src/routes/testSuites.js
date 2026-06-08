@@ -100,14 +100,6 @@ router.post('/:id/generate', async (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  // Git repository must be initialized before scripts can be generated
-  if (!proj.folder_path) {
-    return res.status(400).json({
-      error: 'git_not_initialized',
-      message: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.',
-    });
-  }
-
   const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Suite not found' });
 
@@ -161,20 +153,18 @@ router.post('/:id/generate', async (req, res) => {
     let filePath = '';
 
     let scriptBaseDir = null;
-    if (collection && proj.folder_path) {
-      // Determine target env: suite.env → collection's first env → 'Default'
+    const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+    const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+    const userProjPath = getUserProjectPath(req.userId, callerRole, proj.name);
+    if (collection && userProjPath) {
       let targetEnv = suite.env;
       if (!targetEnv && collection) {
-        try {
-          const envs = JSON.parse(collection.environments || '[]');
-          targetEnv = envs[0] || collection.environment || 'Default';
-        } catch { targetEnv = collection.environment || 'Default'; }
+        try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
       }
-      const { getCollectionPath } = require('../utils/projectFolders');
-      const envPath = getCollectionPath(proj.folder_path, collection.name, collection.id, targetEnv);
+      const envPath = getCollectionPath(userProjPath, collection.name, targetEnv);
       scriptBaseDir = require('path').join(envPath, 'script');
-    } else if (proj.folder_path) {
-      scriptBaseDir = require('path').join(proj.folder_path, 'script');
+    } else if (userProjPath) {
+      scriptBaseDir = require('path').join(userProjPath, 'script');
     }
 
     if (scriptBaseDir) {

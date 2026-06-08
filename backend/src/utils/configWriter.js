@@ -42,14 +42,12 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
     let envPath;
 
-    // Use explicitly passed folder path first (user's workspace), then project.folder_path
-    const basePath = projectFolderPath || project?.folder_path;
-    if (basePath) {
-      // New clean-name format: CollectionName/Env/
-      envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
-    } else {
-      return; // no path available
-    }
+    // Use explicitly passed folder path (user's workspace). Do NOT fall back to
+    // project.folder_path — that may point to the wrong (e.g. admin) workspace.
+    const basePath = projectFolderPath;
+    if (!basePath) return; // no user workspace path supplied — skip write
+    // New clean-name format: CollectionName/Env/
+    envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
 
     // Project already fetched above for path derivation
 
@@ -134,11 +132,14 @@ function updateCollectionConfigs(collectionId, projectFolderPath) {
 
 // ── Update all collections for a project ─────────────────────────────────────
 
-function updateProjectCollectionConfigs(projectId) {
+function updateProjectCollectionConfigs(projectId, projectFolderPath) {
+  // When no explicit user workspace path is provided, skip writing to avoid
+  // accidentally writing to the wrong (e.g. admin) workspace.
+  if (!projectFolderPath) return;
   try {
     const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
     for (const col of collections) {
-      updateCollectionConfigs(col.id);
+      updateCollectionConfigs(col.id, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateProjectCollectionConfigs error:', e.message);
