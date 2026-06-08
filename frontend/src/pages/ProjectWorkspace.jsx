@@ -66,6 +66,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
   const [testSuitesModalTrig,   setTestSuitesModalTrig]   = useState(0);
   const [configTab,             setConfigTab]             = useState('environment'); // 'environment' | 'ai' | 'pipeline'
   const [gitDrawerOpen,         setGitDrawerOpen]         = useState(false);
+  const [gitDrawerKey,          setGitDrawerKey]          = useState(0);
   const [drawerWidth,           setDrawerWidth]           = useState(700);
   const isResizing   = useRef(false);
   const resizeStartX = useRef(0);
@@ -347,61 +348,79 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         {/* ── Two-panel row: sidebar card + content card ── */}
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
 
-          {/* Sidebar card — rounded, bordered, sticky */}
-          <div style={{
-            width: 256, flexShrink: 0,
-            background: '#ffffff',
-            borderRadius: 14,
-            border: '1px solid #e2e8f0',
-            overflow: 'hidden',
-            position: 'sticky', top: 16,
-          }}>
-            {/* Workspace */}
-            <div style={{ padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
-              <img src="/favicon.svg" alt="Quarks" style={{ height: 32, width: 32, flexShrink: 0 }} />
-              <div>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 1.3, marginBottom: 1 }}>Workspace</div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{user?.org_name || 'Organization'}</div>
+          {/* Sidebar column — nav card + git tile stacked */}
+          <div style={{ width: 256, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12, position: 'sticky', top: 16 }}>
+
+            {/* Sidebar nav card */}
+            <div style={{
+              background: '#ffffff',
+              borderRadius: 14,
+              border: '1px solid #e2e8f0',
+              overflow: 'hidden',
+            }}>
+              {/* Workspace */}
+              <div style={{ padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <img src="/favicon.svg" alt="Quarks" style={{ height: 32, width: 32, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 1.3, marginBottom: 1 }}>Workspace</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{user?.org_name || 'Organization'}</div>
+                </div>
+              </div>
+              <div style={{ height: 1, background: '#f1f5f9', margin: '0 0 4px' }} />
+
+              {/* Nav items */}
+              <div style={{ padding: '4px 8px 8px' }}>
+                {NAV_ITEMS.filter(item => item.id !== 'reports' || hasJmeterPlan).map(item => {
+                  const active = activePage === item.id;
+                  return (
+                    <button key={item.id} onClick={() => navigate(item.id)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', padding: '9px 10px', marginBottom: 1, border: 'none', borderRadius: 10, cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left', background: active ? '#f0fdf4' : 'transparent', boxShadow: active ? 'inset 3px 0 0 #22c55e' : 'none', transition: 'background .12s' }}
+                      onMouseEnter={e => { if (!active) e.currentTarget.style.background = '#f8fafc'; }}
+                      onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <div style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, fontSize: 15, background: item.bg, color: item.color, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <i className={`ti ${item.icon}`} />
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: active ? 700 : 500, color: active ? '#16a34a' : '#1e293b', lineHeight: 1.3 }}>{item.label}</div>
+                        <div style={{ fontSize: 11, color: '#64748b', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.sub}</div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
-            <div style={{ height: 1, background: '#f1f5f9', margin: '0 0 4px' }} />
 
-            {/* Nav items */}
-            <div style={{ padding: '4px 8px' }}>
-              {NAV_ITEMS.filter(item => item.id !== 'reports' || hasJmeterPlan).map(item => {
-                const active = activePage === item.id;
-                return (
-                  <button key={item.id} onClick={() => navigate(item.id)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', padding: '9px 10px', marginBottom: 1, border: 'none', borderRadius: 10, cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left', background: active ? '#f0fdf4' : 'transparent', boxShadow: active ? 'inset 3px 0 0 #22c55e' : 'none', transition: 'background .12s' }}
-                    onMouseEnter={e => { if (!active) e.currentTarget.style.background = '#f8fafc'; }}
-                    onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
-                  >
-                    <div style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, fontSize: 15, background: item.bg, color: item.color, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <i className={`ti ${item.icon}`} />
-                    </div>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: active ? 700 : 500, color: active ? '#16a34a' : '#1e293b', lineHeight: 1.3 }}>{item.label}</div>
-                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.sub}</div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Git button at bottom of sidebar */}
-            <div style={{ padding: '8px 8px 12px', borderTop: '1px solid #f1f5f9', marginTop: 4 }}>
-              <button onClick={() => setGitDrawerOpen(true)}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '9px 10px', border: 'none', borderRadius: 10, cursor: 'pointer', background: gitDrawerOpen ? '#f0fdf4' : 'transparent', fontFamily: 'inherit', textAlign: 'left', transition: 'background .12s' }}
-                onMouseEnter={e => { if (!gitDrawerOpen) e.currentTarget.style.background = '#f8fafc'; }}
-                onMouseLeave={e => { if (!gitDrawerOpen) e.currentTarget.style.background = 'transparent'; }}
+            {/* Git tile — separate card below the nav */}
+            <div style={{
+              background: gitDrawerOpen ? '#f0fdf4' : '#ffffff',
+              borderRadius: 14,
+              border: `1.5px solid ${gitDrawerOpen ? '#86efac' : '#e2e8f0'}`,
+              overflow: 'hidden',
+              boxShadow: gitDrawerOpen ? '0 0 0 3px rgba(34,197,94,0.12)' : 'none',
+              transition: 'all .15s',
+            }}>
+              <button onClick={() => { setGitDrawerOpen(true); setGitDrawerKey(k => k + 1); }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  width: '100%', padding: '12px 14px',
+                  border: 'none', cursor: 'pointer',
+                  background: 'transparent',
+                  fontFamily: 'inherit', textAlign: 'left',
+                }}
+                onMouseEnter={e => { if (!gitDrawerOpen) { e.currentTarget.closest('div').style.borderColor = '#bbf7d0'; e.currentTarget.closest('div').style.background = '#f0fdf4'; } }}
+                onMouseLeave={e => { if (!gitDrawerOpen) { e.currentTarget.closest('div').style.borderColor = '#e2e8f0'; e.currentTarget.closest('div').style.background = '#ffffff'; } }}
               >
-                <div style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, fontSize: 15, background: '#f0fdf4', color: '#16a34a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, fontSize: 15, background: gitDrawerOpen ? '#dcfce7' : '#f0fdf4', color: '#16a34a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <i className="ti ti-git-branch" />
                 </div>
                 <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#1e293b', lineHeight: 1.3 }}>Git</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: gitDrawerOpen ? '#15803d' : '#1e293b', lineHeight: 1.3 }}>Git</div>
                   <div style={{ fontSize: 11, color: '#64748b', marginTop: 1 }}>Changes, commits & PRs</div>
                 </div>
+                {gitDrawerOpen && (
+                  <div style={{ marginLeft: 'auto', width: 8, height: 8, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }}/>
+                )}
               </button>
             </div>
 
@@ -442,7 +461,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
 
                 {/* GitPanel inside drawer — workflow tabs only */}
                 <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-                  <GitPanel project={project} user={user} workflowOnly={true} drawerWidth={drawerWidth} />
+                  <GitPanel key={gitDrawerKey} project={project} user={user} workflowOnly={true} drawerWidth={drawerWidth} />
                 </div>
 
                 {/* ── Resize handle — drag right edge to resize ── */}

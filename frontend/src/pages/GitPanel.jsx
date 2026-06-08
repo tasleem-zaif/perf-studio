@@ -102,7 +102,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
   const termInputRef = useRef(null);
 
   // ── Tab ──────────────────────────────────────────────────────────────────
-  const [tab, setTab] = useState('setup');
+  const [tab, setTab] = useState(workflowOnly ? 'changes' : 'setup');
 
   // ── Repo config ───────────────────────────────────────────────────────────
   const [cfg,         setCfg]         = useState(null);
@@ -517,7 +517,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   return (
     <>
-    <div className="page fade-in">
+    <div className="page fade-in" style={{ paddingTop: workflowOnly || setupOnly ? 18 : undefined }}>
 
       {/* ── Status bar ────────────────────────────────────────────────────── */}
       {initialized && (
@@ -541,29 +541,26 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                 <i className="ti ti-git-pull-request" style={{ fontSize:10 }}/>{openPrs} PR{openPrs>1?'s':''}
               </span>
             )}
-            <button onClick={loadAll} style={{ marginLeft:'auto',background:'none',border:'none',cursor:'pointer',color:'#64748b',fontSize:12,display:'flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:6 }}
-              onMouseEnter={e=>e.currentTarget.style.background='#f1f5f9'}
-              onMouseLeave={e=>e.currentTarget.style.background='none'}>
-              <i className="ti ti-refresh" style={{ fontSize:13 }}/> Refresh
+            <button className="btn-primary btn-sm" onClick={e => {
+                const icon = e.currentTarget.querySelector('i');
+                if (icon) {
+                  icon.style.transition = 'transform 0.6s ease';
+                  icon.style.transform = 'rotate(360deg)';
+                  setTimeout(() => { icon.style.transition = 'none'; icon.style.transform = 'rotate(0deg)'; }, 650);
+                }
+                loadAll();
+              }} style={{ marginLeft:'auto' }}>
+              <i className="ti ti-refresh"/> Refresh
             </button>
           </div>
-          {/* Row 2 — files changed + additions + deletions */}
+          {/* Row 2 — files changed */}
           <div style={{ display:'flex', alignItems:'center', gap:16, padding:'8px 14px' }}>
             {statusFiles.length > 0 ? (
-              <>
-                <span style={{ display:'flex',alignItems:'center',gap:5,fontSize:12,color:'#374151' }}>
-                  <i className="ti ti-files" style={{ fontSize:13,color:'#64748b' }}/>
-                  <strong style={{ color:'#0f172a' }}>{statusFiles.length}</strong>
-                  <span style={{ color:'#64748b' }}>changed file{statusFiles.length!==1?'s':''}</span>
-                </span>
-                <span style={{ color:'#e2e8f0' }}>|</span>
-                <span style={{ display:'flex',alignItems:'center',gap:4,fontSize:12,fontWeight:700,color:'#16a34a' }}>
-                  <span style={{ fontSize:14,lineHeight:1 }}>+</span>{status?.additions ?? 0} additions
-                </span>
-                <span style={{ display:'flex',alignItems:'center',gap:4,fontSize:12,fontWeight:700,color:'#dc2626' }}>
-                  <span style={{ fontSize:14,lineHeight:1 }}>−</span>{status?.deletions ?? 0} deletions
-                </span>
-              </>
+              <span style={{ display:'flex',alignItems:'center',gap:5,fontSize:12,color:'#374151' }}>
+                <i className="ti ti-files" style={{ fontSize:13,color:'#64748b' }}/>
+                <strong style={{ color:'#0f172a' }}>{statusFiles.length}</strong>
+                <span style={{ color:'#64748b' }}>changed file{statusFiles.length!==1?'s':''}</span>
+              </span>
             ) : (
               <span style={{ display:'flex',alignItems:'center',gap:6,fontSize:12,color:'#16a34a' }}>
                 <i className="ti ti-circle-check" style={{ fontSize:14 }}/> Working tree clean
