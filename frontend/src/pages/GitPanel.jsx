@@ -1016,120 +1016,181 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
         WINDOW 2 — Diff viewer panel (portal, renders to the right of the drawer)
     ══════════════════════════════════════════════════════════════════════ */}
     {diffFile && createPortal(
-      <div style={{
-        position: 'fixed', top: 0, left: 700, right: 0, bottom: 0,
-        zIndex: 52, background: '#fff',
-        display: 'flex', flexDirection: 'column',
-        boxShadow: 'inset 1px 0 0 #e2e8f0',
-        animation: 'slideInRight .18s ease',
-      }}>
-        {/* Header */}
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          padding: '0 16px', height: 56, flexShrink: 0,
-          borderBottom: '1px solid #e2e8f0', background: '#fff',
-        }}>
-          {/* Status badge */}
-          {(() => {
-            const ft = FILE_TYPE[statusFiles.find(f => f.path === diffFile)?.type] || FILE_TYPE['?'];
-            return (
-              <span style={{ width: 22, height: 22, borderRadius: 5, background: ft.bg, color: ft.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 }} title={ft.title}>{ft.label}</span>
-            );
-          })()}
-          {/* Filename */}
-          <span style={{ flex: 1, minWidth: 0, fontFamily: 'monospace', fontSize: 13, fontWeight: 600, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={diffFile}>
-            {diffFile}
-          </span>
-          {/* Type label */}
-          {(() => {
-            const fileType = statusFiles.find(f => f.path === diffFile)?.type;
-            const label = fileType === '?' ? 'untracked' : fileType === 'M' ? 'modified' : fileType === 'A' ? 'added' : fileType === 'D' ? 'deleted' : 'changed';
-            const colors = { untracked: ['#ede9fe','#7c3aed'], modified: ['#fef3c7','#b45309'], added: ['#dcfce7','#16a34a'], deleted: ['#fee2e2','#dc2626'], changed: ['#dbeafe','#1d4ed8'] };
-            const [bg, color] = colors[label] || colors.changed;
-            return <span style={{ padding: '3px 10px', borderRadius: 20, fontSize: 11, fontWeight: 700, background: bg, color, flexShrink: 0 }}>{label}</span>;
-          })()}
-          {/* Close */}
-          <button onClick={() => { setDiffFile(null); setDiffContent(''); }}
-            style={{ width: 28, height: 28, border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', flexShrink: 0 }}>
-            <i className="ti ti-x" style={{ fontSize: 14 }}/>
-          </button>
-        </div>
+      (() => {
+        const fileInfo = statusFiles.find(f => f.path === diffFile);
+        const ft = FILE_TYPE[fileInfo?.type] || FILE_TYPE['?'];
+        const typeLabel = fileInfo?.type === '?' ? 'untracked'
+          : fileInfo?.type === 'M' ? 'modified'
+          : fileInfo?.type === 'A' ? 'added'
+          : fileInfo?.type === 'D' ? 'deleted' : 'changed';
+        const typePill = {
+          untracked: { bg: '#1f2328', color: '#e6edf3' },
+          modified:  { bg: '#9e6a03', color: '#fff' },
+          added:     { bg: '#1a7f37', color: '#fff' },
+          deleted:   { bg: '#cf222e', color: '#fff' },
+          changed:   { bg: '#0969da', color: '#fff' },
+        }[typeLabel] || { bg: '#1f2328', color: '#e6edf3' };
 
-        {/* New-file notice */}
-        {isNewFile && (
-          <div style={{ padding: '9px 16px', background: '#f0fdf4', borderBottom: '1px solid #bbf7d0', fontSize: 12, color: '#15803d', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <i className="ti ti-file-plus" style={{ fontSize: 14 }}/>
-            New File — Entire content shown as additions (No previous version in git history)
+        return (
+          <div style={{
+            position: 'fixed', top: 0, left: 700, right: 0, bottom: 0,
+            zIndex: 52, background: '#ffffff',
+            display: 'flex', flexDirection: 'column',
+            borderLeft: '1px solid #d1d9e0',
+            animation: 'slideInRight .15s ease',
+            fontFamily: 'inherit',
+          }}>
+
+            {/* ── Header ── */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 10,
+              padding: '0 14px', height: 52, flexShrink: 0,
+              borderBottom: '1px solid #d1d9e0', background: '#f6f8fa',
+            }}>
+              {/* Status badge */}
+              <span style={{
+                width: 20, height: 20, borderRadius: 4,
+                background: ft.bg, color: ft.color,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 10, fontWeight: 700, flexShrink: 0,
+              }}>{ft.label}</span>
+
+              {/* Filename */}
+              <span style={{
+                flex: 1, minWidth: 0,
+                fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+                fontSize: 13, fontWeight: 600, color: '#1f2328',
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }} title={diffFile}>{diffFile}</span>
+
+              {/* Type pill */}
+              <span style={{
+                padding: '2px 9px', borderRadius: 20,
+                fontSize: 11, fontWeight: 600, flexShrink: 0,
+                background: typePill.bg, color: typePill.color,
+              }}>{typeLabel}</span>
+
+              {/* Close */}
+              <button onClick={() => { setDiffFile(null); setDiffContent(''); setIsNewFile(false); }}
+                style={{
+                  width: 26, height: 26, border: 'none', borderRadius: 6,
+                  background: 'transparent', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: '#57606a', flexShrink: 0,
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = '#eaeef2'}
+                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <i className="ti ti-x" style={{ fontSize: 15 }}/>
+              </button>
+            </div>
+
+            {/* ── New-file notice ── */}
+            {isNewFile && (
+              <div style={{
+                padding: '7px 14px', flexShrink: 0,
+                background: '#dafbe1', borderBottom: '1px solid #aceebb',
+                fontSize: 12, color: '#116329',
+                display: 'flex', alignItems: 'center', gap: 6,
+              }}>
+                <i className="ti ti-info-circle" style={{ fontSize: 13, flexShrink: 0 }}/>
+                New file — entire content shown as additions (no previous version in git history)
+              </div>
+            )}
+
+            {/* ── Diff / Content body ── */}
+            <div style={{ flex: 1, overflowY: 'auto', background: '#ffffff' }}>
+              {loadingDiff ? (
+                <div style={{ padding: '32px 20px', display: 'flex', alignItems: 'center', gap: 8, color: '#57606a', fontSize: 13 }}>
+                  <span className="spinner"/> Loading…
+                </div>
+              ) : diffContent ? (
+                <table style={{
+                  width: '100%', borderCollapse: 'collapse',
+                  fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+                  fontSize: 12, lineHeight: '20px',
+                }}>
+                  <tbody>
+                    {(() => {
+                      let lineNum = -1; // will start at 0 for first displayed line
+                      return (diffContent || '').split('\n').map((line, i) => {
+                        const isAdd  = line.startsWith('+') && !line.startsWith('+++');
+                        const isDel  = line.startsWith('-') && !line.startsWith('---');
+                        const isHunk = line.startsWith('@@');
+                        const isMeta = line.startsWith('diff --git') || line.startsWith('new file') ||
+                                       line.startsWith('deleted file') || line.startsWith('old mode') ||
+                                       line.startsWith('new mode') || line.startsWith('index ') ||
+                                       line.startsWith('--- ') || line.startsWith('+++ ');
+
+                        // Skip meta header lines entirely
+                        if (isMeta) return null;
+
+                        // Hunk separator — hidden for new files (entire file is one hunk), shown for modified
+                        if (isHunk) {
+                          if (isNewFile) return null; // suppress for cleaner new-file view
+                          return (
+                            <tr key={i} style={{ background: '#ddf4ff' }}>
+                              <td style={{ width: 44, padding: '2px 12px 2px 10px', color: '#57606a', textAlign: 'right', userSelect: 'none', borderRight: '1px solid #d1d9e0', fontSize: 11 }}/>
+                              <td style={{ width: 26, padding: '2px 6px', color: '#57606a', userSelect: 'none' }}/>
+                              <td style={{ padding: '2px 10px', color: '#0550ae', fontSize: 11, whiteSpace: 'pre' }}>{line}</td>
+                            </tr>
+                          );
+                        }
+
+                        // Normal content line — count up from 0
+                        lineNum++;
+
+                        const bg   = isAdd ? '#e6ffec' : isDel ? '#ffebe9' : '#ffffff';
+                        const color = isAdd ? '#1a7f37' : isDel ? '#cf222e' : '#1f2328';
+                        const sign  = isAdd ? '+' : isDel ? '-' : ' ';
+                        const text  = (isAdd || isDel) ? line.slice(1) : line;
+
+                        return (
+                          <tr key={i} style={{ background: bg }}>
+                            {/* Line number */}
+                            <td style={{
+                              width: 44, padding: '0 10px 0 10px',
+                              color: '#6e7781', textAlign: 'right',
+                              userSelect: 'none', fontSize: 11, lineHeight: '20px',
+                              borderRight: '1px solid #d1d9e0',
+                              fontVariantNumeric: 'tabular-nums',
+                              background: isAdd ? '#ccffd8' : isDel ? '#ffd7d5' : '#f6f8fa',
+                              whiteSpace: 'nowrap',
+                            }}>
+                              {lineNum}
+                            </td>
+                            {/* +/- sign */}
+                            <td style={{
+                              width: 26, padding: '0 6px',
+                              color: isAdd ? '#1a7f37' : isDel ? '#cf222e' : '#6e7781',
+                              fontWeight: 700, lineHeight: '20px',
+                              userSelect: 'none', textAlign: 'center',
+                              background: isAdd ? '#ccffd8' : isDel ? '#ffd7d5' : '#f6f8fa',
+                            }}>
+                              {sign}
+                            </td>
+                            {/* Code content */}
+                            <td style={{
+                              padding: '0 10px', color,
+                              whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                              lineHeight: '20px',
+                            }}>{text || ' '}</td>
+                          </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </table>
+              ) : (
+                <div style={{ padding: '48px 24px', textAlign: 'center', color: '#57606a', fontSize: 13 }}>
+                  <i className="ti ti-file-diff" style={{ fontSize: 40, display: 'block', marginBottom: 12, color: '#d1d9e0' }}/>
+                  No content available for this file
+                </div>
+              )}
+            </div>
+
           </div>
-        )}
-
-        {/* Diff body */}
-        <div style={{ flex: 1, overflowY: 'auto', background: '#0d1117' }}>
-          {loadingDiff ? (
-            <div style={{ padding: '32px 24px', color: '#4ade80', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span className="spinner" style={{ borderTopColor: '#4ade80' }}/> Loading…
-            </div>
-          ) : diffContent ? (
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: '"Fira Mono", "Cascadia Code", Consolas, monospace', fontSize: 12 }}>
-              <tbody>
-                {(() => {
-                  let lineNum = 0;
-                  // Parse all diff lines; skip pure meta header lines for new-file view
-                  const allLines = (diffContent || '').split('\n');
-                  return allLines.map((line, i) => {
-                    const isAdd  = line.startsWith('+') && !line.startsWith('+++');
-                    const isDel  = line.startsWith('-') && !line.startsWith('---');
-                    const isHunk = line.startsWith('@@');
-                    const isMeta = line.startsWith('diff --git') || line.startsWith('new file') ||
-                                   line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ');
-
-                    // Hide meta header lines — they clutter the content view
-                    if (isMeta) return null;
-
-                    if (!isDel && !isHunk) lineNum++;
-
-                    // Hunk header row (@@ ... @@) — render as a separator bar
-                    if (isHunk) {
-                      return (
-                        <tr key={i} style={{ background: 'rgba(88,166,255,0.08)' }}>
-                          <td style={{ width: 52, borderRight: '1px solid #21262d', userSelect: 'none' }}/>
-                          <td style={{ width: 20 }}/>
-                          <td style={{ padding: '2px 16px 2px 4px', color: '#79c0ff', fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre' }}>{line}</td>
-                        </tr>
-                      );
-                    }
-
-                    const bg    = isAdd ? 'rgba(63,185,80,0.15)' : isDel ? 'rgba(248,81,73,0.15)' : 'transparent';
-                    const color = isAdd ? '#3fb950' : isDel ? '#f85149' : '#e6edf3';
-                    const sign  = isAdd ? '+' : isDel ? '-' : '';
-                    const text  = (isAdd || isDel) ? line.slice(1) : line;
-
-                    return (
-                      <tr key={i} style={{ background: bg }}>
-                        {/* Line number */}
-                        <td style={{ width: 52, paddingRight: 12, paddingLeft: 16, color: '#484f58', textAlign: 'right', userSelect: 'none', fontSize: 11, lineHeight: '20px', borderRight: '1px solid #21262d', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-                          {lineNum}
-                        </td>
-                        {/* +/- sign */}
-                        <td style={{ width: 20, paddingLeft: 10, paddingRight: 4, color: isAdd ? '#3fb950' : isDel ? '#f85149' : 'transparent', fontWeight: 700, lineHeight: '20px', userSelect: 'none', fontSize: 13, flexShrink: 0 }}>
-                          {sign}
-                        </td>
-                        {/* Code */}
-                        <td style={{ padding: '0 16px 0 4px', color, whiteSpace: 'pre-wrap', wordBreak: 'break-all', lineHeight: '20px' }}>{text}</td>
-                      </tr>
-                    );
-                  });
-                })()}
-              </tbody>
-            </table>
-          ) : (
-            <div style={{ padding: '40px 24px', textAlign: 'center', color: '#484f58', fontSize: 13 }}>
-              <i className="ti ti-file-diff" style={{ fontSize: 36, display: 'block', marginBottom: 10, color: '#30363d' }}/>
-              No content available for this file
-            </div>
-          )}
-        </div>
-      </div>,
+        );
+      })(),
       document.body
     )}
     </>

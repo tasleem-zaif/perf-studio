@@ -1155,13 +1155,13 @@ router.get('/diff', async (req, res) => {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
 
-    // Try to get a real git diff first (works for tracked/staged files)
     let diff = '';
     let isNewFile = false;
     try {
-      diff = await git.diff(['HEAD', '--', filePath]);
-      if (!diff) diff = await git.diff(['--cached', '--', filePath]);
-      if (!diff) diff = await git.diff(['--', filePath]);
+      // Use -U999999 to get the ENTIRE file content as context (not just changed hunks)
+      diff = await git.diff(['HEAD', '-U999999', '--', filePath]);
+      if (!diff) diff = await git.diff(['--cached', '-U999999', '--', filePath]);
+      if (!diff) diff = await git.diff(['-U999999', '--', filePath]);
     } catch {}
 
     // If diff is still empty the file is untracked — read full content and
@@ -1172,13 +1172,13 @@ router.get('/diff', async (req, res) => {
         isNewFile = true;
         const content = fs.readFileSync(absPath, 'utf8');
         const lines = content.split('\n');
-        // Build a pseudo-diff header + all lines as additions
+        // Build pseudo-diff: all lines as additions (0-based line numbers in hunk)
         const header = [
           `diff --git a/${filePath} b/${filePath}`,
           `new file mode 100644`,
           `--- /dev/null`,
           `+++ b/${filePath}`,
-          `@@ -0,0 +1,${lines.length} @@`,
+          `@@ -0,0 +0,${lines.length} @@`,
         ].join('\n');
         diff = header + '\n' + lines.map(l => '+' + l).join('\n');
       }
