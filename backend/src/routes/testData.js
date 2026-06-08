@@ -126,6 +126,50 @@ router.post('/', upload.single('csv'), (req, res) => {
     const colId   = req.query.collection_id || req.body?.collection_id || null;
     const envName = req.query.env || req.body?.env || '';
 
+    // "All environments" — copy file to every env folder of the collection
+    if (colId && !envName) {
+      const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+      if (col) {
+        let allEnvs = [];
+        try { allEnvs = JSON.parse(col.environments || '[]'); } catch {}
+        if (!allEnvs.length && col.environment) allEnvs = [col.environment];
+        if (!allEnvs.length) allEnvs = ['Default'];
+
+        const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+        const callerUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+        const userProjPath = getUserProjectPath(req.userId, callerUser?.role, proj.name);
+
+        let lastFileId = null;
+        for (const ev of allEnvs) {
+          // Determine the CORRECT path for THIS env's testData folder
+          let evFilePath = req.file.path; // fallback
+          if (userProjPath) {
+            const envPath = getCollectionPath(userProjPath, col.name, ev);
+            const destFolder = path.join(envPath, 'testData');
+            require('fs').mkdirSync(destFolder, { recursive: true });
+            const destFile = path.join(destFolder, req.file.filename);
+            require('fs').copyFileSync(req.file.path, destFile);
+            evFilePath = destFile; // store THE ACTUAL path for this env
+          }
+          // Save a DB record per env with CORRECT path
+          const evExisting = db.prepare(
+            "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ?"
+          ).get(req.params.projectId, req.file.originalname, ev, colId);
+          if (evExisting) {
+            db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?')
+              .run(req.file.filename, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id);
+            lastFileId = evExisting.id;
+          } else {
+            const r = db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .run(req.params.projectId, colId, ev, req.file.filename, req.file.originalname, evFilePath, JSON.stringify(headers));
+            lastFileId = r.lastInsertRowid;
+          }
+        }
+        return res.json({ file: db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(lastFileId), copied_to_envs: allEnvs });
+      }
+    }
+
+    // Single environment upload
     if (existing) {
       db.prepare(
         'UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?'
@@ -178,10 +222,14 @@ router.put('/:id/content', (req, res) => {
 });
 
 router.delete('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const proj = ownsProject(req.userId, req.params.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!file) return res.status(404).json({ error: 'Not found' });
-  try { unlinkSync(file.path); } catch (_) { /* file may already be gone */ }
+
+  // Delete the actual file — path is now always the correct env-specific location
+  try { unlinkSync(file.path); } catch (_) { /* already gone */ }
+
   db.prepare('DELETE FROM test_data_files WHERE id = ?').run(req.params.id);
   resetSequence('test_data_files');
   res.json({ ok: true });

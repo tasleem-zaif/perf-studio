@@ -1178,10 +1178,36 @@ router.post('/discard', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
+
     for (const p of paths) {
-      try { await git.checkout(['--', p]); } catch {}
-      try { await git.clean(['-fd', '--', p]); } catch {}
+      const absPath = path.join(gitDir, p);
+      // Check if file is tracked (committed) or untracked (new)
+      let isTracked = false;
+      try {
+        await git.raw(['ls-files', '--error-unmatch', p]);
+        isTracked = true;
+      } catch {}
+
+      if (isTracked) {
+        // Tracked file: restore to last committed state
+        try { await git.checkout(['--', p]); } catch {}
+      } else {
+        // Untracked file: delete directly from disk (git clean unreliable for nested dirs)
+        try {
+          if (fs.existsSync(absPath)) {
+            const stat = fs.statSync(absPath);
+            if (stat.isDirectory()) {
+              fs.rmSync(absPath, { recursive: true, force: true });
+            } else {
+              fs.unlinkSync(absPath);
+            }
+          }
+        } catch (delErr) {
+          console.warn('[Git] Discard delete failed:', delErr.message);
+        }
+      }
     }
+
     res.json({ ok: true, message: `Discarded changes in ${paths.length} file(s)` });
   } catch (e) {
     res.status(500).json({ error: e.message });

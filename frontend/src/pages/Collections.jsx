@@ -108,9 +108,41 @@ export default function Collections({ project, collection: activeCollection, onN
   }
 
   async function del(id) {
-    const col = p?.collections?.find(c => c.id === id);
+    const col = ownCollections?.find(c => c.id === id) || p?.collections?.find(c => c.id === id);
+    let envList = [];
+    try { envList = JSON.parse(col?.environments || '[]'); } catch {}
+    if (!envList.length && col?.environment) envList = [col.environment];
+
+    const envText = envList.length
+      ? `Environments: ${envList.join(', ')}`
+      : 'No environments configured';
+
     const ok = await confirm(
-      `Delete "${col?.name || 'this collection'}" and all its endpoints? This cannot be undone.`,
+      <div>
+        <div style={{ marginBottom: 12 }}>
+          Are you sure you want to delete <strong>"{col?.name}"</strong>?
+        </div>
+        <div style={{ background: 'rgba(247,84,100,0.07)', border: '1px solid rgba(247,84,100,0.2)', borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
+          <div style={{ fontWeight: 600, color: '#dc2626', marginBottom: 6, fontSize: 13 }}>
+            <i className="ti ti-alert-triangle" style={{ marginRight: 6 }} />The following will be permanently deleted:
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: '#475569', lineHeight: 1.8 }}>
+            <li>All API endpoints in this collection</li>
+            <li>Folder structure from your local git workspace</li>
+            <li>Test data files (CSV/XLSX) in all environment folders</li>
+            <li>Generated test scripts (.jmx / .js)</li>
+            <li>Environment config files (config.json)</li>
+          </ul>
+        </div>
+        {envList.length > 0 && (
+          <div style={{ fontSize: 12, color: '#64748b' }}>
+            <strong>Affected environments:</strong> {envList.join(', ')}
+          </div>
+        )}
+        <div style={{ marginTop: 10, fontSize: 12, fontWeight: 600, color: '#dc2626' }}>
+          This action cannot be undone.
+        </div>
+      </div>,
       'Delete Collection'
     );
     if (!ok) return;

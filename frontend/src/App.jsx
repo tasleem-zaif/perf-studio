@@ -526,14 +526,14 @@ function AppInner() {
     <div>
       {/* Banner */}
       <div className="app-banner">
-        {/* Left: Quarks logo + subtitle */}
-        <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+        {/* Left: Quarks logo + subtitle — left aligned */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <img
             src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
             alt="QTSolv"
-            style={{ height: '28px', width: 'auto', objectFit: 'contain' }}
+            style={{ height: '30px', width: 'auto', objectFit: 'contain', flexShrink: 0 }}
           />
-          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 500, letterSpacing: '.3px' }}>
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', fontWeight: 500, letterSpacing: '.3px' }}>
             AI-Powered Performance Test Studio
           </span>
         </div>

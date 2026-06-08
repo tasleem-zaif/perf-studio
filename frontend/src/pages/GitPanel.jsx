@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 
@@ -94,7 +94,7 @@ function parseStatusFiles(status) {
   return files;
 }
 
-export default function GitPanel({ project, user }) {
+export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false }) {
   const { toast } = useToast();
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
   const pid = project?.id;
@@ -118,6 +118,8 @@ export default function GitPanel({ project, user }) {
   const [savingId,       setSavingId]       = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [autoIniting,    setAutoIniting]    = useState(false);
+  const [testingId,      setTestingId]      = useState(false);
+  const [testIdResult,   setTestIdResult]   = useState(null); // { ok, message, preview }
 
   // ── Git state ─────────────────────────────────────────────────────────────
   const [status,   setStatus]   = useState(null);
@@ -243,6 +245,24 @@ export default function GitPanel({ project, user }) {
     } finally { setIniting(false); }
   }
 
+  // ── Test connection using user's personal PAT ─────────────────────────────
+  async function testIdentityConnection() {
+    // Save identity first if token field has a new value
+    if (idForm.auth_token) {
+      setSavingId(true);
+      try { await api.put(`/projects/${pid}/git/identity`, idForm); } catch {}
+      finally { setSavingId(false); }
+    }
+    setTestingId(true);
+    setTestIdResult(null);
+    try {
+      const { data } = await api.post(`/projects/${pid}/git/test`);
+      setTestIdResult({ ok: true, message: data.message, preview: data.token_preview });
+    } catch (err) {
+      setTestIdResult({ ok: false, message: err.response?.data?.error || 'Connection failed' });
+    } finally { setTestingId(false); }
+  }
+
   // ── Save identity (with auto-init) ────────────────────────────────────────
   async function saveIdentity(e) {
     e.preventDefault();
@@ -292,8 +312,8 @@ export default function GitPanel({ project, user }) {
     setLoadingDiff(true);
     try {
       const { data } = await api.get(`/projects/${pid}/git/diff?path=${encodeURIComponent(filePath)}`);
-      setDiffContent(data.diff || '(no diff available)');
-    } catch { setDiffContent('Failed to load diff'); }
+      setDiffContent(data.diff || '');
+    } catch { setDiffContent(''); }
     finally { setLoadingDiff(false); }
   }
 
@@ -466,13 +486,23 @@ export default function GitPanel({ project, user }) {
   }
 
   // ── Tabs ──────────────────────────────────────────────────────────────────
-  const tabs = [
-    { id: 'setup',    label: 'Setup',         icon: 'ti-settings-2' },
-    { id: 'changes',  label: 'Changes',       icon: 'ti-git-commit',       show: initialized, badge: statusFiles.length || null },
-    { id: 'prs',      label: 'Pull Requests', icon: 'ti-git-pull-request', badge: openPrs || null },
-    { id: 'history',  label: 'History',       icon: 'ti-history',          show: initialized },
-    { id: 'terminal', label: 'Terminal',       icon: 'ti-terminal-2',       show: initialized },
-  ].filter(t => t.show !== false);
+  // workflowOnly = sidebar Git section (Changes, PRs, History, Terminal)
+  // setupOnly    = Configuration > Git (Setup only — reserved for future use)
+  const allTabs = [
+    { id: 'setup',    label: 'Setup',         icon: 'ti-settings-2',       show: !workflowOnly },
+    { id: 'changes',  label: 'Changes',       icon: 'ti-git-commit',       show: !setupOnly && initialized, badge: statusFiles.length || null },
+    { id: 'prs',      label: 'Pull Requests', icon: 'ti-git-pull-request', show: !setupOnly, badge: openPrs || null },
+    { id: 'history',  label: 'History',       icon: 'ti-history',          show: !setupOnly && initialized },
+    { id: 'terminal', label: 'Terminal',       icon: 'ti-terminal-2',       show: !setupOnly && initialized },
+  ];
+  const tabs = allTabs.filter(t => t.show !== false && t.show !== undefined ? true : t.show === undefined);
+
+  // Auto-switch to first visible tab if current tab is hidden
+  useEffect(() => {
+    if (tabs.length && !tabs.find(t => t.id === tab)) {
+      setTab(tabs[0].id);
+    }
+  }, [workflowOnly, setupOnly, initialized]);
 
   const closeBtn = (fn) => (
     <button onClick={fn} style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
@@ -638,15 +668,49 @@ export default function GitPanel({ project, user }) {
                   <input type="email" value={idForm.author_email} onChange={e => setIdForm(f => ({ ...f, author_email: e.target.value }))} placeholder="jane@yourorg.com" />
                 </Field>
               </div>
-              <Field label="Personal access token" required hint="Used to push and create PRs. Never shared with other users.">
-                <input type="password" value={idForm.auth_token} onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
-                  placeholder={identity?.auth_token ? `••••••••  (saved${cfg?.token_preview ? ' — ' + cfg.token_preview : ''})` : 'ghp_…'} />
+              <Field label="Personal access token" required hint="GitHub PAT starting with ghp_ or github_pat_ — never your login password.">
+                <input
+                  type="text"
+                  value={idForm.auth_token}
+                  onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
+                  placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : 'ghp_xxxxxxxxxxxxxxxxxxxx'}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
+                />
+                {idForm.auth_token && !idForm.auth_token.startsWith('ghp_') && !idForm.auth_token.startsWith('github_pat_') && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
+                    This doesn't look like a GitHub PAT. It should start with <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>ghp_</code> or <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>github_pat_</code>
+                  </div>
+                )}
               </Field>
-              <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
-                {(savingId || autoIniting) && <span className="spinner"/>}
-                <i className="ti ti-device-floppy"/>
-                {savingId ? ' Saving…' : autoIniting ? ' Setting up branch…' : ' Save Settings'}
-              </button>
+              <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
+                  {(savingId || autoIniting) && <span className="spinner"/>}
+                  <i className="ti ti-device-floppy"/>
+                  {savingId ? ' Saving…' : autoIniting ? ' Setting up branch…' : ' Save Settings'}
+                </button>
+                <button type="button" className="btn-secondary" onClick={testIdentityConnection} disabled={testingId}>
+                  {testingId ? <><span className="spinner"/>Testing…</> : <><i className="ti ti-wifi"/>Test Connection</>}
+                </button>
+              </div>
+
+              {/* Test connection result */}
+              {testIdResult && (
+                <div style={{ marginTop:10, padding:'10px 14px', borderRadius:8, background: testIdResult.ok ? '#f0fdf4' : '#fef2f2', border:`1px solid ${testIdResult.ok ? '#bbf7d0' : '#fecaca'}`, display:'flex', alignItems:'flex-start', gap:8 }}>
+                  <i className={`ti ${testIdResult.ok ? 'ti-circle-check' : 'ti-circle-x'}`} style={{ color: testIdResult.ok ? '#16a34a' : '#dc2626', fontSize:16, flexShrink:0, marginTop:1 }}/>
+                  <div>
+                    <div style={{ fontSize:13, fontWeight:600, color: testIdResult.ok ? '#15803d' : '#b91c1c' }}>
+                      {testIdResult.ok ? 'Connection successful!' : 'Connection failed'}
+                    </div>
+                    <div style={{ fontSize:12, color:'#475569', marginTop:2 }}>
+                      {testIdResult.message}
+                      {testIdResult.ok && testIdResult.preview && <span style={{ marginLeft:8, fontFamily:'monospace', color:'#64748b' }}>Token: {testIdResult.preview}</span>}
+                    </div>
+                  </div>
+                </div>
+              )}
             </form>
           </Section>
 
@@ -682,15 +746,13 @@ export default function GitPanel({ project, user }) {
           </div>
 
           <Section title="Changed Files" subtitle={`${statusFiles.length} file${statusFiles.length!==1?'s':''} · Branch: ${currentBranch}`}
-            extra={
-              selectedFiles.size > 0 ? (
-                <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
-                  style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
-                  onMouseEnter={e=>e.currentTarget.style.opacity='.85'} onMouseLeave={e=>e.currentTarget.style.opacity='1'}>
-                  {discarding?<span className="spinner"/>:<i className="ti ti-trash"/>} Discard {selectedFiles.size} file{selectedFiles.size!==1?'s':''}
-                </button>
-              ) : null
-            }
+            extra={selectedFiles.size > 0 ? (
+              <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
+                style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
+                onMouseEnter={e=>e.currentTarget.style.opacity='.85'} onMouseLeave={e=>e.currentTarget.style.opacity='1'}>
+                {discarding?<span className="spinner"/>:<i className="ti ti-trash"/>} Discard {selectedFiles.size} file{selectedFiles.size!==1?'s':''}
+              </button>
+            ) : null}
           >
             {statusFiles.length === 0 ? (
               <div style={{ textAlign:'center',padding:'24px',color:'#94a3b8',fontSize:13 }}>
@@ -699,73 +761,50 @@ export default function GitPanel({ project, user }) {
               </div>
             ) : (
               <>
-                {/* Select all */}
-                <table style={{ width:'100%', borderCollapse:'collapse', marginBottom:4 }}>
-                  <tbody>
-                    <tr style={{ borderBottom:'1px solid #f1f5f9' }}>
-                      <td style={{ width:28, padding:'6px 8px' }}>
-                        <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer' }}/>
-                      </td>
-                      <td colSpan={3} style={{ padding:'6px 8px', fontSize:12, color:'#64748b' }}>
-                        Select all ({statusFiles.length})
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-                <table style={{ width:'100%', borderCollapse:'collapse' }}>
-                  <tbody>
+                <div style={{ display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderBottom:'1px solid #f1f5f9',marginBottom:4,width:'100%',boxSizing:'border-box' }}>
+                  <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer',flexShrink:0 }}/>
+                  <span style={{ fontSize:12,color:'#64748b',flex:1 }}>Select all ({statusFiles.length})</span>
+                </div>
                 {statusFiles.map((f, i) => {
                   const ft = FILE_TYPE[f.type] || FILE_TYPE['?'];
                   const isSelected = selectedFiles.has(f.path);
                   const isActive = diffFile === f.path;
-                  return <React.Fragment key={i}>
-                    <tr style={{ background: isActive ? '#f0fdf4' : 'transparent' }}
-                      onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
-                      onMouseLeave={e=>{ e.currentTarget.style.background=isActive?'#f0fdf4':'transparent'; }}>
-                      <td style={{ width:28, padding:'6px 8px', verticalAlign:'middle' }}>
-                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer' }}/>
-                      </td>
-                      <td style={{ width:24, padding:'6px 4px', verticalAlign:'middle' }}>
-                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'inline-flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700 }} title={ft.title}>{ft.label}</span>
-                      </td>
-                      <td style={{ padding:'6px 8px', verticalAlign:'middle', maxWidth:0 }}>
-                        <span style={{ fontFamily:'monospace',fontSize:12,color:'#374151',display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor:'pointer' }} onClick={() => viewDiff(f.path)} title={f.path}>{f.path}</span>
-                      </td>
-                      <td style={{ width:160, padding:'6px 8px', verticalAlign:'middle', whiteSpace:'nowrap' }}>
-                        <div style={{ display:'inline-flex', gap:4 }}>
+                  return (
+                    <div key={i}>
+                      <div style={{ display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:6,background:isActive?'#f0fdf4':'transparent',cursor:'pointer' }}
+                        onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
+                        onMouseLeave={e=>{ if(!isActive) e.currentTarget.style.background='transparent'; }}>
+                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer',flexShrink:0 }}/>
+                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700,flexShrink:0 }} title={ft.title}>{ft.label}</span>
+                        <span style={{ flex:1,fontFamily:'monospace',fontSize:12,color:'#374151',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }} onClick={() => viewDiff(f.path)} title={f.path}>{f.path}</span>
+                        <div style={{ display:'flex',gap:4,flexShrink:0 }}>
                           <button onClick={() => viewDiff(f.path)} style={{ background:'none',border:'1px solid #e2e8f0',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#64748b' }}>
                             {isActive ? 'Hide' : 'Diff'}
                           </button>
-                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }} title="Discard">
+                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }}>
                             <i className="ti ti-trash" style={{ fontSize:11 }}/>
                           </button>
                         </div>
-                      </td>
-                    </tr>
-                    {isActive && <tr>
-                      <td colSpan={4} style={{ padding:'0 0 8px 38px' }}>
-                        <div style={{ borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
+                      </div>
+                      {isActive && (
+                        <div style={{ margin:'4px 0 4px 38px',borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
                           <div style={{ background:'#1e293b',padding:'6px 12px',fontSize:11,color:'#94a3b8',fontFamily:'monospace' }}>{f.path}</div>
                           <div style={{ background:'#0f172a',padding:'10px 14px',maxHeight:300,overflowY:'auto' }}>
                             {loadingDiff ? <div style={{ color:'#64748b',fontSize:12,fontFamily:'monospace' }}>Loading…</div> : renderDiff(diffContent)}
                           </div>
                         </div>
-                      </td>
-                    </tr>}
-                  </React.Fragment>;
+                      )}
+                    </div>
+                  );
                 })}
-                  </tbody>
-                </table>
               </>
             )}
           </Section>
 
-          {/* Commit */}
           <Section title="Commit & Push" subtitle={`Committing to: ${currentBranch}`}>
             <div className="form-group">
               <label className="form-label">Commit message</label>
-              <input type="text" value={commitMsg} onChange={e => setCommitMsg(e.target.value)}
-                placeholder="feat: describe your changes" onKeyDown={e => e.key==='Enter' && commitChanges()} />
+              <input type="text" value={commitMsg} onChange={e => setCommitMsg(e.target.value)} placeholder="feat: describe your changes" onKeyDown={e => e.key==='Enter' && commitChanges()} />
             </div>
             <div style={{ display:'flex',gap:8,flexWrap:'wrap' }}>
               <button className="btn-primary" onClick={commitChanges} disabled={committing || !commitMsg.trim()}>
@@ -788,6 +827,7 @@ export default function GitPanel({ project, user }) {
           )}
         </>
       )}
+
 
       {/* ══════════════════════════════════════════════════════════════════════
           PULL REQUESTS TAB
