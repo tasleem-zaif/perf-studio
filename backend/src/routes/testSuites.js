@@ -54,7 +54,17 @@ router.post('/', (req, res) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(req.params.projectId, name, test_type || 'load', collection_id || null, env || null, primaryId,
     JSON.stringify(idsArr), engine || 'jmeter', JSON.stringify(config || {}), vusers||50, rampup||30, iter_mode||'duration', loops||1, duration||300);
-  if (collection_id) setImmediate(() => updateCollectionConfigs(collection_id));
+  if (collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(collection_id, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ suite: db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
 });
 
@@ -82,7 +92,17 @@ router.put('/:id', (req, res) => {
       duration !== undefined ? duration : suite.duration,
       req.params.id);
   const updatedSuite = db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
-  if (updatedSuite?.collection_id) setImmediate(() => updateCollectionConfigs(updatedSuite.collection_id));
+  if (updatedSuite?.collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId, _cid = updatedSuite.collection_id;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ suite: updatedSuite });
 });
 
@@ -92,7 +112,17 @@ router.delete('/:id', (req, res) => {
   if (!suite) return res.status(404).json({ error: 'Not found' });
   db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
   resetSequence('test_suites');
-  if (suite.collection_id) setImmediate(() => updateCollectionConfigs(suite.collection_id));
+  if (suite.collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId, _cid = suite.collection_id;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ ok: true });
 });
 

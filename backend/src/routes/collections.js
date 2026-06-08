@@ -299,30 +299,65 @@ router.put('/:id', upload.single('file'), (req, res) => {
         colBasePath, req.params.id);
 
   const updatedCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(req.params.id);
-  writeCollectionConfig(updatedCol);
   // Re-populate project config if endpoints changed
   setImmediate(() => autoPopulateProjectConfig(req.params.projectId, updatedCol.json_content, updatedCol.id));
 
-  // Create folder structure in git-workspaces for all environments
+  // Sync folder structure + config.json in current user's workspace
   try {
-    const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
-    const proj = db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
-    if (proj?.folder_path) {
-      let envs = [];
-      try { envs = JSON.parse(req.body.environments || '[]'); } catch {}
-      if (!envs.length && req.body.environment) envs = [req.body.environment];
-      if (!envs.length) envs = ['Default'];
-      ensureCollectionFolders(proj.folder_path, req.body.name || '', envs);
+    const { ensureAllEnvFolders, getUserProjectPath, cleanName } = require('../utils/projectFolders');
+    const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+    const projRow    = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+    const userProjPath = getUserProjectPath(req.userId, callerRole, projRow?.name || '');
+    if (userProjPath) {
+      let newEnvs = [];
+      try { newEnvs = JSON.parse(req.body.environments || '[]'); } catch {}
+      if (!newEnvs.length && req.body.environment) newEnvs = [req.body.environment];
+      if (!newEnvs.length) newEnvs = ['Default'];
+
+      // If collection was renamed, rename the folder
+      if (col.name !== newName) {
+        const oldDir = path.join(userProjPath, cleanName(col.name));
+        const newDir = path.join(userProjPath, cleanName(newName));
+        if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) {
+          fs.renameSync(oldDir, newDir);
+        }
+      }
+
+      // Ensure all env folders exist (creates new ones, keeps existing)
+      ensureAllEnvFolders(userProjPath, newName || col.name, newEnvs);
+
+      // Update config.json for all envs
+      writeCollectionConfig(updatedCol, userProjPath);
     }
-  } catch (_) {}
+  } catch (e) {
+    console.warn('[Collections] Folder sync on edit failed:', e.message);
+  }
 
   res.json({ collection: updatedCol });
 });
 
 router.delete('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const col = db.prepare('SELECT id FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const proj = ownsProject(req.userId, req.params.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+  const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!col) return res.status(404).json({ error: 'Not found' });
+
+  // Delete the collection's folder from the current user's git workspace
+  try {
+    const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+    const { getUserProjectPath, cleanName } = require('../utils/projectFolders');
+    const userProjPath = getUserProjectPath(req.userId, callerRole, proj.name);
+    if (userProjPath) {
+      const colDir = path.join(userProjPath, cleanName(col.name));
+      if (fs.existsSync(colDir)) {
+        fs.rmSync(colDir, { recursive: true, force: true });
+        console.log(`[Collections] Deleted folder: ${colDir}`);
+      }
+    }
+  } catch (e) {
+    console.warn('[Collections] Folder delete failed:', e.message);
+  }
+
   db.prepare('DELETE FROM collections WHERE id = ?').run(req.params.id);
   resetSequence('collections');
   res.json({ ok: true });
