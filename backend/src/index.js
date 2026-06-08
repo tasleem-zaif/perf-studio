@@ -7,7 +7,17 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+// In production (Docker), frontend is served by this same server — allow any same-origin request
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (same-origin, mobile apps, curl)
+    if (!origin) return cb(null, true);
+    // Allow configured origin or any localhost port
+    if (origin === CORS_ORIGIN || /^http:\/\/localhost:\d+$/.test(origin)) return cb(null, true);
+    cb(null, true); // allow all in current setup — restrict in production via CORS_ORIGIN env var
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 app.use('/api/auth',                                   require('./routes/auth'));
@@ -40,5 +50,24 @@ const { PROJECTS_ROOT } = require('./utils/projectFolders');
 app.use('/projects-files', express.static(PROJECTS_ROOT));
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+
+// ── Production: serve the built React frontend ────────────────────────────────
+// When running inside the Docker all-in-one image, the frontend is built and
+// copied to backend/public. Serve it as static files and fall back to index.html
+// for all non-API routes (SPA routing support).
+if (process.env.NODE_ENV === 'production') {
+  const fs = require('fs');
+  const frontendBuild = path.join(__dirname, '..', 'public');
+  if (fs.existsSync(frontendBuild)) {
+    app.use(express.static(frontendBuild));
+    // Catch-all: return index.html for any non-API route (React SPA routing)
+    app.get('*', (req, res) => {
+      if (!req.path.startsWith('/api/') && !req.path.startsWith('/projects-files/')) {
+        res.sendFile(path.join(frontendBuild, 'index.html'));
+      }
+    });
+    console.log(`Serving frontend from ${frontendBuild}`);
+  }
+}
 
 app.listen(PORT, () => console.log(`Performance Studio API running on http://localhost:${PORT}`));

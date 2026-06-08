@@ -121,22 +121,50 @@ function countActiveRuns(userId) {
   `).get(userId)?.n || 0;
 }
 
+// Check whether we're running in native mode (JMeter/K6 in PATH) or Docker mode
+function isNativeMode() {
+  return process.env.EXECUTION_MODE === 'native' || !!getJMeterBin(null) || !!getK6Bin(null);
+}
+
 router.get('/check-deps', auth, (req, res) => {
-  // All execution runs inside Docker — the only dependency is the Docker daemon.
-  let dockerStatus = 'missing';
-  let dockerVersion = null;
-  try {
-    execSync('docker info 2>&1', { timeout: 8000 });
-    const ver = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
-    dockerVersion = ver;
-    dockerStatus = 'ok';
-  } catch (_) {
+  const native = isNativeMode();
+  const deps = [];
+
+  if (native) {
+    // ── Native mode: check JMeter + K6 binaries directly ──────────────────
+    const jmeterBin = getJMeterBin(null);
+    let jmeterVersion = null;
+    if (jmeterBin) {
+      try { jmeterVersion = execSync(`"${jmeterBin}" --version 2>&1`, { timeout: 8000 }).toString().split('\n')[0].trim(); } catch {}
+    }
+    deps.push({ name: 'jmeter', status: jmeterBin ? 'ok' : 'missing', version: jmeterVersion || (jmeterBin ? 'installed' : null), path: jmeterBin });
+
+    const k6Bin = getK6Bin(null);
+    let k6Version = null;
+    if (k6Bin) {
+      try { k6Version = execSync(`"${k6Bin}" version 2>&1`, { timeout: 5000 }).toString().trim(); } catch {}
+    }
+    deps.push({ name: 'k6', status: k6Bin ? 'ok' : 'missing', version: k6Version || (k6Bin ? 'installed' : null), path: k6Bin });
+
+    let javaVersion = null;
+    try { javaVersion = execSync('java -version 2>&1', { timeout: 5000 }).toString().split('\n')[0].trim(); } catch {}
+    deps.push({ name: 'java', status: javaVersion ? 'ok' : 'missing', version: javaVersion });
+
+  } else {
+    // ── Docker mode: check Docker daemon ──────────────────────────────────
+    let dockerStatus = 'missing';
+    let dockerVersion = null;
     try {
-      const ver = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
-      dockerVersion = ver + ' (daemon not running — start Docker Desktop)';
-    } catch (_) {}
+      execSync('docker info 2>&1', { timeout: 8000 });
+      dockerVersion = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
+      dockerStatus = 'ok';
+    } catch (_) {
+      try { dockerVersion = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim() + ' (daemon not running)'; } catch {}
+    }
+    deps.push({ name: 'docker', status: dockerStatus, version: dockerVersion });
   }
-  res.json({ deps: [{ name: 'docker', status: dockerStatus, version: dockerVersion }] });
+
+  res.json({ deps, mode: native ? 'native' : 'docker' });
 });
 
 // Standalone Docker check — used by the Configuration page
@@ -227,21 +255,52 @@ router.get('/system-check', auth, async (req, res) => {
   const checks = [];
   const { PROJECTS_ROOT, BACKUPS_ROOT } = require('../utils/projectFolders');
 
-  // 1. Docker daemon
-  let dockerOk = false;
-  try {
-    execSync('docker info', { timeout: 8000, stdio: 'pipe' });
-    const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
-    checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'ok', detail: ver });
-    dockerOk = true;
-  } catch (_) {
+  const nativeMode = isNativeMode();
+
+  if (nativeMode) {
+    // ── Native mode: check Java, JMeter, K6 directly ─────────────────────
+    let javaVer = null;
+    try { javaVer = execSync('java -version 2>&1', { timeout: 5000, stdio: 'pipe' }).toString().split('\n')[0].trim(); } catch {}
+    checks.push({ id: 'java', name: 'Java (JDK)', status: javaVer ? 'ok' : 'fail', detail: javaVer || 'Not found — Java 17+ required for JMeter' });
+
+    const jmeterBin = getJMeterBin(null);
+    let jmeterVer = null;
+    if (jmeterBin) {
+      try { jmeterVer = execSync(`"${jmeterBin}" --version 2>&1`, { timeout: 10000, stdio: 'pipe' }).toString().split('\n')[0].trim(); } catch {}
+    }
+    checks.push({ id: 'jmeter', name: 'Apache JMeter', status: jmeterBin ? 'ok' : 'fail', detail: jmeterVer || (jmeterBin ? 'Installed' : 'Not found — install JMeter 5.6+') });
+
+    const k6Bin = getK6Bin(null);
+    let k6Ver = null;
+    if (k6Bin) {
+      try { k6Ver = execSync(`"${k6Bin}" version 2>&1`, { timeout: 5000, stdio: 'pipe' }).toString().trim(); } catch {}
+    }
+    checks.push({ id: 'k6', name: 'K6', status: k6Bin ? 'ok' : 'fail', detail: k6Ver || (k6Bin ? 'Installed' : 'Not found — install K6') });
+
+    let gitVer = null;
+    try { gitVer = execSync('git --version 2>&1', { timeout: 5000, stdio: 'pipe' }).toString().trim(); } catch {}
+    checks.push({ id: 'git', name: 'Git', status: gitVer ? 'ok' : 'warn', detail: gitVer || 'Not found (optional — needed for Git integration)' });
+
+  } else {
+    // ── Docker mode: check Docker daemon ─────────────────────────────────
+    let dockerOk = false;
     try {
+      execSync('docker info', { timeout: 8000, stdio: 'pipe' });
       const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
-      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: ver + ' (daemon not running — start Docker Desktop)' });
+      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'ok', detail: ver });
+      dockerOk = true;
     } catch (_) {
-      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: 'Not installed — download Docker Desktop from docker.com' });
+      try {
+        const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
+        checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: ver + ' (daemon not running — start Docker Desktop)' });
+      } catch (_) {
+        checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: 'Not installed — download Docker Desktop from docker.com' });
+      }
     }
   }
+
+  // Keep dockerOk in scope for downstream checks that use it
+  let dockerOk = !nativeMode && checks.find(c => c.id === 'docker_daemon')?.status === 'ok';
 
   // 2. Windows Virtualization — detect via services + WSL executable (no admin needed)
   if (process.platform === 'win32') {
@@ -639,6 +698,12 @@ router.post('/run', auth, async (req, res) => {
   const project = ownsProject(req.userId, project_id);
   if (!project) { log('err', 'Access denied'); return done({ ok: false, error: 'Forbidden' }); }
 
+  // Git repository must be initialized before running tests
+  if (!project.folder_path) {
+    log('err', 'Git repository not initialized');
+    return done({ ok: false, error: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.' });
+  }
+
   // Soft concurrency cap — prevent accidental resource exhaustion
   const activeCount = countActiveRuns(req.userId);
   if (activeCount >= MAX_CONCURRENT_RUNS) {
@@ -765,70 +830,106 @@ router.post('/run', auth, async (req, res) => {
       if (testDataExists) {
         let jmxContent = fs.readFileSync(patchedJmx, 'utf8');
 
-        // Replace ALL absolute testData paths in the JMX with the container mount point /jmeter/testdata/
-        // This handles paths like: C:\...\QA\testData\  or  C:/..../QA/testData/
-        jmxContent = jmxContent.replace(
-          /[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi,
-          '/jmeter/testdata/'
-        );
-        // Also handle Unix-style absolute paths (Linux/Mac or Docker paths)
-        jmxContent = jmxContent.replace(
-          /\/[^\s<"]*\/testData\/?/gi,
-          '/jmeter/testdata/'
-        );
+        if (isNativeMode()) {
+          // Native mode: replace testData paths with the actual disk path
+          const nativeTestDataDir = testDataHostDir.replace(/\\/g, '/').replace(/\/?$/, '/');
+          jmxContent = jmxContent.replace(/[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi, nativeTestDataDir);
+          jmxContent = jmxContent.replace(/\/[^\s<"]*\/testData\/?/gi, nativeTestDataDir);
+          log('info', `  Test data  : ${nativeTestDataDir} (native)`);
+        } else {
+          // Docker mode: replace with container mount point /jmeter/testdata/
+          jmxContent = jmxContent.replace(/[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi, '/jmeter/testdata/');
+          jmxContent = jmxContent.replace(/\/[^\s<"]*\/testData\/?/gi, '/jmeter/testdata/');
+          log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+        }
 
         fs.writeFileSync(patchedJmx, jmxContent, 'utf8');
-        log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
       }
 
-      log('info', `  JMeter img : ${jmeterImage}`);
-      log('info', `  JTL file   : ${jtlPath}`);
-      log('info', `  Report dir : ${reportDir}`);
-      log('info', `  JMeter log : ${jmeterLogPath}`);
-      if (testDataExists) log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+      if (!isNativeMode()) {
+        log('info', `  JMeter img : ${jmeterImage}`);
+        log('info', `  JTL file   : ${jtlPath}`);
+        log('info', `  Report dir : ${reportDir}`);
+        log('info', `  JMeter log : ${jmeterLogPath}`);
+        if (testDataExists) log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+      }
 
-      cmd = 'docker';
-      args = ['run', '--rm',
-        '-v', `${dockerScriptDir}:/jmeter/scripts`,
-        '-v', `${dockerResultDir}:/jmeter/results`,
-      ];
-      if (testDataExists) args.push('-v', `${testDataHostDir}:/jmeter/testdata`);
-      args.push(
-        jmeterImage,
-        '-n', '-t', `/jmeter/scripts/${scriptName}`,
-        '-l', '/jmeter/results/results.jtl',
-        '-e', '-o', '/jmeter/results/report',
-        '-j', '/jmeter/results/jmeter.log',
-      );
-      if (vusers)  args.push(`-Jthreads=${vusers}`);
-      if (rampup)  args.push(`-Jrampup=${rampup}`);
-      if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
-      if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      if (isNativeMode()) {
+        // ── Native mode: run JMeter binary directly (no Docker) ──────────────
+        const jmeterBin = process.env.JMETER_BIN || getJMeterBin(null) || 'jmeter';
+        log('info', `  Mode       : Native (${jmeterBin})`);
+        log('info', `  JTL file   : ${jtlPath}`);
+        log('info', `  Report dir : ${reportDir}`);
+        log('info', `  JMeter log : ${jmeterLogPath}`);
+        cmd  = jmeterBin;
+        args = [
+          '-n', '-t', patchedJmx || scriptPath,
+          '-l', jtlPath,
+          '-e', '-o', reportDir,
+          '-j', jmeterLogPath,
+        ];
+        if (vusers)  args.push(`-Jthreads=${vusers}`);
+        if (rampup)  args.push(`-Jrampup=${rampup}`);
+        if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
+        if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      } else {
+        // ── Docker mode: run via justb4/jmeter image ─────────────────────────
+        cmd = 'docker';
+        args = ['run', '--rm',
+          '-v', `${dockerScriptDir}:/jmeter/scripts`,
+          '-v', `${dockerResultDir}:/jmeter/results`,
+        ];
+        if (testDataExists) args.push('-v', `${testDataHostDir}:/jmeter/testdata`);
+        args.push(
+          jmeterImage,
+          '-n', '-t', `/jmeter/scripts/${scriptName}`,
+          '-l', '/jmeter/results/results.jtl',
+          '-e', '-o', '/jmeter/results/report',
+          '-j', '/jmeter/results/jmeter.log',
+        );
+        if (vusers)  args.push(`-Jthreads=${vusers}`);
+        if (rampup)  args.push(`-Jrampup=${rampup}`);
+        if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
+        if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      }
 
       // NOTE: PROTOCOL/SERVER/PORT are baked into JMX User Defined Variables at generation time.
       // Runtime only controls execution params (threads, ramp-up, duration/loops).
 
     } else if (engine === 'k6') {
-      const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
-      const dockerScriptDir = toHostPath(path.dirname(scriptPath));
-      const dockerResultDir = toHostPath(resultDir);
-      const scriptName = path.basename(scriptPath);
+      const resultsJson = path.join(resultDir, 'results.json');
 
-      log('info', `  K6 image   : ${k6Image}`);
-
-      cmd = 'docker';
-      args = [
-        'run', '--rm',
-        '-v', `${dockerScriptDir}:/scripts`,
-        '-v', `${dockerResultDir}:/results`,
-        k6Image,
-        'run', `/scripts/${scriptName}`,
-        '--out', 'json=/results/results.json',
-      ];
-      if (vusers) args.push('--vus', String(vusers));
-      if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
-      if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
-      if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      if (isNativeMode()) {
+        // ── Native mode: run K6 binary directly ──────────────────────────────
+        const k6Bin = process.env.K6_BIN || getK6Bin(null) || 'k6';
+        log('info', `  Mode       : Native (${k6Bin})`);
+        cmd  = k6Bin;
+        args = ['run', scriptPath, '--out', `json=${resultsJson}`];
+        if (vusers) args.push('--vus', String(vusers));
+        if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
+        if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
+        if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      } else {
+        // ── Docker mode: run via grafana/k6 image ─────────────────────────────
+        const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
+        const dockerScriptDir = toHostPath(path.dirname(scriptPath));
+        const dockerResultDir = toHostPath(resultDir);
+        const scriptName = path.basename(scriptPath);
+        log('info', `  K6 image   : ${k6Image}`);
+        cmd  = 'docker';
+        args = [
+          'run', '--rm',
+          '-v', `${dockerScriptDir}:/scripts`,
+          '-v', `${dockerResultDir}:/results`,
+          k6Image,
+          'run', `/scripts/${scriptName}`,
+          '--out', 'json=/results/results.json',
+        ];
+        if (vusers) args.push('--vus', String(vusers));
+        if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
+        if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
+        if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      }
 
     } else {
       log('err', `Unsupported engine: ${engine}`);

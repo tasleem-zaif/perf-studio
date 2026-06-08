@@ -39,23 +39,32 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   const [showLogs, setShowLogs] = useState({});
   const [expandedLog, setExpandedLog] = useState({});
   const [testDataFiles, setTestDataFiles] = useState([]);
+  const [ownCollections, setOwnCollections] = useState(project?.collections || []);
   const dlRef = useRef(null);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
 
-  // Fetch ALL suites and ALL test-data files in one call each — no env filter
+  // Load suites + test-data filtered by collection + env (one call per env change)
   useEffect(() => {
     if (project) {
       loadSuites();
       loadTestDataFiles();
+      // Fetch collections for the env dropdown in the modal
+      api.get(`/projects/${project.id}/collections`)
+        .then(r => setOwnCollections(r.data.collections || []))
+        .catch(() => {});
     }
-  }, [project?.id]);
+  }, [project?.id, collection?.id, env]);
 
   async function loadTestDataFiles() {
     if (!project) return;
     try {
-      const { data } = await api.get(`/projects/${project.id}/test-data`);
+      // Filter by collection + env so only relevant files appear in the test plan modal
+      const params = collection?.id
+        ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
+        : '';
+      const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
       // Deduplicate by original_name
       const seen = new Set();
       const unique = (data.files || []).filter(f => {
@@ -79,8 +88,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   }, [openModalTrigger]);
 
   async function loadSuites() {
-    // Fetch ALL suites — no env/collection filter — backend returns full list with env tags
-    const { data } = await api.get(`/projects/${project.id}/test-suites`);
+    // Filter by collection + env — shows only suites relevant to current context
+    const params = collection?.id
+      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
+      : '';
+    const { data } = await api.get(`/projects/${project.id}/test-suites${params}`);
     setSuites(data.suites || []);
     // Restore persisted pre-run data so logs survive page refresh
     const restored = {};
@@ -471,10 +483,25 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <div className="form-group">
               <label className="form-label">Collection</label>
-              <CustomSelect value={form.collection_id} onChange={e => setForm(f => ({ ...f, collection_id: e.target.value }))}>
+              <CustomSelect value={form.collection_id} onChange={e => setForm(f => ({ ...f, collection_id: e.target.value, env: '' }))}>
                 <option value="">— None —</option>
-                {project.collections?.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
               </CustomSelect>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Environment</label>
+              {(() => {
+                const col = ownCollections.find(c => String(c.id) === String(form.collection_id));
+                let envOptions = [];
+                try { envOptions = JSON.parse(col?.environments || '[]'); } catch {}
+                if (!envOptions.length && col?.environment) envOptions = [col.environment];
+                return (
+                  <CustomSelect value={form.env || ''} onChange={e => setForm(f => ({ ...f, env: e.target.value }))}>
+                    <option value="">— All environments —</option>
+                    {envOptions.map(e => <option key={e} value={e}>{e}</option>)}
+                  </CustomSelect>
+                );
+              })()}
             </div>
             <div className="form-group">
               <label className="form-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

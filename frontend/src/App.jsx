@@ -215,6 +215,19 @@ function AppInner() {
         markVisited('project-home');
         setPage('project-home');
         setActiveTab('projects');
+        // Fetch collections + rules for the restored project (same as selectProject())
+        Promise.all([
+          api.get(`/projects/${projectId}/collections`),
+          api.get(`/projects/${projectId}/rules`),
+        ]).then(([colsRes, rulesRes]) => {
+          const enriched = {
+            ...proj,
+            collections: colsRes.data.collections || [],
+            rules: rulesRes.data.rules || [],
+          };
+          setProjects(prev => prev.map(p => p.id === projectId ? enriched : p));
+          setActiveProject(enriched);
+        }).catch(() => {});
       } else {
         // Project not found or not accessible — reset URL to dashboard
         window.history.replaceState(null, '', '/dashboard');
@@ -493,6 +506,8 @@ function AppInner() {
   // ── Project Workspace — replaces entire layout (banner + sidebar + content) ──
   if (showWorkspace) {
     return (
+      <>
+      <Toast />
       <ProjectWorkspace
         key={activeProject.id}
         project={{ ...activeProject, collections }}
@@ -503,6 +518,7 @@ function AppInner() {
         theme={theme}
         onThemeChange={setTheme}
       />
+      </>
     );
   }
 

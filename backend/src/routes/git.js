@@ -98,10 +98,25 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken);
 
   if (!fs.existsSync(path.join(gitRoot, '.git'))) {
-    // First time — clone from remote into user's workspace
-    fs.mkdirSync(gitRoot, { recursive: true });
-    const git = simpleGit();
-    await git.clone(remoteWithAuth, gitRoot);
+    const dirExists = fs.existsSync(gitRoot);
+    const isEmpty   = !dirExists || fs.readdirSync(gitRoot).length === 0;
+
+    if (isEmpty) {
+      // Empty or missing — clone directly
+      fs.mkdirSync(gitRoot, { recursive: true });
+      const git = simpleGit();
+      await git.clone(remoteWithAuth, gitRoot);
+    } else {
+      // Directory has pre-existing files (e.g. collection folders created before clone)
+      // Save them, clone into temp, move .git across, then restore files
+      const tmpDir = gitRoot + '_clone_tmp';
+      if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
+      const git = simpleGit();
+      await git.clone(remoteWithAuth, tmpDir);
+      // Move .git from temp clone into existing workspace
+      fs.renameSync(path.join(tmpDir, '.git'), path.join(gitRoot, '.git'));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 
   const git = gitInstance(gitRoot);
@@ -123,14 +138,15 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
 }
 
 function buildRemoteWithAuth(url, username, token) {
-  // Inject token into HTTPS URL for authentication
-  // https://github.com/org/repo.git → https://<token>@github.com/org/repo.git
+  // Inject PAT into HTTPS URL for GitHub authentication.
+  // Most reliable format: https://TOKEN@github.com/owner/repo.git
+  // This works for both classic PATs (ghp_...) and fine-grained tokens (github_pat_...)
   if (!token) return url;
   try {
-    const u = new URL(url);
-    u.username = username || token;
-    u.password = token;
-    return u.toString();
+    // Strip any existing credentials first
+    const clean = url.replace(/^(https?:\/\/)[^@]+@/, '$1');
+    // Inject token — use token as username, empty password
+    return clean.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(token)}@`);
   } catch {
     return url;
   }
@@ -177,9 +193,13 @@ async function applyBranchProtection(cfg, branch = 'main') {
       allow_deletions:    false,   // never allow deletion of protected branch
     });
     console.log(`[Git] Branch protection applied to "${branch}" on ${parsed.owner}/${parsed.repo}`);
+    return { ok: true };
   } catch (e) {
     // Never block the main flow — log and move on
-    console.warn(`[Git] Branch protection skipped for "${branch}": ${e.message}`);
+    const msg = e.message || 'Unknown error';
+    console.warn(`[Git] Branch protection skipped for "${branch}": ${msg}`);
+    // Return the error so callers can surface it to the user
+    return { ok: false, error: msg };
   }
 }
 
@@ -243,10 +263,8 @@ router.post('/init', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg || !cfg.remote_url) return res.status(400).json({ error: 'Configure git remote URL first.' });
 
-  const projectPath = proj.folder_path;
-  if (!projectPath || !fs.existsSync(projectPath)) {
-    return res.status(400).json({ error: 'Project folder not found on disk.' });
-  }
+  // folder_path is null before first init — that's expected.
+  // The project folder will be created inside git-workspaces during this init.
 
   try {
     const token = cfg.auth_token ? decrypt(cfg.auth_token) : '';
@@ -280,24 +298,23 @@ router.post('/init', async (req, res) => {
       `# Projects\n\nAll PerfStudio performance test projects are stored here.\nEach sub-folder is one project managed by PerfStudio.\n`
     );
 
-    // Copy existing project files into the workspace subfolder
-    function copyDir(src, dest) {
-      if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
-      fs.readdirSync(src).forEach(entry => {
-        if (entry === '.git') return; // skip any existing .git
-        const srcFull = path.join(src, entry);
-        const destFull = path.join(dest, entry);
-        if (fs.statSync(srcFull).isDirectory()) {
-          copyDir(srcFull, destFull);
-        } else {
-          fs.copyFileSync(srcFull, destFull);
-        }
-      });
-    }
-    copyDir(projectPath, gitProjectPath);
+    // Create the project folder structure in the git workspace
+    const { ensureProjectFolders, ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
+    fs.mkdirSync(gitProjectPath, { recursive: true });
+    ensureProjectFolders(proj.name); // creates gitProjectPath with .gitkeep
 
-    // NOTE: We do NOT update folder_path here.
-    // folder_path always stays in projects/ — the git workspace is separate.
+    // Create collection subfolders for all existing collections
+    const existingCols = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
+    for (const col of existingCols) {
+      let envs = [];
+      try { envs = JSON.parse(col.environments || '[]'); } catch {}
+      if (!envs.length && col.environment) envs = [col.environment];
+      if (!envs.length) envs = ['Default'];
+      ensureAllEnvFolders(gitProjectPath, col.name, envs);
+    }
+
+    // Update folder_path in DB to point to git-workspaces/admin/projects/<name>/
+    db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitProjectPath, proj.id);
 
     const git = gitInstance(gitRoot);
 
@@ -502,8 +519,8 @@ ${proj.name}/
       await git.push(['--set-upstream', 'origin', 'main']);
     }
 
-    // 3. Re-apply branch protection after push
-    await applyBranchProtection(cfg);
+    // 3. Apply branch protection after push
+    const protectionResult = await applyBranchProtection(cfg);
 
     // Mark as initialized and save git_root (workspace directory)
     db.prepare('UPDATE git_configs SET is_initialized=1, git_root=? WHERE project_id=?')
@@ -512,7 +529,10 @@ ${proj.name}/
     db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
       .run(req.params.projectId, req.userId, 'main', 'Initial commit: PerfStudio project structure', 1);
 
-    res.json({ ok: true, message: 'Repository initialized and pushed to main.' });
+    const protectionWarning = protectionResult?.ok === false
+      ? ` Note: Branch protection could not be applied (${protectionResult.error}). Add "Administration: Read & Write" permission to your GitHub token and re-initialize.`
+      : '';
+    res.json({ ok: true, message: `Repository initialized and pushed to main.${protectionWarning}`, branch_protection: protectionResult?.ok !== false });
   } catch (e) {
     console.error('[Git] Init error:', e.message);
     res.status(500).json({ error: e.message });
@@ -527,6 +547,8 @@ router.get('/status', async (req, res) => {
 
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ initialized: false });
+
+  const caller = getCaller(req.userId);
 
   try {
     const gitDir = getUserWorkspace(proj, caller);
@@ -717,6 +739,7 @@ router.get('/branches', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ branches: [], current: null });
 
+  const caller = getCaller(req.userId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
@@ -739,6 +762,7 @@ router.get('/log', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ commits: [] });
 
+  const caller = getCaller(req.userId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
@@ -983,30 +1007,33 @@ router.post('/branch', async (req, res) => {
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.remote_url) return res.status(400).json({ error: 'Repository not configured.' });
+  if (!cfg?.is_initialized) return res.status(400).json({ error: 'Repository not initialized. Ask an admin to initialize it first.' });
   const caller = getCaller(req.userId);
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
   const branchName = identity?.branch_name || req.body.branch_name;
   if (!branchName) return res.status(400).json({ error: 'Save your Git Identity first to set a branch name.' });
 
-  const projectPath = proj.folder_path;
-  const gitRoot = path.join(path.dirname(projectPath), `${path.basename(projectPath)}_workspace`);
-  if (!fs.existsSync(path.join(gitRoot, '.git'))) return res.status(400).json({ error: 'Repository not initialized. Ask an admin to initialize it first.' });
-
+  // Use the per-user workspace (clones from remote if not yet set up)
+  const gitRoot = getUserWorkspace(proj, caller);
   try {
-    const git = gitInstance(gitRoot);
-    await git.addConfig('user.name',  identity?.author_name  || caller.name);
-    await git.addConfig('user.email', identity?.author_email || caller.email || cfg.email || 'noreply@perfstudio.com');
+    const { git } = await ensureUserWorkspace(gitRoot, { ...cfg, project_id: req.params.projectId }, caller);
 
     const branchSummary = await git.branchLocal();
     if (branchSummary.all.includes(branchName)) {
       await git.checkout(branchName);
       return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
     }
-    // Ensure we start from main
+    // Create from latest main
+    try { await git.fetch('origin', 'main'); } catch {}
     try { await git.checkout('main'); } catch {}
     await git.checkoutLocalBranch(branchName);
-    res.json({ message: `Branch "${branchName}" created from main`, branch: branchName });
+
+    // Push branch to remote and apply protection
+    await git.push(['--set-upstream', 'origin', branchName]);
+    await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
+
+    res.json({ message: `Branch "${branchName}" created from main and pushed to remote.`, branch: branchName });
   } catch (err) {
     console.error('Branch error:', err);
     res.status(500).json({ error: err.message });

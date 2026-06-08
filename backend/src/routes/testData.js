@@ -13,6 +13,7 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const proj = ownsProject(req.userId, req.params.projectId);
     if (!proj) return cb(new Error('Project not found'));
+    if (!proj.folder_path) return cb(new Error('git_not_initialized: Git repository not initialized. Go to Configuration → Git to initialize the repository first.'));
 
     // If a collection_id is provided, store inside collection/env/testData/
     const colId = req.query.collection_id || req.body?.collection_id;

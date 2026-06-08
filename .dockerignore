@@ -1,0 +1,45 @@
+# ── Node modules ─────────────────────────────────────────────────────────────
+node_modules
+**/node_modules
+npm-debug.log*
+
+# ── Frontend dev artifacts ────────────────────────────────────────────────────
+frontend/.vite
+frontend/dist
+
+# ── Local data & runtime dirs ─────────────────────────────────────────────────
+backend/data
+projects
+git-workspaces
+backups
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+frontend/frontend.log
+backend/backend.log
+
+# ── Secrets / env files ───────────────────────────────────────────────────────
+.env
+.env.*
+!.env.docker.example
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode
+.idea
+*.suo
+*.user
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+README.md
+*.md
+pr_body.txt

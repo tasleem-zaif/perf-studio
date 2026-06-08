@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 
@@ -154,9 +154,15 @@ export default function GitPanel({ project, user }) {
   const addLog = (msg, type = 'info') =>
     setOpLog(prev => [...prev.slice(-49), { msg, type, ts: new Date().toLocaleTimeString() }]);
 
-  const initialized  = status?.initialized;
+  // Use DB flag (cfg.is_initialized) as the source of truth.
+  // status.initialized only reflects the LOCAL workspace which may not exist yet
+  // for regular users (their workspace is cloned on first commit).
+  const initialized  = !!(cfg?.is_initialized || status?.initialized);
   const currentBranch = status?.branch || identity?.branch_name || '—';
-  const statusFiles  = parseStatusFiles(status);
+  // Filter out .gitkeep files — they are internal placeholders for empty folders
+  // and are committed automatically along with all other files
+  const allStatusFiles = parseStatusFiles(status);
+  const statusFiles    = allStatusFiles.filter(f => !f.path.endsWith('.gitkeep'));
   const openPrs      = prs.filter(p => p.status === 'open').length;
   const baseBranch   = cfgForm.base_branch || cfg?.base_branch || 'main';
   const branchConflict = idForm.branch_name && idForm.branch_name === baseBranch;
@@ -694,48 +700,62 @@ export default function GitPanel({ project, user }) {
             ) : (
               <>
                 {/* Select all */}
-                <div style={{ display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderBottom:'1px solid #f1f5f9',marginBottom:4 }}>
-                  <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer' }}/>
-                  <span style={{ fontSize:12,color:'#64748b' }}>Select all ({statusFiles.length})</span>
-                </div>
+                <table style={{ width:'100%', borderCollapse:'collapse', marginBottom:4 }}>
+                  <tbody>
+                    <tr style={{ borderBottom:'1px solid #f1f5f9' }}>
+                      <td style={{ width:28, padding:'6px 8px' }}>
+                        <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer' }}/>
+                      </td>
+                      <td colSpan={3} style={{ padding:'6px 8px', fontSize:12, color:'#64748b' }}>
+                        Select all ({statusFiles.length})
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <tbody>
                 {statusFiles.map((f, i) => {
                   const ft = FILE_TYPE[f.type] || FILE_TYPE['?'];
                   const isSelected = selectedFiles.has(f.path);
                   const isActive = diffFile === f.path;
-                  return (
-                    <div key={i}>
-                      <div style={{ display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:6,background:isActive?'#f0fdf4':'transparent',cursor:'pointer',transition:'background .12s' }}
-                        onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
-                        onMouseLeave={e=>{ if(!isActive) e.currentTarget.style.background='transparent'; }}>
-                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer',flexShrink:0 }}/>
-                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700,flexShrink:0 }} title={ft.title}>{ft.label}</span>
-                        <span style={{ flex:1,fontFamily:'monospace',fontSize:12,color:'#374151' }} onClick={() => viewDiff(f.path)}>{f.path}</span>
-                        <div style={{ display:'flex',gap:4 }}>
+                  return <React.Fragment key={i}>
+                    <tr style={{ background: isActive ? '#f0fdf4' : 'transparent' }}
+                      onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
+                      onMouseLeave={e=>{ e.currentTarget.style.background=isActive?'#f0fdf4':'transparent'; }}>
+                      <td style={{ width:28, padding:'6px 8px', verticalAlign:'middle' }}>
+                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer' }}/>
+                      </td>
+                      <td style={{ width:24, padding:'6px 4px', verticalAlign:'middle' }}>
+                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'inline-flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700 }} title={ft.title}>{ft.label}</span>
+                      </td>
+                      <td style={{ padding:'6px 8px', verticalAlign:'middle', maxWidth:0 }}>
+                        <span style={{ fontFamily:'monospace',fontSize:12,color:'#374151',display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor:'pointer' }} onClick={() => viewDiff(f.path)} title={f.path}>{f.path}</span>
+                      </td>
+                      <td style={{ width:160, padding:'6px 8px', verticalAlign:'middle', whiteSpace:'nowrap' }}>
+                        <div style={{ display:'inline-flex', gap:4 }}>
                           <button onClick={() => viewDiff(f.path)} style={{ background:'none',border:'1px solid #e2e8f0',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#64748b' }}>
-                            {isActive ? 'Hide diff' : 'View diff'}
+                            {isActive ? 'Hide' : 'Diff'}
                           </button>
-                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }} title="Discard changes">
+                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }} title="Discard">
                             <i className="ti ti-trash" style={{ fontSize:11 }}/>
                           </button>
                         </div>
-                      </div>
-                      {/* Inline diff viewer */}
-                      {isActive && (
-                        <div style={{ margin:'4px 0 4px 38px',borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
-                          <div style={{ background:'#1e293b',padding:'8px 14px',display:'flex',alignItems:'center',justifyContent:'space-between' }}>
-                            <span style={{ fontFamily:'monospace',fontSize:12,color:'#94a3b8' }}>{f.path}</span>
-                            <span style={{ fontSize:11,color:'#475569' }}>diff</span>
-                          </div>
-                          <div style={{ background:'#0f172a',padding:'10px 14px',maxHeight:320,overflowY:'auto' }}>
-                            {loadingDiff
-                              ? <div style={{ color:'#64748b',fontSize:12,fontFamily:'monospace' }}>Loading diff…</div>
-                              : renderDiff(diffContent)}
+                      </td>
+                    </tr>
+                    {isActive && <tr>
+                      <td colSpan={4} style={{ padding:'0 0 8px 38px' }}>
+                        <div style={{ borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
+                          <div style={{ background:'#1e293b',padding:'6px 12px',fontSize:11,color:'#94a3b8',fontFamily:'monospace' }}>{f.path}</div>
+                          <div style={{ background:'#0f172a',padding:'10px 14px',maxHeight:300,overflowY:'auto' }}>
+                            {loadingDiff ? <div style={{ color:'#64748b',fontSize:12,fontFamily:'monospace' }}>Loading…</div> : renderDiff(diffContent)}
                           </div>
                         </div>
-                      )}
-                    </div>
-                  );
+                      </td>
+                    </tr>}
+                  </React.Fragment>;
                 })}
+                  </tbody>
+                </table>
               </>
             )}
           </Section>

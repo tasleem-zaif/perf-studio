@@ -100,6 +100,14 @@ router.post('/:id/generate', async (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
+  // Git repository must be initialized before scripts can be generated
+  if (!proj.folder_path) {
+    return res.status(400).json({
+      error: 'git_not_initialized',
+      message: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.',
+    });
+  }
+
   const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Suite not found' });
 

@@ -31,22 +31,22 @@ function writeJson(filePath, data) {
 
 // ── Core: write comprehensive config.json for one collection + env ────────────
 
-function writeCollectionEnvConfig(collectionId, env) {
+function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
   try {
     const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
 
     const envName = env || col.environment || 'Default';
+    const { cleanName } = require('./projectFolders');
 
-    // Derive env path from the PROJECT's current folder_path (always up to date)
-    // rather than col.folder_path which may point to a stale location after git workspace moves
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
     let envPath;
-    if (project?.folder_path) {
-      const colSafeName = `${col.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_${col.id}`;
-      envPath = path.join(project.folder_path, colSafeName, envName);
-    } else if (col.folder_path) {
-      envPath = path.join(col.folder_path, envName);
+
+    // Use explicitly passed folder path first (user's workspace), then project.folder_path
+    const basePath = projectFolderPath || project?.folder_path;
+    if (basePath) {
+      // New clean-name format: CollectionName/Env/
+      envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
     } else {
       return; // no path available
     }
@@ -117,7 +117,7 @@ function writeCollectionEnvConfig(collectionId, env) {
 
 // ── Update all env folders for a collection ───────────────────────────────────
 
-function updateCollectionConfigs(collectionId) {
+function updateCollectionConfigs(collectionId, projectFolderPath) {
   try {
     const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
@@ -125,7 +125,7 @@ function updateCollectionConfigs(collectionId) {
     try { envs = JSON.parse(col.environments || '[]'); } catch {}
     if (!envs.length) envs = col.environment ? [col.environment] : ['Default'];
     for (const env of envs) {
-      writeCollectionEnvConfig(collectionId, env);
+      writeCollectionEnvConfig(collectionId, env, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateCollectionConfigs error:', e.message);
@@ -150,8 +150,8 @@ function writeProjectConfig() { /* no-op */ }
 function writeGlobalConfig()   { /* no-op */ }
 
 // ── Legacy stubs (no-ops kept for backward compat) ───────────────────────────
-function writeCollectionConfig(collection) {
-  if (collection?.id) updateCollectionConfigs(collection.id);
+function writeCollectionConfig(collection, projectFolderPath) {
+  if (collection?.id) updateCollectionConfigs(collection.id, projectFolderPath);
 }
 function writeRulesConfig()         { /* no-op: use updateProjectCollectionConfigs */ }
 function writeProjectLevelConfig(projectId) {
