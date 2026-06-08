@@ -71,11 +71,9 @@ router.post('/', (req, res) => {
     'INSERT INTO projects (user_id, name, description, color, bg, uuid) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(req.userId, name, description || '', COLORS[idx], BKGS[idx], uuid);
 
-  const folderPath = ensureProjectFolders(name, result.lastInsertRowid, uuid);
-  db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, result.lastInsertRowid);
-
+  // folder_path is null until Org Admin initializes the Git repository.
+  // The folder structure is created inside git-workspaces during git init.
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
-  // config.json written per collection/env when collections are added
   res.json({ project });
 });
 

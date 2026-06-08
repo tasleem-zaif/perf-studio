@@ -698,6 +698,12 @@ router.post('/run', auth, async (req, res) => {
   const project = ownsProject(req.userId, project_id);
   if (!project) { log('err', 'Access denied'); return done({ ok: false, error: 'Forbidden' }); }
 
+  // Git repository must be initialized before running tests
+  if (!project.folder_path) {
+    log('err', 'Git repository not initialized');
+    return done({ ok: false, error: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.' });
+  }
+
   // Soft concurrency cap — prevent accidental resource exhaustion
   const activeCount = countActiveRuns(req.userId);
   if (activeCount >= MAX_CONCURRENT_RUNS) {

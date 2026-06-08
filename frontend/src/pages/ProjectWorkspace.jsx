@@ -132,8 +132,39 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
     { label: 'TEST DATA',   value: testDataCount,              color: '#a78bfa', iconBg: '#ede9fe', icon: 'ti-table',                  link: 'test-data' },
   ];
 
+  // Pages that require git to be initialized (folder_path must exist)
+  const GIT_REQUIRED_PAGES = ['test-suites', 'test-data', 'runner', 'analytics', 'reports'];
+  const gitNotInitialized = !project?.folder_path;
+
+  function GitNotInitializedBanner() {
+    return (
+      <div style={{ margin: '20px 24px', padding: '16px 20px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+          <i className="ti ti-git-branch" style={{ color: '#b45309', fontSize: 20, flexShrink: 0, marginTop: 2 }} />
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: '#b45309', marginBottom: 4 }}>
+              Git Repository Not Initialized
+            </div>
+            <div style={{ fontSize: 13, color: '#92400e', lineHeight: 1.6 }}>
+              You need to initialize the Git repository before using this feature.
+              <br />Scripts, test data and test runs are stored inside the git workspace.
+            </div>
+            <button onClick={() => { navigate('config'); setConfigTab('git'); }}
+              style={{ marginTop: 10, padding: '6px 14px', background: '#22c55e', border: 'none', borderRadius: 7, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <i className="ti ti-settings-2" style={{ fontSize: 13 }} /> Go to Configuration → Git
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderRightContent() {
     if (activePage !== 'overview') {
+      // Block git-dependent pages if repository not initialized
+      if (gitNotInitialized && GIT_REQUIRED_PAGES.includes(activePage)) {
+        return <GitNotInitializedBanner />;
+      }
       switch (activePage) {
         case 'config': {
           const CFG_TABS = [
@@ -189,6 +220,20 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
     // Overview — stat cards + quick access
     return (
       <div style={{ padding: '20px 24px' }}>
+        {/* Git not initialized banner on overview */}
+        {gitNotInitialized && (
+          <div style={{ marginBottom: 20, padding: '14px 18px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <i className="ti ti-git-branch" style={{ color: '#b45309', fontSize: 18, flexShrink: 0 }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#b45309' }}>Git Repository Not Initialized</div>
+              <div style={{ fontSize: 12, color: '#92400e' }}>Initialize the Git repository to enable script generation, test data upload and test execution.</div>
+            </div>
+            <button onClick={() => { navigate('config'); setConfigTab('git'); }}
+              style={{ padding: '6px 14px', background: '#22c55e', border: 'none', borderRadius: 7, color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', flexShrink: 0 }}>
+              Initialize Repository
+            </button>
+          </div>
+        )}
         {/* Stat cards */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 28 }}>
           {stats.map(s => (
