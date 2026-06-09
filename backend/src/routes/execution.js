@@ -682,6 +682,8 @@ router.post('/run', auth, async (req, res) => {
     const entry = { type, message };
     allLogs.push(entry);
     res.write('data: ' + JSON.stringify(entry) + '\n\n');
+    // Force immediate flush through any compression/proxy middleware
+    if (typeof res.flush === 'function') res.flush();
   }
   function done(data) {
     res.write('data: ' + JSON.stringify({ done: true, ...data }) + '\n\n');
@@ -972,6 +974,63 @@ router.post('/run', auth, async (req, res) => {
       }, 300);
     }
 
+    // ── Mid-run rule monitoring setup ─────────────────────────────────────────
+    const { sendBreachAlertEmail } = require('../utils/emailUtils');
+    const alertedRuleIds = new Set();   // track which rule IDs already fired an alert
+    const testStartMs    = Date.now();
+    const project        = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
+    const suiteName      = suite?.name || 'Test Run';
+    const projectName    = project?.name || '';
+
+    // Metrics that can be meaningfully evaluated in real-time (mid-run).
+    // Response Time / P95 / P90 can swing during ramp-up and only stabilise at
+    // the end, so we intentionally exclude them from live monitoring.
+    const LIVE_MONITOR_METRICS = new Set([
+      'error rate',
+      'cpu usage',
+      'memory usage',
+    ]);
+
+    // Check rules against current partial JTL every second
+    const ruleMonitor = setInterval(async () => {
+      if (!jtlPath || !fs.existsSync(jtlPath)) return;
+      try {
+        const { evaluateRules: evalRules } = require('../utils/ruleEvaluator');
+        const result = evalRules(project_id, jtlPath);
+        if (!result || result.noRules || !result.violations?.length) return;
+
+        // Only alert on live-monitorable metrics — ignore Response Time, P95, etc.
+        const liveViolations = result.violations.filter(
+          v => LIVE_MONITOR_METRICS.has((v.rule.metric || '').toLowerCase().trim())
+        );
+        if (!liveViolations.length) return;
+
+        // Find new violations (not yet alerted for this run)
+        const newViolations = liveViolations.filter(v => !alertedRuleIds.has(v.rule.id));
+        if (!newViolations.length) return;
+
+        // Mark as alerted — each rule fires at most once per run
+        newViolations.forEach(v => alertedRuleIds.add(v.rule.id));
+
+        const elapsedSec = Math.floor((Date.now() - testStartMs) / 1000);
+        log('warn', `  [Rules] ⚡ ${newViolations.length} rule breach(es) detected at ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s — sending alert…`);
+        newViolations.forEach(v => log('warn', `          ${v.label} [${v.rule.severity}]`));
+
+        // Send breach alert email (non-blocking)
+        sendBreachAlertEmail(runId, req.userId, project_id, {
+          violations:    newViolations,
+          suiteName,
+          projectName,
+          elapsedSec,
+          totalDuration: duration || 0,
+          runId,
+        }).catch(e => console.error('[Alerts] Breach email error:', e.message));
+
+      } catch (e) {
+        console.error('[RuleMonitor] Error:', e.message);
+      }
+    }, 1000); // check every second
+
     await new Promise((resolve, reject) => {
       const proc = spawn(cmd, args, { shell: true });
 
@@ -998,13 +1057,18 @@ router.post('/run', auth, async (req, res) => {
       proc.stderr.on('data', c => handleLines(c, 'stderr'));
 
       proc.on('close', code => {
+        clearInterval(ruleMonitor); // stop monitoring when test ends
         if (logTailer) clearInterval(logTailer);
         // Resolve regardless of exit code — JMeter exits non-zero even when all
         // samples pass (e.g. when using certain plugins or non-GUI flags).
         // The JTL file is the authoritative source for pass/fail status.
         resolve(code);
       });
-      proc.on('error', err => { if (logTailer) clearInterval(logTailer); reject(err); });
+      proc.on('error', err => {
+        clearInterval(ruleMonitor);
+        if (logTailer) clearInterval(logTailer);
+        reject(err);
+      });
     });
 
     // ── Completion summary ─────────────────────────────────────────────────

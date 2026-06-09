@@ -57,10 +57,19 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
 
     // Rules for this project
     const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(col.project_id)
-      .map(r => ({
-        id: r.id, metric: r.metric, operator: r.operator,
-        value: r.value, unit: r.unit, severity: r.severity,
-      }));
+      .map(r => {
+        const rule = {
+          id: r.id, metric: r.metric, operator: r.operator,
+          unit: r.unit, severity: r.severity,
+        };
+        if (r.operator === 'between') {
+          rule.value_min = r.value_min;
+          rule.value_max = r.value_max;
+        } else {
+          rule.value = r.value;
+        }
+        return rule;
+      });
 
     // Test plans linked to this collection
     const testPlans = db.prepare('SELECT * FROM test_suites WHERE collection_id = ?').all(collectionId)

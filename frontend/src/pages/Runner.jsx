@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, startTransition } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
@@ -277,7 +277,11 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 startHealPolling(msg.run_id);
               }
             } else {
-              setLogs(prev => [...prev, { type: msg.type || 'info', message: msg.message || '' }]);
+              // Use startTransition to let React render each log line immediately
+              // without batching multiple lines into a single deferred render
+              startTransition(() => {
+                setLogs(prev => [...prev, { type: msg.type || 'info', message: msg.message || '' }]);
+              });
             }
           } catch {}
         }

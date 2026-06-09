@@ -5,48 +5,98 @@ import { useConfirm } from '../hooks/useConfirm';
 import CustomSelect from '../components/CustomSelect';
 import api from '../api';
 
-const METRICS = ['Response Time','Error Rate','Throughput','Latency P95','Latency P99','CPU Usage','Memory Usage'];
-const OPERATORS = ['<','>','<=','>=','='];
-const UNITS = ['ms','s','%','req/s','MB','KB'];
+// ── Metric config — drives operator list and unit automatically ───────────────
+const METRIC_CONFIG = {
+  'Response Time': { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 50  },
+  'Error Rate':    { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 1   },
+  'Throughput':    { unit: 'req/s', operators: ['<','<=','between'],          min: 0, max: 100000, step: 10 },
+  'Latency P95':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 50  },
+  'Latency P99':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 100 },
+  'CPU Usage':     { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 5   },
+  'Memory Usage':  { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 5   },
+};
 
-const DEFAULT_FORM = { metric: METRICS[0], operator: '<', value: '500', unit: 'ms', severity: 'error' };
+const METRICS = Object.keys(METRIC_CONFIG);
 
-export default function Rules({ project, collection, onNav, onProjectUpdated, openModalTrigger }) {
-  const [modal, setModal] = useState(null); // null | 'add' | ruleObj
-  const [form, setForm] = useState(DEFAULT_FORM);
+const OPERATOR_LABELS = {
+  '>':       '> Greater than',
+  '>=':      '≥ Greater than or equal',
+  '<':       '< Less than',
+  '<=':      '≤ Less than or equal',
+  'between': '↔ Between (range)',
+};
+
+function makeDefault(metric = 'Response Time') {
+  const cfg = METRIC_CONFIG[metric];
+  return { metric, operator: cfg.operators[0], value: '', value_min: '', value_max: '', unit: cfg.unit, severity: 'error' };
+}
+
+function ruleLabel(r) {
+  if (r.operator === 'between') return `between ${r.value_min} – ${r.value_max} ${r.unit}`;
+  const sym = { '>=': '≥', '<=': '≤' }[r.operator] || r.operator;
+  return `${sym} ${r.value} ${r.unit}`;
+}
+
+export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
+  const [modal,  setModal]  = useState(null);
+  const [form,   setForm]   = useState(makeDefault());
   const [saving, setSaving] = useState(false);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
 
   useEffect(() => {
     if (firstRender.current) { firstRender.current = false; return; }
-    if (openModalTrigger > 0) { setForm(DEFAULT_FORM); setModal('add'); }
+    if (openModalTrigger > 0) { setForm(makeDefault()); setModal('add'); }
   }, [openModalTrigger]);
 
-  if (!project) return <div className="page"><div className="empty"><i className="ti ti-folder-off" /><div className="empty-title">Select a project first</div></div></div>;
+  if (!project) return (
+    <div className="page"><div className="empty"><i className="ti ti-folder-off"/><div className="empty-title">Select a project first</div></div></div>
+  );
+
+  function handleMetricChange(metric) {
+    const cfg = METRIC_CONFIG[metric];
+    setForm(f => ({ ...f, metric, operator: cfg.operators[0], unit: cfg.unit, value: '', value_min: '', value_max: '' }));
+  }
+
+  function handleOperatorChange(operator) {
+    setForm(f => ({ ...f, operator, value: '', value_min: '', value_max: '' }));
+  }
 
   function openEdit(r) {
-    setForm({ metric: r.metric, operator: r.operator, value: r.value, unit: r.unit, severity: r.severity });
+    setForm({ metric: r.metric, operator: r.operator, value: r.value || '', value_min: r.value_min || '', value_max: r.value_max || '', unit: r.unit, severity: r.severity });
     setModal(r);
   }
 
   async function save() {
+    if (form.operator === 'between') {
+      if (!form.value_min || !form.value_max) return alert('Enter both From and To values for the range.');
+      if (Number(form.value_min) >= Number(form.value_max)) return alert('From value must be less than To value.');
+    } else {
+      if (form.value === '') return alert('Enter a threshold value.');
+    }
     setSaving(true);
     try {
-      if (modal === 'add') {
-        await api.post(`/projects/${project.id}/rules`, form);
-      } else {
-        await api.put(`/projects/${project.id}/rules/${modal.id}`, form);
-      }
+      const cfg = METRIC_CONFIG[form.metric];
+      const payload = {
+        metric:    form.metric,
+        operator:  form.operator,
+        value:     form.operator === 'between' ? '' : String(form.value),
+        value_min: form.operator === 'between' ? String(form.value_min) : null,
+        value_max: form.operator === 'between' ? String(form.value_max) : null,
+        unit:      cfg.unit,
+        severity:  form.severity,
+      };
+      if (modal === 'add') await api.post(`/projects/${project.id}/rules`, payload);
+      else                 await api.put(`/projects/${project.id}/rules/${modal.id}`, payload);
       await onProjectUpdated();
       setModal(null);
     } finally { setSaving(false); }
   }
 
   async function del(id) {
-    const rule = p?.rules?.find(r => r.id === id);
+    const rule = project?.rules?.find(r => r.id === id);
     const ok = await confirm(
-      `Delete the rule "${rule?.metric || 'this rule'}" (${rule?.operator || ''} ${rule?.value || ''} ${rule?.unit || ''})? This cannot be undone.`,
+      `Delete the rule "${rule?.metric || 'this rule'}" (${ruleLabel(rule || {})})? This cannot be undone.`,
       'Delete Rule'
     );
     if (!ok) return;
@@ -54,80 +104,122 @@ export default function Rules({ project, collection, onNav, onProjectUpdated, op
     onProjectUpdated();
   }
 
-  const p = project;
+  const metricCfg  = METRIC_CONFIG[form.metric] || METRIC_CONFIG['Response Time'];
+  const isBetween  = form.operator === 'between';
+
   return (
     <div className="page fade-in">
-      <div style={{ marginBottom: '16px', padding: '14px 16px', background: 'var(--color-background-secondary)', borderRadius: 'var(--border-radius-md)', borderLeft: '3px solid var(--accent)' }}>
-        <div style={{ fontSize: '13px', fontWeight: 500, marginBottom: '4px' }}><i className="ti ti-adjustments-horizontal" style={{ marginRight: '7px', color: 'var(--accent)' }} />Performance Configuration Rules</div>
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>Define thresholds and constraints for your collections. Rules are applied during script generation to set pass/fail criteria.</div>
+      <div style={{ marginBottom: 16, padding: '14px 16px', background: 'var(--color-background-secondary)', borderRadius: 'var(--border-radius-md)', borderLeft: '3px solid var(--accent)' }}>
+        <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}><i className="ti ti-adjustments-horizontal" style={{ marginRight: 7, color: 'var(--accent)' }}/>Performance Configuration Rules</div>
+        <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>Define thresholds for your metrics. Rules are applied during script generation to set pass/fail criteria.</div>
       </div>
 
       <div className="card">
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 80px 130px 80px 120px', gap: '8px', padding: '0 0 8px', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-secondary)' }}>
-          <div>Metric</div><div>Operator</div><div>Threshold</div><div>Severity</div><div>Actions</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px 110px 150px', gap: 8, padding: '0 0 8px', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: .5, color: 'var(--color-text-secondary)' }}>
+          <div>Metric</div><div>Threshold</div><div>Severity</div><div>Actions</div>
         </div>
-        {p.rules?.length ? p.rules.map(r => (
-          <div className="rule-row" key={r.id}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <i className="ti ti-chart-line" style={{ color: 'var(--accent)', fontSize: '15px' }} />
-              <div>
-                <div style={{ fontWeight: 500, fontSize: '13.5px' }}>{r.metric}</div>
-                <span className={`badge ${r.severity === 'error' ? 'tag-red' : 'tag-amber'}`}>{r.severity}</span>
-              </div>
+
+        {project.rules?.length ? project.rules.map(r => (
+          <div className="rule-row" key={r.id} style={{ display: 'grid', gridTemplateColumns: '1fr 220px 110px 150px', gap: 8, alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <i className="ti ti-chart-line" style={{ color: 'var(--accent)', fontSize: 15 }}/>
+              <span style={{ fontWeight: 500, fontSize: 13.5 }}>{r.metric}</span>
             </div>
-            <div style={{ fontFamily: 'monospace', fontSize: '15px', fontWeight: 600, textAlign: 'center' }}>{r.operator}</div>
-            <div style={{ fontWeight: 600 }}>{r.value} <span style={{ color: 'var(--color-text-tertiary)', fontWeight: 400 }}>{r.unit}</span></div>
+            <div style={{ fontWeight: 600, fontFamily: 'monospace', fontSize: 13, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{ruleLabel(r)}</div>
             <div><span className={`badge ${r.severity === 'error' ? 'tag-red' : 'tag-amber'}`}>{r.severity}</span></div>
-            <div style={{ display: 'flex', gap: '4px' }}>
-              <button className="btn-icon" onClick={() => openEdit(r)}><i className="ti ti-edit" style={{ fontSize: '14px' }} /></button>
-              <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)' }} onClick={() => del(r.id)}><i className="ti ti-trash" /> Delete</button>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button className="btn-icon" onClick={() => openEdit(r)}><i className="ti ti-edit" style={{ fontSize: 14 }}/></button>
+              <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)' }} onClick={() => del(r.id)}><i className="ti ti-trash"/> Delete</button>
             </div>
           </div>
         )) : (
-          <div className="empty" style={{ padding: '24px' }}>
-            <i className="ti ti-adjustments-horizontal" />
+          <div className="empty" style={{ padding: 24 }}>
+            <i className="ti ti-adjustments-horizontal"/>
             <div className="empty-title">No rules configured</div>
           </div>
         )}
       </div>
 
-      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel}/>
 
       {modal && (
         <Modal onClose={() => setModal(null)}>
           <div className="modal-hdr">
             <div className="modal-title">{modal === 'add' ? 'Add' : 'Edit'} Performance Rule</div>
-            <button className="btn-icon" onClick={() => setModal(null)}><i className="ti ti-x" /></button>
+            <button className="btn-icon" onClick={() => setModal(null)}><i className="ti ti-x"/></button>
           </div>
-          <div className="form-group"><label className="form-label">Metric</label>
-            <CustomSelect value={form.metric} onChange={e => setForm(f => ({ ...f, metric: e.target.value }))}>
-              {METRICS.map(m => <option key={m}>{m}</option>)}
+
+          {/* Metric */}
+          <div className="form-group">
+            <label className="form-label">Metric</label>
+            <CustomSelect value={form.metric} onChange={e => handleMetricChange(e.target.value)}>
+              {METRICS.map(m => <option key={m} value={m}>{m}</option>)}
             </CustomSelect>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px' }}>
-            <div className="form-group"><label className="form-label">Operator</label>
-              <CustomSelect value={form.operator} onChange={e => setForm(f => ({ ...f, operator: e.target.value }))}>
-                {OPERATORS.map(o => <option key={o}>{o}</option>)}
+
+          {/* Operator + Value(s) */}
+          <div style={{ display: 'grid', gridTemplateColumns: isBetween ? '1fr 1fr 1fr' : '1fr 1fr', gap: 10 }}>
+            {/* Operator */}
+            <div className="form-group">
+              <label className="form-label">Operator</label>
+              <CustomSelect value={form.operator} onChange={e => handleOperatorChange(e.target.value)}>
+                {metricCfg.operators.map(op => (
+                  <option key={op} value={op}>{OPERATOR_LABELS[op]}</option>
+                ))}
               </CustomSelect>
             </div>
-            <div className="form-group"><label className="form-label">Value</label>
-              <input type="number" value={form.value} onChange={e => setForm(f => ({ ...f, value: e.target.value }))} />
-            </div>
-            <div className="form-group"><label className="form-label">Unit</label>
-              <CustomSelect value={form.unit} onChange={e => setForm(f => ({ ...f, unit: e.target.value }))}>
-                {UNITS.map(u => <option key={u}>{u}</option>)}
-              </CustomSelect>
-            </div>
+
+            {isBetween ? (
+              <>
+                {/* From */}
+                <div className="form-group">
+                  <label className="form-label">From ({metricCfg.unit})</label>
+                  <input type="number"
+                    value={form.value_min}
+                    onChange={e => setForm(f => ({ ...f, value_min: e.target.value }))}
+                    placeholder="e.g. 200"
+                    min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
+                  />
+                </div>
+                {/* To */}
+                <div className="form-group">
+                  <label className="form-label">To ({metricCfg.unit})</label>
+                  <input type="number"
+                    value={form.value_max}
+                    onChange={e => setForm(f => ({ ...f, value_max: e.target.value }))}
+                    placeholder="e.g. 500"
+                    min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
+                  />
+                </div>
+              </>
+            ) : (
+              /* Single value */
+              <div className="form-group">
+                <label className="form-label">Value ({metricCfg.unit})</label>
+                <input type="number"
+                  value={form.value}
+                  onChange={e => setForm(f => ({ ...f, value: e.target.value }))}
+                  placeholder="e.g. 500"
+                  min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
+                />
+              </div>
+            )}
           </div>
-          <div className="form-group"><label className="form-label">Severity</label>
+
+          {/* Severity */}
+          <div className="form-group">
+            <label className="form-label">Severity</label>
             <CustomSelect value={form.severity} onChange={e => setForm(f => ({ ...f, severity: e.target.value }))}>
-              <option value="error">Error (fail test)</option>
               <option value="warning">Warning (alert only)</option>
+              <option value="error">Error (fail test)</option>
             </CustomSelect>
           </div>
+
           <div className="modal-footer">
             <button className="btn-secondary" onClick={() => setModal(null)}>Cancel</button>
-            <button className="btn-primary" onClick={save} disabled={saving}>{saving && <span className="spinner" />}{modal === 'add' ? 'Add Rule' : 'Save Changes'}</button>
+            <button className="btn-primary" onClick={save} disabled={saving}>
+              {saving && <span className="spinner"/>}{modal === 'add' ? 'Add Rule' : 'Save Changes'}
+            </button>
           </div>
         </Modal>
       )}

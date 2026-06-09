@@ -279,7 +279,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
         setAutoIniting(true);
         addLog(`Setting up branch "${idForm.branch_name}"…`);
         try {
-          const { data } = await api.post(`/projects/${pid}/git/branch`);
+          const { data } = await api.post(`/projects/${pid}/git/branch`, { branch_name: idForm.branch_name.trim() });
           addLog(data.message, 'success');
           toast(data.message, 'success');
           loadAll();
@@ -291,18 +291,21 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
     finally { setSavingId(false); }
   }
 
-  // ── Create branch manually ────────────────────────────────────────────────
+  // ── Create / switch branch ────────────────────────────────────────────────
   async function createBranch() {
+    if (!idForm.branch_name?.trim()) return toast('Enter a branch name first', 'warn');
     if (branchConflict) return toast('Branch name cannot be the same as the base branch', 'warn');
     setCreatingBranch(true);
-    addLog(`Creating branch "${idForm.branch_name}"…`);
+    addLog(`Creating / switching to branch "${idForm.branch_name}"…`);
     try {
-      const { data } = await api.post(`/projects/${pid}/git/branch`);
+      // Always send branch_name in body so backend uses the current form value,
+      // not whatever was previously saved in the DB
+      const { data } = await api.post(`/projects/${pid}/git/branch`, { branch_name: idForm.branch_name.trim() });
       addLog(data.message, 'success');
       toast(data.message, 'success');
       loadAll();
     } catch (err) {
-      const msg = err.response?.data?.error || 'Branch creation failed';
+      const msg = err.response?.data?.error || 'Branch operation failed';
       addLog(msg, 'error'); toast(msg, 'error');
     } finally { setCreatingBranch(false); }
   }

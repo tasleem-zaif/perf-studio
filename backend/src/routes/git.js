@@ -769,9 +769,15 @@ router.get('/branches', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
-    const summary = await git.branch(['-a']);
+
+    // Only return LOCAL branches — no remotes/origin/... tracking refs.
+    // Also exclude the base branch (main) since users never work directly on it.
+    const summary = await git.branchLocal();
+    const baseBranch = cfg.base_branch || 'main';
+    const userBranches = summary.all.filter(b => b !== baseBranch);
+
     res.json({
-      branches: summary.all,
+      branches: userBranches,
       current: summary.current,
     });
   } catch (e) {
@@ -1037,8 +1043,22 @@ router.post('/branch', async (req, res) => {
   const caller = getCaller(req.userId);
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
-  const branchName = identity?.branch_name || req.body.branch_name;
-  if (!branchName) return res.status(400).json({ error: 'Save your Git Identity first to set a branch name.' });
+
+  // Prefer branch name from request body (current form value) over the saved DB value
+  const branchName = (req.body.branch_name || '').trim() || identity?.branch_name;
+  if (!branchName) return res.status(400).json({ error: 'Enter a branch name in Git Identity first.' });
+
+  // For regular users, require a personal PAT so the push is attributed to their
+  // own GitHub account — not the org admin's account.
+  const isAdmin = caller.role === 'org_admin' || caller.role === 'super_admin';
+  if (!isAdmin) {
+    const hasPersonalToken = identity?.auth_token && identity.auth_token.trim();
+    if (!hasPersonalToken) {
+      return res.status(400).json({
+        error: 'Please save your Personal Access Token in Git Identity before creating a branch. Without it, the branch would be pushed under the org admin\'s GitHub account.',
+      });
+    }
+  }
 
   // Use the per-user workspace (clones from remote if not yet set up)
   const gitRoot = getUserWorkspace(proj, caller);
