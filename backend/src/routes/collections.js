@@ -100,13 +100,9 @@ function setupCollectionFolder(proj, colId, colName, env, sourceContent, sourceT
   const userProjectPath = getUserProjectPath(userId, role, proj.name);
   if (!userProjectPath) return null;
 
-  // Admin workspace holds only empty folders — skip all file writes for admin
+  // Admin workspace is completely empty (no folders, no files) — skip everything
   const { isAdminWorkspace } = require('../utils/projectFolders');
-  if (isAdminWorkspace(userProjectPath)) {
-    // Still create the empty folder structure but write nothing inside
-    try { require('../utils/projectFolders').ensureCollectionFolders(userProjectPath, colName, env); } catch (_) {}
-    return null;
-  }
+  if (isAdminWorkspace(userProjectPath)) return null;
 
   // Ensure the workspace is a proper git repo (clone if .git missing)
   const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
@@ -312,11 +308,11 @@ router.put('/:id', upload.single('file'), (req, res) => {
 
   // Sync folder structure + config.json in current user's workspace
   try {
-    const { ensureAllEnvFolders, getUserProjectPath, cleanName } = require('../utils/projectFolders');
+    const { ensureAllEnvFolders, getUserProjectPath, isAdminWorkspace, cleanName } = require('../utils/projectFolders');
     const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
     const projRow    = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
     const userProjPath = getUserProjectPath(req.userId, callerRole, projRow?.name || '');
-    if (userProjPath) {
+    if (userProjPath && !isAdminWorkspace(userProjPath)) {
       let newEnvs = [];
       try { newEnvs = JSON.parse(req.body.environments || '[]'); } catch {}
       if (!newEnvs.length && req.body.environment) newEnvs = [req.body.environment];
