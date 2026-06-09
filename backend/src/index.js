@@ -76,6 +76,21 @@ if (process.env.NODE_ENV === 'production') {
 app.listen(PORT, () => {
   console.log(`Performance Studio API running on http://localhost:${PORT}`);
 
+  // ── On startup: mark orphaned running runs as failed ─────────────────────
+  // If the server was restarted mid-execution, runs stuck in 'running' state
+  // will never complete. Mark them failed so the UI doesn't show stale spinners.
+  try {
+    const db = require('./db');
+    const orphanedExec = db.prepare(
+      "UPDATE execution_runs SET status='failed', finished_at=datetime('now') WHERE status='running'"
+    ).run();
+    const orphanedPipeline = db.prepare(
+      "UPDATE pipeline_runs SET status='failed', finished_at=datetime('now') WHERE status='running'"
+    ).run();
+    if (orphanedExec.changes > 0)    console.log(`[Startup] Marked ${orphanedExec.changes} orphaned execution run(s) as failed`);
+    if (orphanedPipeline.changes > 0) console.log(`[Startup] Marked ${orphanedPipeline.changes} orphaned pipeline run(s) as failed`);
+  } catch (e) { console.error('[Startup] Orphan cleanup error:', e.message); }
+
   // ── Regenerate all config.json files on startup ─────────────────────────
   // Ensures every workspace's config.json is always up-to-date with the
   // latest rules, test plans and settings — regardless of which user last
