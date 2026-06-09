@@ -309,12 +309,34 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciRuns,         setCiRuns]         = useState([]);
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
   const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
+  const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
+  const ciStepsPollerRef = useRef(null);
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
     api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => setCiConfig(data.config)).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
   }, [selectedProjectId]);
+
+  // Poll live steps when a terminal is expanded
+  useEffect(() => {
+    if (ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; }
+    if (!ciExpandedRun || !selectedProjectId) return;
+
+    const fetchSteps = async () => {
+      try {
+        const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${ciExpandedRun}/steps`);
+        setCiSteps(prev => ({ ...prev, [ciExpandedRun]: data }));
+        // Stop polling when run is done
+        const done = ['completed','failed','cancelled','success','failure'].includes(data.status);
+        if (done && ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; }
+      } catch {}
+    };
+
+    fetchSteps(); // immediate first fetch
+    ciStepsPollerRef.current = setInterval(fetchSteps, 4000); // then every 4s
+    return () => { if (ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; } };
+  }, [ciExpandedRun, selectedProjectId]);
 
   async function triggerCiPipeline() {
     setCiTriggering(true);
@@ -751,38 +773,83 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           </div>
 
                           {/* Expandable terminal */}
-                          {isExpanded && (
-                            <div style={{ borderTop: '1px solid #e2e8f0', background: '#0d1117', padding: '10px 14px', fontFamily: 'monospace', fontSize: 11, maxHeight: 240, overflowY: 'auto' }}>
-                              <div style={{ color: '#58a6ff', marginBottom: 6, fontSize: 10 }}>── CI Pipeline Execution Log ──</div>
-                              {/* Trigger info */}
-                              <div style={{ color: '#94a3b8' }}>{r.started_at?.replace('T',' ').slice(0,19)}  Pipeline triggered on {r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</div>
-                              {r.external_id && <div style={{ color: '#94a3b8' }}>  External Run ID: #{r.external_id}</div>}
-                              {/* Variables */}
-                              {vars.jmeter_users && (
-                                <div style={{ color: '#94a3b8', marginTop: 4 }}>
-                                  <div>  Script    : {r.script_name}</div>
-                                  <div>  Users     : {vars.jmeter_users}</div>
-                                  <div>  Ramp-up   : {vars.jmeter_rampup}s</div>
-                                  {vars.jmeter_duration > 0 ? <div>  Duration  : {vars.jmeter_duration}s</div> : <div>  Loops     : {vars.jmeter_loops}</div>}
+                          {isExpanded && (() => {
+                            const stepsData = ciSteps[r.id];
+                            const steps     = stepsData?.steps || [];
+                            const job       = stepsData?.job;
+                            const stepIcon  = s => {
+                              if (s.status === 'in_progress') return { icon: '⟳', color: '#f59e0b' };
+                              if (s.conclusion === 'success')  return { icon: '✔', color: '#3fb950' };
+                              if (s.conclusion === 'failure')  return { icon: '✘', color: '#f85149' };
+                              if (s.conclusion === 'skipped')  return { icon: '⊘', color: '#8b949e' };
+                              return { icon: '○', color: '#484f58' };
+                            };
+                            return (
+                              <div style={{ borderTop: '1px solid #21262d', background: '#0d1117', padding: '10px 14px', fontFamily: '"Fira Mono",Consolas,monospace', fontSize: 11, maxHeight: 320, overflowY: 'auto' }}>
+                                {/* Header */}
+                                <div style={{ color: '#58a6ff', marginBottom: 8, fontSize: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  <span>── CI Pipeline Execution Log ──</span>
+                                  {['running','in_progress'].includes(r.status) && (
+                                    <span style={{ color: '#f59e0b', animation: 'pulse 1s infinite' }}>● LIVE</span>
+                                  )}
                                 </div>
-                              )}
-                              {/* Status timeline */}
-                              <div style={{ marginTop: 6, color: '#94a3b8' }}>  Status: <span style={{ color: color }}>{r.status.toUpperCase()}</span></div>
-                              {r.finished_at && <div style={{ color: '#94a3b8' }}>  Finished  : {r.finished_at?.replace('T',' ').slice(0,19)}</div>}
-                              {/* Link */}
-                              {r.web_url && (
-                                <div style={{ marginTop: 6 }}>
-                                  <a href={r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
-                                    → Open full logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
-                                  </a>
+
+                                {/* Trigger info */}
+                                <div style={{ color: '#8b949e', marginBottom: 6 }}>
+                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</span></div>
+                                  {r.external_id && <div>Run ID: <span style={{ color: '#58a6ff' }}>#{r.external_id}</span>  {job?.runner_name ? `· Runner: ${job.runner_name}` : ''}</div>}
                                 </div>
-                              )}
-                              {/* Prompt to check live logs */}
-                              {['running','in_progress'].includes(r.status) && (
-                                <div style={{ color: '#f59e0b', marginTop: 6 }}>  ⟳ Test is currently running on {r.provider === 'github' ? 'GitHub' : 'GitLab'} infrastructure…</div>
-                              )}
-                            </div>
-                          )}
+
+                                {/* Test params */}
+                                {vars.jmeter_users && (
+                                  <div style={{ color: '#8b949e', borderLeft: '2px solid #21262d', paddingLeft: 8, marginBottom: 8 }}>
+                                    <div>Script   <span style={{ color: '#e6edf3' }}>{r.script_name}</span></div>
+                                    <div>Users    <span style={{ color: '#e6edf3' }}>{vars.jmeter_users}</span>  Ramp <span style={{ color: '#e6edf3' }}>{vars.jmeter_rampup}s</span>  {vars.jmeter_duration > 0 ? <>Duration <span style={{ color: '#e6edf3' }}>{vars.jmeter_duration}s</span></> : <>Loops <span style={{ color: '#e6edf3' }}>{vars.jmeter_loops}</span></>}</div>
+                                  </div>
+                                )}
+
+                                {/* Live steps */}
+                                {steps.length > 0 ? (
+                                  <div style={{ marginBottom: 8 }}>
+                                    <div style={{ color: '#484f58', fontSize: 10, marginBottom: 4 }}>── Steps ──</div>
+                                    {steps.map((s, i) => {
+                                      const ic = stepIcon(s);
+                                      const dur = s.duration_s != null ? ` (${s.duration_s}s)` : '';
+                                      const startTs = s.started_at ? s.started_at.replace('T',' ').slice(0,19) : '';
+                                      return (
+                                        <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 2 }}>
+                                          <span style={{ color: ic.color, width: 12, flexShrink: 0 }}>{ic.icon}</span>
+                                          <span style={{ color: '#e6edf3', flex: 1 }}>{s.name}</span>
+                                          {startTs && <span style={{ color: '#484f58', fontSize: 10 }}>{startTs}{dur}</span>}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <div style={{ color: '#484f58', marginBottom: 8 }}>
+                                    {['running','in_progress','queued','pending'].includes(r.status)
+                                      ? '⟳ Fetching live steps from GitHub…'
+                                      : 'No step details available'}
+                                  </div>
+                                )}
+
+                                {/* Status + finish time */}
+                                <div style={{ color: '#8b949e', borderTop: '1px solid #21262d', paddingTop: 6 }}>
+                                  <span>Status: </span><span style={{ color }}>{r.status.toUpperCase()}</span>
+                                  {r.finished_at && <span style={{ color: '#484f58' }}>  · Finished: {r.finished_at?.replace('T',' ').slice(0,19)}</span>}
+                                </div>
+
+                                {/* GitHub link */}
+                                {(r.web_url || job?.html_url) && (
+                                  <div style={{ marginTop: 6 }}>
+                                    <a href={job?.html_url || r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
+                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
+                                    </a>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       );
                     })}

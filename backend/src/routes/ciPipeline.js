@@ -1003,4 +1003,92 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   }
 });
 
+// ── GET /runs/:runId/steps — live step details from GitHub/GitLab ─────────────
+router.get('/runs/:runId/steps', async (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (!run.external_id) return res.json({ steps: [], status: run.status });
+
+  const cfg = decryptConfig(getConfig(req.params.projectId));
+  if (!cfg) return res.json({ steps: [], status: run.status });
+
+  try {
+    if (run.provider === 'github') {
+      if (!cfg.github_token) return res.json({ steps: [], status: run.status });
+      const ghHeaders = {
+        Authorization: `token ${cfg.github_token}`,
+        'User-Agent': 'PerfStudio',
+        Accept: 'application/vnd.github+json',
+      };
+
+      // Get jobs for this run
+      const jobsResp = await apiRequest(
+        `https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/jobs`,
+        'GET', null, ghHeaders
+      );
+
+      if (jobsResp.status !== 200) return res.json({ steps: [], status: run.status });
+
+      const job = jobsResp.body?.jobs?.[0];
+      if (!job) return res.json({ steps: [], status: run.status });
+
+      const steps = (job.steps || []).map(s => ({
+        number:       s.number,
+        name:         s.name,
+        status:       s.status,       // queued | in_progress | completed
+        conclusion:   s.conclusion,   // success | failure | skipped | cancelled | null
+        started_at:   s.started_at,
+        completed_at: s.completed_at,
+        duration_s:   s.started_at && s.completed_at
+          ? Math.round((new Date(s.completed_at) - new Date(s.started_at)) / 1000)
+          : null,
+      }));
+
+      // Job-level details
+      const jobInfo = {
+        id:           job.id,
+        name:         job.name,
+        status:       job.status,
+        conclusion:   job.conclusion,
+        started_at:   job.started_at,
+        completed_at: job.completed_at,
+        html_url:     job.html_url,
+        runner_name:  job.runner_name,
+      };
+
+      return res.json({ steps, job: jobInfo, status: run.status, provider: 'github' });
+    }
+
+    if (run.provider === 'gitlab') {
+      if (!cfg.gitlab_token) return res.json({ steps: [], status: run.status });
+      const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
+      const encodedId = encodeURIComponent(cfg.gitlab_project_id);
+
+      const jobsResp = await apiRequest(
+        `${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`,
+        'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token }
+      );
+
+      if (jobsResp.status !== 200) return res.json({ steps: [], status: run.status });
+
+      const steps = (jobsResp.body || []).map(j => ({
+        number:       j.id,
+        name:         j.name,
+        status:       j.status,
+        conclusion:   j.status === 'success' ? 'success' : j.status === 'failed' ? 'failure' : null,
+        started_at:   j.started_at,
+        completed_at: j.finished_at,
+        duration_s:   j.duration ? Math.round(j.duration) : null,
+      }));
+
+      return res.json({ steps, status: run.status, provider: 'gitlab' });
+    }
+
+    res.json({ steps: [], status: run.status });
+  } catch (e) {
+    res.json({ steps: [], status: run.status, error: e.message });
+  }
+});
+
 module.exports = router;
