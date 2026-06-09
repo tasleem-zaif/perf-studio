@@ -299,8 +299,242 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   // Active runs across all projects (for concurrency awareness)
   const activeRuns = runs.filter(r => r.status === 'running');
 
+  // ── Pipeline runner state ─────────────────────────────────────────────────
+  const [runTab,           setRunTab]           = useState('single'); // 'single' | 'pipeline'
+  const [pipelines,        setPipelines]        = useState([]);
+  const [selectedPipeline, setSelectedPipeline] = useState('');
+  const [pipelineRunning,  setPipelineRunning]  = useState(false);
+  const [pipelineLogs,     setPipelineLogs]     = useState([]);
+  const [pipelineSteps,    setPipelineSteps]    = useState([]);
+  const [pipelineRunId,    setPipelineRunId]    = useState(null);
+  const [pipelineStatus,   setPipelineStatus]   = useState(null); // 'running'|'completed'|'failed'
+  const pipelineConsoleRef = useRef(null);
+
+  useEffect(() => {
+    if (pipelineConsoleRef.current) {
+      pipelineConsoleRef.current.scrollTop = pipelineConsoleRef.current.scrollHeight;
+    }
+  }, [pipelineLogs]);
+
+  useEffect(() => {
+    if (!selectedProjectId) { setPipelines([]); setSelectedPipeline(''); return; }
+    api.get(`/projects/${selectedProjectId}/pipelines`)
+      .then(({ data }) => setPipelines(data.pipelines || []))
+      .catch(() => setPipelines([]));
+  }, [selectedProjectId]);
+
+  async function runPipeline() {
+    if (!selectedPipeline) return toast('Select a pipeline first', 'warn');
+    setPipelineRunning(true);
+    setPipelineLogs([{ type: 'info', message: 'Starting pipeline...' }]);
+    setPipelineStatus('running');
+    setPipelineRunId(null);
+
+    // Reset step statuses from selected pipeline definition
+    const pl = pipelines.find(p => String(p.id) === String(selectedPipeline));
+    const steps = pl ? JSON.parse(pl.steps || '[]') : [];
+    setPipelineSteps(steps.map(s => ({ ...s, status: 'pending' })));
+
+    try {
+      const token = localStorage.getItem('ps_token');
+      const response = await fetch(`/api/projects/${selectedProjectId}/pipelines/${selectedPipeline}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      });
+
+      const reader  = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop();
+        for (const event of events) {
+          const line = event.trim();
+          if (!line.startsWith('data:')) continue;
+          try {
+            const msg = JSON.parse(line.slice(5).trim());
+            if (msg.run_id && !msg.done) {
+              setPipelineRunId(msg.run_id);
+            }
+            if (msg.step_update) {
+              const { index, status, error } = msg.step_update;
+              setPipelineSteps(prev => prev.map((s, i) => i === index ? { ...s, status, error } : s));
+            }
+            if (msg.done) {
+              setPipelineStatus(msg.status || 'completed');
+              // Reload run history
+              api.get(`/projects/${selectedProjectId}/pipelines/${selectedPipeline}/runs`).catch(() => {});
+            } else if (msg.type && msg.message) {
+              startTransition(() => {
+                setPipelineLogs(prev => [...prev, { type: msg.type, message: msg.message }]);
+              });
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      setPipelineLogs(prev => [...prev, { type: 'err', message: 'Connection error: ' + e.message }]);
+      setPipelineStatus('failed');
+    } finally {
+      setPipelineRunning(false);
+    }
+  }
+
   return (
     <div className="page fade-in">
+
+      {/* ── Run mode tabs ─────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
+        {[
+          { id: 'single',   icon: 'ti-player-play',  label: 'Single Test Run' },
+          { id: 'pipeline', icon: 'ti-git-merge',     label: 'Pipeline Run'    },
+        ].map(t => (
+          <button key={t.id} onClick={() => setRunTab(t.id)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 7,
+              padding: '8px 16px', border: 'none', cursor: 'pointer',
+              fontFamily: 'inherit', fontSize: 13, fontWeight: runTab === t.id ? 700 : 500,
+              background: 'transparent',
+              color: runTab === t.id ? 'var(--accent)' : 'var(--color-text-secondary)',
+              borderBottom: runTab === t.id ? '2px solid var(--accent)' : '2px solid transparent',
+              marginBottom: -2, transition: 'all .12s',
+            }}>
+            <i className={`ti ${t.icon}`} style={{ fontSize: 14 }}/>{t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Pipeline Run tab ─────────────────────────────────────────────── */}
+      {runTab === 'pipeline' && (
+        <div>
+          {/* Pipeline selector */}
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <i className="ti ti-git-merge" style={{ color: 'var(--accent)' }}/> Select Pipeline
+            </div>
+            {!activeProject ? (
+              <div style={{ fontSize: 12, color: 'var(--color-text-tertiary)' }}>
+                <i className="ti ti-info-circle" style={{ marginRight: 6, color: 'var(--warn)' }}/>
+                No project selected. Choose a project from the sidebar first.
+              </div>
+            ) : pipelines.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--color-text-tertiary)' }}>
+                <i className="ti ti-info-circle" style={{ marginRight: 6, color: 'var(--warn)' }}/>
+                No pipelines found. Go to <strong>Configuration → Pipeline</strong> to create one.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+                <div style={{ flex: 1 }}>
+                  <label className="form-label">Pipeline</label>
+                  <CustomSelect value={selectedPipeline} onChange={e => { setSelectedPipeline(e.target.value); setPipelineLogs([]); setPipelineSteps([]); setPipelineStatus(null); }}>
+                    <option value="">— Select a pipeline —</option>
+                    {pipelines.map(p => {
+                      const steps = JSON.parse(p.steps || '[]');
+                      return <option key={p.id} value={p.id}>{p.name} ({steps.length} step{steps.length !== 1 ? 's' : ''}){p.environment ? ` · ${p.environment}` : ''}</option>;
+                    })}
+                  </CustomSelect>
+                </div>
+                <button className="btn-primary" onClick={runPipeline}
+                  disabled={pipelineRunning || !selectedPipeline}
+                  style={{ flexShrink: 0, minWidth: 130 }}>
+                  {pipelineRunning
+                    ? <><span className="spinner"/> Running…</>
+                    : <><i className="ti ti-player-play"/> Run Pipeline</>}
+                </button>
+              </div>
+            )}
+
+            {/* Pipeline details preview */}
+            {selectedPipeline && (() => {
+              const pl = pipelines.find(p => String(p.id) === String(selectedPipeline));
+              if (!pl) return null;
+              const steps = JSON.parse(pl.steps || '[]');
+              return (
+                <div style={{ marginTop: 14, paddingTop: 14, borderTop: '1px solid #f1f5f9' }}>
+                  {pl.description && <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10 }}>{pl.description}</div>}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {steps.map((s, i) => (
+                      <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '3px 10px', background: '#f1f5f9', borderRadius: 20, fontSize: 11, color: '#475569' }}>
+                        <span style={{ fontWeight: 700, color: '#4338ca' }}>{i + 1}.</span>{s.name}
+                        <span style={{ fontSize: 10, color: '#94a3b8' }}>{s.engine?.toUpperCase()}</span>
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 8 }}>
+                    <i className="ti ti-player-stop" style={{ marginRight: 4, color: pl.stop_on_failure ? '#ef4444' : '#94a3b8' }}/>
+                    {pl.stop_on_failure ? 'Stops on first failure' : 'Continues on failure'}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Step progress */}
+          {pipelineSteps.length > 0 && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <i className="ti ti-list-check" style={{ color: 'var(--accent)' }}/> Step Progress
+                {pipelineStatus && (
+                  <span style={{
+                    marginLeft: 'auto', padding: '3px 12px', borderRadius: 20, fontSize: 11, fontWeight: 700,
+                    background: pipelineStatus === 'completed' ? '#dcfce7' : pipelineStatus === 'failed' ? '#fee2e2' : '#dbeafe',
+                    color:      pipelineStatus === 'completed' ? '#16a34a' : pipelineStatus === 'failed' ? '#dc2626' : '#1d4ed8',
+                  }}>
+                    {pipelineStatus === 'completed' ? '✔ Completed' : pipelineStatus === 'failed' ? '✘ Failed' : '⟳ Running'}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {pipelineSteps.map((s, i) => {
+                  const statusColors = {
+                    pending:   { bg: '#f1f5f9', color: '#64748b', icon: 'ti-circle',        label: 'Pending'   },
+                    running:   { bg: '#dbeafe', color: '#1d4ed8', icon: 'ti-loader-2',      label: 'Running'   },
+                    completed: { bg: '#dcfce7', color: '#16a34a', icon: 'ti-circle-check',  label: 'Passed'    },
+                    failed:    { bg: '#fee2e2', color: '#dc2626', icon: 'ti-circle-x',      label: 'Failed'    },
+                    skipped:   { bg: '#fef3c7', color: '#b45309', icon: 'ti-circle-dashed', label: 'Skipped'   },
+                  };
+                  const sc = statusColors[s.status] || statusColors.pending;
+                  return (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: sc.bg, border: `1px solid ${sc.bg}` }}>
+                      <i className={`ti ${sc.icon}`} style={{ color: sc.color, fontSize: 16, flexShrink: 0, animation: s.status === 'running' ? 'spin 1s linear infinite' : 'none' }}/>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: '#0f172a', flex: 1 }}>
+                        <span style={{ color: '#94a3b8', marginRight: 6 }}>Step {i + 1}.</span>{s.name}
+                        {s.engine && <span style={{ marginLeft: 8, fontSize: 10, color: '#94a3b8', fontWeight: 400 }}>{s.engine.toUpperCase()}</span>}
+                      </span>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: sc.color }}>{sc.label}</span>
+                      {s.error && <span style={{ fontSize: 10, color: '#dc2626', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={s.error}>{s.error}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Pipeline execution log */}
+          {pipelineLogs.length > 0 && (
+            <>
+              <div className="section-hdr" style={{ marginBottom: 8 }}>
+                <div className="section-title"><i className="ti ti-terminal-2" style={{ marginRight: 6, color: 'var(--accent)' }}/>Pipeline Log</div>
+                <button className="btn-secondary btn-sm" onClick={() => { setPipelineLogs([]); setPipelineSteps([]); setPipelineStatus(null); }}>
+                  <i className="ti ti-trash"/> Clear
+                </button>
+              </div>
+              <div className="run-panel" ref={pipelineConsoleRef} style={{ marginBottom: 20 }}>
+                {pipelineLogs.map((l, i) => (
+                  <div key={i} className={`run-line run-${l.type}`}>{l.message}</div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── Single Test Run tab ──────────────────────────────────────────── */}
+      {runTab === 'single' && <>
 
       {/* Concurrent runs banner */}
       {activeRuns.length > 0 && !running && (
@@ -737,6 +971,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
           )}
         </>
       )}
+      </> /* end single tab */}
     </div>
   );
 }

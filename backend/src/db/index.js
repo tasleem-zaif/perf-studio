@@ -163,6 +163,8 @@ const migrations = [
   "ALTER TABLE projects ADD COLUMN folder_path TEXT DEFAULT ''",
   "ALTER TABLE rules ADD COLUMN value_min TEXT DEFAULT NULL",
   "ALTER TABLE rules ADD COLUMN value_max TEXT DEFAULT NULL",
+  "ALTER TABLE pipeline_runs ADD COLUMN logs TEXT DEFAULT '[]'",
+  "ALTER TABLE pipeline_runs ADD COLUMN triggered_by INTEGER DEFAULT NULL",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (_) { /* column already exists */ }
