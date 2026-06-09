@@ -68,6 +68,8 @@ function lengthWarning(col) {
 }
 
 function generateCellValue(col) {
+  // Custom type: same fixed value for every row
+  if (col.dataType === 'Custom') return col.customValue || '';
   const total  = parseInt(col.length) || 0;
   const prefix = col.prefix  || '';
   const postfix = col.postfix || '';
@@ -76,7 +78,7 @@ function generateCellValue(col) {
   return `${prefix}${raw}${postfix}`;
 }
 
-const DATA_TYPES = ['Text','Number','Decimal','Email','Username','Password','UUID','Name','Date','Phone','Boolean','URL'];
+const DATA_TYPES = ['Text','Number','Decimal','Email','Username','Password','UUID','Name','Date','Phone','Boolean','URL','Custom'];
 const EXTENSIONS = ['.csv', '.txt', '.xlsx', '.xls'];
 
 function makeDefaultColumns(n) {
@@ -97,6 +99,8 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const [genForm, setGenForm] = useState(DEFAULT_GEN);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState('');
+  const [genCollectionId, setGenCollectionId] = useState('');
+  const [genEnv, setGenEnv] = useState('');
   const fileInputRef = useRef(null);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -109,32 +113,59 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const [uploadCollectionId, setUploadCollectionId] = useState('');
   const [ownCollections, setOwnCollections] = useState(project?.collections || []);
 
-  // Load files filtered by collection + env (one call per env change) + collections for modal
+  // Filter bar state (replaces EnvBar)
+  const [filterCollectionId, setFilterCollectionId] = useState('');
+  const [filterEnv,          setFilterEnv]          = useState('');
+
+  // Derived envs for the filter env dropdown
+  const filterCollection = ownCollections.find(c => String(c.id) === String(filterCollectionId));
+  const filterEnvOptions = (() => {
+    if (!filterCollection) return [];
+    let e = [];
+    try { e = JSON.parse(filterCollection.environments || '[]'); } catch {}
+    if (!e.length && filterCollection.environment) e = [filterCollection.environment];
+    return e;
+  })();
+
+  // Load collections once, then reload files when filter changes
   useEffect(() => {
     if (project) {
-      loadFiles();
       api.get(`/projects/${project.id}/collections`)
         .then(r => setOwnCollections(r.data.collections || []))
         .catch(() => {});
     }
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (project) loadFiles();
+  }, [project?.id, filterCollectionId, filterEnv]);
 
   useEffect(() => {
     if (firstUploadRender.current) { firstUploadRender.current = false; return; }
-    if (uploadTrigger > 0) setShowUploadEnvModal(true); // show env picker before file input
+    if (uploadTrigger > 0) {
+      // Pre-populate from the filter bar selection
+      setUploadCollectionId(filterCollectionId || (collection?.id ? String(collection.id) : ''));
+      setUploadEnv(filterEnv || env || '');
+      setShowUploadEnvModal(true);
+    }
   }, [uploadTrigger]);
 
   useEffect(() => {
     if (firstGenRender.current) { firstGenRender.current = false; return; }
-    if (generateTrigger > 0) { setGenForm(DEFAULT_GEN); setGenError(''); setShowGenModal(true); }
+    if (generateTrigger > 0) {
+      setGenForm(DEFAULT_GEN); setGenError('');
+      setGenCollectionId(filterCollectionId || '');
+      setGenEnv(filterEnv || '');
+      setShowGenModal(true);
+    }
   }, [generateTrigger]);
 
   async function loadFiles() {
-    // Filter by collection + env — shows only files for current context
-    const params = collection?.id
-      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
-      : '';
-    const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
+    const params = new URLSearchParams();
+    if (filterCollectionId) params.set('collection_id', filterCollectionId);
+    if (filterEnv)          params.set('env', filterEnv);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const { data } = await api.get(`/projects/${project.id}/test-data${qs}`);
     setFiles(data.files || []);
   }
 
@@ -210,7 +241,10 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
       const fd = new FormData();
       fd.append('csv', file);
       fd.append('columns', JSON.stringify(headers));
-      const colParams = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
+      const params = new URLSearchParams();
+      if (genCollectionId) params.set('collection_id', genCollectionId);
+      if (genEnv)          params.set('env', genEnv);
+      const colParams = params.toString() ? `?${params.toString()}` : '';
       await api.post(`/projects/${project.id}/test-data${colParams}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
       await loadFiles();
       setShowGenModal(false);
@@ -304,9 +338,42 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   return (
     <div className="page fade-in">
       <input ref={fileInputRef} type="file" accept=".csv,.txt,.xlsx,.xls" style={{ display: 'none' }} onChange={handleUpload} />
+      {/* Filter bar: API Source → Environment */}
+      <div style={{ display:'flex', alignItems:'center', gap:16, padding:'12px 16px', background:'var(--color-background-secondary)', border:'1px solid var(--color-border-secondary)', borderRadius:10, marginBottom:16 }}>
+        <i className="ti ti-filter" style={{ color:'var(--accent)', fontSize:15, flexShrink:0 }} />
 
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange}
-        hint="Select environment to view or upload test data files" />
+        {/* API Source dropdown */}
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>API Source</label>
+          <select value={filterCollectionId} onChange={e => { setFilterCollectionId(e.target.value); setFilterEnv(''); }}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', maxWidth:320 }}>
+            <option value="">— All API Sources —</option>
+            {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+
+        {/* Environment dropdown */}
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>Environment</label>
+          <select value={filterEnv} onChange={e => setFilterEnv(e.target.value)}
+            disabled={!filterCollectionId}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', minWidth:140, opacity: filterCollectionId ? 1 : 0.5, cursor: filterCollectionId ? 'pointer' : 'not-allowed' }}>
+            <option value="">— All Environments —</option>
+            {filterEnvOptions.map(e => <option key={e} value={e}>{e}</option>)}
+          </select>
+        </div>
+
+        {(filterCollectionId || filterEnv) && (
+          <button onClick={() => { setFilterCollectionId(''); setFilterEnv(''); }}
+            style={{ background:'none', border:'none', cursor:'pointer', color:'#64748b', fontSize:12, display:'flex', alignItems:'center', gap:4, fontFamily:'inherit', marginTop:18 }}>
+            <i className="ti ti-x" style={{ fontSize:12 }} /> Clear
+          </button>
+        )}
+        <span style={{ marginLeft:'auto', fontSize:12, color:'var(--color-text-tertiary)', marginTop:18 }}>
+          {files.length} file{files.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+
 
       {uploading && (
         <div style={{ padding: '10px 14px', background: '#e8f0ff', borderRadius: '8px', marginBottom: '16px', fontSize: '13px' }}>
@@ -329,7 +396,14 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
                       <i className="ti ti-table" style={{ color: '#00c896' }} />
                     </div>
                     <div>
-                      <div style={{ fontWeight: 600, fontSize: '14px' }}>{f.original_name}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ fontWeight: 600, fontSize: '14px' }}>{f.original_name}</span>
+                        {f.collection_id && (() => {
+                          const col = ownCollections.find(c => String(c.id) === String(f.collection_id));
+                          return col ? <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 12, background: '#dcfce7', color: '#16a34a' }}>{col.name}</span> : null;
+                        })()}
+                        {f.env && <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 12, background: '#e0e7ff', color: '#4338ca' }}>{f.env}</span>}
+                      </div>
                       <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>Columns: {parseColumns(f.columns)}</div>
                     </div>
                   </div>
@@ -491,7 +565,7 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
             <button className="btn-icon" onClick={() => setShowUploadEnvModal(false)}><i className="ti ti-x" /></button>
           </div>
           <div className="form-group">
-            <label className="form-label">Collection <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(optional)</span></label>
+            <label className="form-label">Collection</label>
             <select value={uploadCollectionId} onChange={e => { setUploadCollectionId(e.target.value); setUploadEnv(''); }}
               style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
               <option value="">— No collection —</option>
@@ -499,18 +573,23 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
             </select>
           </div>
           <div className="form-group">
-            <label className="form-label">Environment <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(optional)</span></label>
+            <label className="form-label">Environment <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>— determines which folder the file goes to</span></label>
             {(() => {
               const col = ownCollections.find(c => String(c.id) === String(uploadCollectionId));
               let envOpts = [];
               try { envOpts = JSON.parse(col?.environments || '[]'); } catch {}
               if (!envOpts.length && col?.environment) envOpts = [col.environment];
               return (
-                <select value={uploadEnv} onChange={e => setUploadEnv(e.target.value)}
-                  style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
-                  <option value="">— All environments —</option>
-                  {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
-                </select>
+                <>
+                  <select value={uploadEnv} onChange={e => setUploadEnv(e.target.value)}
+                    style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
+                    <option value="">— All environments —</option>
+                    {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
+                  </select>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+                    "All environments" copies the file to every environment folder
+                  </div>
+                </>
               );
             })()}
           </div>
@@ -532,6 +611,34 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
           </div>
 
           {genError && <div className="auth-error">{genError}</div>}
+
+          {/* Collection + Environment selectors */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: 4 }}>
+            <div className="form-group">
+              <label className="form-label">API Source <span style={{ fontWeight:400, color:'var(--color-text-tertiary)' }}>(optional)</span></label>
+              <select value={genCollectionId} onChange={e => { setGenCollectionId(e.target.value); setGenEnv(''); }}
+                style={{ width:'100%', padding:'7px 10px', borderRadius:6, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit' }}>
+                <option value="">— All API Sources —</option>
+                {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Environment <span style={{ fontWeight:400, color:'var(--color-text-tertiary)' }}>(optional)</span></label>
+              {(() => {
+                const col = ownCollections.find(c => String(c.id) === String(genCollectionId));
+                let envOpts = [];
+                try { envOpts = JSON.parse(col?.environments || '[]'); } catch {}
+                if (!envOpts.length && col?.environment) envOpts = [col.environment];
+                return (
+                  <select value={genEnv} onChange={e => setGenEnv(e.target.value)} disabled={!genCollectionId}
+                    style={{ width:'100%', padding:'7px 10px', borderRadius:6, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', opacity: genCollectionId ? 1 : 0.5 }}>
+                    <option value="">— All Environments —</option>
+                    {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
+                  </select>
+                );
+              })()}
+            </div>
+          </div>
 
           {/* Row 1: filename + extension + rows */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 110px', gap: '12px' }}>
@@ -573,15 +680,15 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
               </div>
             ) : (
               <>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 90px 90px 32px', gap: '6px', padding: '6px 8px', background: 'var(--color-background-secondary)', borderRadius: '6px 6px 0 0', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)' }}>
-                  <div>Column Name</div><div>Data Type</div><div>Length</div><div>Prefix</div><div>Postfix</div><div />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 1fr 32px', gap: '6px', padding: '6px 8px', background: 'var(--color-background-secondary)', borderRadius: '6px 6px 0 0', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)' }}>
+                  <div>Column Name</div><div>Data Type</div><div>Length</div><div>Prefix / Postfix / Custom Value</div><div />
                 </div>
                 <div style={{ border: '1px solid var(--color-border-tertiary)', borderTop: 'none', borderRadius: '0 0 6px 6px', maxHeight: '280px', overflowY: 'auto' }}>
                   {genForm.columns.map((col, i) => {
                     const warn = lengthWarning(col);
                     return (
                       <div key={i} style={{ borderBottom: i < genForm.columns.length - 1 ? '1px solid var(--color-border-tertiary)' : 'none' }}>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 90px 90px 32px', gap: '6px', padding: '6px 8px', alignItems: 'center' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 1fr 32px', gap: '6px', padding: '6px 8px', alignItems: 'center' }}>
                           <input
                             type="text"
                             value={col.name}
@@ -595,26 +702,39 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
                           </CustomSelect>
                           <input
                             type="number"
-                            value={col.length}
+                            value={col.dataType === 'Custom' ? '' : col.length}
                             onChange={e => updateCol(i, 'length', e.target.value)}
                             placeholder="Any"
                             min="1"
-                            style={{ padding: '5px 6px', fontSize: '12px', borderRadius: '5px', border: `1px solid ${warn ? 'var(--danger)' : 'var(--color-border)'}`, background: warn ? 'rgba(247,84,100,0.06)' : 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                            disabled={col.dataType === 'Custom'}
+                            style={{ padding: '5px 6px', fontSize: '12px', borderRadius: '5px', border: `1px solid ${warn ? 'var(--danger)' : 'var(--color-border)'}`, background: col.dataType === 'Custom' ? 'var(--color-background-secondary)' : warn ? 'rgba(247,84,100,0.06)' : 'var(--color-background)', color: 'var(--color-text-primary)', opacity: col.dataType === 'Custom' ? 0.4 : 1 }}
                           />
-                          <input
-                            type="text"
-                            value={col.prefix}
-                            onChange={e => updateCol(i, 'prefix', e.target.value)}
-                            placeholder="prefix"
-                            style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
-                          />
-                          <input
-                            type="text"
-                            value={col.postfix}
-                            onChange={e => updateCol(i, 'postfix', e.target.value)}
-                            placeholder="postfix"
-                            style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
-                          />
+                          {col.dataType === 'Custom' ? (
+                            <input
+                              type="text"
+                              value={col.customValue || ''}
+                              onChange={e => updateCol(i, 'customValue', e.target.value)}
+                              placeholder="Enter fixed value (same for all rows)"
+                              style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '2px solid var(--accent)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                            />
+                          ) : (
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              <input
+                                type="text"
+                                value={col.prefix}
+                                onChange={e => updateCol(i, 'prefix', e.target.value)}
+                                placeholder="prefix"
+                                style={{ flex:1, padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                              />
+                              <input
+                                type="text"
+                                value={col.postfix}
+                                onChange={e => updateCol(i, 'postfix', e.target.value)}
+                                placeholder="postfix"
+                                style={{ flex:1, padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                              />
+                            </div>
+                          )}
                           <button
                             onClick={() => setGenForm(f => ({ ...f, columns: f.columns.filter((_, idx) => idx !== i) }))}
                             style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2px' }}

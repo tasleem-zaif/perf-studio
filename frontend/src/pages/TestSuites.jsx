@@ -40,30 +40,44 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   const [expandedLog, setExpandedLog] = useState({});
   const [testDataFiles, setTestDataFiles] = useState([]);
   const [ownCollections, setOwnCollections] = useState(project?.collections || []);
+  const [filterCollectionId, setFilterCollectionId] = useState('');
+  const [filterEnv,          setFilterEnv]          = useState('');
   const dlRef = useRef(null);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
 
-  // Load suites + test-data filtered by collection + env (one call per env change)
+  // Derived envs for filter bar
+  const filterCollection = ownCollections.find(c => String(c.id) === String(filterCollectionId));
+  const filterEnvOptions = (() => {
+    if (!filterCollection) return [];
+    let e = [];
+    try { e = JSON.parse(filterCollection.environments || '[]'); } catch {}
+    if (!e.length && filterCollection.environment) e = [filterCollection.environment];
+    return e;
+  })();
+
+  // Load collections once, reload suites when filter changes
   useEffect(() => {
     if (project) {
-      loadSuites();
-      loadTestDataFiles();
-      // Fetch collections for the env dropdown in the modal
       api.get(`/projects/${project.id}/collections`)
         .then(r => setOwnCollections(r.data.collections || []))
         .catch(() => {});
     }
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (project) { loadSuites(); loadTestDataFiles(); }
+  }, [project?.id, filterCollectionId, filterEnv]);
 
   async function loadTestDataFiles() {
     if (!project) return;
     try {
-      // Filter by collection + env so only relevant files appear in the test plan modal
-      const params = collection?.id
-        ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
-        : '';
+      // Filter by selected collection + env for the test data dropdown in modal
+      const p = new URLSearchParams();
+      if (filterCollectionId) p.set('collection_id', filterCollectionId);
+      if (filterEnv)          p.set('env', filterEnv);
+      const params = p.toString() ? `?${p.toString()}` : '';
       const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
       // Deduplicate by original_name
       const seen = new Set();
@@ -88,11 +102,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   }, [openModalTrigger]);
 
   async function loadSuites() {
-    // Filter by collection + env — shows only suites relevant to current context
-    const params = collection?.id
-      ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}`
-      : '';
-    const { data } = await api.get(`/projects/${project.id}/test-suites${params}`);
+    const params = new URLSearchParams();
+    if (filterCollectionId) params.set('collection_id', filterCollectionId);
+    if (filterEnv)          params.set('env', filterEnv);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const { data } = await api.get(`/projects/${project.id}/test-suites${qs}`);
     setSuites(data.suites || []);
     // Restore persisted pre-run data so logs survive page refresh
     const restored = {};
@@ -215,7 +229,36 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   return (
     <div className="page fade-in">
       <a ref={dlRef} style={{ display: 'none' }} />
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view or create test plans" />
+
+      {/* Filter bar: API Source → Environment */}
+      <div style={{ display:'flex', alignItems:'flex-end', gap:16, padding:'12px 16px', background:'var(--color-background-secondary)', border:'1px solid var(--color-border-secondary)', borderRadius:10, marginBottom:16 }}>
+        <i className="ti ti-filter" style={{ color:'var(--accent)', fontSize:15, flexShrink:0, marginBottom:4 }} />
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>API Source</label>
+          <select value={filterCollectionId} onChange={e => { setFilterCollectionId(e.target.value); setFilterEnv(''); }}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', maxWidth:320 }}>
+            <option value="">— All API Sources —</option>
+            {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>Environment</label>
+          <select value={filterEnv} onChange={e => setFilterEnv(e.target.value)} disabled={!filterCollectionId}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', minWidth:140, opacity: filterCollectionId ? 1 : 0.5, cursor: filterCollectionId ? 'pointer' : 'not-allowed' }}>
+            <option value="">— All Environments —</option>
+            {filterEnvOptions.map(e => <option key={e} value={e}>{e}</option>)}
+          </select>
+        </div>
+        {(filterCollectionId || filterEnv) && (
+          <button onClick={() => { setFilterCollectionId(''); setFilterEnv(''); }}
+            style={{ background:'none', border:'none', cursor:'pointer', color:'#64748b', fontSize:12, display:'flex', alignItems:'center', gap:4, fontFamily:'inherit', marginBottom:4 }}>
+            <i className="ti ti-x" style={{ fontSize:12 }} /> Clear
+          </button>
+        )}
+        <span style={{ marginLeft:'auto', fontSize:12, color:'var(--color-text-tertiary)', marginBottom:4 }}>
+          {suites.length} plan{suites.length !== 1 ? 's' : ''}
+        </span>
+      </div>
 
       <div className="section-hdr">
         <div className="section-title"><i className="ti ti-test-pipe" style={{ marginRight: '8px', color: 'var(--accent)' }} />Test Plans <span className="badge tag-gray">{suites.length}</span></div>

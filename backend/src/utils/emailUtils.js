@@ -310,4 +310,162 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
   }
 }
 
-module.exports = { sendAlertEmail, getAlertConfig, getRecipients };
+// ── Mid-run breach alert ──────────────────────────────────────────────────────
+
+function buildBreachEmailBody(params, orgName, recipientName) {
+  const { violations, suiteName, projectName, elapsedSec, totalDuration, runId } = params;
+  const greeting   = recipientName ? `Dear ${recipientName},` : 'Dear Team,';
+  const elapsedMin = Math.floor(elapsedSec / 60);
+  const elapsedStr = elapsedMin > 0 ? `${elapsedMin}m ${elapsedSec % 60}s` : `${elapsedSec}s`;
+  const totalStr   = totalDuration ? `${Math.floor(totalDuration / 60)}m` : 'unknown';
+
+  const violationRows = violations.map(v => {
+    const severityColor = v.rule.severity === 'error' ? '#ef4444' : '#f59e0b';
+    const severityBg    = v.rule.severity === 'error' ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)';
+    const icon          = v.rule.severity === 'error' ? '🔴' : '⚠️';
+    const thresholdLabel = v.rule.operator === 'between'
+      ? `between ${v.rule.value_min}–${v.rule.value_max} ${v.rule.unit}`
+      : `${v.rule.operator} ${v.rule.value} ${v.rule.unit}`;
+    return `
+      <tr>
+        <td style="padding:10px 14px;border-bottom:1px solid #2e3a55;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:15px;">${icon}</span>
+            <div>
+              <div style="font-weight:700;color:#f0f3fa;font-size:13px;">${v.rule.metric}</div>
+              <div style="font-size:11px;color:#7a8eaa;margin-top:2px;">Rule: ${thresholdLabel}</div>
+            </div>
+          </div>
+        </td>
+        <td style="padding:10px 14px;border-bottom:1px solid #2e3a55;text-align:center;">
+          <span style="font-family:monospace;font-size:14px;font-weight:700;color:${severityColor};">${v.actual} ${v.rule.unit}</span>
+        </td>
+        <td style="padding:10px 14px;border-bottom:1px solid #2e3a55;text-align:center;">
+          <span style="padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:${severityBg};color:${severityColor};border:1px solid ${severityColor};">${v.rule.severity.toUpperCase()}</span>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#111827;font-family:'Segoe UI',Arial,sans-serif;">
+<div style="max-width:640px;margin:0 auto;background:#1a2035;border-radius:12px;overflow:hidden;">
+
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#7f1d1d 0%,#1e3a5f 100%);padding:20px 24px;">
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <td style="vertical-align:middle;">
+        <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
+             alt="Quarks" height="32" style="height:32px;filter:brightness(0) invert(1);vertical-align:middle;margin-right:10px;"/>
+        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Performance Studio</span>
+        <span style="color:#fca5a5;font-size:12px;margin-left:8px;vertical-align:middle;">⚡ Live Rule Breach Alert</span>
+      </td>
+    </tr></table>
+  </div>
+
+  <!-- Body -->
+  <div style="padding:22px 24px 0;">
+    <p style="color:#f0f3fa;font-size:14px;margin:0 0 6px;">${greeting}</p>
+    <p style="color:#b8c4d8;font-size:13px;line-height:1.6;margin:0 0 18px;">
+      A performance rule breach has been detected in your running test
+      <strong style="color:#f0f3fa;">${suiteName}</strong>
+      (Project: <strong style="color:#f0f3fa;">${projectName || '—'}</strong>).<br>
+      Detected at <strong style="color:#fbbf24;">${elapsedStr}</strong> into a
+      <strong style="color:#f0f3fa;">${totalStr}</strong> test run.
+    </p>
+
+    <!-- Alert banner -->
+    <div style="background:rgba(239,68,68,0.12);border:1px solid #ef4444;border-radius:8px;padding:12px 16px;margin-bottom:20px;">
+      <span style="font-size:16px;margin-right:8px;">🚨</span>
+      <span style="font-weight:700;color:#ef4444;font-size:13px;">${violations.length} rule${violations.length > 1 ? 's' : ''} breached during active test execution</span>
+    </div>
+
+    <!-- Violations table -->
+    <table style="width:100%;border-collapse:collapse;background:#1e2840;border-radius:8px;overflow:hidden;margin-bottom:20px;">
+      <thead>
+        <tr style="background:#0f172a;">
+          <th style="padding:10px 14px;text-align:left;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Metric / Rule</th>
+          <th style="padding:10px 14px;text-align:center;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Actual Value</th>
+          <th style="padding:10px 14px;text-align:center;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Severity</th>
+        </tr>
+      </thead>
+      <tbody>${violationRows}</tbody>
+    </table>
+
+    <p style="color:#b8c4d8;font-size:12px;line-height:1.6;margin:0 0 20px;background:#1e2840;border-radius:8px;padding:12px 14px;border-left:3px solid #f59e0b;">
+      ⏱ The test is still running. This is an early warning — the final report will be sent when the test completes.
+      Consider stopping the test if these breaches indicate a critical issue.
+    </p>
+  </div>
+
+  <!-- Sign-off -->
+  <div style="padding:0 24px 22px;">
+    <p style="color:#b8c4d8;font-size:13px;margin:0 0 4px;">Thanks,</p>
+    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'Performance Studio Team'}</p>
+  </div>
+
+  <!-- Footer -->
+  <div style="background:#0f172a;padding:12px 24px;text-align:center;border-top:1px solid #2e3a55;">
+    <p style="color:#4b5563;font-size:11px;margin:0;">Automated breach alert from Performance Studio &nbsp;·&nbsp; Run ID: ${runId}</p>
+  </div>
+
+</div>
+</body>
+</html>`;
+}
+
+/**
+ * Send mid-run rule breach alert emails.
+ * Called when the monitoring loop detects a new breach during test execution.
+ */
+async function sendBreachAlertEmail(runId, userId, projectId, params) {
+  try {
+    const cfg = getAlertConfig(userId);
+    if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
+
+    const recipients = getRecipients(userId, projectId);
+    if (!recipients.length) return;
+
+    const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
+    const orgName = userRow?.org_name || userRow?.name || 'Performance Studio';
+
+    const transport = createTransport(cfg);
+    const subject = `🚨 [PerfStudio ALERT] Rule Breach — ${params.suiteName} (Run #${runId})`;
+
+    for (const recipient of recipients) {
+      const html = buildBreachEmailBody(params, orgName, recipient.name);
+      const plain = [
+        `Performance Studio — Rule Breach Alert`,
+        ``,
+        `Hello ${recipient.name || 'Team'},`,
+        ``,
+        `A rule breach was detected in test "${params.suiteName}" at ${Math.floor(params.elapsedSec / 60)}m ${params.elapsedSec % 60}s into the run.`,
+        ``,
+        `Breached Rules:`,
+        ...(params.violations || []).map(v => `  - ${v.label} [${v.rule.severity}]`),
+        ``,
+        `The test is still running. Final report will follow on completion.`,
+        ``,
+        `Thanks,`,
+        `${orgName}`,
+      ].join('\n');
+
+      await transport.sendMail({
+        from:    `"${cfg.from_name || 'Performance Studio'}" <${cfg.from_email}>`,
+        to:      recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+        replyTo: cfg.from_email,
+        subject,
+        text:    plain,
+        html,
+        headers: { 'X-Mailer': 'Performance Studio', 'X-Priority': '1', 'Importance': 'High' },
+      });
+    }
+
+    console.log(`[Alerts] Breach alert sent to ${recipients.length} recipient(s) — Run ${runId}, ${params.violations.length} violation(s)`);
+  } catch (e) {
+    console.error('[Alerts] Failed to send breach alert:', e.message);
+  }
+}
+
+module.exports = { sendAlertEmail, sendBreachAlertEmail, getAlertConfig, getRecipients };

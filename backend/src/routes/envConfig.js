@@ -69,8 +69,17 @@ router.put('/:env', (req, res) => {
     ).run(collectionId, env, JSON.stringify(cfg));
   }
 
-  // Refresh config.json on disk
-  setImmediate(() => updateCollectionConfigs(collectionId));
+  // Refresh config.json in the current user's workspace
+  setImmediate(() => {
+    try {
+      const { getUserProjectPath } = require('../utils/projectFolders');
+      const db = require('../db');
+      const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+      const projRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+      const userProjPath = getUserProjectPath(req.userId, callerRole, projRow?.name || '');
+      updateCollectionConfigs(collectionId, userProjPath);
+    } catch (_) {}
+  });
 
   res.json({ ok: true });
 });

@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 
@@ -94,14 +95,14 @@ function parseStatusFiles(status) {
   return files;
 }
 
-export default function GitPanel({ project, user }) {
+export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false, drawerWidth = 700 }) {
   const { toast } = useToast();
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
   const pid = project?.id;
   const termInputRef = useRef(null);
 
   // ── Tab ──────────────────────────────────────────────────────────────────
-  const [tab, setTab] = useState('setup');
+  const [tab, setTab] = useState(workflowOnly ? 'changes' : 'setup');
 
   // ── Repo config ───────────────────────────────────────────────────────────
   const [cfg,         setCfg]         = useState(null);
@@ -118,6 +119,8 @@ export default function GitPanel({ project, user }) {
   const [savingId,       setSavingId]       = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [autoIniting,    setAutoIniting]    = useState(false);
+  const [testingId,      setTestingId]      = useState(false);
+  const [testIdResult,   setTestIdResult]   = useState(null); // { ok, message, preview }
 
   // ── Git state ─────────────────────────────────────────────────────────────
   const [status,   setStatus]   = useState(null);
@@ -131,6 +134,7 @@ export default function GitPanel({ project, user }) {
   const [diffFile,      setDiffFile]      = useState(null);
   const [diffContent,   setDiffContent]   = useState('');
   const [loadingDiff,   setLoadingDiff]   = useState(false);
+  const [isNewFile,     setIsNewFile]     = useState(false);
   const [discarding,    setDiscarding]    = useState(false);
   const [fetching,      setFetching]      = useState(false);
   const [syncing,       setSyncing]       = useState(false);
@@ -243,6 +247,24 @@ export default function GitPanel({ project, user }) {
     } finally { setIniting(false); }
   }
 
+  // ── Test connection using user's personal PAT ─────────────────────────────
+  async function testIdentityConnection() {
+    // Save identity first if token field has a new value
+    if (idForm.auth_token) {
+      setSavingId(true);
+      try { await api.put(`/projects/${pid}/git/identity`, idForm); } catch {}
+      finally { setSavingId(false); }
+    }
+    setTestingId(true);
+    setTestIdResult(null);
+    try {
+      const { data } = await api.post(`/projects/${pid}/git/test`);
+      setTestIdResult({ ok: true, message: data.message, preview: data.token_preview });
+    } catch (err) {
+      setTestIdResult({ ok: false, message: err.response?.data?.error || 'Connection failed' });
+    } finally { setTestingId(false); }
+  }
+
   // ── Save identity (with auto-init) ────────────────────────────────────────
   async function saveIdentity(e) {
     e.preventDefault();
@@ -257,7 +279,7 @@ export default function GitPanel({ project, user }) {
         setAutoIniting(true);
         addLog(`Setting up branch "${idForm.branch_name}"…`);
         try {
-          const { data } = await api.post(`/projects/${pid}/git/branch`);
+          const { data } = await api.post(`/projects/${pid}/git/branch`, { branch_name: idForm.branch_name.trim() });
           addLog(data.message, 'success');
           toast(data.message, 'success');
           loadAll();
@@ -269,31 +291,36 @@ export default function GitPanel({ project, user }) {
     finally { setSavingId(false); }
   }
 
-  // ── Create branch manually ────────────────────────────────────────────────
+  // ── Create / switch branch ────────────────────────────────────────────────
   async function createBranch() {
+    if (!idForm.branch_name?.trim()) return toast('Enter a branch name first', 'warn');
     if (branchConflict) return toast('Branch name cannot be the same as the base branch', 'warn');
     setCreatingBranch(true);
-    addLog(`Creating branch "${idForm.branch_name}"…`);
+    addLog(`Creating / switching to branch "${idForm.branch_name}"…`);
     try {
-      const { data } = await api.post(`/projects/${pid}/git/branch`);
+      // Always send branch_name in body so backend uses the current form value,
+      // not whatever was previously saved in the DB
+      const { data } = await api.post(`/projects/${pid}/git/branch`, { branch_name: idForm.branch_name.trim() });
       addLog(data.message, 'success');
       toast(data.message, 'success');
       loadAll();
     } catch (err) {
-      const msg = err.response?.data?.error || 'Branch creation failed';
+      const msg = err.response?.data?.error || 'Branch operation failed';
       addLog(msg, 'error'); toast(msg, 'error');
     } finally { setCreatingBranch(false); }
   }
 
   // ── File diff ─────────────────────────────────────────────────────────────
   async function viewDiff(filePath) {
-    if (diffFile === filePath) { setDiffFile(null); setDiffContent(''); return; }
+    if (diffFile === filePath) { setDiffFile(null); setDiffContent(''); setIsNewFile(false); return; }
     setDiffFile(filePath);
+    setIsNewFile(false);
     setLoadingDiff(true);
     try {
       const { data } = await api.get(`/projects/${pid}/git/diff?path=${encodeURIComponent(filePath)}`);
-      setDiffContent(data.diff || '(no diff available)');
-    } catch { setDiffContent('Failed to load diff'); }
+      setDiffContent(data.diff || '');
+      setIsNewFile(!!data.isNewFile);
+    } catch { setDiffContent(''); setIsNewFile(false); }
     finally { setLoadingDiff(false); }
   }
 
@@ -466,13 +493,23 @@ export default function GitPanel({ project, user }) {
   }
 
   // ── Tabs ──────────────────────────────────────────────────────────────────
-  const tabs = [
-    { id: 'setup',    label: 'Setup',         icon: 'ti-settings-2' },
-    { id: 'changes',  label: 'Changes',       icon: 'ti-git-commit',       show: initialized, badge: statusFiles.length || null },
-    { id: 'prs',      label: 'Pull Requests', icon: 'ti-git-pull-request', badge: openPrs || null },
-    { id: 'history',  label: 'History',       icon: 'ti-history',          show: initialized },
-    { id: 'terminal', label: 'Terminal',       icon: 'ti-terminal-2',       show: initialized },
-  ].filter(t => t.show !== false);
+  // workflowOnly = sidebar Git section (Changes, PRs, History, Terminal)
+  // setupOnly    = Configuration > Git (Setup only — reserved for future use)
+  const allTabs = [
+    { id: 'setup',    label: 'Setup',         icon: 'ti-settings-2',       show: !workflowOnly },
+    { id: 'changes',  label: 'Changes',       icon: 'ti-git-commit',       show: !setupOnly && initialized, badge: statusFiles.length || null },
+    { id: 'prs',      label: 'Pull Requests', icon: 'ti-git-pull-request', show: !setupOnly, badge: openPrs || null },
+    { id: 'history',  label: 'History',       icon: 'ti-history',          show: !setupOnly && initialized },
+    { id: 'terminal', label: 'Terminal',       icon: 'ti-terminal-2',       show: !setupOnly && initialized },
+  ];
+  const tabs = allTabs.filter(t => t.show !== false && t.show !== undefined ? true : t.show === undefined);
+
+  // Auto-switch to first visible tab if current tab is hidden
+  useEffect(() => {
+    if (tabs.length && !tabs.find(t => t.id === tab)) {
+      setTab(tabs[0].id);
+    }
+  }, [workflowOnly, setupOnly, initialized]);
 
   const closeBtn = (fn) => (
     <button onClick={fn} style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
@@ -482,23 +519,57 @@ export default function GitPanel({ project, user }) {
   );
 
   return (
-    <div className="page fade-in">
+    <>
+    <div className="page fade-in" style={{ paddingTop: workflowOnly || setupOnly ? 18 : undefined }}>
 
       {/* ── Status bar ────────────────────────────────────────────────────── */}
       {initialized && (
-        <div style={{ display:'flex',alignItems:'center',gap:12,padding:'10px 16px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:10,marginBottom:16,fontSize:13 }}>
-          <i className="ti ti-git-branch" style={{ color:'#16a34a',fontSize:16 }} />
-          <span style={{ color:'#15803d',fontWeight:600 }}>Branch: {currentBranch}</span>
-          <span style={{ color:'#94a3b8' }}>·</span>
-          {statusFiles.length > 0
-            ? <span style={{ color:'#b45309',fontWeight:600 }}>{statusFiles.length} changed file{statusFiles.length!==1?'s':''}</span>
-            : <span style={{ color:'#16a34a' }}>Working tree clean</span>}
-          {openPrs > 0 && <><span style={{ color:'#94a3b8' }}>·</span><span style={{ color:'#1d4ed8' }}>{openPrs} open PR{openPrs>1?'s':''}</span></>}
-          {status?.ahead > 0 && <span style={{ color:'#7c3aed' }}>↑{status.ahead} ahead</span>}
-          {status?.behind > 0 && <span style={{ color:'#ea580c' }}>↓{status.behind} behind</span>}
-          <button onClick={loadAll} style={{ marginLeft:'auto',background:'none',border:'none',cursor:'pointer',color:'#64748b',fontSize:12,display:'flex',alignItems:'center',gap:4 }}>
-            <i className="ti ti-refresh"/> Refresh
-          </button>
+        <div style={{ marginBottom:16, borderRadius:10, border:'1px solid #e2e8f0', overflow:'hidden', background:'#fff' }}>
+          {/* Row 1 — branch + refresh */}
+          <div style={{ display:'flex', alignItems:'center', gap:10, padding:'9px 14px', background:'#f8fafc', borderBottom:'1px solid #f1f5f9' }}>
+            <i className="ti ti-git-branch" style={{ color:'#16a34a', fontSize:15, flexShrink:0 }}/>
+            <span style={{ fontWeight:700, color:'#0f172a', fontSize:13 }}>{currentBranch}</span>
+            {status?.ahead > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#7c3aed',background:'#ede9fe',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-arrow-up" style={{ fontSize:10 }}/>{status.ahead} ahead
+              </span>
+            )}
+            {status?.behind > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#ea580c',background:'#ffedd5',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-arrow-down" style={{ fontSize:10 }}/>{status.behind} behind
+              </span>
+            )}
+            {openPrs > 0 && (
+              <span style={{ display:'flex',alignItems:'center',gap:3,fontSize:11,fontWeight:600,color:'#1d4ed8',background:'#dbeafe',padding:'1px 7px',borderRadius:20 }}>
+                <i className="ti ti-git-pull-request" style={{ fontSize:10 }}/>{openPrs} PR{openPrs>1?'s':''}
+              </span>
+            )}
+            <button className="btn-primary btn-sm" onClick={e => {
+                const icon = e.currentTarget.querySelector('i');
+                if (icon) {
+                  icon.style.transition = 'transform 0.6s ease';
+                  icon.style.transform = 'rotate(360deg)';
+                  setTimeout(() => { icon.style.transition = 'none'; icon.style.transform = 'rotate(0deg)'; }, 650);
+                }
+                loadAll();
+              }} style={{ marginLeft:'auto' }}>
+              <i className="ti ti-refresh"/> Refresh
+            </button>
+          </div>
+          {/* Row 2 — files changed */}
+          <div style={{ display:'flex', alignItems:'center', gap:16, padding:'8px 14px' }}>
+            {statusFiles.length > 0 ? (
+              <span style={{ display:'flex',alignItems:'center',gap:5,fontSize:12,color:'#374151' }}>
+                <i className="ti ti-files" style={{ fontSize:13,color:'#64748b' }}/>
+                <strong style={{ color:'#0f172a' }}>{statusFiles.length}</strong>
+                <span style={{ color:'#64748b' }}>changed file{statusFiles.length!==1?'s':''}</span>
+              </span>
+            ) : (
+              <span style={{ display:'flex',alignItems:'center',gap:6,fontSize:12,color:'#16a34a' }}>
+                <i className="ti ti-circle-check" style={{ fontSize:14 }}/> Working tree clean
+              </span>
+            )}
+          </div>
         </div>
       )}
 
@@ -638,15 +709,49 @@ export default function GitPanel({ project, user }) {
                   <input type="email" value={idForm.author_email} onChange={e => setIdForm(f => ({ ...f, author_email: e.target.value }))} placeholder="jane@yourorg.com" />
                 </Field>
               </div>
-              <Field label="Personal access token" required hint="Used to push and create PRs. Never shared with other users.">
-                <input type="password" value={idForm.auth_token} onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
-                  placeholder={identity?.auth_token ? `••••••••  (saved${cfg?.token_preview ? ' — ' + cfg.token_preview : ''})` : 'ghp_…'} />
+              <Field label="Personal access token" required hint="GitHub PAT starting with ghp_ or github_pat_ — never your login password.">
+                <input
+                  type="text"
+                  value={idForm.auth_token}
+                  onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
+                  placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : 'ghp_xxxxxxxxxxxxxxxxxxxx'}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
+                />
+                {idForm.auth_token && !idForm.auth_token.startsWith('ghp_') && !idForm.auth_token.startsWith('github_pat_') && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
+                    This doesn't look like a GitHub PAT. It should start with <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>ghp_</code> or <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>github_pat_</code>
+                  </div>
+                )}
               </Field>
-              <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
-                {(savingId || autoIniting) && <span className="spinner"/>}
-                <i className="ti ti-device-floppy"/>
-                {savingId ? ' Saving…' : autoIniting ? ' Setting up branch…' : ' Save Settings'}
-              </button>
+              <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
+                  {(savingId || autoIniting) && <span className="spinner"/>}
+                  <i className="ti ti-device-floppy"/>
+                  {savingId ? ' Saving…' : autoIniting ? ' Setting up branch…' : ' Save Settings'}
+                </button>
+                <button type="button" className="btn-secondary" onClick={testIdentityConnection} disabled={testingId}>
+                  {testingId ? <><span className="spinner"/>Testing…</> : <><i className="ti ti-wifi"/>Test Connection</>}
+                </button>
+              </div>
+
+              {/* Test connection result */}
+              {testIdResult && (
+                <div style={{ marginTop:10, padding:'10px 14px', borderRadius:8, background: testIdResult.ok ? '#f0fdf4' : '#fef2f2', border:`1px solid ${testIdResult.ok ? '#bbf7d0' : '#fecaca'}`, display:'flex', alignItems:'flex-start', gap:8 }}>
+                  <i className={`ti ${testIdResult.ok ? 'ti-circle-check' : 'ti-circle-x'}`} style={{ color: testIdResult.ok ? '#16a34a' : '#dc2626', fontSize:16, flexShrink:0, marginTop:1 }}/>
+                  <div>
+                    <div style={{ fontSize:13, fontWeight:600, color: testIdResult.ok ? '#15803d' : '#b91c1c' }}>
+                      {testIdResult.ok ? 'Connection successful!' : 'Connection failed'}
+                    </div>
+                    <div style={{ fontSize:12, color:'#475569', marginTop:2 }}>
+                      {testIdResult.message}
+                      {testIdResult.ok && testIdResult.preview && <span style={{ marginLeft:8, fontFamily:'monospace', color:'#64748b' }}>Token: {testIdResult.preview}</span>}
+                    </div>
+                  </div>
+                </div>
+              )}
             </form>
           </Section>
 
@@ -681,91 +786,75 @@ export default function GitPanel({ project, user }) {
             </button>
           </div>
 
-          <Section title="Changed Files" subtitle={`${statusFiles.length} file${statusFiles.length!==1?'s':''} · Branch: ${currentBranch}`}
-            extra={
-              selectedFiles.size > 0 ? (
+          {/* ── Changed Files card ── */}
+          <div style={{ background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,marginBottom:16,overflow:'hidden' }}>
+            {/* Card header */}
+            <div style={{ display:'flex',alignItems:'center',justifyContent:'space-between',padding:'14px 16px',borderBottom:'1px solid #f1f5f9' }}>
+              <div>
+                <div style={{ fontSize:14,fontWeight:700,color:'#0f172a' }}>Changed Files</div>
+                <div style={{ fontSize:12,color:'#64748b',marginTop:2 }}>{statusFiles.length} file{statusFiles.length!==1?'s':''} · Branch: {currentBranch}</div>
+              </div>
+              {selectedFiles.size > 0 && (
                 <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
-                  style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',transition:'opacity .15s' }}
-                  onMouseEnter={e=>e.currentTarget.style.opacity='.85'} onMouseLeave={e=>e.currentTarget.style.opacity='1'}>
-                  {discarding?<span className="spinner"/>:<i className="ti ti-trash"/>} Discard {selectedFiles.size} file{selectedFiles.size!==1?'s':''}
+                  style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',flexShrink:0 }}>
+                  {discarding ? <span className="spinner"/> : <i className="ti ti-trash"/>} Discard ({selectedFiles.size})
                 </button>
-              ) : null
-            }
-          >
+              )}
+            </div>
+
             {statusFiles.length === 0 ? (
-              <div style={{ textAlign:'center',padding:'24px',color:'#94a3b8',fontSize:13 }}>
-                <i className="ti ti-circle-check" style={{ fontSize:24,display:'block',marginBottom:6 }}/>
+              <div style={{ textAlign:'center',padding:'32px 24px',color:'#94a3b8',fontSize:13 }}>
+                <i className="ti ti-circle-check" style={{ fontSize:28,display:'block',marginBottom:8,color:'#22c55e' }}/>
                 Working tree is clean — nothing to commit
               </div>
             ) : (
               <>
-                {/* Select all */}
-                <table style={{ width:'100%', borderCollapse:'collapse', marginBottom:4 }}>
-                  <tbody>
-                    <tr style={{ borderBottom:'1px solid #f1f5f9' }}>
-                      <td style={{ width:28, padding:'6px 8px' }}>
-                        <input type="checkbox" checked={selectedFiles.size===statusFiles.length && statusFiles.length>0} onChange={toggleAll} style={{ cursor:'pointer' }}/>
-                      </td>
-                      <td colSpan={3} style={{ padding:'6px 8px', fontSize:12, color:'#64748b' }}>
-                        Select all ({statusFiles.length})
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-                <table style={{ width:'100%', borderCollapse:'collapse' }}>
-                  <tbody>
+                {/* Select-all row */}
+                <div style={{ display:'flex',alignItems:'center',gap:10,padding:'7px 16px',borderBottom:'1px solid #f1f5f9',background:'#f8fafc' }}>
+                  <input type="checkbox" checked={selectedFiles.size===statusFiles.length} onChange={toggleAll} style={{ cursor:'pointer',flexShrink:0,width:15,height:15 }}/>
+                  <span style={{ fontSize:12,color:'#64748b' }}>Select all ({statusFiles.length} files)</span>
+                </div>
+
+                {/* File rows */}
                 {statusFiles.map((f, i) => {
                   const ft = FILE_TYPE[f.type] || FILE_TYPE['?'];
                   const isSelected = selectedFiles.has(f.path);
                   const isActive = diffFile === f.path;
-                  return <React.Fragment key={i}>
-                    <tr style={{ background: isActive ? '#f0fdf4' : 'transparent' }}
-                      onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
-                      onMouseLeave={e=>{ e.currentTarget.style.background=isActive?'#f0fdf4':'transparent'; }}>
-                      <td style={{ width:28, padding:'6px 8px', verticalAlign:'middle' }}>
-                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer' }}/>
-                      </td>
-                      <td style={{ width:24, padding:'6px 4px', verticalAlign:'middle' }}>
-                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'inline-flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700 }} title={ft.title}>{ft.label}</span>
-                      </td>
-                      <td style={{ padding:'6px 8px', verticalAlign:'middle', maxWidth:0 }}>
-                        <span style={{ fontFamily:'monospace',fontSize:12,color:'#374151',display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor:'pointer' }} onClick={() => viewDiff(f.path)} title={f.path}>{f.path}</span>
-                      </td>
-                      <td style={{ width:160, padding:'6px 8px', verticalAlign:'middle', whiteSpace:'nowrap' }}>
-                        <div style={{ display:'inline-flex', gap:4 }}>
-                          <button onClick={() => viewDiff(f.path)} style={{ background:'none',border:'1px solid #e2e8f0',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#64748b' }}>
-                            {isActive ? 'Hide' : 'Diff'}
-                          </button>
-                          <button onClick={() => discardFiles([f.path])} disabled={discarding} style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'2px 8px',fontSize:11,color:'#ef4444' }} title="Discard">
-                            <i className="ti ti-trash" style={{ fontSize:11 }}/>
-                          </button>
+                  const parts = f.path.split('/');
+                  const fileName = parts[parts.length - 1];
+                  const dirPath = parts.slice(0, -1).join('/');
+                  return (
+                    <div key={i} style={{ borderBottom: i < statusFiles.length - 1 ? '1px solid #f1f5f9' : 'none' }}>
+                      <div style={{ display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:isActive?'#f0fdf4':'transparent',minWidth:0,cursor:'pointer' }}
+                        onClick={() => viewDiff(f.path)}
+                        onMouseEnter={e=>{ if(!isActive) e.currentTarget.style.background='#f8fafc'; }}
+                        onMouseLeave={e=>{ e.currentTarget.style.background=isActive?'#f0fdf4':'transparent'; }}>
+                        {/* Checkbox */}
+                        <input type="checkbox" checked={isSelected} onChange={() => toggleFile(f.path)} onClick={e=>e.stopPropagation()} style={{ cursor:'pointer',flexShrink:0,width:15,height:15 }}/>
+                        {/* Status badge */}
+                        <span style={{ width:20,height:20,borderRadius:4,background:ft.bg,color:ft.color,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700,flexShrink:0 }} title={ft.title}>{ft.label}</span>
+                        {/* Filename */}
+                        <div style={{ flex:1,minWidth:0 }}>
+                          <div style={{ fontSize:13,fontWeight:isActive?600:500,color:isActive?'#15803d':'#1e293b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }} title={f.path}>{fileName}</div>
+                          {dirPath && <div style={{ fontSize:11,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{dirPath}</div>}
                         </div>
-                      </td>
-                    </tr>
-                    {isActive && <tr>
-                      <td colSpan={4} style={{ padding:'0 0 8px 38px' }}>
-                        <div style={{ borderRadius:8,overflow:'hidden',border:'1px solid #1e293b' }}>
-                          <div style={{ background:'#1e293b',padding:'6px 12px',fontSize:11,color:'#94a3b8',fontFamily:'monospace' }}>{f.path}</div>
-                          <div style={{ background:'#0f172a',padding:'10px 14px',maxHeight:300,overflowY:'auto' }}>
-                            {loadingDiff ? <div style={{ color:'#64748b',fontSize:12,fontFamily:'monospace' }}>Loading…</div> : renderDiff(diffContent)}
-                          </div>
-                        </div>
-                      </td>
-                    </tr>}
-                  </React.Fragment>;
+                        {/* Discard button */}
+                        <button onClick={e => { e.stopPropagation(); discardFiles([f.path]); }} disabled={discarding}
+                          style={{ background:'none',border:'1px solid rgba(239,68,68,0.3)',borderRadius:5,cursor:'pointer',padding:'3px 7px',fontSize:11,color:'#ef4444',flexShrink:0 }}>
+                          <i className="ti ti-trash" style={{ fontSize:11 }}/>
+                        </button>
+                      </div>
+                    </div>
+                  );
                 })}
-                  </tbody>
-                </table>
               </>
             )}
-          </Section>
+          </div>
 
-          {/* Commit */}
           <Section title="Commit & Push" subtitle={`Committing to: ${currentBranch}`}>
             <div className="form-group">
               <label className="form-label">Commit message</label>
-              <input type="text" value={commitMsg} onChange={e => setCommitMsg(e.target.value)}
-                placeholder="feat: describe your changes" onKeyDown={e => e.key==='Enter' && commitChanges()} />
+              <input type="text" value={commitMsg} onChange={e => setCommitMsg(e.target.value)} placeholder="feat: describe your changes" onKeyDown={e => e.key==='Enter' && commitChanges()} />
             </div>
             <div style={{ display:'flex',gap:8,flexWrap:'wrap' }}>
               <button className="btn-primary" onClick={commitChanges} disabled={committing || !commitMsg.trim()}>
@@ -788,6 +877,7 @@ export default function GitPanel({ project, user }) {
           )}
         </>
       )}
+
 
       {/* ══════════════════════════════════════════════════════════════════════
           PULL REQUESTS TAB
@@ -957,5 +1047,188 @@ export default function GitPanel({ project, user }) {
         </div>
       )}
     </div>
+
+    {/* ══════════════════════════════════════════════════════════════════════
+        WINDOW 2 — Diff viewer panel (portal, renders to the right of the drawer)
+    ══════════════════════════════════════════════════════════════════════ */}
+    {diffFile && createPortal(
+      (() => {
+        const fileInfo = statusFiles.find(f => f.path === diffFile);
+        const ft = FILE_TYPE[fileInfo?.type] || FILE_TYPE['?'];
+        const typeLabel = fileInfo?.type === '?' ? 'untracked'
+          : fileInfo?.type === 'M' ? 'modified'
+          : fileInfo?.type === 'A' ? 'added'
+          : fileInfo?.type === 'D' ? 'deleted' : 'changed';
+        const typePill = {
+          untracked: { bg: '#1f2328', color: '#e6edf3' },
+          modified:  { bg: '#9e6a03', color: '#fff' },
+          added:     { bg: '#1a7f37', color: '#fff' },
+          deleted:   { bg: '#cf222e', color: '#fff' },
+          changed:   { bg: '#0969da', color: '#fff' },
+        }[typeLabel] || { bg: '#1f2328', color: '#e6edf3' };
+
+        return (
+          <div style={{
+            position: 'fixed', top: 0, left: drawerWidth, right: 0, bottom: 0,
+            zIndex: 52, background: '#ffffff',
+            display: 'flex', flexDirection: 'column',
+            borderLeft: '1px solid #d1d9e0',
+            animation: 'slideInRight .15s ease',
+            fontFamily: 'inherit',
+          }}>
+
+            {/* ── Header ── */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 10,
+              padding: '0 14px', height: 52, flexShrink: 0,
+              borderBottom: '1px solid #d1d9e0', background: '#f6f8fa',
+            }}>
+              {/* Status badge */}
+              <span style={{
+                width: 20, height: 20, borderRadius: 4,
+                background: ft.bg, color: ft.color,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 10, fontWeight: 700, flexShrink: 0,
+              }}>{ft.label}</span>
+
+              {/* Filename */}
+              <span style={{
+                flex: 1, minWidth: 0,
+                fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+                fontSize: 13, fontWeight: 600, color: '#1f2328',
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }} title={diffFile}>{diffFile}</span>
+
+              {/* Type pill */}
+              <span style={{
+                padding: '2px 9px', borderRadius: 20,
+                fontSize: 11, fontWeight: 600, flexShrink: 0,
+                background: typePill.bg, color: typePill.color,
+              }}>{typeLabel}</span>
+
+              {/* Close */}
+              <button onClick={() => { setDiffFile(null); setDiffContent(''); setIsNewFile(false); }}
+                style={{
+                  width: 26, height: 26, border: 'none', borderRadius: 6,
+                  background: 'transparent', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: '#57606a', flexShrink: 0,
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = '#eaeef2'}
+                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <i className="ti ti-x" style={{ fontSize: 15 }}/>
+              </button>
+            </div>
+
+            {/* ── New-file notice ── */}
+            {isNewFile && (
+              <div style={{
+                padding: '7px 14px', flexShrink: 0,
+                background: '#dafbe1', borderBottom: '1px solid #aceebb',
+                fontSize: 12, color: '#116329',
+                display: 'flex', alignItems: 'center', gap: 6,
+              }}>
+                <i className="ti ti-info-circle" style={{ fontSize: 13, flexShrink: 0 }}/>
+                New file — entire content shown as additions (no previous version in git history)
+              </div>
+            )}
+
+            {/* ── Diff / Content body ── */}
+            <div style={{ flex: 1, overflowY: 'auto', background: '#ffffff' }}>
+              {loadingDiff ? (
+                <div style={{ padding: '32px 20px', display: 'flex', alignItems: 'center', gap: 8, color: '#57606a', fontSize: 13 }}>
+                  <span className="spinner"/> Loading…
+                </div>
+              ) : diffContent ? (
+                <table style={{
+                  width: '100%', borderCollapse: 'collapse',
+                  fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+                  fontSize: 12, lineHeight: '20px',
+                }}>
+                  <tbody>
+                    {(() => {
+                      let lineNum = -1; // will start at 0 for first displayed line
+                      return (diffContent || '').split('\n').map((line, i) => {
+                        const isAdd  = line.startsWith('+') && !line.startsWith('+++');
+                        const isDel  = line.startsWith('-') && !line.startsWith('---');
+                        const isHunk = line.startsWith('@@');
+                        const isMeta = line.startsWith('diff --git') || line.startsWith('new file') ||
+                                       line.startsWith('deleted file') || line.startsWith('old mode') ||
+                                       line.startsWith('new mode') || line.startsWith('index ') ||
+                                       line.startsWith('--- ') || line.startsWith('+++ ');
+
+                        // Skip meta header lines entirely
+                        if (isMeta) return null;
+
+                        // Hunk separator — hidden for new files (entire file is one hunk), shown for modified
+                        if (isHunk) {
+                          if (isNewFile) return null; // suppress for cleaner new-file view
+                          return (
+                            <tr key={i} style={{ background: '#ddf4ff' }}>
+                              <td style={{ width: 44, padding: '2px 12px 2px 10px', color: '#57606a', textAlign: 'right', userSelect: 'none', borderRight: '1px solid #d1d9e0', fontSize: 11 }}/>
+                              <td style={{ width: 26, padding: '2px 6px', color: '#57606a', userSelect: 'none' }}/>
+                              <td style={{ padding: '2px 10px', color: '#0550ae', fontSize: 11, whiteSpace: 'pre' }}>{line}</td>
+                            </tr>
+                          );
+                        }
+
+                        // Normal content line — count up from 0
+                        lineNum++;
+
+                        const bg   = isAdd ? '#e6ffec' : isDel ? '#ffebe9' : '#ffffff';
+                        const color = isAdd ? '#1a7f37' : isDel ? '#cf222e' : '#1f2328';
+                        const sign  = isAdd ? '+' : isDel ? '-' : ' ';
+                        const text  = (isAdd || isDel) ? line.slice(1) : line;
+
+                        return (
+                          <tr key={i} style={{ background: bg }}>
+                            {/* Line number */}
+                            <td style={{
+                              width: 44, padding: '0 10px 0 10px',
+                              color: '#6e7781', textAlign: 'right',
+                              userSelect: 'none', fontSize: 11, lineHeight: '20px',
+                              borderRight: '1px solid #d1d9e0',
+                              fontVariantNumeric: 'tabular-nums',
+                              background: isAdd ? '#ccffd8' : isDel ? '#ffd7d5' : '#f6f8fa',
+                              whiteSpace: 'nowrap',
+                            }}>
+                              {lineNum}
+                            </td>
+                            {/* +/- sign */}
+                            <td style={{
+                              width: 26, padding: '0 6px',
+                              color: isAdd ? '#1a7f37' : isDel ? '#cf222e' : '#6e7781',
+                              fontWeight: 700, lineHeight: '20px',
+                              userSelect: 'none', textAlign: 'center',
+                              background: isAdd ? '#ccffd8' : isDel ? '#ffd7d5' : '#f6f8fa',
+                            }}>
+                              {sign}
+                            </td>
+                            {/* Code content */}
+                            <td style={{
+                              padding: '0 10px', color,
+                              whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                              lineHeight: '20px',
+                            }}>{text || ' '}</td>
+                          </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </table>
+              ) : (
+                <div style={{ padding: '48px 24px', textAlign: 'center', color: '#57606a', fontSize: 13 }}>
+                  <i className="ti ti-file-diff" style={{ fontSize: 40, display: 'block', marginBottom: 12, color: '#d1d9e0' }}/>
+                  No content available for this file
+                </div>
+              )}
+            </div>
+
+          </div>
+        );
+      })(),
+      document.body
+    )}
+    </>
   );
 }

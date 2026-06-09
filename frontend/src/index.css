@@ -606,6 +606,7 @@ input[type=password]:not(:placeholder-shown) { letter-spacing: 2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .fade-in { animation: fadeIn .2s ease; }
+@keyframes slideInRight { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: translateX(0); } }
 
 /* AUTH — reset zoom so 100vh works correctly on login page */
 html:has(#auth-screen) {

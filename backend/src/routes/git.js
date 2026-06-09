@@ -555,6 +555,30 @@ router.get('/status', async (req, res) => {
     const git = gitInstance(gitDir);
     const status = await git.status();
     const branch = status.current;
+
+    // Get line-level additions/deletions for tracked changed files
+    let totalAdded = 0, totalDeleted = 0;
+    try {
+      // --numstat gives: <added>\t<deleted>\t<file> for each changed tracked file
+      const numstatTracked = await git.raw(['diff', 'HEAD', '--numstat']);
+      for (const line of numstatTracked.trim().split('\n').filter(Boolean)) {
+        const [a, d] = line.split('\t');
+        if (!isNaN(parseInt(a))) totalAdded   += parseInt(a);
+        if (!isNaN(parseInt(d))) totalDeleted += parseInt(d);
+      }
+    } catch {}
+
+    // Count lines in untracked files as additions (they are entirely new)
+    for (const uf of status.not_added) {
+      try {
+        const absPath = path.join(gitDir, uf);
+        if (fs.existsSync(absPath)) {
+          const content = fs.readFileSync(absPath, 'utf8');
+          totalAdded += content.split('\n').length;
+        }
+      } catch {}
+    }
+
     res.json({
       initialized: true,
       branch,
@@ -565,6 +589,8 @@ router.get('/status', async (req, res) => {
       is_clean: status.isClean(),
       ahead: status.ahead,
       behind: status.behind,
+      additions: totalAdded,
+      deletions: totalDeleted,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -743,9 +769,15 @@ router.get('/branches', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
-    const summary = await git.branch(['-a']);
+
+    // Only return LOCAL branches — no remotes/origin/... tracking refs.
+    // Also exclude the base branch (main) since users never work directly on it.
+    const summary = await git.branchLocal();
+    const baseBranch = cfg.base_branch || 'main';
+    const userBranches = summary.all.filter(b => b !== baseBranch);
+
     res.json({
-      branches: summary.all,
+      branches: userBranches,
       current: summary.current,
     });
   } catch (e) {
@@ -1011,8 +1043,22 @@ router.post('/branch', async (req, res) => {
   const caller = getCaller(req.userId);
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
-  const branchName = identity?.branch_name || req.body.branch_name;
-  if (!branchName) return res.status(400).json({ error: 'Save your Git Identity first to set a branch name.' });
+
+  // Prefer branch name from request body (current form value) over the saved DB value
+  const branchName = (req.body.branch_name || '').trim() || identity?.branch_name;
+  if (!branchName) return res.status(400).json({ error: 'Enter a branch name in Git Identity first.' });
+
+  // For regular users, require a personal PAT so the push is attributed to their
+  // own GitHub account — not the org admin's account.
+  const isAdmin = caller.role === 'org_admin' || caller.role === 'super_admin';
+  if (!isAdmin) {
+    const hasPersonalToken = identity?.auth_token && identity.auth_token.trim();
+    if (!hasPersonalToken) {
+      return res.status(400).json({
+        error: 'Please save your Personal Access Token in Git Identity before creating a branch. Without it, the branch would be pushed under the org admin\'s GitHub account.',
+      });
+    }
+  }
 
   // Use the per-user workspace (clones from remote if not yet set up)
   const gitRoot = getUserWorkspace(proj, caller);
@@ -1154,13 +1200,36 @@ router.get('/diff', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
+
     let diff = '';
+    let isNewFile = false;
     try {
-      diff = await git.diff(['HEAD', '--', filePath]);
-      if (!diff) diff = await git.diff(['--cached', '--', filePath]);
-      if (!diff) diff = await git.diff(['--', filePath]);
+      // Use -U999999 to get the ENTIRE file content as context (not just changed hunks)
+      diff = await git.diff(['HEAD', '-U999999', '--', filePath]);
+      if (!diff) diff = await git.diff(['--cached', '-U999999', '--', filePath]);
+      if (!diff) diff = await git.diff(['-U999999', '--', filePath]);
     } catch {}
-    res.json({ diff, path: filePath });
+
+    // If diff is still empty the file is untracked — read full content and
+    // format every line as an addition so the viewer shows the whole file.
+    if (!diff) {
+      const absPath = path.resolve(gitDir, filePath);
+      if (fs.existsSync(absPath)) {
+        isNewFile = true;
+        const content = fs.readFileSync(absPath, 'utf8');
+        const lines = content.split('\n');
+        const header = [
+          `diff --git a/${filePath} b/${filePath}`,
+          `new file mode 100644`,
+          `--- /dev/null`,
+          `+++ b/${filePath}`,
+          `@@ -0,0 +0,${lines.length} @@`,
+        ].join('\n');
+        diff = header + '\n' + lines.map(l => '+' + l).join('\n');
+      }
+    }
+
+    res.json({ diff, path: filePath, isNewFile });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1178,10 +1247,36 @@ router.post('/discard', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
+
     for (const p of paths) {
-      try { await git.checkout(['--', p]); } catch {}
-      try { await git.clean(['-fd', '--', p]); } catch {}
+      const absPath = path.join(gitDir, p);
+      // Check if file is tracked (committed) or untracked (new)
+      let isTracked = false;
+      try {
+        await git.raw(['ls-files', '--error-unmatch', p]);
+        isTracked = true;
+      } catch {}
+
+      if (isTracked) {
+        // Tracked file: restore to last committed state
+        try { await git.checkout(['--', p]); } catch {}
+      } else {
+        // Untracked file: delete directly from disk (git clean unreliable for nested dirs)
+        try {
+          if (fs.existsSync(absPath)) {
+            const stat = fs.statSync(absPath);
+            if (stat.isDirectory()) {
+              fs.rmSync(absPath, { recursive: true, force: true });
+            } else {
+              fs.unlinkSync(absPath);
+            }
+          }
+        } catch (delErr) {
+          console.warn('[Git] Discard delete failed:', delErr.message);
+        }
+      }
     }
+
     res.json({ ok: true, message: `Discarded changes in ${paths.length} file(s)` });
   } catch (e) {
     res.status(500).json({ error: e.message });

@@ -161,6 +161,8 @@ const migrations = [
   "ALTER TABLE collections ADD COLUMN generated_jmx TEXT DEFAULT ''",
   "ALTER TABLE collections ADD COLUMN generated_k6 TEXT DEFAULT ''",
   "ALTER TABLE projects ADD COLUMN folder_path TEXT DEFAULT ''",
+  "ALTER TABLE rules ADD COLUMN value_min TEXT DEFAULT NULL",
+  "ALTER TABLE rules ADD COLUMN value_max TEXT DEFAULT NULL",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (_) { /* column already exists */ }

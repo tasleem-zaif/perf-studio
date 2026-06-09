@@ -70,4 +70,54 @@ if (process.env.NODE_ENV === 'production') {
   }
 }
 
-app.listen(PORT, () => console.log(`Performance Studio API running on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Performance Studio API running on http://localhost:${PORT}`);
+
+  // ── Regenerate all config.json files on startup ─────────────────────────
+  // Ensures every workspace's config.json is always up-to-date with the
+  // latest rules, test plans and settings — regardless of which user last
+  // triggered a save. Runs after the server is ready so it doesn't block startup.
+  setImmediate(() => {
+    try {
+      const db = require('./db');
+      const { getUserProjectPath } = require('./utils/projectFolders');
+      const { updateCollectionConfigs } = require('./utils/configWriter');
+
+      // For every project, regenerate config for every user who has a workspace
+      const projects = db.prepare('SELECT p.*, u.role as user_role FROM projects p JOIN users u ON u.id = p.user_id').all();
+
+      for (const proj of projects) {
+        try {
+          const projectFolderPath = getUserProjectPath(proj.user_id, proj.user_role, proj.name);
+          const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
+          for (const col of collections) {
+            updateCollectionConfigs(col.id, projectFolderPath);
+          }
+        } catch (_) {}
+      }
+
+      // Also regenerate for any other users (non-owners) who have workspaces for a project
+      const allUsers = db.prepare('SELECT id, role FROM users').all();
+      const allProjects = db.prepare('SELECT * FROM projects').all();
+      for (const user of allUsers) {
+        for (const proj of allProjects) {
+          if (proj.user_id === user.id) continue; // already done above
+          try {
+            const projectFolderPath = getUserProjectPath(user.id, user.role, proj.name);
+            const fs = require('fs');
+            const path = require('path');
+            if (!fs.existsSync(projectFolderPath)) continue; // no workspace for this user
+            const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
+            for (const col of collections) {
+              updateCollectionConfigs(col.id, projectFolderPath);
+            }
+          } catch (_) {}
+        }
+      }
+
+      console.log('[Startup] config.json files regenerated for all workspaces.');
+    } catch (e) {
+      console.error('[Startup] Config regeneration error:', e.message);
+    }
+  });
+});

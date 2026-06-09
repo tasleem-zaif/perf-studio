@@ -18,7 +18,7 @@ export default function ConfirmModal({ open, title, message, confirmLabel = 'Del
         <button className="btn-icon" onClick={onCancel}><i className="ti ti-x" /></button>
       </div>
       <div style={{ fontSize: '14px', color: 'var(--color-text-secondary)', lineHeight: 1.6, padding: '4px 0 8px' }}>
-        {message}
+        {typeof message === 'string' ? message : message}
       </div>
       <div className="modal-footer">
         <button className="btn-secondary" onClick={onCancel}>Cancel</button>

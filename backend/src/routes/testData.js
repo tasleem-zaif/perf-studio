@@ -15,6 +15,11 @@ const storage = multer.diskStorage({
     if (!proj) return cb(new Error('Project not found'));
     if (!proj.folder_path) return cb(new Error('git_not_initialized: Git repository not initialized. Go to Configuration → Git to initialize the repository first.'));
 
+    const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+    const callerUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const userProjPath = getUserProjectPath(req.userId, callerUser?.role, proj.name);
+    if (!userProjPath) return cb(new Error('Git repository not initialized.'));
+
     // If a collection_id is provided, store inside collection/env/testData/
     const colId = req.query.collection_id || req.body?.collection_id;
     const envName = req.query.env || req.body?.env;
@@ -35,23 +40,14 @@ const storage = multer.diskStorage({
         }
 
         // Ensure the env folder exists
-        const { ensureCollectionFolders, getCollectionPath } = require('../utils/projectFolders');
-        const basePath = proj.folder_path || '';
-        if (basePath) {
-          const envFolderPath = getCollectionPath(basePath, col.name, col.id, targetEnv);
-          require('fs').mkdirSync(path.join(envFolderPath, 'testData'), { recursive: true });
-          return cb(null, path.join(envFolderPath, 'testData'));
-        }
+        const envFolderPath = getCollectionPath(userProjPath, col.name, targetEnv);
+        require('fs').mkdirSync(path.join(envFolderPath, 'testData'), { recursive: true });
+        return cb(null, path.join(envFolderPath, 'testData'));
       }
     }
 
     // Fallback: project-level testData folder
-    let folderPath = proj.folder_path;
-    if (!folderPath) {
-      folderPath = ensureProjectFolders(proj.name, proj.id, proj.uuid || proj.environment);
-      db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, proj.id);
-    }
-    const dest = path.join(folderPath, 'testData');
+    const dest = path.join(userProjPath, 'testData');
     require('fs').mkdirSync(dest, { recursive: true });
     cb(null, dest);
   },
@@ -85,7 +81,7 @@ router.get('/', (req, res) => {
         const basePath = proj?.folder_path || '';
         if (basePath) {
           const { getCollectionPath } = require('../utils/projectFolders');
-          const filterPath = getCollectionPath(basePath, col.name, col.id, envName).replace(/\\/g, '/');
+          const filterPath = getCollectionPath(basePath, col.name, envName).replace(/\\/g, '/');
           files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND (collection_id IS NULL OR collection_id = 0) ORDER BY created_at DESC').all(req.params.projectId)
             .filter(f => f.path && f.path.replace(/\\/g, '/').startsWith(filterPath));
         }
@@ -130,6 +126,50 @@ router.post('/', upload.single('csv'), (req, res) => {
     const colId   = req.query.collection_id || req.body?.collection_id || null;
     const envName = req.query.env || req.body?.env || '';
 
+    // "All environments" — copy file to every env folder of the collection
+    if (colId && !envName) {
+      const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+      if (col) {
+        let allEnvs = [];
+        try { allEnvs = JSON.parse(col.environments || '[]'); } catch {}
+        if (!allEnvs.length && col.environment) allEnvs = [col.environment];
+        if (!allEnvs.length) allEnvs = ['Default'];
+
+        const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+        const callerUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+        const userProjPath = getUserProjectPath(req.userId, callerUser?.role, proj.name);
+
+        let lastFileId = null;
+        for (const ev of allEnvs) {
+          // Determine the CORRECT path for THIS env's testData folder
+          let evFilePath = req.file.path; // fallback
+          if (userProjPath) {
+            const envPath = getCollectionPath(userProjPath, col.name, ev);
+            const destFolder = path.join(envPath, 'testData');
+            require('fs').mkdirSync(destFolder, { recursive: true });
+            const destFile = path.join(destFolder, req.file.filename);
+            require('fs').copyFileSync(req.file.path, destFile);
+            evFilePath = destFile; // store THE ACTUAL path for this env
+          }
+          // Save a DB record per env with CORRECT path
+          const evExisting = db.prepare(
+            "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ?"
+          ).get(req.params.projectId, req.file.originalname, ev, colId);
+          if (evExisting) {
+            db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?')
+              .run(req.file.filename, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id);
+            lastFileId = evExisting.id;
+          } else {
+            const r = db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .run(req.params.projectId, colId, ev, req.file.filename, req.file.originalname, evFilePath, JSON.stringify(headers));
+            lastFileId = r.lastInsertRowid;
+          }
+        }
+        return res.json({ file: db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(lastFileId), copied_to_envs: allEnvs });
+      }
+    }
+
+    // Single environment upload
     if (existing) {
       db.prepare(
         'UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?'
@@ -182,10 +222,14 @@ router.put('/:id/content', (req, res) => {
 });
 
 router.delete('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const proj = ownsProject(req.userId, req.params.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!file) return res.status(404).json({ error: 'Not found' });
-  try { unlinkSync(file.path); } catch (_) { /* file may already be gone */ }
+
+  // Delete the actual file — path is now always the correct env-specific location
+  try { unlinkSync(file.path); } catch (_) { /* already gone */ }
+
   db.prepare('DELETE FROM test_data_files WHERE id = ?').run(req.params.id);
   resetSequence('test_data_files');
   res.json({ ok: true });
