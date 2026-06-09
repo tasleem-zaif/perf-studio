@@ -375,23 +375,23 @@ jobs:
           echo "=== Enabled elements ==="
           grep "enabled=" "\$SCRIPT" | head -10
 
-      - name: Cache JMeter Docker image
+      - name: Cache PerfStudio Docker image
         uses: actions/cache@v4
         with:
           path: /tmp/docker-cache
-          key: docker-jmeter-justb4-\${{ runner.os }}
-          restore-keys: docker-jmeter-justb4-
+          key: docker-perfstudio-\${{ runner.os }}
+          restore-keys: docker-perfstudio-
 
       - name: Load cached image or pull
         run: |
-          if [ -f /tmp/docker-cache/justb4-jmeter.tar ]; then
-            echo "Loading JMeter image from cache..."
-            docker load -i /tmp/docker-cache/justb4-jmeter.tar
+          if [ -f /tmp/docker-cache/perfstudio.tar ]; then
+            echo "Loading PerfStudio image from cache..."
+            docker load -i /tmp/docker-cache/perfstudio.tar
           else
-            echo "Pulling JMeter image (first run on this runner)..."
-            docker pull justb4/jmeter
+            echo "Pulling PerfStudio image (first run on this runner)..."
+            docker pull tasleemzaif/perfstudio:latest
             mkdir -p /tmp/docker-cache
-            docker save justb4/jmeter -o /tmp/docker-cache/justb4-jmeter.tar
+            docker save tasleemzaif/perfstudio:latest -o /tmp/docker-cache/perfstudio.tar
           fi
 
       - name: Run JMeter
@@ -402,7 +402,8 @@ jobs:
           docker run --rm \\
             -v "\${{ github.workspace }}":/workspace \\
             -v "\${{ github.workspace }}/reports":/output \\
-            justb4/jmeter \\
+            tasleemzaif/perfstudio:latest \\
+            jmeter \\
             -n -t "/workspace/\$SCRIPT" \\
             -l /output/results.jtl \\
             -e -o /output/html
