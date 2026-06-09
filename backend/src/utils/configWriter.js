@@ -54,6 +54,10 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     // project.folder_path — that may point to the wrong (e.g. admin) workspace.
     const basePath = projectFolderPath;
     if (!basePath) return; // no user workspace path supplied — skip write
+
+    // Admin workspace holds only empty folders — never write config.json there
+    const { isAdminWorkspace } = require('./projectFolders');
+    if (isAdminWorkspace(basePath)) return;
     // New clean-name format: CollectionName/Env/
     envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
 

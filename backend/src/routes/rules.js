@@ -18,11 +18,13 @@ function syncRules(projectId, userId) {
       const cols     = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
 
       // Regenerate config for ALL users who have a workspace for this project
+      const { isAdminWorkspace } = require('../utils/projectFolders');
       const allUsers = db.prepare('SELECT id, role FROM users').all();
       for (const user of allUsers) {
         try {
           const userProjPath = getUserProjectPath(user.id, user.role, projName);
-          if (!fs.existsSync(userProjPath)) continue; // skip if workspace not initialised
+          if (isAdminWorkspace(userProjPath)) continue; // admin workspace holds no files
+          if (!fs.existsSync(userProjPath)) continue;  // skip if workspace not initialised
           cols.forEach(c => updateCollectionConfigs(c.id, userProjPath));
         } catch (_) {}
       }

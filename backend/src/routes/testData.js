@@ -15,10 +15,15 @@ const storage = multer.diskStorage({
     if (!proj) return cb(new Error('Project not found'));
     if (!proj.folder_path) return cb(new Error('git_not_initialized: Git repository not initialized. Go to Configuration → Git to initialize the repository first.'));
 
-    const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+    const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
     const callerUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const userProjPath = getUserProjectPath(req.userId, callerUser?.role, proj.name);
     if (!userProjPath) return cb(new Error('Git repository not initialized.'));
+
+    // Admin workspace holds only empty folders — block file uploads for admin
+    if (isAdminWorkspace(userProjPath)) {
+      return cb(new Error('admin_workspace: Test data files cannot be uploaded to the admin workspace. Please use a regular user account to upload test data.'));
+    }
 
     // If a collection_id is provided, store inside collection/env/testData/
     const colId = req.query.collection_id || req.body?.collection_id;

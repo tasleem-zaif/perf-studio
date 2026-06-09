@@ -80,15 +80,16 @@ app.listen(PORT, () => {
   setImmediate(() => {
     try {
       const db = require('./db');
-      const { getUserProjectPath } = require('./utils/projectFolders');
+      const { getUserProjectPath, isAdminWorkspace } = require('./utils/projectFolders');
       const { updateCollectionConfigs } = require('./utils/configWriter');
 
-      // For every project, regenerate config for every user who has a workspace
+      // For every project, regenerate config for every NON-ADMIN user who has a workspace
       const projects = db.prepare('SELECT p.*, u.role as user_role FROM projects p JOIN users u ON u.id = p.user_id').all();
 
       for (const proj of projects) {
         try {
           const projectFolderPath = getUserProjectPath(proj.user_id, proj.user_role, proj.name);
+          if (isAdminWorkspace(projectFolderPath)) continue; // skip admin workspace
           const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
           for (const col of collections) {
             updateCollectionConfigs(col.id, projectFolderPath);
@@ -104,6 +105,7 @@ app.listen(PORT, () => {
           if (proj.user_id === user.id) continue; // already done above
           try {
             const projectFolderPath = getUserProjectPath(user.id, user.role, proj.name);
+            if (isAdminWorkspace(projectFolderPath)) continue; // skip admin workspace
             const fs = require('fs');
             const path = require('path');
             if (!fs.existsSync(projectFolderPath)) continue; // no workspace for this user

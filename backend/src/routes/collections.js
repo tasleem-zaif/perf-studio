@@ -100,6 +100,14 @@ function setupCollectionFolder(proj, colId, colName, env, sourceContent, sourceT
   const userProjectPath = getUserProjectPath(userId, role, proj.name);
   if (!userProjectPath) return null;
 
+  // Admin workspace holds only empty folders — skip all file writes for admin
+  const { isAdminWorkspace } = require('../utils/projectFolders');
+  if (isAdminWorkspace(userProjectPath)) {
+    // Still create the empty folder structure but write nothing inside
+    try { require('../utils/projectFolders').ensureCollectionFolders(userProjectPath, colName, env); } catch (_) {}
+    return null;
+  }
+
   // Ensure the workspace is a proper git repo (clone if .git missing)
   const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
   const userFolder = (role === 'org_admin' || role === 'super_admin') ? 'admin' : `user-${userId}`;

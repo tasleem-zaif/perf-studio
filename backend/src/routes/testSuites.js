@@ -183,9 +183,14 @@ router.post('/:id/generate', async (req, res) => {
     let filePath = '';
 
     let scriptBaseDir = null;
-    const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+    const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
     const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
     const userProjPath = getUserProjectPath(req.userId, callerRole, proj.name);
+
+    // Admin workspace holds only empty folders — skip script generation for admin
+    if (isAdminWorkspace(userProjPath)) {
+      return res.status(400).json({ error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.' });
+    }
     if (collection && userProjPath) {
       let targetEnv = suite.env;
       if (!targetEnv && collection) {
