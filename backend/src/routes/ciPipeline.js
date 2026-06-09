@@ -394,6 +394,19 @@ jobs:
             docker save tasleemzaif/perfstudio:latest -o /tmp/docker-cache/perfstudio.tar
           fi
 
+      - name: Verify patch and CSV files
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          echo "=== ThreadGroup after patch ==="
+          grep -E "num_threads|ramp_time|scheduler|duration|continue_forever|LoopController.loops" "\$SCRIPT" || echo "WARN: no matches found"
+          echo "=== CSV paths in JMX ==="
+          grep -i "CSV_PATH\\|Argument.value.*testData\\|filename.*CSV\\|CSVDataSet" "\$SCRIPT" | head -10
+          echo "=== CSV files in workspace ==="
+          TESTDATA="\$(grep -o 'Argument.value>[^<]*testData' \$SCRIPT | head -1 | sed 's/Argument.value>//')"
+          [ -n "\$TESTDATA" ] && ls -la "\$TESTDATA/" 2>/dev/null || echo "testData dir: \$TESTDATA (checking /workspace prefix)"
+          ls -la "/workspace/projects/Demo1/Demo1_API_Collection/QA/testData/" 2>/dev/null || echo "Path not found"
+
       - name: Run JMeter
         run: |
           SCRIPT="\${{ inputs.script_path }}"
@@ -405,8 +418,11 @@ jobs:
             tasleemzaif/perfstudio:latest \\
             jmeter \\
             -n -t "/workspace/\$SCRIPT" \\
+            -j /output/jmeter.log \\
             -l /output/results.jtl \\
-            -e -o /output/html
+            -e -o /output/html || true
+          echo "=== JMeter Log (last 50 lines) ==="
+          tail -50 reports/jmeter.log 2>/dev/null || echo "No jmeter.log found"
 
       - name: Validate results
         run: |
