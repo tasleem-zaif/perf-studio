@@ -338,16 +338,22 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   async function pollCiStatus(runId) {
     setCiPolling(runId);
+    const DONE = new Set(['completed','failed','cancelled','success','failure','skipped']);
     const poll = async () => {
       try {
         const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${runId}/status`);
         setCiRuns(prev => prev.map(r => r.id === runId ? { ...r, ...data.run } : r));
-        const done = ['completed','failed','cancelled','success','failure'].includes(data.run?.status);
-        if (!done) setTimeout(poll, 5000);
-        else setCiPolling(null);
+        if (!DONE.has(data.run?.status)) setTimeout(poll, 5000); // poll every 5s until done
+        else {
+          setCiPolling(null);
+          // Refresh full run list to pick up any runs triggered outside PerfStudio
+          api.get(`/projects/${selectedProjectId}/ci/runs`)
+            .then(({ data: d }) => setCiRuns(d.runs || []))
+            .catch(() => {});
+        }
       } catch { setCiPolling(null); }
     };
-    setTimeout(poll, 3000);
+    setTimeout(poll, 5000); // first poll after 5s (GitHub needs a moment to register the run)
   }
 
   // ── Pipeline runner state ─────────────────────────────────────────────────

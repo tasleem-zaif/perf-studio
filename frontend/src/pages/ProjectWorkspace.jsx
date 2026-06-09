@@ -236,7 +236,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
                 <GitPanel project={project} user={user} setupOnly={true} />
               </div>
               <div style={{ display: configTab === 'pipeline' ? 'contents' : 'none' }}>
-                <PipelineConfig project={project} envs={collectionEnvs} />
+                <PipelineConfig project={project} envs={collectionEnvs} user={user} />
               </div>
             </div>
           );
