@@ -1324,14 +1324,18 @@ router.post('/run', auth, async (req, res) => {
           summary, by_api, timeline, errors: Object.values(errMap), logs: [],
         };
 
-        // PDF to temp file
+        // Generate PDF — save to result_dir for permanent storage AND send via email
         let pdfPath = null;
         try {
-          const runNum = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
-          const tmpPdf = path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
-          await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-          pdfPath = tmpPdf;
-          console.log('[Alerts] PDF generated:', pdfPath);
+          const runNum    = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
+          const suiteName = (runRow.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
+          // Primary: save directly to result_dir so it persists
+          const resultPdf = runRow.result_dir && fs.existsSync(runRow.result_dir)
+            ? path.join(runRow.result_dir, `${suiteName}_Run${runNum}_Analytics.pdf`)
+            : path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
+          await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
+          pdfPath = resultPdf;
+          console.log('[Alerts] Analytics PDF saved:', pdfPath);
         } catch (pdfErr) {
           console.error('[Alerts] PDF generation failed:', pdfErr.message);
         }

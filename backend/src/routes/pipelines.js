@@ -84,8 +84,9 @@ router.post('/:id/run', auth, async (req, res) => {
   if (res.socket) res.socket.setNoDelay(true);
 
   const allLogs = [];
+  function ts() { return new Date().toLocaleTimeString('en-GB', { hour12: false }); }
   function log(type, message) {
-    const entry = { type, message };
+    const entry = { type, message: `${ts()} ${message}` };
     allLogs.push(entry);
     res.write('data: ' + JSON.stringify(entry) + '\n\n');
     if (typeof res.flush === 'function') res.flush();
@@ -126,6 +127,8 @@ router.post('/:id/run', auth, async (req, res) => {
 
   // Notify frontend of run_id immediately so it can poll status
   send({ run_id: runId, total_steps: steps.length });
+  log('ok', `Pipeline queued — Run #${runId} | ${steps.length} step(s)`);
+  log('info', `Started at: ${new Date().toLocaleString()}`);
 
   // ── Execute steps sequentially ────────────────────────────────────────────
   let finalStatus = 'completed';
@@ -135,9 +138,12 @@ router.post('/:id/run', auth, async (req, res) => {
     const step = steps[i];
     log('info', '');
     log('info', `┌─ Step ${i + 1}/${steps.length}: ${step.name} ─────────────────────────`);
+    log('info', `│  Engine: ${step.engine?.toUpperCase() || 'JMETER'} · Type: ${step.test_type || 'load'}`);
+    log('info', `│  Status: RUNNING`);
 
     // Mark step as running
     stepsResult[i].status = 'running';
+    stepsResult[i].started_at = new Date().toISOString();
     saveSteps();
     send({ step_update: { index: i, status: 'running', name: step.name } });
 

@@ -58,20 +58,13 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
     setSelectedId('');
     api.get('/execution/runs', { params: { project_id: project.id } })
       .then(({ data }) => {
-        let filtered = data.runs || [];
-        // Filter by collection
-        if (collection?.id) {
-          filtered = filtered.filter(r => String(r.collection_id) === String(collection.id));
-        }
-        // Soft env filter — show runs for this env OR untagged runs
-        if (env) {
-          filtered = filtered.filter(r => !r.suite_env || r.suite_env === env);
-        }
-        setRuns(filtered);
+        // Show ALL runs for this project — do not filter by env/collection
+        // so the selected run is never "not found" after the user picks it.
+        setRuns(data.runs || []);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
 
   if (!project) {
     return (
