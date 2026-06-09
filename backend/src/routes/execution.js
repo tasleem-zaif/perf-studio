@@ -1322,6 +1322,13 @@ router.post('/run', auth, async (req, res) => {
           errMap[k].count++;
         });
 
+        // Evaluate rules against this run's JTL so violations appear in the email
+        let ruleViolationsForEmail = [];
+        try {
+          const rr = evaluateRules(runRow.project_id, jtlPath);
+          ruleViolationsForEmail = rr?.violations || [];
+        } catch (_) {}
+
         const reportData = {
           meta: {
             run_id: runRow.id, suite_name: runRow.suite_name || 'Test Plan',
@@ -1330,6 +1337,7 @@ router.post('/run', auth, async (req, res) => {
             duration_s: parseFloat(durS2.toFixed(1)),
           },
           summary, by_api, timeline, errors: Object.values(errMap), logs: [],
+          rule_violations: ruleViolationsForEmail,
         };
 
         // Generate PDF — save to result_dir for permanent storage AND send via email
@@ -1360,36 +1368,9 @@ router.post('/run', auth, async (req, res) => {
       }
     };
 
-    // ── Auto-save analytics PDF to result_dir regardless of email config ───────
-    // This runs unconditionally — even if no SMTP is configured
-    setImmediate(async () => {
-      try {
-        const runRow2 = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
-        if (!runRow2?.result_dir || !fs.existsSync(runRow2.result_dir)) return;
-        const jtlPath2 = path.join(runRow2.result_dir, 'results.jtl');
-        if (!fs.existsSync(jtlPath2)) return;
-        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
-        const s2 = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(runRow2.suite_id);
-        const sName2 = (s2?.name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
-        const rNum2  = (runRow2.result_dir.match(/Run_(\d+)/) || [])[1] || runRow2.id;
-        const pdfOut = path.join(runRow2.result_dir, `${sName2}_Run${rNum2}_Analytics.pdf`);
-        if (fs.existsSync(pdfOut)) return; // already exists
-        // Re-use the existing export-pdf data-building logic via internal call
-        const apiModule = require('http');
-        // Simpler: call the report-data endpoint logic inline via the JTL parser
-        const { parseJtlMetrics } = require('../utils/ruleEvaluator');
-        const metrics = parseJtlMetrics(jtlPath2);
-        if (metrics) {
-          const reportData = {
-            meta: { suite_name: s2?.name || 'Test Run', started_at: runRow2.started_at, duration_s: metrics.total > 0 ? 0 : 0, status: runRow2.status },
-            summary: { total_requests: metrics.total, total_failed: metrics.fail, total_success: metrics.pass, avg_response_time: metrics.avg_response_time, overall_tps: metrics.throughput, p90: metrics.p90, p95: metrics.p95 },
-            rule_violations: [],
-          };
-          await generateAnalyticsPdfToFile(reportData, rNum2, pdfOut);
-          console.log('[PDF] Auto-saved analytics PDF:', pdfOut);
-        }
-      } catch (e) { console.warn('[PDF] Auto-save failed:', e.message); }
-    });
+    // PDF is saved inside sendEmailForRun which builds the full reportData
+    // (with by_api, timeline, errors) required by generateAnalyticsPdfToFile.
+    // The separate minimal-reportData approach was removed because it crashed.
 
     if (shouldHeal) {
       log('warn', '');

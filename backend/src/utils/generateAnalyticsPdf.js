@@ -33,7 +33,13 @@ function esc(s)   { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&
 function trunc(s,n=18){ return s && s.length>n ? s.slice(0,n-1)+'…' : (s||''); }
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
-function buildHtml({ summary, by_api, timeline, errors, meta }, runNum) {
+function buildHtml({ summary, by_api, timeline, errors, meta, rule_violations }, runNum) {
+  // Defensive defaults — prevent crashes when called with minimal reportData
+  by_api    = by_api    || [];
+  timeline  = timeline  || [];
+  errors    = errors    || [];
+  summary   = summary   || {};
+  meta      = meta      || {};
   const suiteName = meta.suite_name || 'Unknown';
   const runLabel  = `Run ${runNum || meta.run_id}`;
   const startedAt = meta.started_at  ? new Date(meta.started_at).toLocaleString()  : '—';
