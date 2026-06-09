@@ -362,12 +362,51 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Patch JMX parameters
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          if [ -z "\$SCRIPT" ]; then SCRIPT="\${{ inputs.script_name }}"; fi
+          USERS="\${{ inputs.jmeter_users }}"
+          RAMPUP="\${{ inputs.jmeter_rampup }}"
+          LOOPS="\${{ inputs.jmeter_loops }}"
+          DURATION="\${{ inputs.jmeter_duration }}"
+
+          echo "Patching: /workspace/\$SCRIPT"
+          echo "  users=\$USERS  rampup=\$RAMPUP  loops=\$LOOPS  duration=\$DURATION"
+
+          # Patch virtual users
+          sed -i "s|<stringProp name=\\"ThreadGroup.num_threads\\">[^<]*|<stringProp name=\\"ThreadGroup.num_threads\\">\$USERS|g" "\$SCRIPT"
+          sed -i "s|<intProp name=\\"ThreadGroup.num_threads\\">[^<]*|<intProp name=\\"ThreadGroup.num_threads\\">\$USERS|g" "\$SCRIPT"
+
+          # Patch ramp-up
+          sed -i "s|<stringProp name=\\"ThreadGroup.ramp_time\\">[^<]*|<stringProp name=\\"ThreadGroup.ramp_time\\">\$RAMPUP|g" "\$SCRIPT"
+          sed -i "s|<intProp name=\\"ThreadGroup.ramp_time\\">[^<]*|<intProp name=\\"ThreadGroup.ramp_time\\">\$RAMPUP|g" "\$SCRIPT"
+
+          if [ "\$DURATION" != "-1" ] && [ "\$DURATION" -gt 0 ]; then
+            echo "Mode: Duration (\${DURATION}s)"
+            # Set scheduler=true
+            sed -i "s|<boolProp name=\\"ThreadGroup.scheduler\\">[^<]*|<boolProp name=\\"ThreadGroup.scheduler\\">true|g" "\$SCRIPT"
+            # Patch duration
+            sed -i "s|<stringProp name=\\"ThreadGroup.duration\\">[^<]*|<stringProp name=\\"ThreadGroup.duration\\">\$DURATION|g" "\$SCRIPT"
+            sed -i "s|<longProp name=\\"ThreadGroup.duration\\">[^<]*|<longProp name=\\"ThreadGroup.duration\\">\$DURATION|g" "\$SCRIPT"
+            sed -i "s|<intProp name=\\"ThreadGroup.duration\\">[^<]*|<intProp name=\\"ThreadGroup.duration\\">\$DURATION|g" "\$SCRIPT"
+            # Set loops=-1 so scheduler controls stop
+            sed -i "s|<stringProp name=\\"LoopController.loops\\">[^<]*|<stringProp name=\\"LoopController.loops\\">-1|g" "\$SCRIPT"
+            sed -i "s|<intProp name=\\"LoopController.loops\\">[^<]*|<intProp name=\\"LoopController.loops\\">-1|g" "\$SCRIPT"
+          else
+            echo "Mode: Fixed loops (\$LOOPS)"
+            # Disable scheduler
+            sed -i "s|<boolProp name=\\"ThreadGroup.scheduler\\">[^<]*|<boolProp name=\\"ThreadGroup.scheduler\\">false|g" "\$SCRIPT"
+            # Set loop count
+            sed -i "s|<stringProp name=\\"LoopController.loops\\">[^<]*|<stringProp name=\\"LoopController.loops\\">\$LOOPS|g" "\$SCRIPT"
+            sed -i "s|<intProp name=\\"LoopController.loops\\">[^<]*|<intProp name=\\"LoopController.loops\\">\$LOOPS|g" "\$SCRIPT"
+          fi
+          echo "JMX patched successfully"
+
       - name: Run JMeter performance test
         run: |
           SCRIPT="\${{ inputs.script_path }}"
-          if [ -z "\$SCRIPT" ]; then
-            SCRIPT="\${{ inputs.script_name }}"
-          fi
+          if [ -z "\$SCRIPT" ]; then SCRIPT="\${{ inputs.script_name }}"; fi
           echo "Running script: \$SCRIPT"
           mkdir -p reports
 
@@ -377,10 +416,6 @@ jobs:
             justb4/jmeter \\
             -Dlog4j2.formatMsgNoLookups=true \\
             -n -t "/workspace/\$SCRIPT" \\
-            -Jusers="\${{ inputs.jmeter_users }}" \\
-            -Jrampup="\${{ inputs.jmeter_rampup }}" \\
-            -Jloops="\${{ inputs.jmeter_loops }}" \\
-            -Jduration="\${{ inputs.jmeter_duration }}" \\
             -l /output/results.jtl \\
             -e -o /output/html
 
@@ -413,16 +448,16 @@ router.post('/trigger', async (req, res) => {
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
-  // Prefer the calling user's personal PAT over the project CI config token.
-  // This way each user's pipeline trigger is attributed to their own GitHub/GitLab account.
-  // Regular users already have a PAT saved in Git Identity — no extra setup needed.
+  // Token priority for CI triggers:
+  // 1. CI config token (saved specifically for CI/CD under Configuration → Pipeline)
+  // 2. User's Git Identity PAT as fallback
+  // The CI config token should have both `repo` + `workflow` scopes.
   const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
   const userToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : null;
 
-  // Effective tokens: user's personal PAT takes priority
-  const effectiveGithubToken = userToken || cfg.github_token;
-  const effectiveGitlabToken = userToken || cfg.gitlab_token;
+  const effectiveGithubToken = cfg.github_token || userToken;
+  const effectiveGitlabToken = cfg.gitlab_token || cfg.gitlab_trigger_token || userToken;
 
   const variables = { script_name, script_path: script_path || '', jmeter_users: String(jmeter_users || 10), jmeter_rampup: String(jmeter_rampup || 30), jmeter_loops: String(jmeter_loops || 1), jmeter_duration: String(jmeter_duration || 300) };
 
@@ -484,28 +519,60 @@ router.post('/trigger', async (req, res) => {
 
       const workflowFile = cfg.github_workflow_file || 'perf-test.yml';
       const ref          = cfg.github_ref || 'main';
-
-      const r = await apiRequest(
-        `https://api.github.com/repos/${cfg.github_repo}/actions/workflows/${workflowFile}/dispatches`,
-        'POST',
-        {
-          ref,
-          inputs: {
-            script_name:     script_name || 'test.jmx',
-            script_path:     script_path || '',
-            jmeter_users:    String(jmeter_users || 10),
-            jmeter_rampup:   String(jmeter_rampup || 30),
-            jmeter_loops:    String(jmeter_loops || 1),
-            jmeter_duration: String(jmeter_duration || 300),
-          },
+      const ghHeaders    = {
+        Authorization:          `token ${effectiveGithubToken}`,
+        'User-Agent':           'PerfStudio',
+        Accept:                 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      };
+      const dispatchBody = {
+        ref,
+        inputs: {
+          script_name:     script_name || 'test.jmx',
+          script_path:     script_path || '',
+          jmeter_users:    String(jmeter_users || 10),
+          jmeter_rampup:   String(jmeter_rampup || 30),
+          jmeter_loops:    String(jmeter_loops || 1),
+          jmeter_duration: String(jmeter_duration || 300),
         },
-        {
-          Authorization:  `token ${effectiveGithubToken}`,
-          'User-Agent':   'PerfStudio',
-          Accept:         'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        }
+      };
+
+      // Try filename first, then full path as fallback (both are valid per GitHub docs)
+      let r = await apiRequest(
+        `https://api.github.com/repos/${cfg.github_repo}/actions/workflows/${workflowFile}/dispatches`,
+        'POST', dispatchBody, ghHeaders
       );
+
+      if (r.status === 404) {
+        // Fallback: try with full path
+        r = await apiRequest(
+          `https://api.github.com/repos/${cfg.github_repo}/actions/workflows/.github%2Fworkflows%2F${workflowFile}/dispatches`,
+          'POST', dispatchBody, ghHeaders
+        );
+      }
+
+      if (r.status === 404) {
+        // Last resort: look up the numeric workflow ID and use that
+        const wfList = await apiRequest(
+          `https://api.github.com/repos/${cfg.github_repo}/actions/workflows`,
+          'GET', null, ghHeaders
+        );
+        const wf = (wfList.body?.workflows || []).find(w =>
+          w.path === `.github/workflows/${workflowFile}` || w.name === 'PerfStudio Performance Test'
+        );
+        if (wf?.id) {
+          r = await apiRequest(
+            `https://api.github.com/repos/${cfg.github_repo}/actions/workflows/${wf.id}/dispatches`,
+            'POST', dispatchBody, ghHeaders
+          );
+        }
+      }
+
+      if (r.status === 404) {
+        return res.status(404).json({
+          error: `Workflow not found. Verify: 1) perf-test.yml is merged to "${ref}" branch. 2) The repo in CI settings is exactly "${cfg.github_repo}". 3) Your PAT has "repo" scope.`,
+        });
+      }
 
       if (r.status === 204) {
         await new Promise(r => setTimeout(r, 2000));
@@ -747,13 +814,83 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     const zip = new AdmZip(tmpZip);
     zip.extractAllTo(resultDir, true);
-    fs.unlinkSync(tmpZip); // clean up temp file
+    fs.unlinkSync(tmpZip);
 
-    // ── Create execution_run record so it shows in Run History ───────────────
-    const jtlPath = path.join(resultDir, 'results.jtl');
-    const htmlPath = path.join(resultDir, 'html', 'index.html');
+    // ── Normalise folder names to match local run structure ───────────────────
+    // CI YAML writes HTML to reports/html/ — local runs use resultDir/report/
+    const ciHtmlDir    = path.join(resultDir, 'html');
+    const localHtmlDir = path.join(resultDir, 'report');
+    if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) {
+      fs.renameSync(ciHtmlDir, localHtmlDir);
+    }
+    const reportPath = path.join(localHtmlDir, 'index.html');
+    const jtlPath    = path.join(resultDir, 'results.jtl');
 
-    // Find matching suite for DB record
+    // ── Generate analytics PDF from JTL ──────────────────────────────────────
+    let pdfPath = null;
+    if (fs.existsSync(jtlPath)) {
+      try {
+        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+        const runNum  = (resultDir.match(/Run_(\d+)/) || [])[1] || run.id;
+        const tmpPdf  = path.join(resultDir, `Analytics_CI_Run_${runNum}.pdf`);
+
+        // Build reportData structure expected by generateAnalyticsPdfToFile
+        const content   = fs.readFileSync(jtlPath, 'utf8');
+        const lines     = content.trim().split('\n').filter(Boolean);
+        if (lines.length >= 2) {
+          const HNORM = { Latency:'latency', Connect:'connect', Bytes:'bytes', SentBytes:'sentBytes' };
+          const hdrs  = lines[0].split(',').map(h => { const c = h.trim().replace(/^"|"$/g,''); return HNORM[c]||c; });
+          const splitCsvLine = line => {
+            const cells = []; let cur = '', inQ = false;
+            for (const ch of line) {
+              if (ch === '"') inQ = !inQ;
+              else if (ch === ',' && !inQ) { cells.push(cur.trim()); cur = ''; }
+              else cur += ch;
+            } cells.push(cur.trim()); return cells;
+          };
+          const parseRow = ln => { const p=splitCsvLine(ln),r={}; hdrs.forEach((h,i)=>{r[h]=(p[i]||'').replace(/^"|"$/g,'').trim();}); return r; };
+          const pct = (arr,p) => { if(!arr.length)return null; const s=[...arr].sort((a,b)=>a-b); return s[Math.max(0,Math.ceil(p/100*s.length)-1)]; };
+
+          const allRows   = lines.slice(1).map(parseRow);
+          const elapsed   = allRows.map(r=>parseInt(r.elapsed)||0);
+          const totalReqs = allRows.length;
+          const totalFail = allRows.filter(r=>r.success==='false').length;
+          const tsList    = allRows.map(r=>parseInt(r.timeStamp)||0).filter(Boolean);
+          const durS      = tsList.length ? (Math.max(...tsList) - Math.min(...tsList))/1000 : 1;
+
+          const suite = db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
+
+          const reportData = {
+            meta: {
+              suite_name: suite?.name || run.script_name || 'CI Run',
+              started_at: run.started_at,
+              duration_s: Math.round(durS),
+              status:     'completed',
+            },
+            summary: {
+              total_requests:    totalReqs,
+              total_failed:      totalFail,
+              total_success:     totalReqs - totalFail,
+              avg_response_time: elapsed.length ? elapsed.reduce((a,b)=>a+b,0)/elapsed.length : 0,
+              min_response_time: elapsed.length ? Math.min(...elapsed.filter(v=>v>0)) : 0,
+              max_response_time: elapsed.length ? Math.max(...elapsed) : 0,
+              p90:               pct(elapsed, 90) || 0,
+              p95:               pct(elapsed, 95) || 0,
+              overall_tps:       durS > 0 ? totalReqs / durS : 0,
+            },
+            rule_violations: [],
+          };
+
+          await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
+          pdfPath = tmpPdf;
+          console.log('[CI Sync] Analytics PDF generated:', pdfPath);
+        }
+      } catch (e) {
+        console.warn('[CI Sync] PDF generation failed:', e.message);
+      }
+    }
+
+    // ── Create execution_run record ───────────────────────────────────────────
     let suiteId = null;
     if (run.script_name) {
       const scriptFile = run.script_name.split('/').pop();
@@ -762,29 +899,33 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       suiteId = suite?.id || null;
     }
 
-    db.prepare(`
+    const execRunRow = db.prepare(`
       INSERT INTO execution_runs
-        (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `).run(
       req.params.projectId,
       suiteId,
       'jmeter',
       'completed',
       resultDir,
+      fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString()
     );
 
-    // Update ci_pipeline_run with result_dir
+    // Update ci_pipeline_run with result_dir reference
     db.prepare("UPDATE ci_pipeline_runs SET variables = ? WHERE id = ?")
       .run(JSON.stringify({ ...JSON.parse(run.variables || '{}'), result_dir: resultDir }), run.id);
 
+    const savedFiles = fs.readdirSync(resultDir);
     res.json({
       ok: true,
       result_dir: resultDir,
-      files: fs.readdirSync(resultDir),
-      message: `Results saved to ${resultDir.replace(/\\/g, '/')}`,
+      files: savedFiles,
+      has_html_report: fs.existsSync(reportPath),
+      has_pdf: !!pdfPath,
+      message: `Results saved → ${path.basename(path.dirname(resultDir))}/${path.basename(resultDir)} (JTL + ${fs.existsSync(reportPath)?'HTML report + ':''}${pdfPath?'PDF':'no PDF'})`,
     });
 
   } catch (e) {

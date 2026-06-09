@@ -304,7 +304,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciProvider,     setCiProvider]     = useState('gitlab');
   const [ciScriptName,   setCiScriptName]   = useState('');
   const [ciScriptPath,   setCiScriptPath]   = useState('');
-  const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300 });
+  const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300, iter_mode: 'duration' });
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
@@ -319,10 +319,14 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     setCiTriggering(true);
     try {
       const { data } = await api.post(`/projects/${selectedProjectId}/ci/trigger`, {
-        provider: ciProvider,
-        script_name: ciScriptName,
-        script_path: ciScriptPath,
-        ...ciVars,
+        provider:      ciProvider,
+        script_name:   ciScriptName,
+        script_path:   ciScriptPath,
+        jmeter_users:    ciVars.jmeter_users,
+        jmeter_rampup:   ciVars.jmeter_rampup,
+        // Pass only the active param; set the other to -1 so JMeter ignores it
+        jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
+        jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
       });
       toast(`Pipeline triggered on ${ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'}`, 'success');
       setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, started_at: new Date().toISOString() }, ...prev]);
@@ -650,18 +654,33 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 )}
 
                 {/* Variables */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
-                  {[
-                    { key: 'jmeter_users',    label: 'Virtual Users',    placeholder: '10'  },
-                    { key: 'jmeter_rampup',   label: 'Ramp-up (secs)',   placeholder: '30'  },
-                    { key: 'jmeter_duration', label: 'Duration (secs)',   placeholder: '300' },
-                    { key: 'jmeter_loops',    label: 'Loops',             placeholder: '1'   },
-                  ].map(({ key, label, placeholder }) => (
-                    <div key={key} className="form-group" style={{ margin: 0 }}>
-                      <label className="form-label" style={{ fontSize: 11 }}>{label}</label>
-                      <input type="number" value={ciVars[key]} onChange={e => setCiVars(v => ({ ...v, [key]: e.target.value }))} placeholder={placeholder} />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: 11 }}>Virtual Users</label>
+                    <input type="number" value={ciVars.jmeter_users} min={1} onChange={e => setCiVars(v => ({ ...v, jmeter_users: e.target.value }))} placeholder="10" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: 11 }}>Ramp-up (secs)</label>
+                    <input type="number" value={ciVars.jmeter_rampup} min={0} onChange={e => setCiVars(v => ({ ...v, jmeter_rampup: e.target.value }))} placeholder="30" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: 11 }}>Iteration Mode</label>
+                    <CustomSelect value={ciVars.iter_mode} onChange={e => setCiVars(v => ({ ...v, iter_mode: e.target.value }))}>
+                      <option value="duration">Test Duration (secs)</option>
+                      <option value="loops">Fixed Loops</option>
+                    </CustomSelect>
+                  </div>
+                  {ciVars.iter_mode === 'duration' ? (
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label" style={{ fontSize: 11 }}>Duration (secs)</label>
+                      <input type="number" value={ciVars.jmeter_duration} min={1} onChange={e => setCiVars(v => ({ ...v, jmeter_duration: e.target.value }))} placeholder="300" />
                     </div>
-                  ))}
+                  ) : (
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label" style={{ fontSize: 11 }}>Loops</label>
+                      <input type="number" value={ciVars.jmeter_loops} min={1} onChange={e => setCiVars(v => ({ ...v, jmeter_loops: e.target.value }))} placeholder="1" />
+                    </div>
+                  )}
                 </div>
 
                 <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled)}>

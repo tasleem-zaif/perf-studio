@@ -30,7 +30,7 @@ function StepRow({ step, index, total, onRemove, onMoveUp, onMoveDown }) {
   );
 }
 
-export default function PipelineConfig({ project, envs }) {
+export default function PipelineConfig({ project, envs, user }) {
   const { toast } = useToast();
   const [configTab,  setConfigTab]  = useState('local'); // 'local' | 'ci'
   const [pipelines, setPipelines]   = useState([]);
@@ -195,12 +195,12 @@ export default function PipelineConfig({ project, envs }) {
   return (
     <div className="page fade-in">
 
-      {/* ── Tab switcher ─────────────────────────────────────────────── */}
+      {/* ── Tab switcher — CI/CD tab only visible to Org Admin ──────── */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
-          { id: 'local', icon: 'ti-git-merge',    label: 'Local Pipelines' },
-          { id: 'ci',    icon: 'ti-brand-gitlab',  label: 'CI/CD Integration' },
-        ].map(t => (
+          { id: 'local', icon: 'ti-git-merge',   label: 'Local Pipelines',   show: true },
+          { id: 'ci',    icon: 'ti-brand-gitlab', label: 'CI/CD Integration', show: user?.role === 'org_admin' || user?.role === 'super_admin' },
+        ].filter(t => t.show).map(t => (
           <button key={t.id} onClick={() => setConfigTab(t.id)}
             style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 16px', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13, fontWeight: configTab === t.id ? 700 : 500, background: 'transparent', color: configTab === t.id ? 'var(--accent)' : 'var(--color-text-secondary)', borderBottom: configTab === t.id ? '2px solid var(--accent)' : '2px solid transparent', marginBottom: -2, transition: 'all .12s' }}>
             <i className={`ti ${t.icon}`} style={{ fontSize: 14 }}/>{t.label}
