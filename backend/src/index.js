@@ -46,9 +46,11 @@ app.use('/api/projects/:projectId/git',              require('./routes/git'));
 app.use('/api/projects/:projectId/pipelines',        require('./routes/pipelines'));
 app.use('/api/projects/:projectId/ci',               require('./routes/ciPipeline'));
 
-// Serve generated project files (scripts, test data) for download
-const { PROJECTS_ROOT } = require('./utils/projectFolders');
+// Serve generated project files (scripts, test data, HTML reports) for download
+// Mount the entire git-workspaces root so user workspace reports are accessible
+const { PROJECTS_ROOT, GIT_WORKSPACES_ROOT } = require('./utils/projectFolders');
 app.use('/projects-files', express.static(PROJECTS_ROOT));
+app.use('/workspace-files', express.static(GIT_WORKSPACES_ROOT));
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 

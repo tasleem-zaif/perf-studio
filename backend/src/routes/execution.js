@@ -86,7 +86,12 @@ function getK6Bin(customPath) {
 const resetSequence = require('../utils/resetSequence');
 
 function cleanStaleRuns(projectId) {
-  const runs = db.prepare('SELECT id, result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
+  // Only remove runs that are older than 24h AND have a missing result_dir.
+  // Never remove recent runs — they may be in-progress or synced from CI.
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const runs = db.prepare(
+    "SELECT id, result_dir FROM execution_runs WHERE project_id = ? AND started_at < ?"
+  ).all(projectId, cutoff);
   let deleted = false;
   for (const run of runs) {
     if (run.result_dir && !fs.existsSync(run.result_dir)) {
@@ -1352,17 +1357,46 @@ router.post('/run', auth, async (req, res) => {
       }
     };
 
+    // ── Auto-save analytics PDF to result_dir regardless of email config ───────
+    // This runs unconditionally — even if no SMTP is configured
+    setImmediate(async () => {
+      try {
+        const runRow2 = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
+        if (!runRow2?.result_dir || !fs.existsSync(runRow2.result_dir)) return;
+        const jtlPath2 = path.join(runRow2.result_dir, 'results.jtl');
+        if (!fs.existsSync(jtlPath2)) return;
+        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+        const s2 = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(runRow2.suite_id);
+        const sName2 = (s2?.name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const rNum2  = (runRow2.result_dir.match(/Run_(\d+)/) || [])[1] || runRow2.id;
+        const pdfOut = path.join(runRow2.result_dir, `${sName2}_Run${rNum2}_Analytics.pdf`);
+        if (fs.existsSync(pdfOut)) return; // already exists
+        // Re-use the existing export-pdf data-building logic via internal call
+        const apiModule = require('http');
+        // Simpler: call the report-data endpoint logic inline via the JTL parser
+        const { parseJtlMetrics } = require('../utils/ruleEvaluator');
+        const metrics = parseJtlMetrics(jtlPath2);
+        if (metrics) {
+          const reportData = {
+            meta: { suite_name: s2?.name || 'Test Run', started_at: runRow2.started_at, duration_s: metrics.total > 0 ? 0 : 0, status: runRow2.status },
+            summary: { total_requests: metrics.total, total_failed: metrics.fail, total_success: metrics.pass, avg_response_time: metrics.avg_response_time, overall_tps: metrics.throughput, p90: metrics.p90, p95: metrics.p95 },
+            rule_violations: [],
+          };
+          await generateAnalyticsPdfToFile(reportData, rNum2, pdfOut);
+          console.log('[PDF] Auto-saved analytics PDF:', pdfOut);
+        }
+      } catch (e) { console.warn('[PDF] Auto-save failed:', e.message); }
+    });
+
     if (shouldHeal) {
       log('warn', '');
       log('warn', '[Auto Healer] Starting automatic diagnosis and repair...');
-      // Pass onComplete so email waits for final result
       startAutoHeal(req.userId, runId, (finalRunId, succeeded) => {
         console.log(`[Alerts] Auto-heal finished. Final run: ${finalRunId}, succeeded: ${succeeded}`);
         log('info', `[Alerts] Sending ${succeeded ? 'success' : 'failure'} report email for run ${finalRunId}`);
         sendEmailForRun(finalRunId);
       });
     } else {
-      // No auto-heal — send immediately (passed or failed without healer)
       setImmediate(() => sendEmailForRun(runId));
     }
 
@@ -1406,11 +1440,22 @@ router.get('/runs', auth, (req, res) => {
     ORDER BY r.started_at DESC
   `).all(project_id);
 
+  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
-      const rel = path.relative(PROJECTS_ROOT, r.report_path).replace(/\\/g, '/');
-      report_url = `/projects-files/${rel}`;
+      const absReport = path.resolve(r.report_path);
+      const absWS     = path.resolve(GIT_WORKSPACES_ROOT);
+      const absAdmin  = path.resolve(PROJECTS_ROOT);
+      if (absReport.startsWith(absWS)) {
+        // User/admin workspace — serve via /workspace-files
+        const rel = path.relative(absWS, absReport).replace(/\\/g, '/');
+        report_url = `/workspace-files/${rel}`;
+      } else if (absReport.startsWith(absAdmin)) {
+        // Legacy admin projects root
+        const rel = path.relative(absAdmin, absReport).replace(/\\/g, '/');
+        report_url = `/projects-files/${rel}`;
+      }
     }
     return { ...r, logs: JSON.parse(r.logs || '[]'), report_url, heal_status: r.heal_status, heal_run_id: r.heal_run_id };
   });

@@ -308,6 +308,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
+  const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
@@ -706,39 +707,81 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                     {ciRuns.map(r => {
                       const statusMap = { pending: ['#dbeafe','#1d4ed8'], queued: ['#dbeafe','#1d4ed8'], running: ['#fef9c3','#b45309'], in_progress: ['#fef9c3','#b45309'], completed: ['#dcfce7','#16a34a'], success: ['#dcfce7','#16a34a'], failed: ['#fee2e2','#dc2626'], failure: ['#fee2e2','#dc2626'], cancelled: ['#f1f5f9','#64748b'] };
                       const [bg, color] = statusMap[r.status] || statusMap.pending;
-                      const isPolling = ciPolling === r.id;
+                      const isPolling  = ciPolling === r.id;
+                      const isExpanded = ciExpandedRun === r.id;
+                      const vars = (() => { try { return JSON.parse(r.variables || '{}'); } catch { return {}; } })();
                       return (
-                        <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                          <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
-                          <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
-                          <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
-                          <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
-                            {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
-                          </span>
-                          {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
-                            <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
-                              <i className="ti ti-refresh"/>
+                        <div key={r.id} style={{ borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+                          {/* Run row */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
+                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
+                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
+                            <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
+                              {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
+                            </span>
+                            {/* Terminal toggle */}
+                            <button className="btn-secondary btn-sm" onClick={() => setCiExpandedRun(isExpanded ? null : r.id)}
+                              style={{ padding: '2px 8px', fontSize: 11 }} title="Show/hide execution log">
+                              <i className={`ti ${isExpanded ? 'ti-chevron-up' : 'ti-terminal-2'}`} style={{ fontSize: 11 }}/>
                             </button>
-                          )}
-                          {/* Sync Results — only for completed runs */}
-                          {['completed','success'].includes(r.status) && (
-                            <button className="btn-secondary btn-sm"
-                              style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
-                              title="Download artifacts and save to local env results folder"
-                              onClick={async () => {
-                                try {
-                                  const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
-                                  toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
-                                } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
-                              }}>
-                              <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
-                            </button>
-                          )}
-                          {r.web_url && (
-                            <a href={r.web_url} target="_blank" rel="noreferrer"
-                              style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
-                              <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
-                            </a>
+                            {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
+                              <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
+                                <i className="ti ti-refresh"/>
+                              </button>
+                            )}
+                            {['completed','success'].includes(r.status) && (
+                              <button className="btn-secondary btn-sm"
+                                style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
+                                onClick={async () => {
+                                  try {
+                                    const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
+                                    toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
+                                  } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
+                                }}>
+                                <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
+                              </button>
+                            )}
+                            {r.web_url && (
+                              <a href={r.web_url} target="_blank" rel="noreferrer"
+                                style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
+                                <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Expandable terminal */}
+                          {isExpanded && (
+                            <div style={{ borderTop: '1px solid #e2e8f0', background: '#0d1117', padding: '10px 14px', fontFamily: 'monospace', fontSize: 11, maxHeight: 240, overflowY: 'auto' }}>
+                              <div style={{ color: '#58a6ff', marginBottom: 6, fontSize: 10 }}>── CI Pipeline Execution Log ──</div>
+                              {/* Trigger info */}
+                              <div style={{ color: '#94a3b8' }}>{r.started_at?.replace('T',' ').slice(0,19)}  Pipeline triggered on {r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</div>
+                              {r.external_id && <div style={{ color: '#94a3b8' }}>  External Run ID: #{r.external_id}</div>}
+                              {/* Variables */}
+                              {vars.jmeter_users && (
+                                <div style={{ color: '#94a3b8', marginTop: 4 }}>
+                                  <div>  Script    : {r.script_name}</div>
+                                  <div>  Users     : {vars.jmeter_users}</div>
+                                  <div>  Ramp-up   : {vars.jmeter_rampup}s</div>
+                                  {vars.jmeter_duration > 0 ? <div>  Duration  : {vars.jmeter_duration}s</div> : <div>  Loops     : {vars.jmeter_loops}</div>}
+                                </div>
+                              )}
+                              {/* Status timeline */}
+                              <div style={{ marginTop: 6, color: '#94a3b8' }}>  Status: <span style={{ color: color }}>{r.status.toUpperCase()}</span></div>
+                              {r.finished_at && <div style={{ color: '#94a3b8' }}>  Finished  : {r.finished_at?.replace('T',' ').slice(0,19)}</div>}
+                              {/* Link */}
+                              {r.web_url && (
+                                <div style={{ marginTop: 6 }}>
+                                  <a href={r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
+                                    → Open full logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
+                                  </a>
+                                </div>
+                              )}
+                              {/* Prompt to check live logs */}
+                              {['running','in_progress'].includes(r.status) && (
+                                <div style={{ color: '#f59e0b', marginTop: 6 }}>  ⟳ Test is currently running on {r.provider === 'github' ? 'GitHub' : 'GitLab'} infrastructure…</div>
+                              )}
+                            </div>
                           )}
                         </div>
                       );
