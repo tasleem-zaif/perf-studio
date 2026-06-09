@@ -12,16 +12,37 @@ const db = require('../db');
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function getAlertConfig(userId) {
+  // Try the triggering user's own SMTP config first
   const row = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
-  return row || null;
+  if (row?.smtp_host) return row;
+
+  // Fallback: use any org_admin or super_admin's SMTP config
+  // This means regular users benefit from the admin's email setup automatically
+  const adminCfg = db.prepare(`
+    SELECT ac.* FROM alert_configs ac
+    JOIN users u ON u.id = ac.user_id
+    WHERE u.role IN ('org_admin', 'super_admin')
+      AND ac.smtp_host IS NOT NULL AND ac.smtp_host != ''
+    ORDER BY CASE u.role WHEN 'super_admin' THEN 0 ELSE 1 END
+    LIMIT 1
+  `).get();
+  return adminCfg || null;
 }
 
 function getRecipients(userId, projectId) {
+  // Collect ALL relevant recipients:
+  // 1. Global recipients configured by this user
+  // 2. Global recipients configured by any admin (so admin-configured lists apply to all runs)
+  // 3. Project-specific recipients (tied to projectId regardless of who configured them)
   return db.prepare(`
-    SELECT DISTINCT email, name FROM alert_recipients
-    WHERE (user_id = ? AND project_id IS NULL)
-       OR (project_id = ?)
-    ORDER BY email
+    SELECT DISTINCT ar.email, ar.name FROM alert_recipients ar
+    LEFT JOIN users u ON u.id = ar.user_id
+    WHERE (
+      ar.project_id IS NULL
+      AND (ar.user_id = ? OR u.role IN ('org_admin', 'super_admin'))
+    )
+    OR ar.project_id = ?
+    ORDER BY ar.email
   `).all(userId, projectId);
 }
 
