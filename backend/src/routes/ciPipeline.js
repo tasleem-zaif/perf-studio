@@ -375,6 +375,25 @@ jobs:
           echo "=== Enabled elements ==="
           grep "enabled=" "\$SCRIPT" | head -10
 
+      - name: Cache JMeter Docker image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache
+          key: docker-jmeter-justb4-\${{ runner.os }}
+          restore-keys: docker-jmeter-justb4-
+
+      - name: Load cached image or pull
+        run: |
+          if [ -f /tmp/docker-cache/justb4-jmeter.tar ]; then
+            echo "Loading JMeter image from cache..."
+            docker load -i /tmp/docker-cache/justb4-jmeter.tar
+          else
+            echo "Pulling JMeter image (first run on this runner)..."
+            docker pull justb4/jmeter
+            mkdir -p /tmp/docker-cache
+            docker save justb4/jmeter -o /tmp/docker-cache/justb4-jmeter.tar
+          fi
+
       - name: Run JMeter
         run: |
           SCRIPT="\${{ inputs.script_path }}"
