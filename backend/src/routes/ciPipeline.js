@@ -413,6 +413,17 @@ router.post('/trigger', async (req, res) => {
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
+  // Prefer the calling user's personal PAT over the project CI config token.
+  // This way each user's pipeline trigger is attributed to their own GitHub/GitLab account.
+  // Regular users already have a PAT saved in Git Identity — no extra setup needed.
+  const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+    .get(req.userId, req.params.projectId);
+  const userToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : null;
+
+  // Effective tokens: user's personal PAT takes priority
+  const effectiveGithubToken = userToken || cfg.github_token;
+  const effectiveGitlabToken = userToken || cfg.gitlab_token;
+
   const variables = { script_name, script_path: script_path || '', jmeter_users: String(jmeter_users || 10), jmeter_rampup: String(jmeter_rampup || 30), jmeter_loops: String(jmeter_loops || 1), jmeter_duration: String(jmeter_duration || 300) };
 
   try {
@@ -468,8 +479,8 @@ router.post('/trigger', async (req, res) => {
 
     // ── GitHub Actions trigger ─────────────────────────────────────────────
     if (provider === 'github') {
-      if (!cfg.github_token)  return res.status(400).json({ error: 'GitHub token not set.' });
-      if (!cfg.github_repo)   return res.status(400).json({ error: 'GitHub repo (owner/repo) not set.' });
+      if (!effectiveGithubToken) return res.status(400).json({ error: 'No GitHub token available. Save your Personal Access Token in Git Identity (Configuration → Git).' });
+      if (!cfg.github_repo)      return res.status(400).json({ error: 'GitHub repo (owner/repo) not set in CI configuration.' });
 
       const workflowFile = cfg.github_workflow_file || 'perf-test.yml';
       const ref          = cfg.github_ref || 'main';
@@ -489,7 +500,7 @@ router.post('/trigger', async (req, res) => {
           },
         },
         {
-          Authorization:  `token ${cfg.github_token}`,
+          Authorization:  `token ${effectiveGithubToken}`,
           'User-Agent':   'PerfStudio',
           Accept:         'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28',
@@ -497,12 +508,11 @@ router.post('/trigger', async (req, res) => {
       );
 
       if (r.status === 204) {
-        // GitHub returns 204 No Content on success — fetch the latest run ID
-        await new Promise(r => setTimeout(r, 2000)); // wait briefly for run to appear
+        await new Promise(r => setTimeout(r, 2000));
         const runsResp = await apiRequest(
           `https://api.github.com/repos/${cfg.github_repo}/actions/runs?event=workflow_dispatch&per_page=1`,
           'GET', null,
-          { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+          { Authorization: `token ${effectiveGithubToken}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
         );
         const latestRun = runsResp.body?.workflow_runs?.[0];
         const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?)')
