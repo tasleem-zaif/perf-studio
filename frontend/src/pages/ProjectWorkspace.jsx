@@ -236,7 +236,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
                 <GitPanel project={project} user={user} setupOnly={true} />
               </div>
               <div style={{ display: configTab === 'pipeline' ? 'contents' : 'none' }}>
-                <PipelineConfig project={project} envs={collectionEnvs} />
+                <PipelineConfig project={project} envs={collectionEnvs} user={user} />
               </div>
             </div>
           );
@@ -349,14 +349,20 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
 
           {/* Sidebar column — nav card + git tile stacked */}
-          <div style={{ width: 256, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12, position: 'sticky', top: 16 }}>
+          {/* height: calc(100vh - 32px) keeps the column within the viewport so the
+              Git tile never scrolls away; the nav card grows to fill remaining space */}
+          <div style={{ width: 256, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12, position: 'sticky', top: 16, height: 'calc(100vh - 32px)' }}>
 
-            {/* Sidebar nav card */}
+            {/* Sidebar nav card — flex:1 so it fills remaining height above the Git tile */}
             <div style={{
               background: '#ffffff',
               borderRadius: 14,
               border: '1px solid #e2e8f0',
               overflow: 'hidden',
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
             }}>
               {/* Workspace */}
               <div style={{ padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -368,8 +374,8 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
               </div>
               <div style={{ height: 1, background: '#f1f5f9', margin: '0 0 4px' }} />
 
-              {/* Nav items */}
-              <div style={{ padding: '4px 8px 8px' }}>
+              {/* Nav items — scrollable if list grows taller than the card */}
+              <div style={{ padding: '4px 8px 8px', overflowY: 'auto', flex: 1 }}>
                 {NAV_ITEMS.filter(item => item.id !== 'reports' || hasJmeterPlan).map(item => {
                   const active = activePage === item.id;
                   return (

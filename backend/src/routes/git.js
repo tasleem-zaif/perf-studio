@@ -179,18 +179,12 @@ async function applyBranchProtection(cfg, branch = 'main') {
       owner:  parsed.owner,
       repo:   parsed.repo,
       branch,
-      required_status_checks: null,
-      enforce_admins: false,
-      // Main branch: require 1 PR approval before merge
-      // Feature branches: no PR review required (users push freely)
-      required_pull_request_reviews: isFeatureBranch ? null : {
-        dismiss_stale_reviews:           true,
-        require_code_owner_reviews:      false,
-        required_approving_review_count: 1,
-      },
-      restrictions: null,
-      allow_force_pushes: false,   // never allow force-push on any protected branch
-      allow_deletions:    false,   // never allow deletion of protected branch
+      required_status_checks:        null,
+      enforce_admins:                false,  // admins can always bypass
+      required_pull_request_reviews: null,   // no review requirement — admins merge freely
+      restrictions:                  null,
+      allow_force_pushes:            false,  // prevent accidental force-push
+      allow_deletions:               false,  // prevent branch deletion
     });
     console.log(`[Git] Branch protection applied to "${branch}" on ${parsed.owner}/${parsed.repo}`);
     return { ok: true };
@@ -660,9 +654,15 @@ router.post('/push', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
-    const token = cfg.auth_token ? decrypt(cfg.auth_token) : '';
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, token);
     const userIdentity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
+
+    // Prefer user's personal PAT over the project-level token so that
+    // token updates in Git Identity are picked up immediately on next push.
+    const projectToken  = cfg.auth_token          ? decrypt(cfg.auth_token)          : '';
+    const personalToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : '';
+    const effectiveToken = personalToken || projectToken;
+
+    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken);
     const branch = userIdentity?.branch_name || getBranchForUser(caller, proj);
     await git.addConfig('user.name',  userIdentity?.author_name  || caller.name);
     await git.addConfig('user.email', userIdentity?.author_email || caller.email || cfg.email || 'noreply@perfstudio.com');
@@ -672,7 +672,7 @@ router.post('/push', async (req, res) => {
       await git.checkout(['-b', branch, 'main']).catch(() => git.checkout(['-b', branch]));
     });
 
-    // Update remote URL with auth token
+    // Update remote URL with the effective token
     await git.remote(['set-url', 'origin', remoteWithAuth]);
 
     // Push

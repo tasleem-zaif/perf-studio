@@ -23,7 +23,15 @@ const db   = require('../db');
 function writeJson(filePath, data) {
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    const newContent = JSON.stringify(data, null, 2);
+    // Skip write if file content is identical — avoids unnecessary git modifications
+    if (fs.existsSync(filePath)) {
+      try {
+        const existing = fs.readFileSync(filePath, 'utf8');
+        if (existing === newContent) return; // nothing changed — don't touch the file
+      } catch (_) {}
+    }
+    fs.writeFileSync(filePath, newContent, 'utf8');
   } catch (e) {
     console.error('[ConfigWriter] Failed to write', filePath, ':', e.message);
   }
@@ -46,6 +54,10 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     // project.folder_path — that may point to the wrong (e.g. admin) workspace.
     const basePath = projectFolderPath;
     if (!basePath) return; // no user workspace path supplied — skip write
+
+    // Admin workspace holds only empty folders — never write config.json there
+    const { isAdminWorkspace } = require('./projectFolders');
+    if (isAdminWorkspace(basePath)) return;
     // New clean-name format: CollectionName/Env/
     envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
 
@@ -94,7 +106,6 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     const mergedCfg = stripDeprecated({ ...globalCfg, ...projectCfg });
 
     const snapshot = {
-      _generated_at: new Date().toISOString(),
       project: project ? {
         id:          project.id,
         name:        project.name,

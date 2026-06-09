@@ -70,22 +70,20 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     if (project) { loadSuites(); loadTestDataFiles(); }
   }, [project?.id, filterCollectionId, filterEnv]);
 
-  async function loadTestDataFiles() {
+  // Load test data filtered by collection + env.
+  // When called from inside the modal, pass the modal's form values directly
+  // so it filters by what the user selected — not the top filter bar.
+  async function loadTestDataFiles(colId, envName) {
     if (!project) return;
     try {
-      // Filter by selected collection + env for the test data dropdown in modal
       const p = new URLSearchParams();
-      if (filterCollectionId) p.set('collection_id', filterCollectionId);
-      if (filterEnv)          p.set('env', filterEnv);
+      const resolvedCol = colId ?? filterCollectionId;
+      const resolvedEnv = envName ?? filterEnv;
+      if (resolvedCol) p.set('collection_id', resolvedCol);
+      if (resolvedEnv) p.set('env', resolvedEnv);
       const params = p.toString() ? `?${p.toString()}` : '';
       const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
-      // Deduplicate by original_name
-      const seen = new Set();
-      const unique = (data.files || []).filter(f => {
-        if (seen.has(f.original_name)) return false;
-        seen.add(f.original_name); return true;
-      });
-      setTestDataFiles(unique);
+      setTestDataFiles(data.files || []);
     } catch (e) {
       console.error('Failed to load test data files:', e.response?.data || e.message);
     }
@@ -94,10 +92,12 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   useEffect(() => {
     if (firstRender.current) { firstRender.current = false; return; }
     if (openModalTrigger > 0) {
-      setForm({ ...DEFAULT_FORM, collection_id: collection?.id ? String(collection.id) : '', env: env || '' });
+      const initCol = collection?.id ? String(collection.id) : '';
+      const initEnv = env || '';
+      setForm({ ...DEFAULT_FORM, collection_id: initCol, env: initEnv });
       setError('');
       setModal('add');
-      loadTestDataFiles(); // always refresh when modal opens
+      loadTestDataFiles(initCol, initEnv); // filter by initial env
     }
   }, [openModalTrigger]);
 
@@ -488,7 +488,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
           <i className="ti ti-test-pipe" />
           <div className="empty-title">No test plans yet</div>
           <div className="empty-sub">Create a test plan to generate JMeter or K6 scripts</div>
-          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { setForm({ ...DEFAULT_FORM, collection_id: collection?.id ? String(collection.id) : '', env: env || '' }); setError(''); loadTestDataFiles(); setModal('add'); }}>New Test Plan</button>
+          <button className="btn-primary" style={{ marginTop: '16px' }} onClick={() => { const c = collection?.id ? String(collection.id) : ''; const e = env || ''; setForm({ ...DEFAULT_FORM, collection_id: c, env: e }); setError(''); loadTestDataFiles(c, e); setModal('add'); }}>New Test Plan</button>
         </div>
       )}
 
@@ -526,7 +526,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <div className="form-group">
               <label className="form-label">Collection</label>
-              <CustomSelect value={form.collection_id} onChange={e => setForm(f => ({ ...f, collection_id: e.target.value, env: '' }))}>
+              <CustomSelect value={form.collection_id} onChange={e => {
+                const newCol = e.target.value;
+                setForm(f => ({ ...f, collection_id: newCol, env: '', test_data_ids: [] }));
+                loadTestDataFiles(newCol, '');
+              }}>
                 <option value="">— None —</option>
                 {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
               </CustomSelect>
@@ -539,8 +543,12 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                 try { envOptions = JSON.parse(col?.environments || '[]'); } catch {}
                 if (!envOptions.length && col?.environment) envOptions = [col.environment];
                 return (
-                  <CustomSelect value={form.env || ''} onChange={e => setForm(f => ({ ...f, env: e.target.value }))}>
-                    <option value="">— All environments —</option>
+                  <CustomSelect value={form.env || ''} onChange={e => {
+                    const newEnv = e.target.value;
+                    setForm(f => ({ ...f, env: newEnv, test_data_ids: [] }));
+                    loadTestDataFiles(form.collection_id, newEnv);
+                  }}>
+                    <option value="">— Select environment —</option>
                     {envOptions.map(e => <option key={e} value={e}>{e}</option>)}
                   </CustomSelect>
                 );
@@ -549,15 +557,17 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
             <div className="form-group">
               <label className="form-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span>Test Data (CSV) <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>— select multiple</span></span>
-                <button type="button" onClick={loadTestDataFiles}
+                <button type="button" onClick={() => loadTestDataFiles(form.collection_id, form.env)}
                   style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: 11, display: 'flex', alignItems: 'center', gap: 3, padding: '0 2px' }}
                   title="Refresh file list">
                   <i className="ti ti-refresh" style={{ fontSize: 12 }} /> Refresh
                 </button>
               </label>
               <div style={{ border: '1px solid var(--color-border, #3a3c42)', borderRadius: '6px', maxHeight: '110px', overflowY: 'auto', padding: '4px 2px', background: 'var(--color-background)' }}>
-                {testDataFiles.length === 0
-                  ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No CSV files uploaded</div>
+                {!form.env
+                  ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>Select an environment first to see available test data files</div>
+                  : testDataFiles.length === 0
+                  ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No CSV files uploaded for {form.env}</div>
                   : testDataFiles.map(f => {
                       const checked = form.test_data_ids.includes(f.id) || form.test_data_ids.includes(String(f.id));
                       return (

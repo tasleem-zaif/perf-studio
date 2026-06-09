@@ -134,7 +134,21 @@ function getUserProjectPath(userId, userRole, projectName) {
   return path.join(GIT_WORKSPACES_ROOT, userFolder, 'projects', cleanName(projectName));
 }
 
+/**
+ * Returns true if the given path belongs to the admin workspace.
+ * Admin workspace holds only empty folders (with .gitkeep) — no config.json,
+ * no collection source files, no test data, no scripts.
+ */
+function isAdminWorkspace(workspacePath) {
+  if (!workspacePath) return false;
+  const normalised = workspacePath.replace(/\\/g, '/');
+  const adminRoot  = GIT_WORKSPACES_ROOT.replace(/\\/g, '/');
+  return normalised.startsWith(`${adminRoot}/admin/`) ||
+         normalised.startsWith(`${adminRoot}/admin`);
+}
+
 module.exports = {
+  isAdminWorkspace,
   getProjectPath,
   ensureProjectFolders,
   getCollectionPath,

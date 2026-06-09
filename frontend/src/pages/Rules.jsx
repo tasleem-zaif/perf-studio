@@ -37,6 +37,42 @@ function ruleLabel(r) {
   return `${sym} ${r.value} ${r.unit}`;
 }
 
+// ── Conflict / collision detection ───────────────────────────────────────────
+// Converts a rule into a numeric [lo, hi] range for overlap comparison.
+// Open-ended operators use ±Infinity; strict inequalities shift by epsilon.
+const EPS = 0.0001;
+function ruleToRange(rule) {
+  const v    = parseFloat(rule.value);
+  const vMin = parseFloat(rule.value_min);
+  const vMax = parseFloat(rule.value_max);
+  switch (rule.operator) {
+    case '>':       return isNaN(v)            ? null : [v + EPS,  Infinity];
+    case '>=':      return isNaN(v)            ? null : [v,        Infinity];
+    case '<':       return isNaN(v)            ? null : [-Infinity, v - EPS];
+    case '<=':      return isNaN(v)            ? null : [-Infinity, v];
+    case '=':       return isNaN(v)            ? null : [v,        v];
+    case 'between': return (isNaN(vMin) || isNaN(vMax)) ? null : [vMin, vMax];
+    default:        return null;
+  }
+}
+
+function rangesOverlap([lo1, hi1], [lo2, hi2]) {
+  return lo1 <= hi2 && lo2 <= hi1;
+}
+
+// Returns existing rules that overlap with the given form values (same metric).
+function findConflicts(form, existingRules, editingId) {
+  const newRange = ruleToRange(form);
+  if (!newRange) return []; // form not fully filled yet — no conflict check
+  return (existingRules || []).filter(r => {
+    if (r.id === editingId) return false;            // skip rule being edited
+    if (r.metric !== form.metric) return false;      // different metric
+    const range = ruleToRange(r);
+    if (!range) return false;
+    return rangesOverlap(newRange, range);
+  });
+}
+
 export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
   const [modal,  setModal]  = useState(null);
   const [form,   setForm]   = useState(makeDefault());
@@ -68,12 +104,19 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
   }
 
   async function save() {
+    // ── Basic validation ──────────────────────────────────────────────────────
     if (form.operator === 'between') {
       if (!form.value_min || !form.value_max) return alert('Enter both From and To values for the range.');
       if (Number(form.value_min) >= Number(form.value_max)) return alert('From value must be less than To value.');
     } else {
       if (form.value === '') return alert('Enter a threshold value.');
     }
+
+    // ── Conflict check — block save if any overlapping rule exists ───────────
+    const editingId = modal === 'add' ? null : modal?.id;
+    const conflicts = findConflicts(form, project?.rules, editingId);
+    if (conflicts.length > 0) return; // blocked — UI already shows the error
+
     setSaving(true);
     try {
       const cfg = METRIC_CONFIG[form.metric];
@@ -106,6 +149,9 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
 
   const metricCfg  = METRIC_CONFIG[form.metric] || METRIC_CONFIG['Response Time'];
   const isBetween  = form.operator === 'between';
+  // Live conflict detection — recomputed on every form change
+  const editingId  = modal === 'add' ? null : modal?.id;
+  const conflicts  = modal ? findConflicts(form, project?.rules, editingId) : [];
 
   return (
     <div className="page fade-in">
@@ -215,9 +261,50 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
             </CustomSelect>
           </div>
 
+          {/* ── Conflict error — blocks saving, shown live as user fills values ── */}
+          {conflicts.length > 0 && (
+            <div style={{
+              marginBottom: 14, padding: '12px 14px',
+              background: '#fef2f2', border: '1.5px solid #fca5a5',
+              borderRadius: 8, fontSize: 13,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 700, color: '#dc2626', marginBottom: 8 }}>
+                <i className="ti ti-xbox-x" style={{ fontSize: 16 }}/>
+                Cannot save — conflicts with {conflicts.length} existing rule{conflicts.length > 1 ? 's' : ''}
+              </div>
+              <div style={{ fontSize: 12, color: '#991b1b', marginBottom: 10, lineHeight: 1.6 }}>
+                The range you entered overlaps with {conflicts.length > 1 ? 'these existing rules' : 'this existing rule'} for <strong>{form.metric}</strong>.
+                Please update or delete the conflicting rule first before adding this one.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {conflicts.map(r => (
+                  <div key={r.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '7px 10px', background: '#fee2e2',
+                    borderRadius: 6, border: '1px solid #fca5a5',
+                  }}>
+                    <i className="ti ti-git-compare" style={{ fontSize: 12, color: '#dc2626', flexShrink: 0 }}/>
+                    <span style={{ fontWeight: 600, color: '#1e293b', fontSize: 12 }}>Rule #{r.id} —</span>
+                    <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#374151' }}>{r.metric} {ruleLabel(r)}</span>
+                    <span style={{
+                      marginLeft: 'auto', fontSize: 11, fontWeight: 700, padding: '1px 8px', borderRadius: 20, flexShrink: 0,
+                      background: r.severity === 'error' ? '#fecaca' : '#fef9c3',
+                      color: r.severity === 'error' ? '#dc2626' : '#b45309',
+                    }}>{r.severity}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 10, fontSize: 12, color: '#991b1b', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <i className="ti ti-arrow-back-up" style={{ fontSize: 13 }}/>
+                Close this modal and edit the conflicting rule first, then come back to add this one.
+              </div>
+            </div>
+          )}
+
           <div className="modal-footer">
             <button className="btn-secondary" onClick={() => setModal(null)}>Cancel</button>
-            <button className="btn-primary" onClick={save} disabled={saving}>
+            <button className="btn-primary" onClick={save} disabled={saving || conflicts.length > 0}
+              title={conflicts.length > 0 ? 'Resolve conflicting rules before saving' : ''}>
               {saving && <span className="spinner"/>}{modal === 'add' ? 'Add Rule' : 'Save Changes'}
             </button>
           </div>
