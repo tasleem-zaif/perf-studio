@@ -209,11 +209,16 @@ router.post('/generate-yaml', async (req, res) => {
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
-  // Get user workspace
-  const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
-  const { getUserProjectPath } = require('../utils/projectFolders');
-  const userProjPath = getUserProjectPath(req.userId, callerRole, project.name);
-  const gitRoot = path.resolve(userProjPath, '..', '..'); // git-workspaces/user-X/
+  // YAML files (.github/workflows/*, .gitlab-ci.yml) must ALWAYS go into the
+  // ADMIN workspace. GitHub requires the `workflow` PAT scope to push workflow
+  // files — regular users don't have this scope. The org admin pushes these
+  // files once, after which all users can trigger the pipeline.
+  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
+  const gitRoot = path.join(GIT_WORKSPACES_ROOT, 'admin'); // git-workspaces/admin/
+
+  // Get all generated test plans for this project to include as YAML comments
+  // Use admin workspace paths to build relative script paths
+  const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
 
   // Get all generated test plans for this project to include as YAML comments
   const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);

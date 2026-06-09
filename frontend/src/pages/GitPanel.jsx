@@ -393,7 +393,17 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
     try {
       const { data } = await api.post(`/projects/${pid}/git/push`);
       addLog(data.message, 'success'); toast(data.message, 'success'); loadAll();
-    } catch (err) { const m = err.response?.data?.error || 'Push failed'; addLog(m, 'error'); toast(m, 'error'); }
+    } catch (err) {
+      let m = err.response?.data?.error || 'Push failed';
+      // Detect GitHub workflow scope error and give a clear actionable message
+      if (m.includes('workflow') && m.includes('scope')) {
+        m = '⚠️ Push rejected by GitHub: your Personal Access Token is missing the "workflow" scope.\n\n' +
+            'The commit contains .github/workflows/ files which require extra permission.\n\n' +
+            'Fix: Go to GitHub → Settings → Developer Settings → Personal Access Tokens → ' +
+            'edit your token → enable the "workflow" checkbox → Save → update your PAT in Git Identity.';
+      }
+      addLog(m, 'error'); toast('Push failed — see log for details', 'error');
+    }
     finally { setPushing(false); }
   }
 

@@ -348,9 +348,12 @@ export default function PipelineConfig({ project, envs }) {
               {ciGenerating ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML Files</>}
             </button>
           </div>
-          <div style={{ marginTop: 8, fontSize: 11, color: '#94a3b8' }}>
-            <i className="ti ti-info-circle" style={{ marginRight: 4 }}/>
-            After generating, go to the <strong>Git Changes</strong> tab to commit and push the YAML files to your branch.
+          <div style={{ marginTop: 10, padding: '10px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, fontSize: 12, color: '#92400e' }}>
+            <i className="ti ti-alert-triangle" style={{ marginRight: 6 }}/>
+            <strong>Important:</strong> YAML files are generated into the <strong>admin workspace</strong> and must be committed and pushed by an <strong>Org Admin</strong> whose GitHub PAT has the <strong>"workflow" scope</strong> enabled.
+            Regular user PATs will be rejected by GitHub when pushing <code>.github/workflows/</code> files.
+            <br/><br/>
+            To add workflow scope: GitHub → Settings → Developer Settings → Personal Access Tokens → edit token → tick <strong>workflow</strong> → Save → update your PAT in Git Identity.
           </div>
         </div>
       )}
