@@ -299,6 +299,53 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   // Active runs across all projects (for concurrency awareness)
   const activeRuns = runs.filter(r => r.status === 'running');
 
+  // ── CI Pipeline state ────────────────────────────────────────────────────
+  const [ciConfig,       setCiConfig]       = useState(null);
+  const [ciProvider,     setCiProvider]     = useState('gitlab');
+  const [ciScriptName,   setCiScriptName]   = useState('');
+  const [ciScriptPath,   setCiScriptPath]   = useState('');
+  const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300 });
+  const [ciTriggering,   setCiTriggering]   = useState(false);
+  const [ciRuns,         setCiRuns]         = useState([]);
+  const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
+
+  useEffect(() => {
+    if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
+    api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => setCiConfig(data.config)).catch(() => {});
+    api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
+  }, [selectedProjectId]);
+
+  async function triggerCiPipeline() {
+    setCiTriggering(true);
+    try {
+      const { data } = await api.post(`/projects/${selectedProjectId}/ci/trigger`, {
+        provider: ciProvider,
+        script_name: ciScriptName,
+        script_path: ciScriptPath,
+        ...ciVars,
+      });
+      toast(`Pipeline triggered on ${ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'}`, 'success');
+      setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, started_at: new Date().toISOString() }, ...prev]);
+      // Start polling
+      pollCiStatus(data.run_id);
+    } catch (e) { toast(e.response?.data?.error || 'Trigger failed', 'error'); }
+    finally { setCiTriggering(false); }
+  }
+
+  async function pollCiStatus(runId) {
+    setCiPolling(runId);
+    const poll = async () => {
+      try {
+        const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${runId}/status`);
+        setCiRuns(prev => prev.map(r => r.id === runId ? { ...r, ...data.run } : r));
+        const done = ['completed','failed','cancelled','success','failure'].includes(data.run?.status);
+        if (!done) setTimeout(poll, 5000);
+        else setCiPolling(null);
+      } catch { setCiPolling(null); }
+    };
+    setTimeout(poll, 3000);
+  }
+
   // ── Pipeline runner state ─────────────────────────────────────────────────
   const [runTab,           setRunTab]           = useState('single'); // 'single' | 'pipeline'
   const [pipelines,        setPipelines]        = useState([]);
@@ -390,8 +437,9 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Run mode tabs ─────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
-          { id: 'single',   icon: 'ti-player-play',  label: 'Single Test Run' },
-          { id: 'pipeline', icon: 'ti-git-merge',     label: 'Pipeline Run'    },
+          { id: 'single',      icon: 'ti-player-play',   label: 'Single Test Run'  },
+          { id: 'pipeline',    icon: 'ti-git-merge',      label: 'Pipeline Run'     },
+          { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'      },
         ].map(t => (
           <button key={t.id} onClick={() => setRunTab(t.id)}
             style={{
@@ -528,6 +576,137 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   <div key={i} className={`run-line run-${l.type}`}>{l.message}</div>
                 ))}
               </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── CI Pipeline tab ─────────────────────────────────────────────── */}
+      {runTab === 'ci-pipeline' && (
+        <div>
+          {!ciConfig ? (
+            <div style={{ padding: '32px', textAlign: 'center', color: '#64748b', fontSize: 13 }}>
+              <i className="ti ti-settings-2" style={{ fontSize: 40, display: 'block', marginBottom: 12, color: '#cbd5e1' }}/>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>CI/CD not configured</div>
+              <div>Go to <strong>Configuration → Pipeline → CI/CD Integration</strong> to set up GitLab or GitHub Actions first.</div>
+            </div>
+          ) : (
+            <>
+              {/* Provider + settings */}
+              <div className="card" style={{ marginBottom: 14 }}>
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <i className="ti ti-brand-gitlab" style={{ color: 'var(--accent)' }}/> Trigger CI Pipeline
+                </div>
+
+                {/* Provider selector */}
+                <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                  {[
+                    { id: 'gitlab',  icon: 'ti-brand-gitlab',  label: 'GitLab',         enabled: ciConfig?.gitlab_enabled },
+                    { id: 'github',  icon: 'ti-brand-github',  label: 'GitHub Actions', enabled: ciConfig?.github_enabled },
+                  ].filter(p => p.enabled).map(p => (
+                    <button key={p.id} onClick={() => setCiProvider(p.id)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 16px', border: `1.5px solid ${ciProvider === p.id ? 'var(--accent)' : '#e2e8f0'}`, borderRadius: 8, background: ciProvider === p.id ? '#f0fdf4' : '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13, fontWeight: ciProvider === p.id ? 700 : 500, color: ciProvider === p.id ? '#16a34a' : '#374151', transition: 'all .12s' }}>
+                      <i className={`ti ${p.icon}`}/>{p.label}
+                    </button>
+                  ))}
+                  {!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && (
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>No providers enabled. Enable GitLab or GitHub in CI/CD settings.</div>
+                  )}
+                </div>
+
+                {/* Script */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Script filename <span style={{ fontWeight: 400, color: '#94a3b8' }}>(e.g. test.jmx)</span></label>
+                    <input type="text" value={ciScriptName} onChange={e => setCiScriptName(e.target.value)} placeholder="MyLoadTest.jmx" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Full script path <span style={{ fontWeight: 400, color: '#94a3b8' }}>(relative to repo root, optional)</span></label>
+                    <input type="text" value={ciScriptPath} onChange={e => setCiScriptPath(e.target.value)} placeholder="projects/Demo1/QA/script/test.jmx" />
+                  </div>
+                </div>
+
+                {/* Suites quick-pick */}
+                {suites.filter(s => s.jmx_path || s.js_path).length > 0 && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: .5 }}>Quick pick from generated test plans</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {suites.filter(s => s.jmx_path || s.js_path).map(s => {
+                        const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                        // path relative to git root (user workspace root)
+                        const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
+                        const fileName = file.split('/').pop();
+                        return (
+                          <button key={s.id} onClick={() => { setCiScriptName(fileName); setCiScriptPath(relPath); }}
+                            style={{ padding: '4px 10px', border: '1px solid #e2e8f0', borderRadius: 20, background: '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, color: '#475569', transition: 'all .12s' }}
+                            onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+                            onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.color = '#475569'; }}>
+                            <i className="ti ti-file-code" style={{ marginRight: 4, fontSize: 10 }}/>{s.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Variables */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
+                  {[
+                    { key: 'jmeter_users',    label: 'Virtual Users',    placeholder: '10'  },
+                    { key: 'jmeter_rampup',   label: 'Ramp-up (secs)',   placeholder: '30'  },
+                    { key: 'jmeter_duration', label: 'Duration (secs)',   placeholder: '300' },
+                    { key: 'jmeter_loops',    label: 'Loops',             placeholder: '1'   },
+                  ].map(({ key, label, placeholder }) => (
+                    <div key={key} className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label" style={{ fontSize: 11 }}>{label}</label>
+                      <input type="number" value={ciVars[key]} onChange={e => setCiVars(v => ({ ...v, [key]: e.target.value }))} placeholder={placeholder} />
+                    </div>
+                  ))}
+                </div>
+
+                <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled)}>
+                  {ciTriggering
+                    ? <><span className="spinner"/> Triggering…</>
+                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'} Pipeline</>}
+                </button>
+              </div>
+
+              {/* Run history */}
+              {ciRuns.length > 0 && (
+                <div className="card">
+                  <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <i className="ti ti-history" style={{ color: 'var(--accent)' }}/> CI Run History
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {ciRuns.map(r => {
+                      const statusMap = { pending: ['#dbeafe','#1d4ed8'], queued: ['#dbeafe','#1d4ed8'], running: ['#fef9c3','#b45309'], in_progress: ['#fef9c3','#b45309'], completed: ['#dcfce7','#16a34a'], success: ['#dcfce7','#16a34a'], failed: ['#fee2e2','#dc2626'], failure: ['#fee2e2','#dc2626'], cancelled: ['#f1f5f9','#64748b'] };
+                      const [bg, color] = statusMap[r.status] || statusMap.pending;
+                      const isPolling = ciPolling === r.id;
+                      return (
+                        <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                          <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
+                          <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
+                          <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
+                          <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
+                            {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
+                          </span>
+                          {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
+                            <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
+                              <i className="ti ti-refresh"/>
+                            </button>
+                          )}
+                          {r.web_url && (
+                            <a href={r.web_url} target="_blank" rel="noreferrer"
+                              style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
+                              <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
+                            </a>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>

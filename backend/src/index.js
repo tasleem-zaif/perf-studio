@@ -44,6 +44,7 @@ app.use('/api/alerts',                                 require('./routes/alerts'
 app.use('/api/invites',                                require('./routes/invites'));
 app.use('/api/projects/:projectId/git',              require('./routes/git'));
 app.use('/api/projects/:projectId/pipelines',        require('./routes/pipelines'));
+app.use('/api/projects/:projectId/ci',               require('./routes/ciPipeline'));
 
 // Serve generated project files (scripts, test data) for download
 const { PROJECTS_ROOT } = require('./utils/projectFolders');

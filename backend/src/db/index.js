@@ -331,6 +331,40 @@ db.exec(`CREATE TABLE IF NOT EXISTS pipeline_runs (
   FOREIGN KEY (pipeline_id) REFERENCES pipeline_configs(id) ON DELETE CASCADE,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 )`);
+// ── CI/CD Pipeline integration tables ────────────────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL UNIQUE,
+  gitlab_enabled INTEGER DEFAULT 0,
+  gitlab_url TEXT DEFAULT 'https://gitlab.com',
+  gitlab_project_id TEXT DEFAULT '',
+  gitlab_token TEXT DEFAULT '',
+  gitlab_trigger_token TEXT DEFAULT '',
+  gitlab_ref TEXT DEFAULT 'main',
+  github_enabled INTEGER DEFAULT 0,
+  github_repo TEXT DEFAULT '',
+  github_token TEXT DEFAULT '',
+  github_workflow_file TEXT DEFAULT 'perf-test.yml',
+  github_ref TEXT DEFAULT 'main',
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  external_id TEXT,
+  web_url TEXT,
+  status TEXT DEFAULT 'pending',
+  script_name TEXT,
+  variables TEXT DEFAULT '{}',
+  triggered_by INTEGER,
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 
