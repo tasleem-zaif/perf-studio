@@ -94,7 +94,10 @@ router.get('/', (req, res) => {
   } else {
     files = db.prepare('SELECT * FROM test_data_files WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
   }
-  res.json({ files });
+  // Flag stale files (DB record exists but file no longer on disk)
+  const fs = require('fs');
+  const result = files.map(f => ({ ...f, stale: !fs.existsSync(f.path) }));
+  res.json({ files: result });
 });
 
 router.post('/', upload.single('csv'), (req, res) => {
@@ -193,6 +196,16 @@ router.get('/:id/content', (req, res) => {
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!file) return res.status(404).json({ error: 'Not found' });
 
+  // Check file exists on disk before attempting to read
+  const fs = require('fs');
+  if (!fs.existsSync(file.path)) {
+    return res.status(404).json({
+      error: `File not found on disk: "${file.original_name}". The file may have been deleted or the workspace was re-initialized. Please delete this record and re-upload the file.`,
+      stale: true,
+      file_id: file.id,
+    });
+  }
+
   const limit = parseInt(req.query.limit) || 500;
   const offset = parseInt(req.query.offset) || 0;
 
@@ -219,6 +232,42 @@ router.put('/:id/content', (req, res) => {
   } catch (e) {
     res.status(500).json({ error: `Failed to write file: ${e.message}` });
   }
+});
+
+// ── POST /:id/open-external — open the file with the OS default application ──
+router.post('/:id/open-external', (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  if (!file) return res.status(404).json({ error: 'Not found' });
+
+  const fs   = require('fs');
+  const { exec } = require('child_process');
+
+  if (!fs.existsSync(file.path)) {
+    return res.status(404).json({ error: 'File not found on disk. Please delete this record and re-upload the file.', stale: true });
+  }
+
+  // Open with the OS default app (Excel/Numbers for .csv on most systems)
+  const absPath = require('path').resolve(file.path);
+  let cmd;
+  if (process.platform === 'win32') {
+    // Use explorer to open with default app — handles paths with spaces correctly
+    cmd = `explorer "${absPath}"`;
+  } else if (process.platform === 'darwin') {
+    cmd = `open "${absPath}"`;
+  } else {
+    cmd = `xdg-open "${absPath}"`;
+  }
+
+  exec(cmd, { timeout: 5000 }, (err) => {
+    if (err && !err.killed) {
+      // explorer.exe often returns exit code 1 even on success — ignore that
+      if (process.platform !== 'win32') {
+        return res.status(500).json({ error: 'Could not open file: ' + err.message });
+      }
+    }
+    res.json({ ok: true, path: absPath, message: `Opened "${file.original_name}" in default application` });
+  });
 });
 
 router.delete('/:id', (req, res) => {

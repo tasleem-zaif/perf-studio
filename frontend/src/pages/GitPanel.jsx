@@ -379,6 +379,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       addLog(data.message, 'success');
       toast(data.message, 'success');
       setCommitMsg('');
+      setSelectedFiles(new Set()); // clear selection — files are now committed
       loadAll();
     } catch (err) {
       const msg = err.response?.data?.error || 'Commit failed';
@@ -794,10 +795,11 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                 <div style={{ fontSize:14,fontWeight:700,color:'#0f172a' }}>Changed Files</div>
                 <div style={{ fontSize:12,color:'#64748b',marginTop:2 }}>{statusFiles.length} file{statusFiles.length!==1?'s':''} · Branch: {currentBranch}</div>
               </div>
-              {selectedFiles.size > 0 && (
-                <button onClick={() => discardFiles([...selectedFiles])} disabled={discarding}
+              {/* Only show Discard when selected files still exist in the working tree */}
+              {selectedFiles.size > 0 && statusFiles.some(f => selectedFiles.has(f.path)) && (
+                <button onClick={() => discardFiles([...selectedFiles].filter(p => statusFiles.some(f => f.path === p)))} disabled={discarding}
                   style={{ display:'flex',alignItems:'center',gap:5,padding:'5px 12px',border:'none',borderRadius:7,cursor:'pointer',fontFamily:'inherit',fontSize:12,fontWeight:600,color:'#fff',background:'#ef4444',flexShrink:0 }}>
-                  {discarding ? <span className="spinner"/> : <i className="ti ti-trash"/>} Discard ({selectedFiles.size})
+                  {discarding ? <span className="spinner"/> : <i className="ti ti-trash"/>} Discard ({[...selectedFiles].filter(p => statusFiles.some(f => f.path === p)).length})
                 </button>
               )}
             </div>
