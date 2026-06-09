@@ -756,7 +756,8 @@ router.post('/run', auth, async (req, res) => {
       const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
       if (suiteCol) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suiteCol.id, suite.env);
+        // getCollectionPath(path, colName, env) — 3 args only, no colId
+        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suite.env);
         resultDir = path.join(envPath, 'results', `Run_${runNumber}`);
       }
     } catch (_) {}
@@ -822,7 +823,7 @@ router.post('/run', auth, async (req, res) => {
 
       if (suiteCollection && suiteEnvName && projectFolderPath) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteCollection.id, suiteEnvName);
+        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteEnvName);
         const envTestDataDir = path.join(envPath, 'testData');
         if (fs.existsSync(envTestDataDir)) {
           testDataHostDir = toHostPath(envTestDataDir);
@@ -1216,10 +1217,12 @@ router.post('/run', auth, async (req, res) => {
         if (!runRow) return;
 
         const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
+        console.log('[Alerts] Checking JTL at:', jtlPath);
         if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found, skipping email:', jtlPath);
+          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
           return;
         }
+        console.log('[Alerts] JTL found, building report data for email...');
 
         const content = fs.readFileSync(jtlPath, 'utf8');
         const lines   = content.trim().split('\n').filter(Boolean);
@@ -1444,17 +1447,22 @@ router.get('/runs', auth, (req, res) => {
   const parsed = runs.map(r => {
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
-      const absReport = path.resolve(r.report_path);
-      const absWS     = path.resolve(GIT_WORKSPACES_ROOT);
-      const absAdmin  = path.resolve(PROJECTS_ROOT);
+      // Use lower-case comparison to handle Windows case-insensitive paths
+      const absReport  = path.resolve(r.report_path).toLowerCase().replace(/\\/g, '/');
+      const absWS      = path.resolve(GIT_WORKSPACES_ROOT).toLowerCase().replace(/\\/g, '/');
+      const absAdmin   = path.resolve(PROJECTS_ROOT).toLowerCase().replace(/\\/g, '/');
       if (absReport.startsWith(absWS)) {
-        // User/admin workspace — serve via /workspace-files
-        const rel = path.relative(absWS, absReport).replace(/\\/g, '/');
+        const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
         report_url = `/workspace-files/${rel}`;
       } else if (absReport.startsWith(absAdmin)) {
-        // Legacy admin projects root
-        const rel = path.relative(absAdmin, absReport).replace(/\\/g, '/');
+        const rel = path.relative(path.resolve(PROJECTS_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
         report_url = `/projects-files/${rel}`;
+      } else {
+        // Absolute path outside known roots — serve relative to GIT_WORKSPACES_ROOT as best-effort
+        try {
+          const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+          if (!rel.startsWith('..')) report_url = `/workspace-files/${rel}`;
+        } catch {}
       }
     }
     return { ...r, logs: JSON.parse(r.logs || '[]'), report_url, heal_status: r.heal_status, heal_run_id: r.heal_run_id };
