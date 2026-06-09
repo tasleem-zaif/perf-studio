@@ -217,10 +217,6 @@ router.post('/generate-yaml', async (req, res) => {
   const gitRoot = path.join(GIT_WORKSPACES_ROOT, 'admin'); // git-workspaces/admin/
 
   // Get all generated test plans for this project to include as YAML comments
-  // Use admin workspace paths to build relative script paths
-  const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
-
-  // Get all generated test plans for this project to include as YAML comments
   const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
 
   const created = [];
@@ -584,6 +580,206 @@ router.get('/runs/:runId/status', async (req, res) => {
     res.json({ run: { ...run, status: mappedStatus, web_url: webUrl } });
   } catch (e) {
     res.json({ run, poll_error: e.message });
+  }
+});
+
+// ── POST /runs/:runId/sync-results — download artifacts and save to env results folder ──
+router.post('/runs/:runId/sync-results', async (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+
+  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
+
+  const cfg = decryptConfig(getConfig(req.params.projectId));
+  if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
+
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+
+  const AdmZip = require('adm-zip');
+  const os = require('os');
+  const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+
+  // ── Determine results directory ────────────────────────────────────────────
+  // Find test suite by script name to get collection + env
+  const callerRole  = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+  const userProjPath = getUserProjectPath(req.userId, callerRole, project.name);
+
+  let resultDir = null;
+  if (run.script_name) {
+    const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
+    const suite = db.prepare(`
+      SELECT ts.*, c.name as col_name FROM test_suites ts
+      LEFT JOIN collections c ON c.id = ts.collection_id
+      WHERE ts.project_id = ?
+        AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
+      LIMIT 1
+    `).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+
+    if (suite?.col_name && suite?.env) {
+      const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
+      // Get next run number
+      const existing = fs.readdirSync(path.join(envPath, 'results').replace(/\\/g, '/'), { withFileTypes: true })
+        .filter(d => d.isDirectory() && d.name.startsWith('Run_'))
+        .map(d => parseInt(d.name.replace('Run_', '')) || 0);
+      try { fs.mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
+      let dirs = [];
+      try { dirs = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && d.name.startsWith('Run_')).map(d => parseInt(d.name.replace('Run_', '')) || 0); } catch {}
+      const nextRun = dirs.length ? Math.max(...dirs) + 1 : 1;
+      resultDir = path.join(envPath, 'results', `Run_${nextRun}`);
+    }
+  }
+
+  // Fallback to project-level results
+  if (!resultDir) {
+    try {
+      const dirs = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true })
+        .filter(d => d.isDirectory() && d.name.startsWith('Run_'))
+        .map(d => parseInt(d.name.replace('Run_', '')) || 0);
+      const next = dirs.length ? Math.max(...dirs) + 1 : 1;
+      resultDir = path.join(userProjPath, 'results', `Run_${next}`);
+    } catch {
+      resultDir = path.join(userProjPath, 'results', `CI_Run_${run.id}`);
+    }
+  }
+
+  fs.mkdirSync(resultDir, { recursive: true });
+
+  // ── Download artifact zip ─────────────────────────────────────────────────
+  const tmpZip = path.join(os.tmpdir(), `ci_artifact_${run.id}_${Date.now()}.zip`);
+
+  try {
+    if (run.provider === 'github') {
+      if (!cfg.github_token) return res.status(400).json({ error: 'GitHub token not set.' });
+
+      // Get artifact list for this run
+      const artifactsResp = await apiRequest(
+        `https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`,
+        'GET', null,
+        { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+      );
+
+      if (artifactsResp.status !== 200 || !artifactsResp.body?.artifacts?.length) {
+        return res.status(404).json({ error: 'No artifacts found for this run. The pipeline may still be running or artifacts may have expired.' });
+      }
+
+      // Pick the first artifact (jmeter-report-*)
+      const artifact = artifactsResp.body.artifacts[0];
+
+      // Get download URL (GitHub returns 302 redirect)
+      const dlResp = await apiRequest(
+        `https://api.github.com/repos/${cfg.github_repo}/actions/artifacts/${artifact.id}/zip`,
+        'GET', null,
+        { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+      );
+
+      // Follow the redirect to get the actual download URL
+      const downloadUrl = dlResp.headers?.location || dlResp.headers?.Location;
+      if (!downloadUrl) return res.status(500).json({ error: 'Could not get artifact download URL from GitHub.' });
+
+      // Download the zip
+      await new Promise((resolve, reject) => {
+        const urlObj = new URL(downloadUrl);
+        const isHttps = urlObj.protocol === 'https:';
+        const fileStream = fs.createWriteStream(tmpZip);
+        (isHttps ? https : http).get(downloadUrl, { rejectUnauthorized: false }, response => {
+          // Handle another redirect if needed
+          if (response.statusCode === 302 || response.statusCode === 301) {
+            const redirectUrl = response.headers.location;
+            (isHttps ? https : http).get(redirectUrl, { rejectUnauthorized: false }, r2 => {
+              r2.pipe(fileStream);
+              fileStream.on('finish', () => { fileStream.close(); resolve(); });
+            }).on('error', reject);
+          } else {
+            response.pipe(fileStream);
+            fileStream.on('finish', () => { fileStream.close(); resolve(); });
+          }
+        }).on('error', reject);
+      });
+    }
+
+    if (run.provider === 'gitlab') {
+      if (!cfg.gitlab_token) return res.status(400).json({ error: 'GitLab token not set.' });
+      const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
+      const encodedId = encodeURIComponent(cfg.gitlab_project_id);
+
+      // Get jobs for this pipeline
+      const jobsResp = await apiRequest(
+        `${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`,
+        'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token }
+      );
+      if (jobsResp.status !== 200 || !jobsResp.body?.length) {
+        return res.status(404).json({ error: 'No jobs found for this GitLab pipeline.' });
+      }
+
+      const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
+      if (!job?.id) return res.status(404).json({ error: 'No artifact-producing job found.' });
+
+      // Download artifacts zip
+      await new Promise((resolve, reject) => {
+        const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
+        const urlObj = new URL(artifactUrl);
+        const isHttps = urlObj.protocol === 'https:';
+        const fileStream = fs.createWriteStream(tmpZip);
+        const options = { hostname: urlObj.hostname, port: urlObj.port || (isHttps ? 443 : 80), path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false };
+        (isHttps ? https : http).request(options, response => {
+          response.pipe(fileStream);
+          fileStream.on('finish', () => { fileStream.close(); resolve(); });
+        }).on('error', reject).end();
+      });
+    }
+
+    // ── Extract zip to resultDir ─────────────────────────────────────────────
+    if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) {
+      return res.status(500).json({ error: 'Downloaded artifact is empty or missing.' });
+    }
+
+    const zip = new AdmZip(tmpZip);
+    zip.extractAllTo(resultDir, true);
+    fs.unlinkSync(tmpZip); // clean up temp file
+
+    // ── Create execution_run record so it shows in Run History ───────────────
+    const jtlPath = path.join(resultDir, 'results.jtl');
+    const htmlPath = path.join(resultDir, 'html', 'index.html');
+
+    // Find matching suite for DB record
+    let suiteId = null;
+    if (run.script_name) {
+      const scriptFile = run.script_name.split('/').pop();
+      const suite = db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+        .get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+      suiteId = suite?.id || null;
+    }
+
+    db.prepare(`
+      INSERT INTO execution_runs
+        (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(
+      req.params.projectId,
+      suiteId,
+      'jmeter',
+      'completed',
+      resultDir,
+      JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
+      run.started_at || new Date().toISOString()
+    );
+
+    // Update ci_pipeline_run with result_dir
+    db.prepare("UPDATE ci_pipeline_runs SET variables = ? WHERE id = ?")
+      .run(JSON.stringify({ ...JSON.parse(run.variables || '{}'), result_dir: resultDir }), run.id);
+
+    res.json({
+      ok: true,
+      result_dir: resultDir,
+      files: fs.readdirSync(resultDir),
+      message: `Results saved to ${resultDir.replace(/\\/g, '/')}`,
+    });
+
+  } catch (e) {
+    try { if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip); } catch {}
+    res.status(500).json({ error: `Failed to sync results: ${e.message}` });
   }
 });
 

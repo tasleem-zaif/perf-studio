@@ -695,6 +695,20 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                               <i className="ti ti-refresh"/>
                             </button>
                           )}
+                          {/* Sync Results — only for completed runs */}
+                          {['completed','success'].includes(r.status) && (
+                            <button className="btn-secondary btn-sm"
+                              style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
+                              title="Download artifacts and save to local env results folder"
+                              onClick={async () => {
+                                try {
+                                  const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
+                                  toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
+                                } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
+                              }}>
+                              <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
+                            </button>
+                          )}
                           {r.web_url && (
                             <a href={r.web_url} target="_blank" rel="noreferrer"
                               style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
