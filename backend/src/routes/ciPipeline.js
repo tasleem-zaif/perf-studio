@@ -443,6 +443,18 @@ def sp(xml, name, val):
     print(("  SET " if n else "  WARN ") + name + "=" + str(val))
     return new
 
+# Fix absolute local paths -> CI workspace paths
+# Replaces Windows paths like C:/Users/.../git-workspaces/user-X/ with /workspace/
+# so JMeter finds CSV test data files inside the Docker container
+path_pattern = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]'
+fixed_content, path_fixes = re.subn(path_pattern, '/workspace/', content)
+if path_fixes:
+    fixed_content = fixed_content.replace('\\\\', '/')
+    content = fixed_content
+    print("  FIXED " + str(path_fixes) + " absolute path(s) -> /workspace/")
+else:
+    print("  No absolute paths to fix")
+
 content = sp(content, "ThreadGroup.num_threads", users)
 content = sp(content, "ThreadGroup.ramp_time", rampup)
 
