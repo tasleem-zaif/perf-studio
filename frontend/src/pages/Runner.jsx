@@ -470,10 +470,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Run mode tabs ─────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
-          { id: 'single',      icon: 'ti-player-play',   label: 'Single Test Run'  },
-          { id: 'pipeline',    icon: 'ti-git-merge',      label: 'Pipeline Run'     },
-          { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'      },
-        ].map(t => (
+          { id: 'single',      icon: 'ti-player-play',   label: 'Local Test Run' },
+          // { id: 'pipeline', icon: 'ti-git-merge', label: 'Pipeline Run' },  // hidden — keep for future use
+          { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'    },
+        ].filter(t => t).map(t => (
           <button key={t.id} onClick={() => setRunTab(t.id)}
             style={{
               display: 'flex', alignItems: 'center', gap: 7,
@@ -489,8 +489,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         ))}
       </div>
 
-      {/* ── Pipeline Run tab ─────────────────────────────────────────────── */}
-      {runTab === 'pipeline' && (
+      {/* ── Pipeline Run tab — hidden, keep code for future use ────────── */}
+      {false && runTab === 'pipeline' && (
         <div>
           {/* Pipeline selector */}
           <div className="card" style={{ marginBottom: 14 }}>
@@ -861,7 +861,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         </div>
       )}
 
-      {/* ── Single Test Run tab ──────────────────────────────────────────── */}
+      {/* ── Local Test Run tab ───────────────────────────────────────────── */}
       {runTab === 'single' && <>
 
       {/* Concurrent runs banner */}
