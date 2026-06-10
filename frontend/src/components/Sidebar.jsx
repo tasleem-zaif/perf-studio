@@ -36,7 +36,7 @@ const COL_STEPS = [
   { id: 'alerts',      label: 'Alerts' },
   { id: 'runner',      label: 'Run Test' },
   { id: 'analytics',   label: 'Analytics' },
-  { id: 'reports',     label: 'JMeter Report' },
+  // { id: 'reports', label: 'JMeter Report' },  // hidden — keep for future use
 ];
 
 /* ── Size tiers (0=top-level … 4=deepest step) ────────────────────────── */

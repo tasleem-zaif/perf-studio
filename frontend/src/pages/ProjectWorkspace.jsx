@@ -23,7 +23,7 @@ const NAV_ITEMS = [
   { id: 'alerts',      icon: 'ti-bell-ringing',           label: 'Alerts',         sub: 'Email notifications',          color: '#dc2626', bg: '#fee2e2' },
   { id: 'runner',      icon: 'ti-player-play',            label: 'Run Test',       sub: 'Execute load tests',           color: '#16a34a', bg: '#dcfce7' },
   { id: 'analytics',   icon: 'ti-chart-dots-3',           label: 'Analytics',      sub: 'Performance dashboards',       color: '#2563eb', bg: '#dbeafe' },
-  { id: 'reports',     icon: 'ti-chart-bar',              label: 'JMeter Report',  sub: 'HTML test reports',            color: '#4338ca', bg: '#e0e7ff' },
+  // { id: 'reports', icon: 'ti-chart-bar', label: 'JMeter Report', sub: 'HTML test reports', color: '#4338ca', bg: '#e0e7ff' },  // hidden — keep for future use
 ];
 
 const QUICK_ACCESS = [
@@ -34,7 +34,7 @@ const QUICK_ACCESS = [
   { id: 'test-suites', icon: 'ti-test-pipe',         label: 'Test Plans',         desc: 'Create test plans and generate JMeter/K6 scripts with AI.',   color: '#4338ca', bg: '#e0e7ff' },
   { id: 'runner',      icon: 'ti-player-play',       label: 'Run Test',           desc: 'Execute load tests and stream live logs.',                    color: '#16a34a', bg: '#dcfce7' },
   { id: 'analytics',   icon: 'ti-chart-dots-3',      label: 'Analytics',          desc: 'Live dashboards for response time, throughput and errors.',   color: '#2563eb', bg: '#dbeafe' },
-  { id: 'reports',     icon: 'ti-chart-bar',         label: 'JMeter Report',      desc: 'Full HTML test report with APDEX, percentiles and errors.',   color: '#4338ca', bg: '#e0e7ff' },
+  // { id: 'reports', icon: 'ti-chart-bar', label: 'JMeter Report', desc: 'Full HTML test report with APDEX, percentiles and errors.', color: '#4338ca', bg: '#e0e7ff' },  // hidden
 ];
 
 // Action button config per page
