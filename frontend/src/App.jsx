@@ -41,6 +41,7 @@ function pageToUrl(p, projectId) {
   if (p === 'dashboard')          return '/dashboard';
   if (p === 'profile')            return '/myprofile';
   if (p === 'settings-users')     return '/settings/users';
+  if (p === 'settings-orgs')      return '/settings/orgs';
   if (p === 'settings-ai')        return '/settings/ai';
   if (p === 'settings-smtp')      return '/settings/smtp';
   if (projectId && (p === 'project-home' || PROJECT_PAGES.includes(p)))
@@ -70,6 +71,7 @@ const PAGE_TITLES = {
   'test-data': 'Test Data',
   config: 'Configuration',
   'settings-users': 'User Management',
+  'settings-orgs':  'Organizations',
   'settings-ai':   'AI Configuration',
   'ai-config':     'AI Configuration',
   'git':           'Git Integration',

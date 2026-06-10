@@ -8,6 +8,7 @@ const IC = {
   'ai-config':           { icon: 'ti-brain',                  bg: '#fef3c7', color: '#d97706', sub: 'Script generation AI' },
   settings:              { icon: 'ti-adjustments',            bg: '#f1f5f9', color: '#475569', sub: 'System configuration' },
   'settings-smtp':       { icon: 'ti-mail-cog',               bg: '#fef9c3', color: '#ca8a04', sub: 'Email config' },
+  'settings-orgs':       { icon: 'ti-building',               bg: '#e0e7ff', color: '#4338ca', sub: 'Manage organizations' },
   'settings-users':      { icon: 'ti-users',                  bg: '#dbeafe', color: '#2563eb', sub: 'Users & orgs' },
   'settings-appearance': { icon: 'ti-palette',                bg: '#ede9fe', color: '#7c3aed', sub: 'Themes & display' },
   profile:               { icon: 'ti-user-circle',            bg: '#cffafe', color: '#0891b2', sub: 'My account' },
@@ -295,7 +296,7 @@ export default function Sidebar({
    * - Parent highlights ONLY when the current page belongs to it.
    * - Opening/closing a group does NOT trigger highlight by itself.
    */
-  const SETTINGS_PAGES = ['settings-smtp', 'settings-users'];
+  const SETTINGS_PAGES = ['settings-smtp', 'settings-users', 'settings-orgs'];
   const PROJECT_PAGES  = ['project-home', 'ai-config', 'git', 'collections',
                           'test-data', 'rules', 'config', 'test-suites',
                           'alerts', 'runner', 'analytics', 'reports'];
@@ -340,15 +341,20 @@ export default function Sidebar({
 
         {settingsOpen && (
           <ChildGroup ml={20} borderColor="#e2e8f0">
-            {(user?.role === 'super_admin' || user?.role === 'org_admin') && (
-              <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
-                active={page === 'settings-smtp'} depth={1}
-                onClick={() => onNav('settings-smtp')} />
+            {user?.role === 'super_admin' && (
+              <CardBtn iconKey="settings-orgs" label="Organizations"
+                active={page === 'settings-orgs'} depth={1}
+                onClick={() => onNav('settings-orgs')} />
             )}
             {isAdmin && (
               <CardBtn iconKey="settings-users" label="User Management"
                 active={page === 'settings-users'} depth={1}
                 onClick={() => onNav('settings-users')} />
+            )}
+            {(user?.role === 'super_admin' || user?.role === 'org_admin') && (
+              <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
+                active={page === 'settings-smtp'} depth={1}
+                onClick={() => onNav('settings-smtp')} />
             )}
           </ChildGroup>
         )}

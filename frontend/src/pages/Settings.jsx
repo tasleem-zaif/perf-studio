@@ -50,10 +50,10 @@ function StatusBadge({ status }) {
   );
 }
 
-function UserManagementPanel({ user, projects = [] }) {
+function UserManagementPanel({ user, projects = [], initialTab }) {
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
-  const [tab, setTab] = useState('invites');
+  const [tab, setTab] = useState(initialTab || 'invites');
   const [users, setUsers] = useState([]);
   const [invites, setInvites] = useState([]);
   const [orgUsers, setOrgUsers] = useState([]);
@@ -929,7 +929,8 @@ function SMTPConfigPanel({ currentUser }) {
 
 export default function Settings({ page, theme, onThemeChange, user, projects }) {
   if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
-  if (page === 'settings-ai') return <AIConfigPanel user={user} />;
-  if (page === 'settings-smtp') return <SMTPConfigPanel currentUser={user} />;
+  if (page === 'settings-orgs')  return <UserManagementPanel user={user} projects={projects || []} initialTab="organizations" />;
+  if (page === 'settings-ai')    return <AIConfigPanel user={user} />;
+  if (page === 'settings-smtp')  return <SMTPConfigPanel currentUser={user} />;
   return null;
 }

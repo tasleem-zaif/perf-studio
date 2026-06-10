@@ -66,9 +66,10 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
   }, [project?.id]);
 
   // Update selected run whenever selectedId or runs change
+  // Compare both as strings — CustomSelect may pass value as number or string
   useEffect(() => {
     if (!selectedId) { setSelected(null); return; }
-    const found = runs.find(r => String(r.id) === selectedId);
+    const found = runs.find(r => String(r.id) === String(selectedId));
     setSelected(found || null);
   }, [selectedId, runs]);
 
@@ -177,8 +178,8 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
       {selectedId && !selected && (
         <div className="empty" style={{ flex: 1 }}>
           <i className="ti ti-refresh" style={{ fontSize: '36px', color: 'var(--warn)', marginBottom: '10px' }} />
-          <div className="empty-title">Run not found</div>
-          <div className="empty-desc">The selected run may have been filtered out. Try clearing the environment filter.</div>
+          <div className="empty-title">Loading run…</div>
+          <div className="empty-desc">Please wait or try selecting the run again.</div>
         </div>
       )}
 
