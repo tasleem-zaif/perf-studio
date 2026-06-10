@@ -261,7 +261,18 @@ router.post('/init', async (req, res) => {
   // The project folder will be created inside git-workspaces during this init.
 
   try {
-    const token = cfg.auth_token ? decrypt(cfg.auth_token) : '';
+    // Prefer the user's personal PAT over the project-level token.
+    // This is critical when an org admin initialises a repo they own —
+    // their PAT must be used so GitHub attributes the push to their account.
+    const projectToken  = cfg.auth_token       ? decrypt(cfg.auth_token)       : '';
+    const identity      = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+    const personalToken = identity?.auth_token  ? decrypt(identity.auth_token)  : '';
+    const token         = personalToken || projectToken;
+
+    if (!token) return res.status(400).json({
+      error: 'No Personal Access Token found. Save your PAT in Git Identity (Configuration → Git → Your Git Identity) before initializing.',
+    });
+
     const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, token);
 
     // ── Resolve workspace paths ───────────────────────────────────────────────
