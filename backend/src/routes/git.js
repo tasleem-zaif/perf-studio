@@ -217,6 +217,12 @@ router.get('/config', (req, res) => {
   });
 });
 
+// ── Helper: check if current user is the project owner ────────────────────────
+function isProjectOwner(userId, projectId) {
+  const proj = db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
+  return proj && String(proj.user_id) === String(userId);
+}
+
 // ── PUT /config ───────────────────────────────────────────────────────────────
 
 router.put('/config', (req, res) => {
@@ -226,6 +232,14 @@ router.put('/config', (req, res) => {
   }
   const proj = getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  // Only the project owner can change the shared git setup
+  if (!isProjectOwner(req.userId, req.params.projectId)) {
+    return res.status(403).json({
+      error: 'Only the project owner can modify the Git repository configuration. Contact the project owner to make changes.',
+      owner_only: true,
+    });
+  }
 
   const { provider, remote_url, username, email, auth_token } = req.body;
   const existing = getGitConfig(req.params.projectId);
@@ -253,6 +267,14 @@ router.post('/init', async (req, res) => {
   }
   const proj = getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  // Only the project owner can initialize the repository
+  if (!isProjectOwner(req.userId, req.params.projectId)) {
+    return res.status(403).json({
+      error: 'Only the project owner can initialize the Git repository.',
+      owner_only: true,
+    });
+  }
 
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg || !cfg.remote_url) return res.status(400).json({ error: 'Configure git remote URL first.' });

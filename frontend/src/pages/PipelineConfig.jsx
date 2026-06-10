@@ -32,6 +32,7 @@ function StepRow({ step, index, total, onRemove, onMoveUp, onMoveDown }) {
 
 export default function PipelineConfig({ project, envs, user }) {
   const { toast } = useToast();
+  const isProjectOwner = project && user && String(project.user_id) === String(user.id);
   // Local Pipelines tab removed — only CI/CD Integration remains
   const [pipelines, setPipelines]   = useState([]);
   const [suites,    setSuites]      = useState([]);
@@ -197,6 +198,13 @@ export default function PipelineConfig({ project, envs, user }) {
 
       {/* ── CI/CD Integration ─────────────────────────────────────── */}
         <div>
+          {/* Owner-only guard */}
+          {!isProjectOwner && (
+            <div style={{ display:'flex', alignItems:'center', gap:8, padding:'12px 14px', background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, marginBottom:16, fontSize:13, color:'#92400e' }}>
+              <i className="ti ti-lock" style={{ fontSize:16, flexShrink:0 }}/>
+              <span>CI/CD configuration is managed by the <strong>project owner</strong>. You can view these settings but cannot modify them.</span>
+            </div>
+          )}
           <div style={{ marginBottom: 16, padding: '12px 16px', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, fontSize: 13, color: '#1d4ed8' }}>
             <i className="ti ti-info-circle" style={{ marginRight: 6 }}/>
             Configure GitLab or GitHub to run JMeter tests on their infrastructure. After saving settings, generate the YAML file, commit + push it, then trigger from the <strong>Run Test</strong> page.
@@ -327,10 +335,10 @@ export default function PipelineConfig({ project, envs, user }) {
 
           {/* ── Actions ───────────────────────────────────────── */}
           <div style={{ display: 'flex', gap: 10 }}>
-            <button className="btn-primary" onClick={saveCiConfig} disabled={ciSaving}>
+            <button className="btn-primary" onClick={saveCiConfig} disabled={ciSaving || !isProjectOwner} title={!isProjectOwner ? 'Only the project owner can modify this' : ''}>
               {ciSaving ? <><span className="spinner"/> Saving…</> : <><i className="ti ti-device-floppy"/> Save Settings</>}
             </button>
-            <button className="btn-secondary" onClick={generateYaml} disabled={ciGenerating} title="Generates .gitlab-ci.yml and/or .github/workflows/perf-test.yml in your workspace">
+            <button className="btn-secondary" onClick={generateYaml} disabled={ciGenerating || !isProjectOwner} title={!isProjectOwner ? 'Only the project owner can generate YAML' : 'Generates .gitlab-ci.yml and/or .github/workflows/perf-test.yml in your workspace'}>
               {ciGenerating ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML Files</>}
             </button>
           </div>

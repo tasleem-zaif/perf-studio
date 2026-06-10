@@ -98,6 +98,8 @@ function parseStatusFiles(status) {
 export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false, drawerWidth = 700 }) {
   const { toast } = useToast();
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
+  // Only the project owner can modify shared git/CI config
+  const isProjectOwner = project && user && String(project.user_id) === String(user.id);
   const pid = project?.id;
   const termInputRef = useRef(null);
 
@@ -620,13 +622,20 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
               title="Repository"
               subtitle="Shared remote repository for this project."
               extra={
-                cfg?.remote_url && !cfgEditMode ? (
+                cfg?.remote_url && !cfgEditMode && isProjectOwner ? (
                   <button className="btn-secondary btn-sm" onClick={() => { setCfgEditMode(true); setTestResult(null); }}>
                     <i className="ti ti-pencil" style={{ fontSize:12 }} /> Edit
                   </button>
                 ) : null
               }
             >
+              {/* Owner-only guard */}
+              {!isProjectOwner && (
+                <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 12px', background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, marginBottom:12, fontSize:12, color:'#92400e' }}>
+                  <i className="ti ti-lock" style={{ fontSize:14, flexShrink:0 }}/>
+                  <span>This configuration is managed by the <strong>project owner</strong>. You can view but not modify it.</span>
+                </div>
+              )}
               {/* Locked display */}
               {cfg?.remote_url && !cfgEditMode ? (
                 <>
@@ -640,7 +649,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                     <button className="btn-secondary" onClick={testConnection} disabled={testing}>
                       {testing ? <><span className="spinner"/>Testing…</> : <><i className="ti ti-wifi"/>Test Connection</>}
                     </button>
-                    {!initialized && cfg.remote_url && (
+                    {!initialized && cfg.remote_url && isProjectOwner && (
                       <button className="btn-secondary" onClick={initRepo} disabled={initing}>
                         {initing ? <><span className="spinner"/>Initializing…</> : <><i className="ti ti-git-branch"/>Initialize repository</>}
                       </button>
@@ -678,7 +687,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                     <input type="text" value={cfgForm.base_branch} onChange={e => setCfgForm(f => ({ ...f, base_branch: e.target.value }))} placeholder="main" style={{ width:200 }} />
                   </Field>
                   <div style={{ display:'flex',gap:8 }}>
-                    <button type="submit" className="btn-primary" disabled={savingCfg}>
+                    <button type="submit" className="btn-primary" disabled={savingCfg || !isProjectOwner}>
                       {savingCfg && <span className="spinner"/>}<i className="ti ti-device-floppy"/> Save repository settings
                     </button>
                     {cfg?.remote_url && (

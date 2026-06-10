@@ -90,9 +90,21 @@ router.get('/config', (req, res) => {
   });
 });
 
+// ── Helper: project owner check ───────────────────────────────────────────────
+function isProjectOwner(userId, projectId) {
+  const proj = db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
+  return proj && String(proj.user_id) === String(userId);
+}
+
 // ── PUT /config ───────────────────────────────────────────────────────────────
 router.put('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!isProjectOwner(req.userId, req.params.projectId)) {
+    return res.status(403).json({
+      error: 'Only the project owner can modify CI/CD configuration.',
+      owner_only: true,
+    });
+  }
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
     github_enabled, github_repo, github_token, github_workflow_file, github_ref,
