@@ -233,16 +233,24 @@ router.put('/config', (req, res) => {
   const proj = getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  // Only the project owner can change the shared git setup
+  // Only the project owner can change git setup
   if (!isProjectOwner(req.userId, req.params.projectId)) {
     return res.status(403).json({
-      error: 'Only the project owner can modify the Git repository configuration. Contact the project owner to make changes.',
+      error: 'Only the project owner can modify the Git repository configuration.',
       owner_only: true,
     });
   }
 
   const { provider, remote_url, username, email, auth_token } = req.body;
   const existing = getGitConfig(req.params.projectId);
+
+  // Repo is permanently locked after initialization — cannot change remote_url or base_branch
+  if (existing?.is_initialized && remote_url && remote_url !== existing.remote_url) {
+    return res.status(403).json({
+      error: 'Repository is already initialized. The remote URL cannot be changed after initialization.',
+      locked: true,
+    });
+  }
 
   const finalToken = (auth_token && auth_token !== '••••••••')
     ? encrypt(auth_token)

@@ -622,20 +622,26 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
               title="Repository"
               subtitle="Shared remote repository for this project."
               extra={
-                cfg?.remote_url && !cfgEditMode && isProjectOwner ? (
+                // Lock after init — no editing allowed
+                cfg?.remote_url && !cfgEditMode && isProjectOwner && !initialized ? (
                   <button className="btn-secondary btn-sm" onClick={() => { setCfgEditMode(true); setTestResult(null); }}>
                     <i className="ti ti-pencil" style={{ fontSize:12 }} /> Edit
                   </button>
                 ) : null
               }
             >
-              {/* Owner-only guard */}
-              {!isProjectOwner && (
+              {/* Permanently locked after initialization */}
+              {initialized ? (
+                <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 12px', background:'#f0fdf4', border:'1px solid #86efac', borderRadius:8, marginBottom:12, fontSize:12, color:'#15803d' }}>
+                  <i className="ti ti-lock" style={{ fontSize:14, flexShrink:0 }}/>
+                  <span>Repository initialized — settings are <strong>locked</strong>. The remote URL and branch configuration cannot be changed after initialization.</span>
+                </div>
+              ) : !isProjectOwner ? (
                 <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 12px', background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, marginBottom:12, fontSize:12, color:'#92400e' }}>
                   <i className="ti ti-lock" style={{ fontSize:14, flexShrink:0 }}/>
-                  <span>This configuration is managed by the <strong>project owner</strong>. You can view but not modify it.</span>
+                  <span>Only the <strong>project owner</strong> can configure the repository. You can view but not modify it.</span>
                 </div>
-              )}
+              ) : null}
               {/* Locked display */}
               {cfg?.remote_url && !cfgEditMode ? (
                 <>

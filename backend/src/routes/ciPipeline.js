@@ -26,8 +26,14 @@ router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function getConfig(projectId) {
-  return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ?').get(projectId) || null;
+// Per-user CI config: first try (project_id, user_id), fall back to legacy (project_id, NULL)
+function getConfig(projectId, userId) {
+  if (userId) {
+    const own = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId);
+    if (own) return own;
+  }
+  // Legacy shared config (user_id IS NULL) — used as read-only template if the user hasn't saved their own yet
+  return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId) || null;
 }
 
 function decryptConfig(cfg) {
@@ -70,19 +76,18 @@ function apiRequest(urlStr, method, body, headers = {}) {
   });
 }
 
-// ── GET /config ───────────────────────────────────────────────────────────────
+// ── GET /config — returns the CALLING USER's own CI config ───────────────────
 router.get('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getConfig(req.params.projectId);
+  const cfg = getConfig(req.params.projectId, req.userId);
   if (!cfg) return res.json({ config: null });
 
-  // Mask tokens — never return raw tokens to frontend
   res.json({
     config: {
       ...cfg,
-      gitlab_token:         cfg.gitlab_token         ? '••••••••' : '',
-      gitlab_trigger_token: cfg.gitlab_trigger_token ? '••••••••' : '',
-      github_token:         cfg.github_token         ? '••••••••' : '',
+      gitlab_token:             cfg.gitlab_token         ? '••••••••' : '',
+      gitlab_trigger_token:     cfg.gitlab_trigger_token ? '••••••••' : '',
+      github_token:             cfg.github_token         ? '••••••••' : '',
       gitlab_token_set:         !!cfg.gitlab_token,
       gitlab_trigger_token_set: !!cfg.gitlab_trigger_token,
       github_token_set:         !!cfg.github_token,
@@ -100,19 +105,15 @@ function isProjectOwner(userId, projectId) {
 router.put('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   if (!isProjectOwner(req.userId, req.params.projectId)) {
-    return res.status(403).json({
-      error: 'Only the project owner can modify CI/CD configuration.',
-      owner_only: true,
-    });
-  }
+  // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
     github_enabled, github_repo, github_token, github_workflow_file, github_ref,
   } = req.body;
 
-  const existing = getConfig(req.params.projectId);
+  // Look up THIS user's own config row (project_id + user_id)
+  const existing = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(req.params.projectId, req.userId);
 
-  // Only encrypt + store token if a new value was provided (not the masked placeholder)
   const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'         ? encrypt(gitlab_token)         : existing?.gitlab_token         || '';
   const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••' ? encrypt(gitlab_trigger_token) : existing?.gitlab_trigger_token || '';
   const encGithubToken        = github_token && github_token !== '••••••••'         ? encrypt(github_token)         : existing?.github_token         || '';
@@ -123,21 +124,21 @@ router.put('/config', (req, res) => {
       gitlab_trigger_token=?, gitlab_ref=?,
       github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?,
       updated_at=datetime('now')
-      WHERE project_id=?`
+      WHERE project_id=? AND user_id=?`
     ).run(
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
       github_workflow_file || 'perf-test.yml', github_ref || 'main',
-      req.params.projectId
+      req.params.projectId, req.userId
     );
   } else {
     db.prepare(`INSERT INTO ci_pipeline_configs
-      (project_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
+      (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
        github_enabled, github_repo, github_token, github_workflow_file, github_ref)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
-      req.params.projectId,
+      req.params.projectId, req.userId,
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
@@ -152,7 +153,7 @@ router.put('/config', (req, res) => {
 router.post('/config/test', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { provider } = req.body;
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'Save CI configuration first.' });
 
   try {
@@ -184,7 +185,7 @@ router.post('/config/test', async (req, res) => {
 // ── POST /config/trigger-token — create GitLab trigger token ─────────────────
 router.post('/config/trigger-token', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg?.gitlab_token)         return res.status(400).json({ error: 'Save GitLab access token first.' });
   if (!cfg?.gitlab_project_id)    return res.status(400).json({ error: 'GitLab project ID/path not set.' });
 
@@ -215,7 +216,7 @@ router.post('/config/trigger-token', async (req, res) => {
 // ── POST /generate-yaml — generate + commit YAML files ───────────────────────
 router.post('/generate-yaml', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg     = decryptConfig(getConfig(req.params.projectId));
+  const cfg     = decryptConfig(getConfig(req.params.projectId, req.userId));
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
@@ -527,7 +528,7 @@ print("Patch complete")
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
 router.post('/trigger', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not saved yet.' });
 
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
@@ -737,7 +738,7 @@ router.get('/runs/:runId/status', async (req, res) => {
   const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!run.external_id || !cfg) return res.json({ run });
 
   try {
@@ -797,7 +798,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
 
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
@@ -1070,7 +1071,7 @@ router.get('/runs/:runId/steps', async (req, res) => {
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.json({ steps: [], status: run.status });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.json({ steps: [], status: run.status });
 
   try {

@@ -165,6 +165,8 @@ const migrations = [
   "ALTER TABLE rules ADD COLUMN value_max TEXT DEFAULT NULL",
   "ALTER TABLE pipeline_runs ADD COLUMN logs TEXT DEFAULT '[]'",
   "ALTER TABLE pipeline_runs ADD COLUMN triggered_by INTEGER DEFAULT NULL",
+  // CI config becomes per-user — add user_id so each user has their own row
+  "ALTER TABLE ci_pipeline_configs ADD COLUMN user_id INTEGER DEFAULT NULL",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (_) { /* column already exists */ }
