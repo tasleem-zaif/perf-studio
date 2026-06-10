@@ -657,40 +657,48 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
-                {/* Script */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Script filename <span style={{ fontWeight: 400, color: '#94a3b8' }}>(e.g. test.jmx)</span></label>
-                    <input type="text" value={ciScriptName} onChange={e => setCiScriptName(e.target.value)} placeholder="MyLoadTest.jmx" />
-                  </div>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Full script path <span style={{ fontWeight: 400, color: '#94a3b8' }}>(relative to repo root, optional)</span></label>
-                    <input type="text" value={ciScriptPath} onChange={e => setCiScriptPath(e.target.value)} placeholder="projects/Demo1/QA/script/test.jmx" />
-                  </div>
-                </div>
-
-                {/* Suites quick-pick */}
-                {suites.filter(s => s.jmx_path || s.js_path).length > 0 && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: .5 }}>Quick pick from generated test plans</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                      {suites.filter(s => s.jmx_path || s.js_path).map(s => {
-                        const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
-                        // path relative to git root (user workspace root)
-                        const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
-                        const fileName = file.split('/').pop();
-                        return (
-                          <button key={s.id} onClick={() => { setCiScriptName(fileName); setCiScriptPath(relPath); }}
-                            style={{ padding: '4px 10px', border: '1px solid #e2e8f0', borderRadius: 20, background: '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, color: '#475569', transition: 'all .12s' }}
-                            onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
-                            onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.color = '#475569'; }}>
-                            <i className="ti ti-file-code" style={{ marginRight: 4, fontSize: 10 }}/>{s.name}
-                          </button>
-                        );
-                      })}
+                {/* Script — dropdown only, filename/path calculated automatically */}
+                <div className="form-group" style={{ marginBottom: 14 }}>
+                  <label className="form-label">Test Plan</label>
+                  {suites.filter(s => s.jmx_path || s.js_path).length === 0 ? (
+                    <div style={{ fontSize: 12, color: '#94a3b8', padding: '8px 0' }}>
+                      <i className="ti ti-alert-triangle" style={{ marginRight: 5, color: '#f59e0b' }}/>
+                      No generated scripts found. Go to Test Plans and generate a script first.
                     </div>
-                  </div>
-                )}
+                  ) : (
+                    <>
+                      <CustomSelect
+                        value={ciScriptName}
+                        onChange={e => {
+                          const selected = suites.find(s => {
+                            const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                            return file.split('/').pop() === e.target.value;
+                          });
+                          if (selected) {
+                            const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
+                            const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
+                            const fileName = file.split('/').pop();
+                            setCiScriptName(fileName);
+                            setCiScriptPath(relPath);
+                          }
+                        }}
+                      >
+                        <option value="">— Select a test plan —</option>
+                        {suites.filter(s => s.jmx_path || s.js_path).map(s => {
+                          const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                          const fileName = file.split('/').pop();
+                          return <option key={s.id} value={fileName}>{s.name}</option>;
+                        })}
+                      </CustomSelect>
+                      {ciScriptName && (
+                        <div style={{ marginTop: 6, fontSize: 11, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <i className="ti ti-file-code" style={{ fontSize: 11, color: '#4338ca' }}/>
+                          <code style={{ fontSize: 10, color: '#475569' }}>{ciScriptPath || ciScriptName}</code>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
 
                 {/* Variables */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
