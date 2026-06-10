@@ -246,7 +246,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         case 'rules':       return <Rules project={project} {...shared} openModalTrigger={rulesModalTrig} />;
         case 'test-suites': return <TestSuites project={project} {...shared} openModalTrigger={testSuitesModalTrig} onAfterSave={refreshJmeterCheck} />;
         case 'alerts':      return <Alerts project={project} {...shared} />;
-        case 'runner':      return <Runner projects={projects || [project]} activeProject={project} activeCollection={activeCollection} activeEnv={activeEnv} onNav={navigate} />;
+        case 'runner':      return null; // rendered persistently below to preserve logs state
         case 'analytics':   return <Analytics project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
         case 'reports':     return <Reports project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
         default: return null;
@@ -546,6 +546,13 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
               );
             })()}
             {renderRightContent()}
+
+            {/* Runner rendered persistently so logs survive navigation away and back */}
+            {project && (
+              <div style={{ display: activePage === 'runner' ? 'block' : 'none' }}>
+                <Runner projects={projects || [project]} activeProject={project} activeCollection={activeCollection} activeEnv={activeEnv} onNav={navigate} />
+              </div>
+            )}
           </div>
 
         </div>
