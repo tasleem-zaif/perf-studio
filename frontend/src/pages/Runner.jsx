@@ -148,13 +148,23 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     setCheckingDeps(true);
     setDepsChecked(false);
     try {
-      const { data } = await api.get('/execution/check-deps');
-      setDeps(data.deps || []);
+      // Only check Docker — JMeter/K6/Java run inside the custom CI image
+      const { data } = await api.get('/execution/check-docker');
+      const dockerOk = data.status === 'ok';
+      const dockerDep = {
+        name:    'docker',
+        status:  dockerOk ? 'ok' : 'missing',
+        version: data.version || null,
+        path:    null,
+      };
+      setDeps([dockerDep]);
       setDepsChecked(true);
-      const allOk = (data.deps || []).every(d => d.status === 'ok');
-      addLog(allOk ? 'ok' : 'warn', allOk ? 'Docker is running — ready to execute.' : 'Docker is not running. Start Docker Desktop and re-check.');
+      addLog(dockerOk ? 'ok' : 'warn',
+        dockerOk
+          ? '✔ Docker is installed and running — ready to execute.'
+          : '✘ Docker is not running. Start Docker Desktop and re-check.');
     } catch (e) {
-      addLog('err', 'Dependency check failed: ' + (e.response?.data?.error || e.message));
+      addLog('err', 'Docker check failed: ' + (e.response?.data?.error || e.message));
     } finally { setCheckingDeps(false); }
   }
 
@@ -1055,18 +1065,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             <button className="btn-secondary btn-sm" onClick={checkDeps} disabled={checkingDeps}>
               {checkingDeps ? <><span className="spinner" />Checking...</> : <><i className="ti ti-brand-docker" />Check Docker</>}
             </button>
-            {depsChecked && missingDeps.length > 0 && missingDeps.map(d => (
-              <button
-                key={d.name}
-                className="btn-primary btn-sm"
-                onClick={() => installDep(d.name)}
-                disabled={!!installingDep}
-              >
-                {installingDep === d.name
+            {depsChecked && missingDeps.length > 0 && (
+              <button className="btn-primary btn-sm" onClick={() => installDep('docker')} disabled={!!installingDep}>
+                {installingDep === 'docker'
                   ? <><span className="spinner" />Installing...</>
-                  : <><i className="ti ti-download" />Install {d.name}</>}
+                  : <><i className="ti ti-download" />Install Docker</>}
               </button>
-            ))}
+            )}
           </div>
         </div>
 
@@ -1075,11 +1080,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             {deps.map(d => (
               <div key={d.name} className="dep-row">
                 <i className={`ti ${d.status === 'ok' ? 'ti-circle-check dep-ok' : 'ti-circle-x dep-missing'}`} style={{ fontSize: '16px' }} />
-                <div className="dep-name">{d.name}</div>
+                <div className="dep-name">
+                  <i className="ti ti-brand-docker" style={{ marginRight: 5, color: '#2496ed', fontSize: 13 }}/>
+                  Docker Desktop
+                </div>
                 {d.version && <div className="dep-version">{d.version}</div>}
-                {d.path && <div className="dep-version" style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.path}</div>}
                 <span className={`badge ${d.status === 'ok' ? 'tag-green' : 'tag-red'}`}>
-                  {d.status === 'ok' ? 'Installed' : 'Missing'}
+                  {d.status === 'ok' ? 'Running' : 'Not Running'}
                 </span>
               </div>
             ))}
