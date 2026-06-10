@@ -516,10 +516,18 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
             </div>
             <div className="form-group">
               <label className="form-label">Engine</label>
-              <CustomSelect value={form.engine} onChange={e => setForm(f => ({ ...f, engine: e.target.value }))}>
+              <CustomSelect
+                value={form.engine}
+                onChange={e => { if (e.target.value !== 'k6') setForm(f => ({ ...f, engine: e.target.value })); }}
+              >
                 <option value="jmeter">Apache JMeter (.jmx)</option>
-                <option value="k6">Grafana K6 (.js)</option>
+                <option value="k6" disabled>Grafana K6 (.js) — Coming Soon</option>
               </CustomSelect>
+              {form.engine === 'k6' && (
+                <div style={{ marginTop: 6, fontSize: 11, color: '#b45309', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <i className="ti ti-clock" style={{ fontSize: 11 }}/> K6 support is coming soon. Please use Apache JMeter for now.
+                </div>
+              )}
             </div>
           </div>
 
