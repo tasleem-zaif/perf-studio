@@ -1205,6 +1205,7 @@ router.post('/run', auth, async (req, res) => {
     //                             or the final failed run if all 3 attempts exhausted
     // • Failed + auto-heal OFF  → send immediately with failed status
     const sendEmailForRun = async (targetRunId) => {
+      console.log(`[Alerts] sendEmailForRun started for run #${targetRunId}`);
       try {
         const { sendAlertEmail }             = require('../utils/emailUtils');
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');

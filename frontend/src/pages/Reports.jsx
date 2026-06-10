@@ -47,24 +47,30 @@ function StatusBadge({ status }) {
 }
 
 export default function Reports({ project, collection, env, envs, onEnvChange }) {
-  const [runs, setRuns] = useState([]);
+  const [runs,     setRuns]     = useState([]);
   const [selectedId, setSelectedId] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState(null); // explicit state — avoids timing bugs
+  const [loading,  setLoading]  = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // Load ALL runs once when project changes
   useEffect(() => {
     if (!project) return;
     setLoading(true);
     setSelectedId('');
+    setSelected(null);
     api.get('/execution/runs', { params: { project_id: project.id } })
-      .then(({ data }) => {
-        // Show ALL runs for this project — do not filter by env/collection
-        // so the selected run is never "not found" after the user picks it.
-        setRuns(data.runs || []);
-      })
+      .then(({ data }) => setRuns(data.runs || []))
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [project?.id]);
+
+  // Update selected run whenever selectedId or runs change
+  useEffect(() => {
+    if (!selectedId) { setSelected(null); return; }
+    const found = runs.find(r => String(r.id) === selectedId);
+    setSelected(found || null);
+  }, [selectedId, runs]);
 
   if (!project) {
     return (
@@ -77,7 +83,6 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
     );
   }
 
-  const selected = runs.find(r => String(r.id) === selectedId);
   const jmeterRuns = runs.filter(r => r.engine === 'jmeter');
   const runNum = selected?.result_dir?.match(/Run_(\d+)/)?.[1];
 
