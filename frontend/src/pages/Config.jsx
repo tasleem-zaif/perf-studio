@@ -770,33 +770,10 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
       </CollapsibleSection>
 
 
-      {/* Global Defaults + Project Override — only shown when NOT in a specific env context */}
-      {(!collection || !env) && <>
-
-      {/* Global Defaults */}
+      {/* Endpoint Details — only shown when NOT in a specific env context */}
+      {(!collection || !env) && (
       <CollapsibleSection
-        title="Global Defaults"
-        icon="ti-world"
-        iconColor="var(--accent)"
-        open={open.global}
-        onToggle={() => setOpen(o => ({ ...o, global: !o.global }))}
-        badge={`${(globalCfg.urls || []).filter(u => u.url).length || 0} URL(s)`}
-      >
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Default base URLs applied to all projects and test suites.
-        </div>
-        {saved === 'global' && <div style={{ marginBottom: '12px', padding: '8px 12px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px', fontSize: '12px', color: '#22c55e' }}>Global defaults saved.</div>}
-        <UrlsEditor cfg={globalCfg} setCfg={setGlobalCfg} />
-        <div style={{ marginTop: '16px' }}>
-          <button className="btn-primary" onClick={saveGlobal} disabled={saving === 'global'}>
-            {saving === 'global' && <span className="spinner" />}Save Global Defaults
-          </button>
-        </div>
-      </CollapsibleSection>
-
-      {/* Project Override */}
-      <CollapsibleSection
-        title={`Project Override${project ? ` — ${project.name}` : ''}`}
+        title={`Endpoint Details${project ? ` — ${project.name}` : ''}`}
         icon="ti-folder"
         iconColor="var(--warn)"
         open={open.project}
@@ -805,25 +782,18 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
       >
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
           {project
-            ? <>Overrides for <strong>{project.name}</strong>. Blank URLs fall back to global defaults. Config is written to <code>projects/{project.name}/config/</code></>
-            : 'Select a project to configure overrides.'}
+            ? <>Endpoint configuration for <strong>{project.name}</strong>.</>
+            : 'Select a project to configure endpoints.'}
         </div>
-        {saved === 'project' && <div style={{ marginBottom: '12px', padding: '8px 12px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px', fontSize: '12px', color: '#22c55e' }}>Project config saved.</div>}
+        {saved === 'project' && <div style={{ marginBottom: '12px', padding: '8px 12px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px', fontSize: '12px', color: '#22c55e' }}>Endpoint details saved.</div>}
         <UrlsEditor cfg={projectCfg} setCfg={setProjectCfg} />
-        <div style={{ marginTop: '16px', display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <div style={{ marginTop: '16px' }}>
           <button className="btn-primary" onClick={saveProject} disabled={!project || saving === 'project'}>
-            {saving === 'project' && <span className="spinner" />}Save Project Config
+            {saving === 'project' && <span className="spinner" />}Save Endpoint Details
           </button>
-          {project && (
-            <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-              <i className="ti ti-file-text" style={{ marginRight: '4px' }} />
-              Also writes to <code>projects/{project.name}/config/config.properties</code>
-            </div>
-          )}
         </div>
       </CollapsibleSection>
-
-      </> /* end of (!collection || !env) block */}
+      )}
 
       {/* ── Env Readiness Dashboard — shown when in collection+env context ── */}
       {collection && env && envReadiness && (
@@ -901,34 +871,6 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         </CollapsibleSection>
       )}
 
-      {/* Effective Configuration */}
-      {(!collection || !env) && <CollapsibleSection
-        title="Effective Configuration (Global + Project Merged)"
-        icon="ti-eye"
-        iconColor="#22c55e"
-        open={open.effective}
-        onToggle={() => setOpen(o => ({ ...o, effective: !o.effective }))}
-      >
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          The actual values that will be used in JMeter User Defined Variables.
-        </div>
-        <div style={{ display: 'grid', gap: '8px' }}>
-          {getMergedUrls().map((entry, idx) => (
-            <div key={idx} style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '8px' }}>
-              {[
-                { key: `PROTOCOL${getMergedUrls().length > 1 ? `_${idx + 1}` : ''}`, val: entry.protocol },
-                { key: `URL${getMergedUrls().length > 1 ? `_${idx + 1}` : ''}`, val: entry.url || '(not set)' },
-                { key: `PORT${getMergedUrls().length > 1 ? `_${idx + 1}` : ''}`, val: entry.port },
-              ].map(({ key, val }) => (
-                <div key={key} style={{ padding: '10px 12px', background: 'var(--color-background-secondary)', borderRadius: '8px' }}>
-                  <div style={{ fontSize: '10px', textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)', marginBottom: '4px', fontFamily: 'var(--font-mono)' }}>{key}</div>
-                  <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--color-text-primary)', wordBreak: 'break-all' }}>{val}</div>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-      </CollapsibleSection>}
     </div>
   );
 }
