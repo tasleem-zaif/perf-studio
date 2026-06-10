@@ -182,8 +182,8 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
   const [enablingVirt, setEnablingVirt] = useState(false);
   const [virtMsg, setVirtMsg] = useState('');
   const [dockerLogs, setDockerLogs] = useState([]);
-  const [jmeterDockerImage, setJmeterDockerImage] = useState('justb4/jmeter:latest');
-  const [k6DockerImage, setK6DockerImage] = useState('grafana/k6:latest');
+  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/perfstudio:latest');
+  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/perfstudio:latest');
   const [pullingImage, setPullingImage] = useState(null); // 'jmeter' | 'k6' | null
 
   useEffect(() => {
@@ -630,7 +630,7 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         badge={dockerStatus === 'ok' ? 'Running' : dockerStatus === 'installed' ? 'Installed' : dockerStatus === 'missing' ? 'Missing' : undefined}
       >
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Docker is required to run containerized test environments. Check its status or install it automatically for your platform.
+          Checks whether Docker is installed and running on your local machine. Required for pulling the CI pipeline image locally.
         </div>
 
         {/* Status display */}
@@ -644,7 +644,7 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
               style={{ fontSize: '18px', color: dockerStatus === 'ok' ? '#22c55e' : dockerStatus === 'installed' ? 'var(--warn)' : 'var(--danger)' }} />
             <div style={{ flex: 1 }}>
               <div style={{ fontWeight: 600, fontSize: '13px', color: dockerStatus === 'ok' ? '#22c55e' : dockerStatus === 'installed' ? 'var(--warn)' : 'var(--danger)' }}>
-                {dockerStatus === 'ok' ? 'Docker is running' : dockerStatus === 'installed' ? 'Docker is installed but not running' : 'Docker is not installed'}
+                {dockerStatus === 'ok' ? '✔ Docker is installed and running locally' : dockerStatus === 'installed' ? 'Docker is installed but daemon is not running' : 'Docker is not installed on this machine'}
               </div>
               {dockerVersion && <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>{dockerVersion}</div>}
             </div>
@@ -697,74 +697,39 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
           </div>
         )}
 
-        {/* Docker Test Tool Images */}
+        {/* CI Docker Image */}
         <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--color-border-secondary)' }}>
           <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <i className="ti ti-test-pipe" style={{ color: '#22c55e', fontSize: '14px' }} />
-            Test Tool Images
+            <i className="ti ti-brand-docker" style={{ color: '#0ea5e9', fontSize: '14px' }} />
+            CI Pipeline Docker Image
           </div>
           <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-            Docker images used to run JMeter and K6 tests. Pull them once to cache locally; they'll be used for all test executions.
+            Custom Docker image used in GitHub Actions / GitLab CI pipelines. Contains JMeter, K6, Java and Node.js.
           </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
-            {/* JMeter image */}
-            <div>
-              <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                <i className="ti ti-test-pipe" style={{ fontSize: '12px' }} /> Apache JMeter
-              </div>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <input
-                  type="text"
-                  value={jmeterDockerImage}
-                  onChange={e => setJmeterDockerImage(e.target.value)}
-                  placeholder="justb4/jmeter:latest"
-                  style={{ flex: 1, minWidth: 0 }}
-                />
-                <button
-                  className="btn-primary btn-sm"
-                  onClick={() => pullImage('jmeter')}
-                  disabled={!!pullingImage || !jmeterDockerImage.trim()}
-                  style={{ whiteSpace: 'nowrap' }}
-                  title="docker pull"
-                >
-                  {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
-                </button>
-              </div>
-            </div>
-
-            {/* K6 image */}
-            <div>
-              <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                <i className="ti ti-brand-grafana" style={{ fontSize: '12px' }} /> Grafana K6
-              </div>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <input
-                  type="text"
-                  value={k6DockerImage}
-                  onChange={e => setK6DockerImage(e.target.value)}
-                  placeholder="grafana/k6:latest"
-                  style={{ flex: 1, minWidth: 0 }}
-                />
-                <button
-                  className="btn-primary btn-sm"
-                  onClick={() => pullImage('k6')}
-                  disabled={!!pullingImage || !k6DockerImage.trim()}
-                  style={{ whiteSpace: 'nowrap' }}
-                  title="docker pull"
-                >
-                  {pullingImage === 'k6' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
-                </button>
-              </div>
-            </div>
+          <div style={{ display: 'flex', gap: '6px', maxWidth: 520, marginBottom: '12px' }}>
+            <input
+              type="text"
+              value={jmeterDockerImage}
+              onChange={e => setJmeterDockerImage(e.target.value)}
+              placeholder="tasleemzaif/perfstudio:latest"
+              style={{ flex: 1, minWidth: 0 }}
+            />
+            <button
+              className="btn-primary btn-sm"
+              onClick={() => pullImage('jmeter')}
+              disabled={!!pullingImage || !jmeterDockerImage.trim()}
+              style={{ whiteSpace: 'nowrap' }}
+              title="docker pull"
+            >
+              {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
+            </button>
           </div>
-
           <button className="btn-secondary btn-sm" onClick={saveDockerImages}>
-            <i className="ti ti-device-floppy" /> Save Images
+            <i className="ti ti-device-floppy" /> Save Image
           </button>
           <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
             <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-            Pull downloads images from Docker Hub to your local cache. Only needed once per version tag.
+            Pull caches the image locally. This is also the image referenced in generated CI YAML files.
           </div>
         </div>
       </CollapsibleSection>
