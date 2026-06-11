@@ -104,7 +104,6 @@ function isProjectOwner(userId, projectId) {
 // ── PUT /config ───────────────────────────────────────────────────────────────
 router.put('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  if (!isProjectOwner(req.userId, req.params.projectId)) {
   // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
