@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Chart as ChartJS,
   CategoryScale, LinearScale, BarElement, LineElement,
@@ -875,6 +875,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const [activeTab, setActiveTab] = useState('summary');
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState('');
+  const analyticsRef = useRef(null);
 
 
   useEffect(() => {
@@ -911,34 +912,61 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   }, [selectedId]);
 
   async function handleExportPDF() {
-    if (!data || !selectedId) return;
+    if (!data || !selectedId || !analyticsRef.current) return;
     setExporting(true);
-    setExportProgress('Generating PDF on server…');
 
     const suiteName = (data?.meta?.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const savedTab  = activeTab;
+    const tabsToExport = TABS.filter(t => t.id !== 'logs');
 
     try {
-      const token = localStorage.getItem('ps_token');
-      const res = await fetch(`/api/execution/runs/${selectedId}/export-pdf`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.error || 'Server error');
+      const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
+        import('jspdf'),
+        import('html2canvas'),
+      ]);
+
+      const pdf       = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+      const pageW     = pdf.internal.pageSize.getWidth();
+      const pageH     = pdf.internal.pageSize.getHeight();
+
+      for (let i = 0; i < tabsToExport.length; i++) {
+        const tab = tabsToExport[i];
+        setExportProgress(`Capturing ${tab.label} (${i + 1}/${tabsToExport.length})…`);
+
+        // Switch tab and wait for React render + Chart.js animation to finish
+        setActiveTab(tab.id);
+        await new Promise(r => setTimeout(r, 900));
+
+        const canvas = await html2canvas(analyticsRef.current, {
+          scale: 2,
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: '#0d1117',
+          logging: false,
+          windowWidth: analyticsRef.current.scrollWidth,
+          windowHeight: analyticsRef.current.scrollHeight,
+        });
+
+        const imgData  = canvas.toDataURL('image/jpeg', 0.93);
+        const imgH     = (canvas.height * pageW) / canvas.width;
+
+        if (i > 0) pdf.addPage();
+
+        if (imgH <= pageH) {
+          pdf.addImage(imgData, 'JPEG', 0, 0, pageW, imgH);
+        } else {
+          // Scale down to fit page height
+          const scale = pageH / imgH;
+          pdf.addImage(imgData, 'JPEG', 0, 0, pageW * scale, pageH);
+        }
       }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${suiteName}_Run${runNum || selectedId}_Analytics.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+
+      pdf.save(`${suiteName}_Run${runNum || selectedId}_Analytics.pdf`);
     } catch (e) {
       console.error('PDF export failed', e);
       alert(`PDF export failed: ${e.message}`);
     } finally {
+      setActiveTab(savedTab);
       setExporting(false);
       setExportProgress('');
     }
@@ -1000,7 +1028,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
       )}
 
       {data && !loadingData && (
-        <div>
+        <div ref={analyticsRef}>
           {/* Tab bar */}
           <div style={{ display:'flex', gap:2, marginBottom:16, borderBottom:`1px solid ${D.border}`, flexWrap:'wrap' }}>
             {TABS.map(t=>(
