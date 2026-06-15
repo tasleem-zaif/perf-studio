@@ -346,21 +346,23 @@ flowchart TD
 
     O -->|10 Upload CSV test data| P["CSV tagged by collection + env\nColumns parsed & stored"]
 
-    P -->|11 Configure env URLs| R[Per-env URL/port config saved]
+    P -->|11 Configure performance rules| RR["Rules saved per project\nmetric · operator · value · severity\n(Response Time · Error Rate · Throughput)"]
 
-    R -->|12 Create Test Plan| S["Test suite record created\nLinked to collection + env + test data\nvusers · rampup · duration configured"]
+    RR -->|12 Configure env URLs| R[Per-env URL/port config saved]
 
-    S -->|13 Generate JMX/K6 script| T["AI assembles JMX/K6 from:\n- Collection endpoints\n- Merged config (global → project → env → suite)\n- CSV column names\n- Pre-run correlation data\n- Performance rules as thresholds"]
+    R -->|13 Create Test Plan| S["Test suite record created\nLinked to collection + env + test data\nvusers · rampup · duration configured"]
+
+    S -->|14 Generate JMX/K6 script| T["AI assembles JMX/K6 from:\n- Collection endpoints\n- Merged config (global → project → env → suite)\n- CSV column names\n- Pre-run correlation data\n- Performance rules as thresholds"]
 
     T -->|Script written to disk| U["git-workspaces/user-id/Project/Collection/ENV/script/suite_load.jmx"]
 
-    U -->|14 Run test| V["docker run perf-studio-runner\nSSE stream to frontend"]
+    U -->|15 Run test| V["docker run perf-studio-runner\nSSE stream to frontend"]
 
     V -->|Pass| W["Results saved · HTML report generated\nEmail alert with analytics PDF"]
     V -->|Fail| X["Auto Healer:\nRead errors → AI fix → Re-run up to 3 times"]
     X --> W
 
-    W -->|15 Commit & push to Git| Y{Role}
+    W -->|16 Commit & push to Git| Y{Role}
     Y -->|Org Admin| Z[Push direct to main branch]
     Y -->|Regular user| AA[Push to users/name branch\nRaise PR → Org Admin merges]
 ```
