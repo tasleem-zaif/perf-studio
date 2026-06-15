@@ -23,7 +23,15 @@ const db   = require('../db');
 function writeJson(filePath, data) {
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    const newContent = JSON.stringify(data, null, 2);
+    // Skip write if file content is identical — avoids unnecessary git modifications
+    if (fs.existsSync(filePath)) {
+      try {
+        const existing = fs.readFileSync(filePath, 'utf8');
+        if (existing === newContent) return; // nothing changed — don't touch the file
+      } catch (_) {}
+    }
+    fs.writeFileSync(filePath, newContent, 'utf8');
   } catch (e) {
     console.error('[ConfigWriter] Failed to write', filePath, ':', e.message);
   }
@@ -31,16 +39,29 @@ function writeJson(filePath, data) {
 
 // ── Core: write comprehensive config.json for one collection + env ────────────
 
-function writeCollectionEnvConfig(collectionId, env) {
+function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
   try {
     const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
-    if (!col?.folder_path) return;
+    if (!col) return;
 
     const envName = env || col.environment || 'Default';
-    const envPath = path.join(col.folder_path, envName);
+    const { cleanName } = require('./projectFolders');
 
-    // Project
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
+    let envPath;
+
+    // Use explicitly passed folder path (user's workspace). Do NOT fall back to
+    // project.folder_path — that may point to the wrong (e.g. admin) workspace.
+    const basePath = projectFolderPath;
+    if (!basePath) return; // no user workspace path supplied — skip write
+
+    // Admin workspace holds only empty folders — never write config.json there
+    const { isAdminWorkspace } = require('./projectFolders');
+    if (isAdminWorkspace(basePath)) return;
+    // New clean-name format: CollectionName/Env/
+    envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
+
+    // Project already fetched above for path derivation
 
     // endpoint count only — full endpoints not stored in config.json
     let endpointCount = 0;
@@ -48,10 +69,19 @@ function writeCollectionEnvConfig(collectionId, env) {
 
     // Rules for this project
     const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(col.project_id)
-      .map(r => ({
-        id: r.id, metric: r.metric, operator: r.operator,
-        value: r.value, unit: r.unit, severity: r.severity,
-      }));
+      .map(r => {
+        const rule = {
+          id: r.id, metric: r.metric, operator: r.operator,
+          unit: r.unit, severity: r.severity,
+        };
+        if (r.operator === 'between') {
+          rule.value_min = r.value_min;
+          rule.value_max = r.value_max;
+        } else {
+          rule.value = r.value;
+        }
+        return rule;
+      });
 
     // Test plans linked to this collection
     const testPlans = db.prepare('SELECT * FROM test_suites WHERE collection_id = ?').all(collectionId)
@@ -76,7 +106,6 @@ function writeCollectionEnvConfig(collectionId, env) {
     const mergedCfg = stripDeprecated({ ...globalCfg, ...projectCfg });
 
     const snapshot = {
-      _generated_at: new Date().toISOString(),
       project: project ? {
         id:          project.id,
         name:        project.name,
@@ -106,7 +135,7 @@ function writeCollectionEnvConfig(collectionId, env) {
 
 // ── Update all env folders for a collection ───────────────────────────────────
 
-function updateCollectionConfigs(collectionId) {
+function updateCollectionConfigs(collectionId, projectFolderPath) {
   try {
     const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
@@ -114,7 +143,7 @@ function updateCollectionConfigs(collectionId) {
     try { envs = JSON.parse(col.environments || '[]'); } catch {}
     if (!envs.length) envs = col.environment ? [col.environment] : ['Default'];
     for (const env of envs) {
-      writeCollectionEnvConfig(collectionId, env);
+      writeCollectionEnvConfig(collectionId, env, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateCollectionConfigs error:', e.message);
@@ -123,11 +152,14 @@ function updateCollectionConfigs(collectionId) {
 
 // ── Update all collections for a project ─────────────────────────────────────
 
-function updateProjectCollectionConfigs(projectId) {
+function updateProjectCollectionConfigs(projectId, projectFolderPath) {
+  // When no explicit user workspace path is provided, skip writing to avoid
+  // accidentally writing to the wrong (e.g. admin) workspace.
+  if (!projectFolderPath) return;
   try {
     const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
     for (const col of collections) {
-      updateCollectionConfigs(col.id);
+      updateCollectionConfigs(col.id, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateProjectCollectionConfigs error:', e.message);
@@ -139,8 +171,8 @@ function writeProjectConfig() { /* no-op */ }
 function writeGlobalConfig()   { /* no-op */ }
 
 // ── Legacy stubs (no-ops kept for backward compat) ───────────────────────────
-function writeCollectionConfig(collection) {
-  if (collection?.id) updateCollectionConfigs(collection.id);
+function writeCollectionConfig(collection, projectFolderPath) {
+  if (collection?.id) updateCollectionConfigs(collection.id, projectFolderPath);
 }
 function writeRulesConfig()         { /* no-op: use updateProjectCollectionConfigs */ }
 function writeProjectLevelConfig(projectId) {

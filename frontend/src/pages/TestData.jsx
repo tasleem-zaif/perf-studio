@@ -68,6 +68,8 @@ function lengthWarning(col) {
 }
 
 function generateCellValue(col) {
+  // Custom type: same fixed value for every row
+  if (col.dataType === 'Custom') return col.customValue || '';
   const total  = parseInt(col.length) || 0;
   const prefix = col.prefix  || '';
   const postfix = col.postfix || '';
@@ -76,7 +78,7 @@ function generateCellValue(col) {
   return `${prefix}${raw}${postfix}`;
 }
 
-const DATA_TYPES = ['Text','Number','Decimal','Email','Username','Password','UUID','Name','Date','Phone','Boolean','URL'];
+const DATA_TYPES = ['Text','Number','Decimal','Email','Username','Password','UUID','Name','Date','Phone','Boolean','URL','Custom'];
 const EXTENSIONS = ['.csv', '.txt', '.xlsx', '.xls'];
 
 function makeDefaultColumns(n) {
@@ -89,6 +91,8 @@ const DEFAULT_GEN = { filename: 'test_data', extension: '.csv', numRows: 10, col
 
 export default function TestData({ project, collection, env, envs, onEnvChange, onNav, onProjectUpdated, uploadTrigger, generateTrigger }) {
   const [files, setFiles] = useState([]);
+  const [viewFile, setViewFile] = useState(null);   // { fileObj, headers, rows, totalRows }
+  const [loadingView, setLoadingView] = useState(false);
   const [editing, setEditing] = useState(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -97,6 +101,8 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const [genForm, setGenForm] = useState(DEFAULT_GEN);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState('');
+  const [genCollectionId, setGenCollectionId] = useState('');
+  const [genEnv, setGenEnv] = useState('');
   const fileInputRef = useRef(null);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -104,23 +110,64 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   const [addColConfig, setAddColConfig] = useState({ name: '', dataType: 'Text', length: '', prefix: '', postfix: '', defaultValue: '' });
   const firstUploadRender = useRef(true);
   const firstGenRender = useRef(true);
+  const [showUploadEnvModal, setShowUploadEnvModal] = useState(false);
+  const [uploadEnv, setUploadEnv] = useState('');
+  const [uploadCollectionId, setUploadCollectionId] = useState('');
+  const [ownCollections, setOwnCollections] = useState(project?.collections || []);
 
-  useEffect(() => { if (project) loadFiles(); }, [project?.id, collection?.id, env]);
+  // Filter bar state (replaces EnvBar)
+  const [filterCollectionId, setFilterCollectionId] = useState('');
+  const [filterEnv,          setFilterEnv]          = useState('');
 
+  // Derived envs for the filter env dropdown
+  const filterCollection = ownCollections.find(c => String(c.id) === String(filterCollectionId));
+  const filterEnvOptions = (() => {
+    if (!filterCollection) return [];
+    let e = [];
+    try { e = JSON.parse(filterCollection.environments || '[]'); } catch {}
+    if (!e.length && filterCollection.environment) e = [filterCollection.environment];
+    return e;
+  })();
+
+  // Load collections once, then reload files when filter changes
+  useEffect(() => {
+    if (project) {
+      api.get(`/projects/${project.id}/collections`)
+        .then(r => setOwnCollections(r.data.collections || []))
+        .catch(() => {});
+    }
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (project) loadFiles();
+  }, [project?.id, filterCollectionId, filterEnv]);
 
   useEffect(() => {
     if (firstUploadRender.current) { firstUploadRender.current = false; return; }
-    if (uploadTrigger > 0) fileInputRef.current?.click();
+    if (uploadTrigger > 0) {
+      // Pre-populate from the filter bar selection
+      setUploadCollectionId(filterCollectionId || (collection?.id ? String(collection.id) : ''));
+      setUploadEnv(filterEnv || env || '');
+      setShowUploadEnvModal(true);
+    }
   }, [uploadTrigger]);
 
   useEffect(() => {
     if (firstGenRender.current) { firstGenRender.current = false; return; }
-    if (generateTrigger > 0) { setGenForm(DEFAULT_GEN); setGenError(''); setShowGenModal(true); }
+    if (generateTrigger > 0) {
+      setGenForm(DEFAULT_GEN); setGenError('');
+      setGenCollectionId(filterCollectionId || '');
+      setGenEnv(filterEnv || '');
+      setShowGenModal(true);
+    }
   }, [generateTrigger]);
 
   async function loadFiles() {
-    const params = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
-    const { data } = await api.get(`/projects/${project.id}/test-data${params}`);
+    const params = new URLSearchParams();
+    if (filterCollectionId) params.set('collection_id', filterCollectionId);
+    if (filterEnv)          params.set('env', filterEnv);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const { data } = await api.get(`/projects/${project.id}/test-data${qs}`);
     setFiles(data.files || []);
   }
 
@@ -133,8 +180,13 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
     try {
       const fd = new FormData();
       fd.append('csv', file);
-      const params = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
-      await api.post(`/projects/${project.id}/test-data${params}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      // Include env + collection if selected in the env picker modal
+      const params = new URLSearchParams();
+      if (uploadEnv)          params.set('env', uploadEnv);
+      if (uploadCollectionId) params.set('collection_id', uploadCollectionId);
+      const qs = params.toString() ? `?${params.toString()}` : '';
+      await api.post(`/projects/${project.id}/test-data${qs}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      setUploadEnv(''); setUploadCollectionId('');
       await loadFiles();
     } catch (err) {
       toast(err.response?.data?.error || 'Upload failed', 'error');
@@ -191,13 +243,27 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
       const fd = new FormData();
       fd.append('csv', file);
       fd.append('columns', JSON.stringify(headers));
-      const colParams = collection?.id ? `?collection_id=${collection.id}${env ? `&env=${encodeURIComponent(env)}` : ''}` : '';
+      const params = new URLSearchParams();
+      if (genCollectionId) params.set('collection_id', genCollectionId);
+      if (genEnv)          params.set('env', genEnv);
+      const colParams = params.toString() ? `?${params.toString()}` : '';
       await api.post(`/projects/${project.id}/test-data${colParams}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
       await loadFiles();
       setShowGenModal(false);
     } catch (e) {
       setGenError(e.response?.data?.error || e.message || 'Generation failed');
     } finally { setGenerating(false); }
+  }
+
+  // ─── Viewer ───────────────────────────────────────────────────────────
+
+  async function openViewer(f) {
+    setLoadingView(true);
+    try {
+      const { data } = await api.get(`/projects/${project.id}/test-data/${f.id}/content?limit=1000`);
+      setViewFile({ fileObj: f, headers: data.headers, rows: data.rows, totalRows: data.totalRows });
+    } catch (e) { toast(e.response?.data?.error || 'Failed to load file', 'error'); }
+    finally { setLoadingView(false); }
   }
 
   // ─── Editor ───────────────────────────────────────────────────────────
@@ -285,17 +351,42 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
   return (
     <div className="page fade-in">
       <input ref={fileInputRef} type="file" accept=".csv,.txt,.xlsx,.xls" style={{ display: 'none' }} onChange={handleUpload} />
+      {/* Filter bar: API Source → Environment */}
+      <div style={{ display:'flex', alignItems:'center', gap:16, padding:'12px 16px', background:'var(--color-background-secondary)', border:'1px solid var(--color-border-secondary)', borderRadius:10, marginBottom:16 }}>
+        <i className="ti ti-filter" style={{ color:'var(--accent)', fontSize:15, flexShrink:0 }} />
 
-      <div className="breadcrumb">
-        <a onClick={() => onNav('dashboard')}><i className="ti ti-layout-dashboard" style={{ fontSize: '12px', marginRight: '4px' }} />Dashboard</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <a onClick={() => onNav('project-home')}><i className="ti ti-folder" style={{ fontSize: '12px', marginRight: '4px' }} />{project.name}</a>
-        <i className="ti ti-chevron-right" style={{ fontSize: '12px' }} />
-        <span><i className="ti ti-table" style={{ fontSize: '12px', marginRight: '4px' }} />Test Data</span>
+        {/* API Source dropdown */}
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>API Source</label>
+          <select value={filterCollectionId} onChange={e => { setFilterCollectionId(e.target.value); setFilterEnv(''); }}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', maxWidth:320 }}>
+            <option value="">— All API Sources —</option>
+            {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+
+        {/* Environment dropdown */}
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:11, fontWeight:600, color:'var(--color-text-tertiary)', textTransform:'uppercase', letterSpacing:0.6 }}>Environment</label>
+          <select value={filterEnv} onChange={e => setFilterEnv(e.target.value)}
+            disabled={!filterCollectionId}
+            style={{ padding:'6px 10px', borderRadius:7, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', width:'auto', minWidth:140, opacity: filterCollectionId ? 1 : 0.5, cursor: filterCollectionId ? 'pointer' : 'not-allowed' }}>
+            <option value="">— All Environments —</option>
+            {filterEnvOptions.map(e => <option key={e} value={e}>{e}</option>)}
+          </select>
+        </div>
+
+        {(filterCollectionId || filterEnv) && (
+          <button onClick={() => { setFilterCollectionId(''); setFilterEnv(''); }}
+            style={{ background:'none', border:'none', cursor:'pointer', color:'#64748b', fontSize:12, display:'flex', alignItems:'center', gap:4, fontFamily:'inherit', marginTop:18 }}>
+            <i className="ti ti-x" style={{ fontSize:12 }} /> Clear
+          </button>
+        )}
+        <span style={{ marginLeft:'auto', fontSize:12, color:'var(--color-text-tertiary)', marginTop:18 }}>
+          {files.length} file{files.length !== 1 ? 's' : ''}
+        </span>
       </div>
 
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange}
-        hint="Select environment to view or upload test data files" />
 
       {uploading && (
         <div style={{ padding: '10px 14px', background: '#e8f0ff', borderRadius: '8px', marginBottom: '16px', fontSize: '13px' }}>
@@ -318,13 +409,48 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
                       <i className="ti ti-table" style={{ color: '#00c896' }} />
                     </div>
                     <div>
-                      <div style={{ fontWeight: 600, fontSize: '14px' }}>{f.original_name}</div>
-                      <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>Columns: {parseColumns(f.columns)}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ fontWeight: 600, fontSize: '14px' }}>{f.original_name}</span>
+                        {f.collection_id && (() => {
+                          const col = ownCollections.find(c => String(c.id) === String(f.collection_id));
+                          return col ? <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 12, background: '#dcfce7', color: '#16a34a' }}>{col.name}</span> : null;
+                        })()}
+                        {f.env && <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 12, background: '#e0e7ff', color: '#4338ca' }}>{f.env}</span>}
+                      </div>
+                      {f.stale ? (
+                        <div style={{ fontSize: 12, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
+                          <i className="ti ti-alert-triangle" style={{ fontSize: 12 }}/>
+                          File missing on disk — please delete and re-upload
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>Columns: {parseColumns(f.columns)}</div>
+                      )}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: '6px' }}>
-                    <button className="btn-secondary btn-sm" onClick={() => openEditor(f)}><i className="ti ti-edit" /> Edit</button>
-                    <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)' }} onClick={() => del(f.id)}><i className="ti ti-trash" /> Delete</button>
+                    {!f.stale && (
+                      <>
+                        <button className="btn-secondary btn-sm" onClick={() => openViewer(f)} disabled={loadingView}>
+                          <i className="ti ti-eye" /> View
+                        </button>
+                        <button className="btn-secondary btn-sm" onClick={() => openEditor(f)}>
+                          <i className="ti ti-edit" /> Edit
+                        </button>
+                        <button className="btn-secondary btn-sm" title="Open in external application (Excel, Notepad++, etc.)"
+                          onClick={async () => {
+                            try {
+                              await api.post(`/projects/${project.id}/test-data/${f.id}/open-external`);
+                            } catch (e) {
+                              toast(e.response?.data?.error || 'Could not open file', 'error');
+                            }
+                          }}>
+                          <i className="ti ti-external-link" /> Open Externally
+                        </button>
+                      </>
+                    )}
+                    <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)', borderColor: 'rgba(247,84,100,0.3)' }} onClick={() => del(f.id)}>
+                      <i className="ti ti-trash" /> Delete
+                    </button>
                   </div>
                 </div>
               ))}
@@ -366,14 +492,31 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead>
                 <tr style={{ background: 'var(--color-background-secondary)' }}>
-                  <th style={{ width: '40px', padding: '8px 10px', borderBottom: '1px solid var(--color-border-secondary)', color: 'var(--color-text-tertiary)', fontSize: '11px' }}>#</th>
+                  <th style={{ width: '40px', padding: '8px 10px', borderBottom: '1px solid var(--color-border-secondary)', borderRight: '1px solid var(--color-border-secondary)', color: 'var(--color-text-tertiary)', fontSize: '11px' }}>#</th>
                   {editing.headers.map((h, ci) => (
-                    <th key={ci} style={{ padding: '6px 8px', borderBottom: '1px solid var(--color-border-secondary)', textAlign: 'left' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <input style={{ flex: 1, border: 'none', background: 'transparent', fontWeight: 600, fontSize: '12px', textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--color-text-secondary)', outline: 'none' }} value={h} onChange={e => updateHeader(ci, e.target.value)} />
-                        <button onClick={() => moveColumn(ci, -1)} disabled={ci === 0} title="Move left" style={{ background: 'none', border: 'none', cursor: ci === 0 ? 'default' : 'pointer', color: ci === 0 ? 'var(--color-text-disabled, #555)' : 'var(--color-text-tertiary)', padding: '0 1px', fontSize: '12px', opacity: ci === 0 ? 0.3 : 1 }}><i className="ti ti-chevron-left" /></button>
-                        <button onClick={() => moveColumn(ci, 1)} disabled={ci === editing.headers.length - 1} title="Move right" style={{ background: 'none', border: 'none', cursor: ci === editing.headers.length - 1 ? 'default' : 'pointer', color: ci === editing.headers.length - 1 ? 'var(--color-text-disabled, #555)' : 'var(--color-text-tertiary)', padding: '0 1px', fontSize: '12px', opacity: ci === editing.headers.length - 1 ? 0.3 : 1 }}><i className="ti ti-chevron-right" /></button>
-                        <button onClick={() => removeColumn(ci)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-tertiary)', padding: '0 2px', fontSize: '12px' }}>×</button>
+                    <th key={ci} style={{ padding: '5px 8px', borderBottom: '1px solid var(--color-border-secondary)', borderRight: '1px solid var(--color-border-secondary)', textAlign: 'left', minWidth: 130, maxWidth: 220, position: 'relative' }}
+                      className="td-col-header">
+                      {/* Column name — always fully visible */}
+                      <input
+                        style={{ display: 'block', width: '100%', border: 'none', background: 'transparent', fontWeight: 700, fontSize: '12px', textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text)', outline: 'none', padding: '2px 0', marginBottom: 2 }}
+                        value={h}
+                        onChange={e => updateHeader(ci, e.target.value)}
+                        title={h}
+                      />
+                      {/* Action buttons — always visible but small */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                        <button onClick={() => moveColumn(ci, -1)} disabled={ci === 0} title="Move left"
+                          style={{ background: 'none', border: 'none', cursor: ci === 0 ? 'default' : 'pointer', color: 'var(--color-text-tertiary)', padding: '0 2px', fontSize: '11px', opacity: ci === 0 ? 0.25 : 0.6, lineHeight: 1 }}>
+                          <i className="ti ti-chevron-left" />
+                        </button>
+                        <button onClick={() => moveColumn(ci, 1)} disabled={ci === editing.headers.length - 1} title="Move right"
+                          style={{ background: 'none', border: 'none', cursor: ci === editing.headers.length - 1 ? 'default' : 'pointer', color: 'var(--color-text-tertiary)', padding: '0 2px', fontSize: '11px', opacity: ci === editing.headers.length - 1 ? 0.25 : 0.6, lineHeight: 1 }}>
+                          <i className="ti ti-chevron-right" />
+                        </button>
+                        <button onClick={() => removeColumn(ci)} title="Remove column"
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger)', padding: '0 2px', fontSize: '11px', opacity: 0.6, lineHeight: 1, marginLeft: 2 }}>
+                          <i className="ti ti-x" />
+                        </button>
                       </div>
                     </th>
                   ))}
@@ -382,11 +525,11 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
               </thead>
               <tbody>
                 {editing.rows.map((row, ri) => (
-                  <tr key={ri} style={{ borderBottom: '1px solid var(--color-border-tertiary)' }}>
-                    <td style={{ padding: '6px 10px', color: 'var(--color-text-tertiary)', fontSize: '11px', textAlign: 'center' }}>{ri + 1}</td>
+                  <tr key={ri} style={{ borderBottom: '1px solid var(--color-border-secondary)' }}>
+                    <td style={{ padding: '6px 10px', color: 'var(--color-text-tertiary)', fontSize: '11px', textAlign: 'center', borderRight: '1px solid var(--color-border-secondary)', background: 'var(--color-background-secondary)' }}>{ri + 1}</td>
                     {editing.headers.map((_, ci) => (
-                      <td key={ci} style={{ padding: '2px 4px' }}>
-                        <input style={{ width: '100%', border: '1px solid transparent', borderRadius: '4px', padding: '4px 8px', fontSize: '13px', background: 'transparent' }} value={row[ci] ?? ''} onChange={e => updateCell(ri, ci, e.target.value)} onFocus={e => e.target.style.border = '1px solid var(--accent)'} onBlur={e => e.target.style.border = '1px solid transparent'} />
+                      <td key={ci} style={{ padding: '2px 4px', minWidth: 130, maxWidth: 220, borderRight: '1px solid var(--color-border-secondary)' }}>
+                        <input style={{ width: '100%', border: '1px solid var(--color-border-secondary)', borderRadius: '4px', padding: '4px 8px', fontSize: '13px', background: '#fff' }} value={row[ci] ?? ''} onChange={e => updateCell(ri, ci, e.target.value)} onFocus={e => e.target.style.borderColor = 'var(--accent)'} onBlur={e => e.target.style.borderColor = 'var(--color-border-secondary)'} />
                       </td>
                     ))}
                     <td style={{ padding: '4px 8px', textAlign: 'center' }}>
@@ -472,6 +615,51 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
         );
       })()}
 
+      {/* ─── Upload: env + collection picker ─── */}
+      {showUploadEnvModal && (
+        <Modal onClose={() => setShowUploadEnvModal(false)} style={{ width: '420px' }}>
+          <div className="modal-hdr">
+            <div className="modal-title"><i className="ti ti-upload" style={{ marginRight: 8, color: 'var(--accent)' }} />Upload Test Data</div>
+            <button className="btn-icon" onClick={() => setShowUploadEnvModal(false)}><i className="ti ti-x" /></button>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Collection</label>
+            <select value={uploadCollectionId} onChange={e => { setUploadCollectionId(e.target.value); setUploadEnv(''); }}
+              style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
+              <option value="">— No collection —</option>
+              {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Environment <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>— determines which folder the file goes to</span></label>
+            {(() => {
+              const col = ownCollections.find(c => String(c.id) === String(uploadCollectionId));
+              let envOpts = [];
+              try { envOpts = JSON.parse(col?.environments || '[]'); } catch {}
+              if (!envOpts.length && col?.environment) envOpts = [col.environment];
+              return (
+                <>
+                  <select value={uploadEnv} onChange={e => setUploadEnv(e.target.value)}
+                    style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit' }}>
+                    <option value="">— All environments —</option>
+                    {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
+                  </select>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+                    "All environments" copies the file to every environment folder
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+          <div className="modal-footer">
+            <button className="btn-secondary" onClick={() => setShowUploadEnvModal(false)}>Cancel</button>
+            <button className="btn-primary" onClick={() => { setShowUploadEnvModal(false); fileInputRef.current?.click(); }}>
+              <i className="ti ti-upload" /> Choose File
+            </button>
+          </div>
+        </Modal>
+      )}
+
       {/* ─── Generate Data modal ─── */}
       {showGenModal && (
         <Modal onClose={() => setShowGenModal(false)} closeOnOutsideClick={false} style={{ width: '720px', minWidth: '520px', maxWidth: '95vw', minHeight: '420px', resize: 'both', overflow: 'auto' }}>
@@ -481,6 +669,34 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
           </div>
 
           {genError && <div className="auth-error">{genError}</div>}
+
+          {/* Collection + Environment selectors */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: 4 }}>
+            <div className="form-group">
+              <label className="form-label">API Source <span style={{ fontWeight:400, color:'var(--color-text-tertiary)' }}>(optional)</span></label>
+              <select value={genCollectionId} onChange={e => { setGenCollectionId(e.target.value); setGenEnv(''); }}
+                style={{ width:'100%', padding:'7px 10px', borderRadius:6, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit' }}>
+                <option value="">— All API Sources —</option>
+                {ownCollections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Environment <span style={{ fontWeight:400, color:'var(--color-text-tertiary)' }}>(optional)</span></label>
+              {(() => {
+                const col = ownCollections.find(c => String(c.id) === String(genCollectionId));
+                let envOpts = [];
+                try { envOpts = JSON.parse(col?.environments || '[]'); } catch {}
+                if (!envOpts.length && col?.environment) envOpts = [col.environment];
+                return (
+                  <select value={genEnv} onChange={e => setGenEnv(e.target.value)} disabled={!genCollectionId}
+                    style={{ width:'100%', padding:'7px 10px', borderRadius:6, border:'1px solid var(--color-border-secondary)', background:'var(--input-bg)', color:'var(--color-text-primary)', fontSize:13, fontFamily:'inherit', opacity: genCollectionId ? 1 : 0.5 }}>
+                    <option value="">— All Environments —</option>
+                    {envOpts.map(e => <option key={e} value={e}>{e}</option>)}
+                  </select>
+                );
+              })()}
+            </div>
+          </div>
 
           {/* Row 1: filename + extension + rows */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 110px', gap: '12px' }}>
@@ -522,15 +738,15 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
               </div>
             ) : (
               <>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 90px 90px 32px', gap: '6px', padding: '6px 8px', background: 'var(--color-background-secondary)', borderRadius: '6px 6px 0 0', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)' }}>
-                  <div>Column Name</div><div>Data Type</div><div>Length</div><div>Prefix</div><div>Postfix</div><div />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 1fr 32px', gap: '6px', padding: '6px 8px', background: 'var(--color-background-secondary)', borderRadius: '6px 6px 0 0', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)' }}>
+                  <div>Column Name</div><div>Data Type</div><div>Length</div><div>Prefix / Postfix / Custom Value</div><div />
                 </div>
                 <div style={{ border: '1px solid var(--color-border-tertiary)', borderTop: 'none', borderRadius: '0 0 6px 6px', maxHeight: '280px', overflowY: 'auto' }}>
                   {genForm.columns.map((col, i) => {
                     const warn = lengthWarning(col);
                     return (
                       <div key={i} style={{ borderBottom: i < genForm.columns.length - 1 ? '1px solid var(--color-border-tertiary)' : 'none' }}>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 90px 90px 32px', gap: '6px', padding: '6px 8px', alignItems: 'center' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 80px 1fr 32px', gap: '6px', padding: '6px 8px', alignItems: 'center' }}>
                           <input
                             type="text"
                             value={col.name}
@@ -544,26 +760,39 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
                           </CustomSelect>
                           <input
                             type="number"
-                            value={col.length}
+                            value={col.dataType === 'Custom' ? '' : col.length}
                             onChange={e => updateCol(i, 'length', e.target.value)}
                             placeholder="Any"
                             min="1"
-                            style={{ padding: '5px 6px', fontSize: '12px', borderRadius: '5px', border: `1px solid ${warn ? 'var(--danger)' : 'var(--color-border)'}`, background: warn ? 'rgba(247,84,100,0.06)' : 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                            disabled={col.dataType === 'Custom'}
+                            style={{ padding: '5px 6px', fontSize: '12px', borderRadius: '5px', border: `1px solid ${warn ? 'var(--danger)' : 'var(--color-border)'}`, background: col.dataType === 'Custom' ? 'var(--color-background-secondary)' : warn ? 'rgba(247,84,100,0.06)' : 'var(--color-background)', color: 'var(--color-text-primary)', opacity: col.dataType === 'Custom' ? 0.4 : 1 }}
                           />
-                          <input
-                            type="text"
-                            value={col.prefix}
-                            onChange={e => updateCol(i, 'prefix', e.target.value)}
-                            placeholder="prefix"
-                            style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
-                          />
-                          <input
-                            type="text"
-                            value={col.postfix}
-                            onChange={e => updateCol(i, 'postfix', e.target.value)}
-                            placeholder="postfix"
-                            style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
-                          />
+                          {col.dataType === 'Custom' ? (
+                            <input
+                              type="text"
+                              value={col.customValue || ''}
+                              onChange={e => updateCol(i, 'customValue', e.target.value)}
+                              placeholder="Enter fixed value (same for all rows)"
+                              style={{ padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '2px solid var(--accent)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                            />
+                          ) : (
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              <input
+                                type="text"
+                                value={col.prefix}
+                                onChange={e => updateCol(i, 'prefix', e.target.value)}
+                                placeholder="prefix"
+                                style={{ flex:1, padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                              />
+                              <input
+                                type="text"
+                                value={col.postfix}
+                                onChange={e => updateCol(i, 'postfix', e.target.value)}
+                                placeholder="postfix"
+                                style={{ flex:1, padding: '5px 8px', fontSize: '12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text-primary)' }}
+                              />
+                            </div>
+                          )}
                           <button
                             onClick={() => setGenForm(f => ({ ...f, columns: f.columns.filter((_, idx) => idx !== i) }))}
                             style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2px' }}
@@ -597,6 +826,75 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
             <button className="btn-primary" onClick={handleGenerate} disabled={generating}>
               {generating ? <><span className="spinner" />Generating...</> : <><i className="ti ti-wand" />Generate & Save</>}
             </button>
+          </div>
+        </Modal>
+      )}
+
+      {/* ── View Modal ───────────────────────────────────────────────── */}
+      {viewFile && (
+        <Modal onClose={() => setViewFile(null)} style={{ width: '90vw', maxWidth: 1100 }}>
+          <div className="modal-hdr">
+            <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <i className="ti ti-table" style={{ color: 'var(--accent)', fontSize: 16 }}/>
+              {viewFile.fileObj.original_name}
+            </div>
+            <button className="btn-icon" onClick={() => setViewFile(null)}><i className="ti ti-x" /></button>
+          </div>
+
+          {/* File meta */}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14, fontSize: 12, color: 'var(--color-text-secondary)' }}>
+            <span><strong style={{ color: 'var(--color-text)' }}>{viewFile.headers.length}</strong> columns</span>
+            <span>·</span>
+            <span><strong style={{ color: 'var(--color-text)' }}>{viewFile.totalRows}</strong> rows</span>
+            {viewFile.totalRows > 1000 && (
+              <span style={{ color: 'var(--warn)', fontSize: 11 }}>
+                <i className="ti ti-info-circle" style={{ marginRight: 3 }}/>
+                Showing first 1,000 rows
+              </span>
+            )}
+            {viewFile.fileObj.env && (
+              <span style={{ marginLeft: 'auto', padding: '2px 8px', borderRadius: 12, background: '#e0e7ff', color: '#4338ca', fontWeight: 600, fontSize: 11 }}>
+                {viewFile.fileObj.env}
+              </span>
+            )}
+          </div>
+
+          {/* Table */}
+          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '60vh', borderRadius: 8, border: '1px solid #e2e8f0' }}>
+            <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: 0, fontSize: 13, minWidth: viewFile.headers.length * 130 }}>
+              {/* Header */}
+              <thead>
+                <tr style={{ background: '#f8fafc', position: 'sticky', top: 0, zIndex: 1 }}>
+                  <th style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 600, color: '#64748b', fontSize: 11, borderBottom: '2px solid #e2e8f0', borderRight: '1px solid #e2e8f0', width: 44, userSelect: 'none' }}>#</th>
+                  {viewFile.headers.map((h, i) => (
+                    <th key={i} style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 700, color: '#0f172a', fontSize: 12, borderBottom: '2px solid #e2e8f0', borderRight: '1px solid #e2e8f0', whiteSpace: 'nowrap', minWidth: 130 }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              {/* Rows */}
+              <tbody>
+                {viewFile.rows.map((row, ri) => (
+                  <tr key={ri} style={{ background: ri % 2 === 0 ? '#fff' : '#f8fafc' }}
+                    onMouseEnter={e => e.currentTarget.style.background = '#f0fdf4'}
+                    onMouseLeave={e => e.currentTarget.style.background = ri % 2 === 0 ? '#fff' : '#f8fafc'}>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: '#94a3b8', fontSize: 11, borderBottom: '1px solid #e2e8f0', borderRight: '1px solid #e2e8f0', background: '#f8fafc', userSelect: 'none' }}>
+                      {ri + 1}
+                    </td>
+                    {row.map((cell, ci) => (
+                      <td key={ci} style={{ padding: '6px 12px', borderBottom: '1px solid #e2e8f0', borderRight: '1px solid #e2e8f0', color: '#1e293b', minWidth: 130, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={String(cell)}>
+                        {cell}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="modal-footer" style={{ marginTop: 12 }}>
+            <button className="btn-primary" onClick={() => setViewFile(null)}>Close</button>
           </div>
         </Modal>
       )}

@@ -86,9 +86,14 @@ function getK6Bin(customPath) {
 const resetSequence = require('../utils/resetSequence');
 
 function cleanStaleRuns(projectId) {
-  const runs = db.prepare('SELECT id, result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
+  // Remove any non-running run whose result_dir no longer exists on disk.
+  // Skip 'running' status to avoid cleaning up in-progress or CI-synced runs.
+  const runs = db.prepare(
+    "SELECT id, result_dir, status FROM execution_runs WHERE project_id = ?"
+  ).all(projectId);
   let deleted = false;
   for (const run of runs) {
+    if (run.status === 'running') continue;
     if (run.result_dir && !fs.existsSync(run.result_dir)) {
       db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
       deleted = true;
@@ -121,22 +126,50 @@ function countActiveRuns(userId) {
   `).get(userId)?.n || 0;
 }
 
+// Check whether we're running in native mode (JMeter/K6 in PATH) or Docker mode
+function isNativeMode() {
+  return process.env.EXECUTION_MODE === 'native' || !!getJMeterBin(null) || !!getK6Bin(null);
+}
+
 router.get('/check-deps', auth, (req, res) => {
-  // All execution runs inside Docker — the only dependency is the Docker daemon.
-  let dockerStatus = 'missing';
-  let dockerVersion = null;
-  try {
-    execSync('docker info 2>&1', { timeout: 8000 });
-    const ver = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
-    dockerVersion = ver;
-    dockerStatus = 'ok';
-  } catch (_) {
+  const native = isNativeMode();
+  const deps = [];
+
+  if (native) {
+    // ── Native mode: check JMeter + K6 binaries directly ──────────────────
+    const jmeterBin = getJMeterBin(null);
+    let jmeterVersion = null;
+    if (jmeterBin) {
+      try { jmeterVersion = execSync(`"${jmeterBin}" --version 2>&1`, { timeout: 8000 }).toString().split('\n')[0].trim(); } catch {}
+    }
+    deps.push({ name: 'jmeter', status: jmeterBin ? 'ok' : 'missing', version: jmeterVersion || (jmeterBin ? 'installed' : null), path: jmeterBin });
+
+    const k6Bin = getK6Bin(null);
+    let k6Version = null;
+    if (k6Bin) {
+      try { k6Version = execSync(`"${k6Bin}" version 2>&1`, { timeout: 5000 }).toString().trim(); } catch {}
+    }
+    deps.push({ name: 'k6', status: k6Bin ? 'ok' : 'missing', version: k6Version || (k6Bin ? 'installed' : null), path: k6Bin });
+
+    let javaVersion = null;
+    try { javaVersion = execSync('java -version 2>&1', { timeout: 5000 }).toString().split('\n')[0].trim(); } catch {}
+    deps.push({ name: 'java', status: javaVersion ? 'ok' : 'missing', version: javaVersion });
+
+  } else {
+    // ── Docker mode: check Docker daemon ──────────────────────────────────
+    let dockerStatus = 'missing';
+    let dockerVersion = null;
     try {
-      const ver = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
-      dockerVersion = ver + ' (daemon not running — start Docker Desktop)';
-    } catch (_) {}
+      execSync('docker info 2>&1', { timeout: 8000 });
+      dockerVersion = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim();
+      dockerStatus = 'ok';
+    } catch (_) {
+      try { dockerVersion = execSync('docker --version 2>&1', { timeout: 3000 }).toString().trim() + ' (daemon not running)'; } catch {}
+    }
+    deps.push({ name: 'docker', status: dockerStatus, version: dockerVersion });
   }
-  res.json({ deps: [{ name: 'docker', status: dockerStatus, version: dockerVersion }] });
+
+  res.json({ deps, mode: native ? 'native' : 'docker' });
 });
 
 // Standalone Docker check — used by the Configuration page
@@ -227,21 +260,52 @@ router.get('/system-check', auth, async (req, res) => {
   const checks = [];
   const { PROJECTS_ROOT, BACKUPS_ROOT } = require('../utils/projectFolders');
 
-  // 1. Docker daemon
-  let dockerOk = false;
-  try {
-    execSync('docker info', { timeout: 8000, stdio: 'pipe' });
-    const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
-    checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'ok', detail: ver });
-    dockerOk = true;
-  } catch (_) {
+  const nativeMode = isNativeMode();
+
+  if (nativeMode) {
+    // ── Native mode: check Java, JMeter, K6 directly ─────────────────────
+    let javaVer = null;
+    try { javaVer = execSync('java -version 2>&1', { timeout: 5000, stdio: 'pipe' }).toString().split('\n')[0].trim(); } catch {}
+    checks.push({ id: 'java', name: 'Java (JDK)', status: javaVer ? 'ok' : 'fail', detail: javaVer || 'Not found — Java 17+ required for JMeter' });
+
+    const jmeterBin = getJMeterBin(null);
+    let jmeterVer = null;
+    if (jmeterBin) {
+      try { jmeterVer = execSync(`"${jmeterBin}" --version 2>&1`, { timeout: 10000, stdio: 'pipe' }).toString().split('\n')[0].trim(); } catch {}
+    }
+    checks.push({ id: 'jmeter', name: 'Apache JMeter', status: jmeterBin ? 'ok' : 'fail', detail: jmeterVer || (jmeterBin ? 'Installed' : 'Not found — install JMeter 5.6+') });
+
+    const k6Bin = getK6Bin(null);
+    let k6Ver = null;
+    if (k6Bin) {
+      try { k6Ver = execSync(`"${k6Bin}" version 2>&1`, { timeout: 5000, stdio: 'pipe' }).toString().trim(); } catch {}
+    }
+    checks.push({ id: 'k6', name: 'K6', status: k6Bin ? 'ok' : 'fail', detail: k6Ver || (k6Bin ? 'Installed' : 'Not found — install K6') });
+
+    let gitVer = null;
+    try { gitVer = execSync('git --version 2>&1', { timeout: 5000, stdio: 'pipe' }).toString().trim(); } catch {}
+    checks.push({ id: 'git', name: 'Git', status: gitVer ? 'ok' : 'warn', detail: gitVer || 'Not found (optional — needed for Git integration)' });
+
+  } else {
+    // ── Docker mode: check Docker daemon ─────────────────────────────────
+    let dockerOk = false;
     try {
+      execSync('docker info', { timeout: 8000, stdio: 'pipe' });
       const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
-      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: ver + ' (daemon not running — start Docker Desktop)' });
+      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'ok', detail: ver });
+      dockerOk = true;
     } catch (_) {
-      checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: 'Not installed — download Docker Desktop from docker.com' });
+      try {
+        const ver = execSync('docker --version', { timeout: 3000, stdio: 'pipe' }).toString().trim();
+        checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: ver + ' (daemon not running — start Docker Desktop)' });
+      } catch (_) {
+        checks.push({ id: 'docker_daemon', name: 'Docker Daemon', status: 'fail', detail: 'Not installed — download Docker Desktop from docker.com' });
+      }
     }
   }
+
+  // Keep dockerOk in scope for downstream checks that use it
+  let dockerOk = !nativeMode && checks.find(c => c.id === 'docker_daemon')?.status === 'ok';
 
   // 2. Windows Virtualization — detect via services + WSL executable (no admin needed)
   if (process.platform === 'win32') {
@@ -623,6 +687,8 @@ router.post('/run', auth, async (req, res) => {
     const entry = { type, message };
     allLogs.push(entry);
     res.write('data: ' + JSON.stringify(entry) + '\n\n');
+    // Force immediate flush through any compression/proxy middleware
+    if (typeof res.flush === 'function') res.flush();
   }
   function done(data) {
     res.write('data: ' + JSON.stringify({ done: true, ...data }) + '\n\n');
@@ -638,6 +704,12 @@ router.post('/run', auth, async (req, res) => {
 
   const project = ownsProject(req.userId, project_id);
   if (!project) { log('err', 'Access denied'); return done({ ok: false, error: 'Forbidden' }); }
+
+  // Git repository must be initialized before running tests
+  if (!project.folder_path) {
+    log('err', 'Git repository not initialized');
+    return done({ ok: false, error: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.' });
+  }
 
   // Soft concurrency cap — prevent accidental resource exhaustion
   const activeCount = countActiveRuns(req.userId);
@@ -676,7 +748,22 @@ router.post('/run', auth, async (req, res) => {
 
   const projectFolderPath = project.folder_path || getProjectPath(project.name, project.id);
   const runNumber = getNextRunNumber(project_id);
-  const resultDir = path.join(projectFolderPath, 'results', `Run_${runNumber}`);
+
+  // Results go into collection/env/results/Run_X/ — tracked per environment in git
+  let resultDir;
+  if (suite.collection_id && suite.env && projectFolderPath) {
+    try {
+      const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      if (suiteCol) {
+        const { getCollectionPath } = require('../utils/projectFolders');
+        // getCollectionPath(path, colName, env) — 3 args only, no colId
+        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suite.env);
+        resultDir = path.join(envPath, 'results', `Run_${runNumber}`);
+      }
+    } catch (_) {}
+  }
+  // Fallback to project-level results
+  if (!resultDir) resultDir = path.join(projectFolderPath, 'results', `Run_${runNumber}`);
   fs.mkdirSync(resultDir, { recursive: true });
   log('info', `  Result dir : ${resultDir}`);
   log('info', `  Run #      : ${runNumber}`);
@@ -726,72 +813,131 @@ router.post('/run', auth, async (req, res) => {
       const dockerResultDir  = toHostPath(resultDir);
       const scriptName       = path.basename(patchedJmx);
 
-      // Mount testData dir so CSV files referenced in the JMX are accessible inside the container.
-      // Rewrite any absolute host paths in the patched JMX to the container path /jmeter/testdata/
-      const testDataHostDir  = toHostPath(path.join(projectFolderPath, 'testData'));
-      const testDataExists   = fs.existsSync(path.join(projectFolderPath, 'testData'));
+      // Mount testData dir — use collection/env/testData (where files actually live)
+      // Fall back to project/testData for legacy scripts
+      let testDataHostDir, testDataExists;
+      const suiteCollection = suite.collection_id
+        ? db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+        : null;
+      const suiteEnvName = suite.env || '';
+
+      if (suiteCollection && suiteEnvName && projectFolderPath) {
+        const { getCollectionPath } = require('../utils/projectFolders');
+        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteEnvName);
+        const envTestDataDir = path.join(envPath, 'testData');
+        if (fs.existsSync(envTestDataDir)) {
+          testDataHostDir = toHostPath(envTestDataDir);
+          testDataExists  = true;
+        }
+      }
+      // Fallback: project-root testData (legacy)
+      if (!testDataExists) {
+        testDataHostDir = toHostPath(path.join(projectFolderPath, 'testData'));
+        testDataExists  = fs.existsSync(path.join(projectFolderPath, 'testData'));
+      }
       if (testDataExists) {
         let jmxContent = fs.readFileSync(patchedJmx, 'utf8');
-        // Replace any absolute host path pointing into the testData folder with the container mount path
-        const escapedHostDir = testDataHostDir.replace(/\\/g, '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        jmxContent = jmxContent.replace(
-          new RegExp(escapedHostDir.replace(/\//g, '[/\\\\]') + '[/\\\\]?', 'gi'),
-          '/jmeter/testdata/'
-        );
-        // Also handle Windows backslash variant of the original path
-        const winHostDir = path.join(projectFolderPath, 'testData').replace(/\\/g, '\\\\');
-        jmxContent = jmxContent.replace(
-          new RegExp(winHostDir.replace(/\\/g, '\\\\') + '\\\\?', 'gi'),
-          '/jmeter/testdata/'
-        );
+
+        if (isNativeMode()) {
+          // Native mode: replace testData paths with the actual disk path
+          const nativeTestDataDir = testDataHostDir.replace(/\\/g, '/').replace(/\/?$/, '/');
+          jmxContent = jmxContent.replace(/[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi, nativeTestDataDir);
+          jmxContent = jmxContent.replace(/\/[^\s<"]*\/testData\/?/gi, nativeTestDataDir);
+          log('info', `  Test data  : ${nativeTestDataDir} (native)`);
+        } else {
+          // Docker mode: replace with container mount point /jmeter/testdata/
+          jmxContent = jmxContent.replace(/[A-Za-z]:[/\\][^\s<"]*[/\\]testData[/\\]?/gi, '/jmeter/testdata/');
+          jmxContent = jmxContent.replace(/\/[^\s<"]*\/testData\/?/gi, '/jmeter/testdata/');
+          log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+        }
+
         fs.writeFileSync(patchedJmx, jmxContent, 'utf8');
       }
 
-      log('info', `  JMeter img : ${jmeterImage}`);
-      log('info', `  JTL file   : ${jtlPath}`);
-      log('info', `  Report dir : ${reportDir}`);
-      log('info', `  JMeter log : ${jmeterLogPath}`);
-      if (testDataExists) log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+      if (!isNativeMode()) {
+        log('info', `  JMeter img : ${jmeterImage}`);
+        log('info', `  JTL file   : ${jtlPath}`);
+        log('info', `  Report dir : ${reportDir}`);
+        log('info', `  JMeter log : ${jmeterLogPath}`);
+        if (testDataExists) log('info', `  Test data  : ${testDataHostDir} → /jmeter/testdata`);
+      }
 
-      cmd = 'docker';
-      args = ['run', '--rm',
-        '-v', `${dockerScriptDir}:/jmeter/scripts`,
-        '-v', `${dockerResultDir}:/jmeter/results`,
-      ];
-      if (testDataExists) args.push('-v', `${testDataHostDir}:/jmeter/testdata`);
-      args.push(
-        jmeterImage,
-        '-n', '-t', `/jmeter/scripts/${scriptName}`,
-        '-l', '/jmeter/results/results.jtl',
-        '-e', '-o', '/jmeter/results/report',
-        '-j', '/jmeter/results/jmeter.log',
-      );
-      if (vusers)  args.push(`-Jthreads=${vusers}`);
-      if (rampup)  args.push(`-Jrampup=${rampup}`);
-      if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
-      if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      if (isNativeMode()) {
+        // ── Native mode: run JMeter binary directly (no Docker) ──────────────
+        const jmeterBin = process.env.JMETER_BIN || getJMeterBin(null) || 'jmeter';
+        log('info', `  Mode       : Native (${jmeterBin})`);
+        log('info', `  JTL file   : ${jtlPath}`);
+        log('info', `  Report dir : ${reportDir}`);
+        log('info', `  JMeter log : ${jmeterLogPath}`);
+        cmd  = jmeterBin;
+        args = [
+          '-n', '-t', patchedJmx || scriptPath,
+          '-l', jtlPath,
+          '-e', '-o', reportDir,
+          '-j', jmeterLogPath,
+        ];
+        if (vusers)  args.push(`-Jthreads=${vusers}`);
+        if (rampup)  args.push(`-Jrampup=${rampup}`);
+        if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
+        if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      } else {
+        // ── Docker mode: run via justb4/jmeter image ─────────────────────────
+        cmd = 'docker';
+        args = ['run', '--rm',
+          '-v', `${dockerScriptDir}:/jmeter/scripts`,
+          '-v', `${dockerResultDir}:/jmeter/results`,
+        ];
+        if (testDataExists) args.push('-v', `${testDataHostDir}:/jmeter/testdata`);
+        args.push(
+          jmeterImage,
+          '-n', '-t', `/jmeter/scripts/${scriptName}`,
+          '-l', '/jmeter/results/results.jtl',
+          '-e', '-o', '/jmeter/results/report',
+          '-j', '/jmeter/results/jmeter.log',
+        );
+        if (vusers)  args.push(`-Jthreads=${vusers}`);
+        if (rampup)  args.push(`-Jrampup=${rampup}`);
+        if (iteration_mode === 'loops' && loops)       args.push(`-Jloops=${loops}`);
+        if (iteration_mode === 'duration' && duration) args.push(`-Jduration=${duration}`);
+      }
+
+      // NOTE: PROTOCOL/SERVER/PORT are baked into JMX User Defined Variables at generation time.
+      // Runtime only controls execution params (threads, ramp-up, duration/loops).
 
     } else if (engine === 'k6') {
-      const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
-      const dockerScriptDir = toHostPath(path.dirname(scriptPath));
-      const dockerResultDir = toHostPath(resultDir);
-      const scriptName = path.basename(scriptPath);
+      const resultsJson = path.join(resultDir, 'results.json');
 
-      log('info', `  K6 image   : ${k6Image}`);
-
-      cmd = 'docker';
-      args = [
-        'run', '--rm',
-        '-v', `${dockerScriptDir}:/scripts`,
-        '-v', `${dockerResultDir}:/results`,
-        k6Image,
-        'run', `/scripts/${scriptName}`,
-        '--out', 'json=/results/results.json',
-      ];
-      if (vusers) args.push('--vus', String(vusers));
-      if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
-      if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
-      if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      if (isNativeMode()) {
+        // ── Native mode: run K6 binary directly ──────────────────────────────
+        const k6Bin = process.env.K6_BIN || getK6Bin(null) || 'k6';
+        log('info', `  Mode       : Native (${k6Bin})`);
+        cmd  = k6Bin;
+        args = ['run', scriptPath, '--out', `json=${resultsJson}`];
+        if (vusers) args.push('--vus', String(vusers));
+        if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
+        if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
+        if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      } else {
+        // ── Docker mode: run via grafana/k6 image ─────────────────────────────
+        const k6Image = savedCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest';
+        const dockerScriptDir = toHostPath(path.dirname(scriptPath));
+        const dockerResultDir = toHostPath(resultDir);
+        const scriptName = path.basename(scriptPath);
+        log('info', `  K6 image   : ${k6Image}`);
+        cmd  = 'docker';
+        args = [
+          'run', '--rm',
+          '-v', `${dockerScriptDir}:/scripts`,
+          '-v', `${dockerResultDir}:/results`,
+          k6Image,
+          'run', `/scripts/${scriptName}`,
+          '--out', 'json=/results/results.json',
+        ];
+        if (vusers) args.push('--vus', String(vusers));
+        if (rampup) args.push('--stage', `${rampup}s:${vusers || 1}`);
+        if (iteration_mode === 'duration' && duration) args.push('--duration', `${duration}s`);
+        if (iteration_mode === 'loops' && loops)       args.push('--iterations', String(loops));
+      }
 
     } else {
       log('err', `Unsupported engine: ${engine}`);
@@ -834,6 +980,63 @@ router.post('/run', auth, async (req, res) => {
       }, 300);
     }
 
+    // ── Mid-run rule monitoring setup ─────────────────────────────────────────
+    const { sendBreachAlertEmail } = require('../utils/emailUtils');
+    const alertedRuleIds = new Set();   // track which rule IDs already fired an alert
+    const testStartMs    = Date.now();
+    const project        = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
+    const suiteName      = suite?.name || 'Test Run';
+    const projectName    = project?.name || '';
+
+    // Metrics that can be meaningfully evaluated in real-time (mid-run).
+    // Response Time / P95 / P90 can swing during ramp-up and only stabilise at
+    // the end, so we intentionally exclude them from live monitoring.
+    const LIVE_MONITOR_METRICS = new Set([
+      'error rate',
+      'cpu usage',
+      'memory usage',
+    ]);
+
+    // Check rules against current partial JTL every second
+    const ruleMonitor = setInterval(async () => {
+      if (!jtlPath || !fs.existsSync(jtlPath)) return;
+      try {
+        const { evaluateRules: evalRules } = require('../utils/ruleEvaluator');
+        const result = evalRules(project_id, jtlPath);
+        if (!result || result.noRules || !result.violations?.length) return;
+
+        // Only alert on live-monitorable metrics — ignore Response Time, P95, etc.
+        const liveViolations = result.violations.filter(
+          v => LIVE_MONITOR_METRICS.has((v.rule.metric || '').toLowerCase().trim())
+        );
+        if (!liveViolations.length) return;
+
+        // Find new violations (not yet alerted for this run)
+        const newViolations = liveViolations.filter(v => !alertedRuleIds.has(v.rule.id));
+        if (!newViolations.length) return;
+
+        // Mark as alerted — each rule fires at most once per run
+        newViolations.forEach(v => alertedRuleIds.add(v.rule.id));
+
+        const elapsedSec = Math.floor((Date.now() - testStartMs) / 1000);
+        log('warn', `  [Rules] ⚡ ${newViolations.length} rule breach(es) detected at ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s — sending alert…`);
+        newViolations.forEach(v => log('warn', `          ${v.label} [${v.rule.severity}]`));
+
+        // Send breach alert email (non-blocking)
+        sendBreachAlertEmail(runId, req.userId, project_id, {
+          violations:    newViolations,
+          suiteName,
+          projectName,
+          elapsedSec,
+          totalDuration: duration || 0,
+          runId,
+        }).catch(e => console.error('[Alerts] Breach email error:', e.message));
+
+      } catch (e) {
+        console.error('[RuleMonitor] Error:', e.message);
+      }
+    }, 1000); // check every second
+
     await new Promise((resolve, reject) => {
       const proc = spawn(cmd, args, { shell: true });
 
@@ -860,13 +1063,18 @@ router.post('/run', auth, async (req, res) => {
       proc.stderr.on('data', c => handleLines(c, 'stderr'));
 
       proc.on('close', code => {
+        clearInterval(ruleMonitor); // stop monitoring when test ends
         if (logTailer) clearInterval(logTailer);
         // Resolve regardless of exit code — JMeter exits non-zero even when all
         // samples pass (e.g. when using certain plugins or non-GUI flags).
         // The JTL file is the authoritative source for pass/fail status.
         resolve(code);
       });
-      proc.on('error', err => { if (logTailer) clearInterval(logTailer); reject(err); });
+      proc.on('error', err => {
+        clearInterval(ruleMonitor);
+        if (logTailer) clearInterval(logTailer);
+        reject(err);
+      });
     });
 
     // ── Completion summary ─────────────────────────────────────────────────
@@ -924,11 +1132,22 @@ router.post('/run', auth, async (req, res) => {
     log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
     // ── Rule Engine verdict ────────────────────────────────────────────────────
-    // Evaluate project rules against the JTL to get the authoritative pass/fail.
-    // If rules are defined, they override the raw fail count for status AND auto-heal decisions.
     let finalStatus = 'completed';
     let ruleViolations = [];
-    if (jtlPath && fs.existsSync(jtlPath)) {
+
+    // Zero requests = test completely failed to execute (missing URL, script error, etc.)
+    // Treat as failure regardless of rules — no point evaluating rules against empty data.
+    const rowCount = jtlPath && fs.existsSync(jtlPath)
+      ? Math.max(0, fs.readFileSync(jtlPath, 'utf8').trim().split('\n').length - 1)
+      : 0;
+
+    if (rowCount === 0) {
+      finalStatus = 'failed';
+      log('err', '');
+      log('err', '  ✘  TEST FAILED — 0 requests were executed.');
+      log('err', '     Likely cause: target URL not configured for this environment.');
+      log('err', '     Fix: Configuration → select env → add target URL → Save Config.');
+    } else if (jtlPath && fs.existsSync(jtlPath)) {
       const ruleResult = evaluateRules(project_id, jtlPath);
       if (!ruleResult.noRules) {
         ruleViolations = ruleResult.violations || [];
@@ -945,13 +1164,36 @@ router.post('/run', auth, async (req, res) => {
           log('ok', '  ✔  RULE ENGINE — All performance thresholds passed');
         }
       } else if (fail > 0) {
-        // No rules — raw fail count decides
         finalStatus = 'failed';
       }
     }
 
     db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=datetime('now') WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, runId);
+
+    // ── Auto-zip JMeter HTML report into results folder ───────────────────────
+    if (engine === 'jmeter' && reportPath && fs.existsSync(path.dirname(reportPath))) {
+      setImmediate(async () => {
+        try {
+          const reportDir = path.dirname(reportPath);
+          const runNum    = (resultDir.match(/Run_(\d+)/) || [])[1] || runId;
+          const zipPath   = path.join(resultDir, `JMeter_Report_Run_${runNum}.zip`);
+          const { ZipArchive } = require('archiver');
+          await new Promise((resolve, reject) => {
+            const output  = fs.createWriteStream(zipPath);
+            const archive = new ZipArchive({ zlib: { level: 6 } });
+            output.on('close', resolve);
+            archive.on('error', reject);
+            archive.pipe(output);
+            archive.directory(reportDir, false);
+            archive.finalize();
+          });
+          log('info', `  Report ZIP : ${zipPath}`);
+        } catch (e) {
+          console.error('[Execution] Failed to zip JMeter report:', e.message);
+        }
+      });
+    }
 
     // Trigger auto healer only when rules say the run actually failed
     const shouldHeal = auto_heal && finalStatus === 'failed';
@@ -963,6 +1205,7 @@ router.post('/run', auth, async (req, res) => {
     //                             or the final failed run if all 3 attempts exhausted
     // • Failed + auto-heal OFF  → send immediately with failed status
     const sendEmailForRun = async (targetRunId) => {
+      console.log(`[Alerts] sendEmailForRun started for run #${targetRunId}`);
       try {
         const { sendAlertEmail }             = require('../utils/emailUtils');
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
@@ -975,10 +1218,12 @@ router.post('/run', auth, async (req, res) => {
         if (!runRow) return;
 
         const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
+        console.log('[Alerts] Checking JTL at:', jtlPath);
         if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found, skipping email:', jtlPath);
+          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
           return;
         }
+        console.log('[Alerts] JTL found, building report data for email...');
 
         const content = fs.readFileSync(jtlPath, 'utf8');
         const lines   = content.trim().split('\n').filter(Boolean);
@@ -1078,6 +1323,13 @@ router.post('/run', auth, async (req, res) => {
           errMap[k].count++;
         });
 
+        // Evaluate rules against this run's JTL so violations appear in the email
+        let ruleViolationsForEmail = [];
+        try {
+          const rr = evaluateRules(runRow.project_id, jtlPath);
+          ruleViolationsForEmail = rr?.violations || [];
+        } catch (_) {}
+
         const reportData = {
           meta: {
             run_id: runRow.id, suite_name: runRow.suite_name || 'Test Plan',
@@ -1086,16 +1338,21 @@ router.post('/run', auth, async (req, res) => {
             duration_s: parseFloat(durS2.toFixed(1)),
           },
           summary, by_api, timeline, errors: Object.values(errMap), logs: [],
+          rule_violations: ruleViolationsForEmail,
         };
 
-        // PDF to temp file
+        // Generate PDF — save to result_dir for permanent storage AND send via email
         let pdfPath = null;
         try {
-          const runNum = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
-          const tmpPdf = path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
-          await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-          pdfPath = tmpPdf;
-          console.log('[Alerts] PDF generated:', pdfPath);
+          const runNum    = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
+          const suiteName = (runRow.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
+          // Primary: save directly to result_dir so it persists
+          const resultPdf = runRow.result_dir && fs.existsSync(runRow.result_dir)
+            ? path.join(runRow.result_dir, `${suiteName}_Run${runNum}_Analytics.pdf`)
+            : path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
+          await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
+          pdfPath = resultPdf;
+          console.log('[Alerts] Analytics PDF saved:', pdfPath);
         } catch (pdfErr) {
           console.error('[Alerts] PDF generation failed:', pdfErr.message);
         }
@@ -1112,17 +1369,19 @@ router.post('/run', auth, async (req, res) => {
       }
     };
 
+    // PDF is saved inside sendEmailForRun which builds the full reportData
+    // (with by_api, timeline, errors) required by generateAnalyticsPdfToFile.
+    // The separate minimal-reportData approach was removed because it crashed.
+
     if (shouldHeal) {
       log('warn', '');
       log('warn', '[Auto Healer] Starting automatic diagnosis and repair...');
-      // Pass onComplete so email waits for final result
       startAutoHeal(req.userId, runId, (finalRunId, succeeded) => {
         console.log(`[Alerts] Auto-heal finished. Final run: ${finalRunId}, succeeded: ${succeeded}`);
         log('info', `[Alerts] Sending ${succeeded ? 'success' : 'failure'} report email for run ${finalRunId}`);
         sendEmailForRun(finalRunId);
       });
     } else {
-      // No auto-heal — send immediately (passed or failed without healer)
       setImmediate(() => sendEmailForRun(runId));
     }
 
@@ -1166,11 +1425,27 @@ router.get('/runs', auth, (req, res) => {
     ORDER BY r.started_at DESC
   `).all(project_id);
 
+  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
-      const rel = path.relative(PROJECTS_ROOT, r.report_path).replace(/\\/g, '/');
-      report_url = `/projects-files/${rel}`;
+      // Use lower-case comparison to handle Windows case-insensitive paths
+      const absReport  = path.resolve(r.report_path).toLowerCase().replace(/\\/g, '/');
+      const absWS      = path.resolve(GIT_WORKSPACES_ROOT).toLowerCase().replace(/\\/g, '/');
+      const absAdmin   = path.resolve(PROJECTS_ROOT).toLowerCase().replace(/\\/g, '/');
+      if (absReport.startsWith(absWS)) {
+        const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+        report_url = `/workspace-files/${rel}`;
+      } else if (absReport.startsWith(absAdmin)) {
+        const rel = path.relative(path.resolve(PROJECTS_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+        report_url = `/projects-files/${rel}`;
+      } else {
+        // Absolute path outside known roots — serve relative to GIT_WORKSPACES_ROOT as best-effort
+        try {
+          const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+          if (!rel.startsWith('..')) report_url = `/workspace-files/${rel}`;
+        } catch {}
+      }
     }
     return { ...r, logs: JSON.parse(r.logs || '[]'), report_url, heal_status: r.heal_status, heal_run_id: r.heal_run_id };
   });
@@ -1544,8 +1819,22 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
     duration_s: parseFloat(totalDuration.toFixed(1)),
   };
 
+  const pdfFilename = `${suiteName}_Run${runNum}_Analytics.pdf`;
+
+  // Save PDF to results folder on disk
+  if (run.result_dir && fs.existsSync(run.result_dir)) {
+    try {
+      const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+      const pdfPath = path.join(run.result_dir, pdfFilename);
+      await generateAnalyticsPdfToFile({ summary, by_api, timeline, errors, meta }, runNum, pdfPath);
+    } catch (e) {
+      console.error('[Execution] Failed to save analytics PDF to results:', e.message);
+    }
+  }
+
+  // Stream PDF to browser for download
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${suiteName}_Run${runNum}_Analytics.pdf"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${pdfFilename}"`);
   await generateAnalyticsPdf({ summary, by_api, timeline, errors, meta }, runNum, res);
 });
 

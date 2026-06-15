@@ -32,26 +32,6 @@ const MODELS = {
 
 const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-4-5' };
 
-const THEMES = [
-  {
-    value: 'intellij',
-    label: 'IntelliJ Dark',
-    desc: 'Professional dark IDE look',
-    swatch: 'linear-gradient(135deg, #2b2d30 50%, #4e9eff 50%)',
-  },
-  {
-    value: 'qtsolv',
-    label: 'Quarks Dark',
-    desc: 'Professional dark theme with green accent',
-    swatch: 'linear-gradient(135deg, #383a3e 50%, #49CC3D 50%)',
-  },
-  {
-    value: 'quarks',
-    label: 'Quarks Light',
-    desc: 'Light grey background with green accent',
-    swatch: 'linear-gradient(135deg, #E7EAF1 50%, #2ea82a 50%)',
-  },
-];
 
 const ROLE_LABELS = { super_admin: 'Super Admin', org_admin: 'Org Admin', user: 'User' };
 const STATUS_LABELS = { active: 'Active', pending: 'Pending', rejected: 'Rejected' };
@@ -70,6 +50,112 @@ function StatusBadge({ status }) {
   );
 }
 
+/* ── Standalone Organizations panel (super_admin only) ─────────────────── */
+function OrganizationsPanel({ user }) {
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
+  const { toast } = useToast();
+  const [orgs,        setOrgs]        = useState([]);
+  const [newOrgName,  setNewOrgName]  = useState('');
+  const [savingOrg,   setSavingOrg]   = useState(false);
+  const [editingOrg,  setEditingOrg]  = useState(null);
+
+  useEffect(() => {
+    api.get('/orgs').then(r => setOrgs(r.data.orgs || [])).catch(() => {});
+  }, []);
+
+  async function createOrg() {
+    if (!newOrgName.trim()) return;
+    setSavingOrg(true);
+    try {
+      const { data } = await api.post('/orgs', { name: newOrgName.trim() });
+      setOrgs(prev => [data.org, ...prev]);
+      setNewOrgName('');
+      toast(`Organization "${data.org.name}" created`, 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Create failed', 'error'); }
+    finally { setSavingOrg(false); }
+  }
+
+  async function saveOrgEdit() {
+    if (!editingOrg?.name?.trim()) return;
+    try {
+      await api.put(`/orgs/${editingOrg.id}`, { name: editingOrg.name });
+      setOrgs(prev => prev.map(o => o.id === editingOrg.id ? { ...o, name: editingOrg.name } : o));
+      setEditingOrg(null);
+      toast('Organization updated', 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Update failed', 'error'); }
+  }
+
+  async function deleteOrg(org) {
+    const ok = await confirm(`Delete "${org.name}"? All associated users will lose access.`, 'Delete Organization');
+    if (!ok) return;
+    try {
+      await api.delete(`/orgs/${org.id}`);
+      setOrgs(prev => prev.filter(o => o.id !== org.id));
+      toast('Organization deleted', 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Delete failed', 'error'); }
+  }
+
+  return (
+    <div className="page fade-in">
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '16px' }}>
+        Create and manage organizations. Invite Org Admins under a specific organization.
+      </div>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px', maxWidth: 480 }}>
+        <input type="text" value={newOrgName} onChange={e => setNewOrgName(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && createOrg()}
+          placeholder="New organization name…" style={{ flex: 1 }} autoComplete="off" />
+        <button className="btn-primary" onClick={createOrg} disabled={savingOrg || !newOrgName.trim()}>
+          {savingOrg ? <span className="spinner" /> : <i className="ti ti-plus" />} Add
+        </button>
+      </div>
+      {orgs.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--color-text-tertiary)' }}>
+          No organizations yet. Create one above.
+        </div>
+      ) : orgs.map(org => (
+        <div key={org.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', background: 'var(--color-background-secondary)', borderRadius: '8px', border: '1px solid var(--color-border-secondary)', marginBottom: '8px' }}>
+          <div style={{ width: 36, height: 36, borderRadius: '8px', background: 'rgba(73,204,61,0.12)', border: '1px solid rgba(73,204,61,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <i className="ti ti-building" style={{ color: 'var(--accent)', fontSize: '16px' }} />
+          </div>
+          {editingOrg?.id === org.id ? (
+            <input type="text" value={editingOrg.name}
+              onChange={e => setEditingOrg(o => ({ ...o, name: e.target.value }))}
+              onKeyDown={e => { if (e.key === 'Enter') saveOrgEdit(); if (e.key === 'Escape') setEditingOrg(null); }}
+              style={{ flex: 1, fontSize: '13px' }} autoFocus />
+          ) : (
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--color-text-primary)' }}>{org.name}</div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
+                {org.member_count || 0} member{(org.member_count || 0) !== 1 ? 's' : ''}
+                {org.admins && <span> · Admin: {org.admins}</span>}
+              </div>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+            {editingOrg?.id === org.id ? (
+              <>
+                <button className="btn-primary btn-sm" onClick={saveOrgEdit}><i className="ti ti-check" /> Save</button>
+                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg(null)}>Cancel</button>
+              </>
+            ) : (
+              <>
+                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg({ id: org.id, name: org.name })}>
+                  <i className="ti ti-pencil" />
+                </button>
+                <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={() => deleteOrg(org)}>
+                  <i className="ti ti-trash" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ── User Management panel ────────────────────────────────────────────── */
 function UserManagementPanel({ user, projects = [] }) {
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -244,7 +330,6 @@ function UserManagementPanel({ user, projects = [] }) {
   }
 
   const TABS = [
-    ...(user?.role === 'super_admin' ? [{ id: 'organizations', label: 'Organizations', icon: 'ti-building' }] : []),
     { id: 'invites', label: 'Send Invite', icon: 'ti-mail-forward' },
     { id: 'pending', label: 'Pending Invites', icon: 'ti-clock', count: invites.filter(i => i.status === 'pending').length },
     { id: 'members', label: 'Active Members', icon: 'ti-users', count: users.filter(u => u.status === 'active' && u.role !== 'super_admin').length },
@@ -348,7 +433,7 @@ function UserManagementPanel({ user, projects = [] }) {
           <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
             {user?.role === 'super_admin'
               ? 'Invite Organization Admins. They will receive an email to set up their account.'
-              : 'Invite team members to your organization. They will receive an email to set up their account.'}
+              : 'Invite team members or additional Org Admins to your organization. They will receive an email to set up their account.'}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <div className="form-group" style={{ marginBottom: 0 }}>
@@ -366,6 +451,7 @@ function UserManagementPanel({ user, projects = [] }) {
               <select value={inviteForm.role} onChange={e => setInviteForm(f => ({ ...f, role: e.target.value }))}
                 style={{ width: '100%', padding: '8px 10px', borderRadius: '6px', border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
                 {user?.role === 'super_admin' && <option value="org_admin">Organization Admin</option>}
+                {user?.role === 'org_admin' && <option value="org_admin">Organization Admin</option>}
                 {user?.role === 'org_admin' && <option value="user">Regular User</option>}
               </select>
             </div>
@@ -582,32 +668,8 @@ function UserManagementPanel({ user, projects = [] }) {
   );
 }
 
-function AppearancePanel({ theme, onThemeChange }) {
-  return (
-    <div className="page fade-in">
-      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
-        Choose a UI theme. Your preference is saved in the browser.
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', maxWidth: '560px' }}>
-        {THEMES.map(t => (
-          <button
-            key={t.value}
-            className={`theme-btn${theme === t.value ? ' active' : ''}`}
-            onClick={() => onThemeChange(t.value)}
-          >
-            <div className="theme-swatch" style={{ background: t.swatch, width: '32px', height: '32px', borderRadius: '6px', border: '1px solid var(--color-border-secondary)' }} />
-            <div>
-              <div style={{ fontWeight: 600, fontSize: '13px' }}>{t.label}</div>
-              <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginTop: '1px' }}>{t.desc}</div>
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
 
-function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor }) {
+function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor, disabled = false }) {
   const selected = models.find(m => m.value === value);
   return (
     <div style={{
@@ -615,6 +677,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
       background: 'var(--color-background-secondary)',
       border: '1px solid var(--color-border-secondary)',
       borderRadius: 'var(--border-radius-md)',
+      opacity: disabled ? 0.7 : 1,
     }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '10px' }}>
         <i className={`ti ${icon}`} style={{ fontSize: '16px', color: iconColor, marginTop: '1px', flexShrink: 0 }} />
@@ -623,7 +686,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
           <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '1px' }}>{subtitle}</div>
         </div>
       </div>
-      <CustomSelect value={value} onChange={e => onChange(e.target.value)}>
+      <CustomSelect value={value} onChange={e => !disabled && onChange(e.target.value)} disabled={disabled}>
         {models.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
       </CustomSelect>
       {selected && (
@@ -636,7 +699,7 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor })
   );
 }
 
-function AIConfigPanel() {
+function AIConfigPanel({ user }) {
   const [provider,   setProvider]   = useState('openai');
   const [model,      setModel]      = useState('');
   const [healModel,  setHealModel]  = useState('');
@@ -683,14 +746,40 @@ function AIConfigPanel() {
   const effectiveModel  = model      || DEFAULT_MODEL[provider] || '';
   const effectiveHeal   = healModel  || DEFAULT_MODEL[provider] || '';
 
+  const isRegularUser = user?.role === 'user';
+
   return (
     <div className="page fade-in" style={{ maxWidth: '560px' }}>
+
+      {/* Read-only notice for regular users */}
+      {isRegularUser && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '12px 16px', marginBottom: 20,
+          background: 'rgba(245,158,11,0.08)',
+          border: '1px solid rgba(245,158,11,0.3)',
+          borderRadius: 8,
+        }}>
+          <i className="ti ti-info-circle" style={{ color: '#f59e0b', fontSize: 18, flexShrink: 0 }} />
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#f59e0b', marginBottom: 2 }}>
+              View only — AI Configuration is managed by your Org Admin
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              Please contact your administrator to change the AI provider or API key.
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
-        Configure separate AI models for script generation and auto-healing. Both use the same provider and API key.
+        {isRegularUser
+          ? 'AI models configured by your Org Admin for this organization.'
+          : 'Configure separate AI models for script generation and auto-healing. Both use the same provider and API key.'}
       </div>
 
-      {error && <div className="auth-error" style={{ marginBottom: '16px' }}>{error}</div>}
-      {saved && (
+      {!isRegularUser && error && <div className="auth-error" style={{ marginBottom: '16px' }}>{error}</div>}
+      {!isRegularUser && saved && (
         <div style={{ marginBottom: '16px', padding: '10px 14px', background: 'rgba(95,201,120,0.12)', border: '1px solid rgba(95,201,120,0.3)', borderRadius: 'var(--border-radius-md)', fontSize: '13px', color: '#5fc978' }}>
           <i className="ti ti-circle-check" style={{ marginRight: '6px' }} />Settings saved successfully.
         </div>
@@ -699,7 +788,7 @@ function AIConfigPanel() {
       {/* Provider */}
       <div className="form-group">
         <label className="form-label">AI Provider</label>
-        <CustomSelect value={provider} onChange={e => handleProviderChange(e.target.value)}>
+        <CustomSelect value={provider} onChange={e => !isRegularUser && handleProviderChange(e.target.value)} disabled={isRegularUser}>
           {PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
         </CustomSelect>
       </div>
@@ -711,8 +800,9 @@ function AIConfigPanel() {
         title="Script Generation Model"
         subtitle="Used when generating JMX / K6 scripts from your API collections"
         value={effectiveModel}
-        onChange={setModel}
+        onChange={isRegularUser ? () => {} : setModel}
         models={providerModels}
+        disabled={isRegularUser}
       />
 
       {/* Auto healer model */}
@@ -722,12 +812,13 @@ function AIConfigPanel() {
         title="Auto Healer Model"
         subtitle="Used when diagnosing and fixing failed test runs (reasoning-heavy — use a smarter model)"
         value={effectiveHeal}
-        onChange={setHealModel}
+        onChange={isRegularUser ? () => {} : setHealModel}
         models={providerModels}
+        disabled={isRegularUser}
       />
 
-      {/* API Key */}
-      <div className="form-group">
+      {/* API Key — hidden for regular users */}
+      {!isRegularUser && <div className="form-group">
         <label className="form-label">
           API Key
           {provider === 'openai' && (
@@ -749,32 +840,15 @@ function AIConfigPanel() {
           onChange={e => setApiKey(e.target.value)}
           placeholder={keySet ? '••••••••••••  (key saved — enter new key to update)' : provider === 'openai' ? 'sk-...' : 'sk-ant-...'}
         />
-      </div>
+      </div>}
 
-      <button className="btn-primary" onClick={save} disabled={saving} style={{ marginTop: '4px' }}>
-        {saving && <span className="spinner" />}
-        <i className="ti ti-device-floppy" />Save Settings
-      </button>
+      {!isRegularUser && (
+        <button className="btn-primary" onClick={save} disabled={saving} style={{ marginTop: '4px' }}>
+          {saving && <span className="spinner" />}
+          <i className="ti ti-device-floppy" />Save Settings
+        </button>
+      )}
 
-      {/* Recommendation hint */}
-      <div style={{
-        marginTop: '18px', padding: '12px 14px',
-        background: 'var(--color-background-secondary)',
-        border: '1px solid var(--color-border-secondary)',
-        borderRadius: 'var(--border-radius-md)', fontSize: '12px',
-        color: 'var(--color-text-secondary)', lineHeight: 1.7,
-      }}>
-        <div style={{ fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <i className="ti ti-bulb" style={{ color: 'var(--accent)' }} /> Recommended combination
-        </div>
-        {provider === 'openai' ? <>
-          <div><i className="ti ti-code" style={{ marginRight: '5px', color: 'var(--accent)' }} /><strong>Script:</strong> GPT-4o — accurate XML/JS generation, good context understanding</div>
-          <div><i className="ti ti-first-aid-kit" style={{ marginRight: '5px', color: '#f59e0b' }} /><strong>Healer:</strong> o3 Mini — step-by-step reasoning to find root cause in complex failures</div>
-        </> : <>
-          <div><i className="ti ti-code" style={{ marginRight: '5px', color: 'var(--accent)' }} /><strong>Script:</strong> Claude Sonnet 4.5 — fast, accurate script generation</div>
-          <div><i className="ti ti-first-aid-kit" style={{ marginRight: '5px', color: '#f59e0b' }} /><strong>Healer:</strong> Claude Opus 4.5 — deepest reasoning for diagnosing complex failures</div>
-        </>}
-      </div>
     </div>
   );
 }
@@ -961,8 +1035,8 @@ function SMTPConfigPanel({ currentUser }) {
 
 export default function Settings({ page, theme, onThemeChange, user, projects }) {
   if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
-  if (page === 'settings-appearance') return <AppearancePanel theme={theme} onThemeChange={onThemeChange} />;
-  if (page === 'settings-ai') return <AIConfigPanel />;
-  if (page === 'settings-smtp') return <SMTPConfigPanel currentUser={user} />;
+  if (page === 'settings-orgs')  return <OrganizationsPanel user={user} />;
+  if (page === 'settings-ai')    return <AIConfigPanel user={user} />;
+  if (page === 'settings-smtp')  return <SMTPConfigPanel currentUser={user} />;
   return null;
 }

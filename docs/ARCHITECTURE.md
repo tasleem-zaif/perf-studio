@@ -1,229 +1,181 @@
-# Performance Studio — Architecture
+# Performance Studio — Architecture & Flow Diagrams
 
-## System Overview
-
-```mermaid
-graph TB
-    subgraph Browser["Browser (User)"]
-        UI["React Frontend\n(Vite + Nginx)"]
-    end
-
-    subgraph Backend["Backend (Node.js)"]
-        API["Express API\n:3001"]
-        Auth["Auth Middleware\n(JWT)"]
-        Routes["Route Handlers"]
-        AI["AI Engine\n(OpenAI / Claude)"]
-        Healer["Auto Healer"]
-        Email["Email / Invites\n(Nodemailer)"]
-        Git["Git Engine\n(simple-git)"]
-        Enc["Encryption\n(AES-256-CBC)"]
-    end
-
-    subgraph Storage["Persistence"]
-        DB["SQLite\n(better-sqlite3)"]
-        FS["File System\n/data/projects"]
-    end
-
-    subgraph Execution["Test Execution (Docker)"]
-        JMeter["JMeter Container\njustb4/jmeter"]
-        K6["K6 Container\ngrafana/k6"]
-    end
-
-    subgraph External["External Services"]
-        GPT["OpenAI GPT-4o"]
-        Claude["Anthropic Claude"]
-        SMTP["SMTP Server\n(Gmail / Outlook)"]
-        GitHub["GitHub / GitLab API\n(Octokit)"]
-    end
-
-    UI -->|"REST + SSE"| API
-    API --> Auth --> Routes
-    Routes --> DB
-    Routes --> FS
-    Routes --> AI
-    AI --> GPT
-    AI --> Claude
-    Routes -->|"docker run"| JMeter
-    Routes -->|"docker run"| K6
-    JMeter -->|"results.jtl"| FS
-    K6 -->|"results.json"| FS
-    Healer --> AI
-    Healer -->|"re-run"| JMeter
-    Routes --> Email --> SMTP
-    Routes --> Git --> GitHub
-```
+All diagrams use [Mermaid](https://mermaid.js.org/) and render natively on GitHub.
 
 ---
 
-## Multi-Environment Isolation
+## Table of Contents
 
-```
-projects/
-└── Project_Name_workspace/          ← git repo root
-    ├── .git/                         ← git history
-    ├── .gitignore
-    └── Project_Name/                 ← visible subfolder on GitHub
-        ├── Collection_Name_ID/       ← per API source
-        │   ├── QA/
-        │   │   ├── testData/         ← env-specific CSV files
-        │   │   ├── script/           ← generated JMX/JS scripts
-        │   │   ├── results/          ← test run output
-        │   │   └── config/           ← URL + port config JSON
-        │   ├── Staging/
-        │   └── UAT/
-        └── README.md
-```
-
-Each environment is **strictly isolated** — test data, configs, scripts and results are tagged
-by `collection_id + env` in the database so switching envs never shows data from another env.
+1. [System Architecture](#1-system-architecture)
+2. [Data Model](#2-data-model)
+3. [User Journey](#3-user-journey)
+4. [Role-Based Access Model](#4-role-based-access-model)
+5. [AI Script Generation Flow](#5-ai-script-generation-flow)
+6. [Pre-Run Flow](#6-pre-run-flow)
+7. [Test Execution Flow](#7-test-execution-flow)
+8. [Auto-Heal Flow](#8-auto-heal-flow)
+9. [Git & CI Integration Flow](#9-git--ci-integration-flow)
+10. [CI Pipeline Flow](#10-ci-pipeline-flow)
+11. [Alert & Email Flow](#11-alert--email-flow)
+12. [Multi-Environment Isolation](#12-multi-environment-isolation)
+13. [Security Model](#13-security-model)
+14. [Technology Stack](#14-technology-stack)
 
 ---
 
-## Role-Based Access Model
+## 1. System Architecture
 
-```
-Super Admin
-  ├── Create organizations
-  ├── Invite Org Admins (assigns them to an org)
-  └── Configure platform SMTP
+High-level view of every component and how they relate.
 
-Org Admin (per organization)
-  ├── Create projects
-  ├── Invite regular users → assign to projects
-  ├── Configure AI (GPT-4o / Claude)
-  ├── Set up Git integration (PAT, remote URL)
-  ├── Push to main branch directly
-  ├── Merge PRs from team members
-  └── Reset user passwords
-
-Regular User (assigned to specific projects)
-  ├── Upload test data (env-specific)
-  ├── Configure environment URLs
-  ├── Create & run test plans
-  ├── Push to users/<name> branch
-  └── Raise pull requests to main
-```
+![system-architecture](./images/system-architecture.png)
 
 ---
 
-## Git Integration Architecture
+## 2. Data Model
 
-```
-PerfStudio Server
-  └── /data/projects/
-       └── Project_workspace/     ← local git repo (git root)
-           ├── .git/
-           └── Project_Name/      ← project files tracked by git
+Entity-relationship diagram for the SQLite database.
 
-GitHub Remote Repo
-  └── Project_Name/               ← matches local workspace subfolder
-      └── Collection/
-          └── QA/
-              ├── testData/
-              ├── script/
-              └── config/
-
-Branch Strategy:
-  main                ← Org Admin (direct push, no PR required)
-  users/alice         ← Regular user Alice (PR required to merge)
-  users/bob           ← Regular user Bob  (PR required to merge)
-```
-
-**PR lifecycle:**
-1. User commits → pushes to `users/<name>`
-2. User creates PR in PerfStudio (optionally synced to GitHub via Octokit)
-3. Org Admin reviews in PerfStudio → clicks Merge
-4. PerfStudio: `git merge --no-ff --allow-unrelated-histories` → push to `main`
-5. PR status updated to `merged` in local DB + GitHub
+![data-model](./images/data-model.png)
 
 ---
 
-## AI Script Generation Flow
+## 3. User Journey
 
-```
-User clicks "Generate Script"
-        ↓
-Backend reads:
-  - Collection endpoints (from JSON/Postman/Swagger source)
-  - Project config (threads, ramp-up, duration)
-  - Env-specific URLs
-  - Test data file columns (for CSV parameterization)
-  - Pre-run response data (for correlation extraction)
-  - Performance rules (for thresholds)
-        ↓
-System prompt + user prompt assembled
-        ↓
-OpenAI GPT-4o or Claude API call
-        ↓
-Raw JMX or JS returned
-        ↓
-Written to: projects/<project>/<collection>/<env>/script/<name>.jmx
-        ↓
-Script path saved in test_suites.jmx_path
-```
+End-to-end flow from account creation to a passing test run.
+
+![user-journey](./images/user-journey.png)
 
 ---
 
-## Test Execution Sequence
+## 4. Role-Based Access Model
 
-```
-User clicks "Run Test"
-        ↓
-Backend: docker run -v <project_path>:/data justb4/jmeter -n -t /data/script.jmx
-        ↓ (real-time)
-SSE stream → Frontend (log lines, progress)
-        ↓
-Test completes
-        ↓
-If FAILED → Auto Healer
-  - Reads error log
-  - Calls AI: "Fix this JMX script given these errors"
-  - Writes fixed script
-  - Re-runs (up to 3 attempts)
-  - Sends alert email after successful correction
-        ↓
-If PASSED
-  - Results saved to /data/results/
-  - Email alert sent with analytics
-  - JMeter HTML report generated
-```
+![role-based-access](./images/role-based-access.png)
 
 ---
 
-## Database Schema (SQLite)
+## 5. AI Script Generation Flow
 
-| Table | Purpose |
-|---|---|
-| `users` | All users (super_admin / org_admin / user) |
-| `organizations` | Organizations managed by Super Admin |
-| `projects` | Test projects (owned by org_admin) |
-| `collections` | API sources per project |
-| `rules` | Performance assertion rules per project |
-| `test_suites` | Test plans (collection + env + script path) |
-| `test_data_files` | CSV test data (tagged by collection_id + env) |
-| `collection_env_config` | Per-env URL/port configuration |
-| `global_config` | Global defaults |
-| `project_config` | Project-level config overrides |
-| `ai_settings` | AI provider + model selection per user |
-| `alert_configs` | SMTP configuration per user |
-| `alert_recipients` | Email recipients per project |
-| `invites` | Invite tokens (pending / accepted / expired) |
-| `password_resets` | Password reset tokens (30-min expiry) |
-| `git_configs` | Git remote URL, PAT, workspace path per project |
-| `git_prs` | Pull requests (local DB + optional GitHub PR URL) |
-| `git_commits` | Commit log per project |
+How a test plan becomes an executable JMeter or K6 script.
+
+![ai-script-generation](./images/ai-script-generation.png)
 
 ---
 
-## Security Model
+## 6. Pre-Run Flow
+
+How live API responses are captured to power correlation and token extraction in generated scripts.
+
+![pre-run-flow](./images/pre-run-flow.png)
+
+---
+
+## 7. Test Execution Flow
+
+How a test run is triggered, streamed, and reported.
+
+![test-execution-flow](./images/test-execution-flow.png)
+
+---
+
+## 8. Auto-Heal Flow
+
+How failed test scripts are automatically diagnosed and fixed by AI.
+
+![auto-heal-flow](./images/auto-heal-flow.png)
+
+---
+
+## 9. Git & CI Integration Flow
+
+How test scripts are versioned, pushed, and merged via Git.
+
+![git-ci-integration](./images/git-ci-integration.png)
+
+---
+
+## 10. CI Pipeline Flow
+
+How sequential performance test pipelines are configured, triggered, and tracked.
+
+![ci-pipeline-flow](./images/ci-pipeline-flow.png)
+
+---
+
+## 11. Alert & Email Flow
+
+How test results trigger email notifications with analytics.
+
+![alert-email-flow](./images/alert-email-flow.png)
+
+---
+
+## 12. Multi-Environment Isolation
+
+```
+git-workspaces/
+├── admin/                                ← Org Admin workspace (main branch)
+│   └── Project_Name/
+│       ├── .git/
+│       ├── .gitignore
+│       └── Project_Name/
+│           └── CollectionName_ID/
+│               ├── QA/
+│               │   ├── testData/         ← env-scoped CSV files
+│               │   ├── script/           ← generated JMX / K6 scripts
+│               │   ├── results/          ← JMeter results.jtl + HTML report
+│               │   └── config/           ← config.json (URLs · rules · test plans)
+│               ├── Staging/
+│               ├── UAT/
+│               └── Production/
+│
+└── user-{id}/                            ← Regular user workspace (users/name branch)
+    └── Project_Name/
+        └── (same structure as above)
+```
+
+**Isolation guarantees:**
+- Every DB query that touches test data, configs, or scripts is scoped by `collection_id + env`
+- Switching environment in the UI never shows data from another environment
+- Regular users write only to their own `user-{id}` workspace; admin workspace is read-only for users
+- Script generation is blocked in the admin workspace — users must generate in their own workspace
+
+---
+
+## 13. Security Model
+
+![security-model](./images/security-model.png)
 
 | Concern | Implementation |
 |---|---|
-| Authentication | JWT (HS256, 14-day expiry) |
-| API Keys / PATs | AES-256-CBC encrypted in SQLite |
-| SMTP Passwords | AES-256-CBC encrypted in SQLite |
-| Password hashing | bcrypt (10 rounds) |
-| Route authorization | `auth` middleware on all routes; role checks per operation |
-| Git push auth | PAT injected into HTTPS URL at runtime, never stored in `.git/config` |
-| Docker | Non-root user in containers; read-only source mounts |
-| CORS | Strict origin whitelist via `CORS_ORIGIN` env var |
+| **Authentication** | JWT HS256, 14-day expiry, `auth` middleware on all routes |
+| **Password storage** | bcrypt, 10 rounds |
+| **Password reset** | Single-use token, 30-minute expiry |
+| **API keys / PATs / SMTP passwords** | AES-256-CBC encrypted in SQLite — never returned via API |
+| **Git push authentication** | PAT injected into HTTPS URL at runtime only, never persisted in `.git/config` |
+| **Route authorization** | Role checks per operation; `ownsProject()` for all project-scoped routes |
+| **SSRF protection** | Pre-run blocks RFC1918 IPs, loopback, and requires http/https scheme |
+| **CORS** | Strict origin whitelist via `CORS_ORIGIN` env var |
+| **Docker containers** | Non-root user; read-only source mounts |
+| **Invite system** | Scoped token per email+org+role; expires 7 days after creation |
+
+---
+
+## 14. Technology Stack
+
+| Layer | Technology |
+|---|---|
+| **Frontend** | React 18, Vite 5, axios, react-chartjs-2 / chart.js |
+| **Backend** | Node.js, Express 4, nodemon (dev) |
+| **Database** | SQLite via `node:sqlite` (built-in, no native deps) |
+| **AI Generation** | OpenAI GPT-4o (`openai` SDK) · Anthropic Claude (`@anthropic-ai/sdk`) |
+| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `perf-studio-runner` Docker image (Java · Node.js pre-installed) |
+| **Git Integration** | `simple-git` (local ops) · `@octokit/rest` (GitHub API) · GitLab REST API |
+| **Email** | `nodemailer` (SMTP transport, TLS) |
+| **PDF Reports** | `puppeteer` (HTML → PDF) · `pdfkit` |
+| **Excel / CSV** | `xlsx` (frontend parsing) · custom CSV parser (backend) |
+| **Encryption** | `crypto` (Node built-in AES-256-CBC) · `bcryptjs` |
+| **File uploads** | `multer` (memory + disk storage) |
+| **Backups** | `archiver` (ZIP on project delete) |
+| **Containerisation** | Docker · Docker Compose (all-in-one + multi-service modes) |
+| **CI/CD** | GitHub Actions (`workflow_dispatch`) · GitLab CI (`pipeline_trigger`) |
+| **Deployment** | Single Docker image (`Dockerfile`) or Compose stack |

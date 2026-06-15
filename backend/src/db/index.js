@@ -3,7 +3,10 @@ const path = require('path');
 const { mkdirSync } = require('fs');
 const bcrypt = require('bcryptjs');
 
-const DB_PATH = path.join(__dirname, '..', '..', 'data', 'perf_studio.db');
+// DB_PATH env var allows Docker to persist the database in a mounted volume.
+// Default: backend/data/perf_studio.db (local dev)
+// Docker:  /app/data/perf_studio.db   (set via ENV DB_PATH in Dockerfile)
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'perf_studio.db');
 mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
@@ -158,6 +161,16 @@ const migrations = [
   "ALTER TABLE collections ADD COLUMN generated_jmx TEXT DEFAULT ''",
   "ALTER TABLE collections ADD COLUMN generated_k6 TEXT DEFAULT ''",
   "ALTER TABLE projects ADD COLUMN folder_path TEXT DEFAULT ''",
+  "ALTER TABLE rules ADD COLUMN value_min TEXT DEFAULT NULL",
+  "ALTER TABLE rules ADD COLUMN value_max TEXT DEFAULT NULL",
+  "ALTER TABLE pipeline_runs ADD COLUMN logs TEXT DEFAULT '[]'",
+  "ALTER TABLE pipeline_runs ADD COLUMN triggered_by INTEGER DEFAULT NULL",
+  // CI config becomes per-user — add user_id so each user has their own row
+  "ALTER TABLE ci_pipeline_configs ADD COLUMN user_id INTEGER DEFAULT NULL",
+  // SSH auth support
+  "ALTER TABLE git_configs ADD COLUMN auth_method TEXT DEFAULT 'pat'",
+  "ALTER TABLE user_git_configs ADD COLUMN auth_method TEXT DEFAULT 'pat'",
+  "ALTER TABLE user_git_configs ADD COLUMN ssh_key TEXT DEFAULT ''",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (_) { /* column already exists */ }
@@ -207,6 +220,10 @@ for (const sql of alterStatements) {
 
 // Add environments array to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN environments TEXT DEFAULT '[]'"); } catch {}
+
+// Pre-run data on collections (migrated from test_suites)
+try { db.exec("ALTER TABLE collections ADD COLUMN pre_run_data TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE collections ADD COLUMN pre_run_collection_hash TEXT DEFAULT NULL"); } catch {}
 
 // Per-env configuration (each collection env has its own URL/config)
 try {
@@ -286,6 +303,78 @@ db.exec(`CREATE TABLE IF NOT EXISTS git_commits (
   created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 )`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS user_git_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  project_id INTEGER NOT NULL,
+  branch_name TEXT NOT NULL DEFAULT '',
+  author_name TEXT NOT NULL DEFAULT '',
+  author_email TEXT NOT NULL DEFAULT '',
+  auth_token TEXT NOT NULL DEFAULT '',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, project_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS pipeline_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  steps TEXT NOT NULL DEFAULT '[]',
+  stop_on_failure INTEGER DEFAULT 1,
+  environment TEXT DEFAULT '',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pipeline_id INTEGER NOT NULL,
+  project_id INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending',
+  steps_result TEXT DEFAULT '[]',
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  FOREIGN KEY (pipeline_id) REFERENCES pipeline_configs(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+// ── CI/CD Pipeline integration tables ────────────────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL UNIQUE,
+  gitlab_enabled INTEGER DEFAULT 0,
+  gitlab_url TEXT DEFAULT 'https://gitlab.com',
+  gitlab_project_id TEXT DEFAULT '',
+  gitlab_token TEXT DEFAULT '',
+  gitlab_trigger_token TEXT DEFAULT '',
+  gitlab_ref TEXT DEFAULT 'main',
+  github_enabled INTEGER DEFAULT 0,
+  github_repo TEXT DEFAULT '',
+  github_token TEXT DEFAULT '',
+  github_workflow_file TEXT DEFAULT 'perf-test.yml',
+  github_ref TEXT DEFAULT 'main',
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  external_id TEXT,
+  web_url TEXT,
+  status TEXT DEFAULT 'pending',
+  script_name TEXT,
+  variables TEXT DEFAULT '{}',
+  triggered_by INTEGER,
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)`);
+
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 

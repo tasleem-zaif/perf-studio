@@ -75,71 +75,76 @@ router.post('/pre-run', async (req, res) => {
   let endpoints = [];
   try { endpoints = JSON.parse(collection.json_content); } catch { return res.status(400).json({ error: 'Invalid collection data' }); }
 
-  const responses = [];
-  let authToken = null;   // Bearer token carried across requests
-  let cookieJar = null;   // Cookie jar carried across requests
+  const batch = endpoints.slice(0, 20);
 
-  for (const ep of endpoints.slice(0, 20)) {
+  // Phase 1: fire all requests in parallel (5s timeout each)
+  async function fireEndpoint(ep, extraHeaders = {}) {
     if (!ep.url || !isSafeUrl(ep.url)) {
-      responses.push({ endpoint: ep.name || ep.url, url: ep.url, method: ep.method || 'GET', skipped: true, reason: 'URL blocked or invalid', success: false });
-      continue;
+      return { endpoint: ep.name || ep.url, url: ep.url, method: ep.method || 'GET', skipped: true, reason: 'URL blocked or invalid', success: false };
     }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const headers = { 'Content-Type': 'application/json', ...(ep.headers || {}), ...extraHeaders };
+    const fetchOpts = { method: ep.method || 'GET', headers, signal: controller.signal };
+    if (ep.body && ep.method !== 'GET') fetchOpts.body = typeof ep.body === 'string' ? ep.body : JSON.stringify(ep.body);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-
-      // Merge static endpoint headers, injected auth token, and cookie jar
-      const headers = { 'Content-Type': 'application/json', ...(ep.headers || {}) };
-      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-      if (cookieJar) headers['Cookie'] = cookieJar;
-
-      const fetchOpts = { method: ep.method || 'GET', headers, signal: controller.signal };
-      if (ep.body && ep.method !== 'GET') fetchOpts.body = typeof ep.body === 'string' ? ep.body : JSON.stringify(ep.body);
-
       const r = await fetch(ep.url, fetchOpts);
       clearTimeout(timer);
       const text = await r.text();
       let body;
       try { body = JSON.parse(text); } catch { body = text.slice(0, 1000); }
-
       const responseHeaders = Object.fromEntries(r.headers.entries());
-
-      // Try to extract token from this response and carry it forward
       const extracted = extractToken(body, responseHeaders);
-      if (extracted) authToken = extracted;
-
-      // Carry cookies forward
       const newCookies = extractCookies(responseHeaders);
-      if (newCookies) cookieJar = newCookies;
-
-      responses.push({
-        endpoint: ep.name || ep.url,
-        method: ep.method || 'GET',
-        url: ep.url,
-        status: r.status,
-        statusText: r.statusText,
-        requestHeaders: headers,
-        requestBody: fetchOpts.body || null,
-        responseHeaders,
-        body,
+      return {
+        endpoint: ep.name || ep.url, method: ep.method || 'GET', url: ep.url,
+        status: r.status, statusText: r.statusText,
+        requestHeaders: headers, requestBody: fetchOpts.body || null,
+        responseHeaders, body,
         success: r.status >= 200 && r.status < 400,
+        _extracted: extracted, _cookies: newCookies,
         tokenExtracted: extracted ? true : undefined,
-        tokenInjected: (authToken && !extracted) ? true : undefined,
-      });
+      };
     } catch (e) {
-      responses.push({
-        endpoint: ep.name || ep.url,
-        method: ep.method || 'GET',
-        url: ep.url,
-        error: e.name === 'AbortError' ? 'Request timed out (5s limit)' : e.message,
-        success: false,
-      });
+      clearTimeout(timer);
+      return { endpoint: ep.name || ep.url, method: ep.method || 'GET', url: ep.url, error: e.name === 'AbortError' ? 'Request timed out (5s limit)' : e.message, success: false };
     }
   }
 
-  // Persist results to the suite so they survive page refreshes
+  // Run all in parallel
+  const rawResults = await Promise.all(batch.map(ep => fireEndpoint(ep)));
+
+  // Extract any auth token from the first successful response that has one
+  let authToken = null;
+  let cookieJar = null;
+  for (const r of rawResults) {
+    if (r._extracted) { authToken = r._extracted; break; }
+    if (r._cookies) { cookieJar = r._cookies; }
+  }
+
+  // Phase 2: retry endpoints that got 401 and we now have a token
+  const responses = await Promise.all(rawResults.map(async (r, i) => {
+    const ep = batch[i];
+    if (r.status === 401 && authToken) {
+      const retry = await fireEndpoint(ep, {
+        Authorization: `Bearer ${authToken}`,
+        ...(cookieJar ? { Cookie: cookieJar } : {}),
+      });
+      retry.tokenInjected = true;
+      delete retry._extracted; delete retry._cookies;
+      return retry;
+    }
+    const clean = { ...r };
+    if (authToken && !r._extracted) clean.tokenInjected = true;
+    delete clean._extracted; delete clean._cookies;
+    return clean;
+  }));
+
+  // Persist results — always on collection, also on test_suite when suite_id provided (legacy)
+  const hash = simpleHash(collection.json_content || '');
+  db.prepare('UPDATE collections SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
+    .run(JSON.stringify(responses), hash, collection_id);
   if (suite_id) {
-    const hash = simpleHash(collection.json_content || '');
     db.prepare('UPDATE test_suites SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
       .run(JSON.stringify(responses), hash, suite_id);
   }

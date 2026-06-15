@@ -82,15 +82,16 @@ function metricKey(ruleName) {
   return METRIC_MAP[(ruleName || '').toLowerCase().trim()] || null;
 }
 
-function compare(actual, op, threshold) {
+function compare(actual, op, threshold, thresholdMin, thresholdMax) {
   switch (op) {
-    case '>':  return actual >  threshold;
-    case '>=': return actual >= threshold;
-    case '<':  return actual <  threshold;
-    case '<=': return actual <= threshold;
+    case '>':       return actual >  threshold;
+    case '>=':      return actual >= threshold;
+    case '<':       return actual <  threshold;
+    case '<=':      return actual <= threshold;
     case '==':
-    case '=':  return actual === threshold;
-    default:   return false;
+    case '=':       return actual === threshold;
+    case 'between': return actual >= thresholdMin && actual <= thresholdMax;
+    default:        return false;
   }
 }
 
@@ -122,16 +123,27 @@ function evaluateRules(projectId, jtlPath) {
     const key = metricKey(rule.metric);
     if (!key) continue;                       // unknown metric — skip
 
-    const actual    = metrics[key];
-    const threshold = parseFloat(rule.value);
-    if (isNaN(threshold)) continue;
+    const actual       = metrics[key];
+    const threshold    = parseFloat(rule.value);
+    const thresholdMin = parseFloat(rule.value_min);
+    const thresholdMax = parseFloat(rule.value_max);
 
-    const breached = compare(actual, rule.operator, threshold);
+    // For non-between rules require a valid threshold; for between require min+max
+    if (rule.operator === 'between') {
+      if (isNaN(thresholdMin) || isNaN(thresholdMax)) continue;
+    } else {
+      if (isNaN(threshold)) continue;
+    }
+
+    const breached = compare(actual, rule.operator, threshold, thresholdMin, thresholdMax);
     if (breached) {
+      const thresholdLabel = rule.operator === 'between'
+        ? `between ${rule.value_min}–${rule.value_max}${rule.unit}`
+        : `${rule.operator} ${rule.value}${rule.unit}`;
       violations.push({
         rule,
         actual: parseFloat(actual.toFixed(2)),
-        label: `${rule.metric} ${rule.operator} ${rule.value}${rule.unit} (actual: ${actual.toFixed(2)}${rule.unit})`,
+        label: `${rule.metric} ${thresholdLabel} (actual: ${actual.toFixed(2)}${rule.unit})`,
       });
     }
   }

@@ -1,43 +1,24 @@
 /**
  * displayName.js
- * Formats project/collection names to match their local directory structure.
- *
- * Project directory:    ProjectName_ID_UUID      e.g. API_Load_Test_5_847291
- * Collection directory: CollectionName_ID/Env    e.g. APICollection_3/QA
+ * Clean display names for the UI — IDs/UUIDs are stored in the DB,
+ * no need to show them on screen.
  */
 
-/** Sanitise a raw name the same way the backend does for folder creation */
-function safeName(name) {
-  return (name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
-/**
- * Project display name — mirrors the on-disk folder name.
- * Format: Name_ID_UUID  (e.g. API_Load_Test_5_847291)
- */
+/** Project display name — just the human-readable name */
 export function projectDirName(project) {
   if (!project) return '';
-  const safe = safeName(project.name);
-  const uuid = project.uuid || '';
-  return uuid ? `${safe}_${project.id}_${uuid}` : `${safe}_${project.id}`;
+  return project.name || '';
 }
 
-/**
- * Collection display name — mirrors the on-disk folder name.
- * Format: Name_ID  (e.g. APICollection_3)
- */
+/** Collection display name — just the human-readable name */
 export function collectionDirName(collection) {
   if (!collection) return '';
-  return `${safeName(collection.name)}_${collection.id}`;
+  return collection.name || '';
 }
 
-/**
- * Collection full path label — Name_ID / Env
- * e.g. APICollection_3 / QA
- */
+/** Collection label with environment — Name / Env */
 export function collectionPathLabel(collection) {
   if (!collection) return '';
-  const base = collectionDirName(collection);
-  const env  = collection.environment;
-  return env ? `${base} / ${env}` : base;
+  const env = collection.environment;
+  return env ? `${collection.name} / ${env}` : (collection.name || '');
 }

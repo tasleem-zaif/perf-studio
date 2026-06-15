@@ -47,31 +47,31 @@ function StatusBadge({ status }) {
 }
 
 export default function Reports({ project, collection, env, envs, onEnvChange }) {
-  const [runs, setRuns] = useState([]);
+  const [runs,     setRuns]     = useState([]);
   const [selectedId, setSelectedId] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState(null); // explicit state — avoids timing bugs
+  const [loading,  setLoading]  = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // Load ALL runs once when project changes
   useEffect(() => {
     if (!project) return;
     setLoading(true);
     setSelectedId('');
+    setSelected(null);
     api.get('/execution/runs', { params: { project_id: project.id } })
-      .then(({ data }) => {
-        let filtered = data.runs || [];
-        // Filter by collection
-        if (collection?.id) {
-          filtered = filtered.filter(r => String(r.collection_id) === String(collection.id));
-        }
-        // Strict env filter — no cross-env bleed
-        if (env) {
-          filtered = filtered.filter(r => r.suite_env === env);
-        }
-        setRuns(filtered);
-      })
+      .then(({ data }) => setRuns(data.runs || []))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
+
+  // Update selected run whenever selectedId or runs change
+  // Compare both as strings — CustomSelect may pass value as number or string
+  useEffect(() => {
+    if (!selectedId) { setSelected(null); return; }
+    const found = runs.find(r => String(r.id) === String(selectedId));
+    setSelected(found || null);
+  }, [selectedId, runs]);
 
   if (!project) {
     return (
@@ -84,12 +84,11 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
     );
   }
 
-  const selected = runs.find(r => String(r.id) === selectedId);
   const jmeterRuns = runs.filter(r => r.engine === 'jmeter');
   const runNum = selected?.result_dir?.match(/Run_(\d+)/)?.[1];
 
   return (
-    <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)', gap: 0 }}>
+    <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view JMeter reports" />
 
       {/* Controls bar */}
@@ -176,6 +175,14 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
         </div>
       )}
 
+      {selectedId && !selected && (
+        <div className="empty" style={{ flex: 1 }}>
+          <i className="ti ti-refresh" style={{ fontSize: '36px', color: 'var(--warn)', marginBottom: '10px' }} />
+          <div className="empty-title">Loading run…</div>
+          <div className="empty-desc">Please wait or try selecting the run again.</div>
+        </div>
+      )}
+
       {selectedId && selected && !selected.report_url && (
         <div className="empty" style={{ flex: 1 }}>
           <i className="ti ti-info-circle" style={{ fontSize: '36px', color: 'var(--warn)', marginBottom: '10px' }} />
@@ -196,7 +203,7 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
       )}
 
       {selectedId && selected?.report_url && (
-        <div style={{ flex: 1, border: '1px solid var(--color-border)', borderRadius: '10px', overflow: 'hidden', background: '#fff' }}>
+        <div style={{ border: '1px solid var(--color-border)', borderRadius: '10px', overflow: 'hidden', background: '#fff', height: '72vh' }}>
           <iframe
             key={selected.report_url}
             src={selected.report_url}

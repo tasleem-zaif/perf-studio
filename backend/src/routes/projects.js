@@ -22,33 +22,45 @@ router.get('/', (req, res) => {
   let projects;
   if (caller.role === 'super_admin') {
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       ORDER BY o.name ASC, p.created_at DESC
     `).all();
   } else if (caller.role === 'org_admin') {
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       WHERE u.org_id = ?
       ORDER BY p.created_at DESC
     `).all(caller.org_id);
   } else if (caller.role === 'user') {
     // Regular users see only projects explicitly assigned to them
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN project_assignments pa ON pa.project_id = p.id AND pa.user_id = ?
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       ORDER BY p.created_at DESC
     `).all(req.userId);
   } else {
-    projects = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC').all(req.userId);
+    projects = db.prepare(`
+      SELECT p.*, COALESCE(gc.is_initialized, 0) as git_initialized
+      FROM projects p
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
+      WHERE p.user_id = ?
+      ORDER BY p.created_at DESC
+    `).all(req.userId);
   }
 
   res.json({ projects });
@@ -71,11 +83,9 @@ router.post('/', (req, res) => {
     'INSERT INTO projects (user_id, name, description, color, bg, uuid) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(req.userId, name, description || '', COLORS[idx], BKGS[idx], uuid);
 
-  const folderPath = ensureProjectFolders(name, result.lastInsertRowid, uuid);
-  db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, result.lastInsertRowid);
-
+  // folder_path is null until Org Admin initializes the Git repository.
+  // The folder structure is created inside git-workspaces during git init.
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
-  // config.json written per collection/env when collections are added
   res.json({ project });
 });
 

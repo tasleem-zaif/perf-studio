@@ -13,6 +13,7 @@ import { useConfirm } from './hooks/useConfirm';
 import { ToastProvider, useToast } from './hooks/useToast';
 import Dashboard from './pages/Dashboard';
 import ProjectHome from './pages/ProjectHome';
+import ProjectWorkspace from './pages/ProjectWorkspace';
 import Collections from './pages/Collections';
 import Rules from './pages/Rules';
 import Runner from './pages/Runner';
@@ -28,6 +29,38 @@ import GitPanel from './pages/GitPanel';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
 
+// ── All pages that live inside the ProjectWorkspace ──
+const PROJECT_PAGES = [
+  'project-home','ai-config','git','collections',
+  'test-data','rules','config','test-suites',
+  'alerts','runner','analytics','reports',
+];
+
+// Map app page-id → browser URL
+function pageToUrl(p, projectId) {
+  if (p === 'dashboard')          return '/dashboard';
+  if (p === 'profile')            return '/myprofile';
+  if (p === 'settings-users')     return '/settings/users';
+  if (p === 'settings-orgs')      return '/settings/orgs';
+  if (p === 'settings-ai')        return '/settings/ai';
+  if (p === 'settings-smtp')      return '/settings/smtp';
+  if (projectId && (p === 'project-home' || PROJECT_PAGES.includes(p)))
+    return `/projects/${projectId}`;
+  return '/dashboard';
+}
+
+// Map browser URL → { page, projectId }
+function urlToPageState(pathname) {
+  if (pathname === '/myprofile') return { page: 'profile', projectId: null };
+  const projMatch = pathname.match(/^\/projects\/(\d+)/);
+  if (projMatch) return { page: 'project-home', projectId: parseInt(projMatch[1]) };
+  if (pathname.startsWith('/settings')) {
+    const sub = pathname.split('/')[2] || 'users';
+    return { page: `settings-${sub}`, projectId: null };
+  }
+  return { page: 'dashboard', projectId: null };
+}
+
 const PAGE_TITLES = {
   dashboard: 'Dashboard',
   'project-home': null,
@@ -38,7 +71,7 @@ const PAGE_TITLES = {
   'test-data': 'Test Data',
   config: 'Configuration',
   'settings-users': 'User Management',
-  'settings-appearance': 'Appearance',
+  'settings-orgs':  'Organizations',
   'settings-ai':   'AI Configuration',
   'ai-config':     'AI Configuration',
   'git':           'Git Integration',
@@ -97,7 +130,9 @@ function AppInner() {
   const [testSuiteModalTrigger, setTestSuiteModalTrigger] = useState(0);
   const [testDataUploadTrigger, setTestDataUploadTrigger] = useState(0);
   const [generateDataTrigger, setGenerateDataTrigger] = useState(0);
-  const [theme, setTheme] = useState(() => localStorage.getItem('ps_theme') || 'quarks');
+  // Single Quarks Light theme — always; clear any stale dark theme from localStorage
+  useEffect(() => { localStorage.setItem('ps_theme', 'quarks'); document.documentElement.setAttribute('data-theme', 'quarks'); }, []);
+  const [theme, setTheme] = useState('quarks');
   // Track which pages have been mounted at least once so KeepAlive can preserve their state.
   const [everVisited, setEverVisited] = useState(() => new Set(['dashboard']));
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
@@ -117,36 +152,114 @@ function AppInner() {
     localStorage.setItem('ps_theme', theme);
   }, [theme]);
 
+  // Sync state when user presses browser Back / Forward
   useEffect(() => {
-    const token = localStorage.getItem('ps_token');
+    const handlePop = () => {
+      const { page: urlPage, projectId } = urlToPageState(window.location.pathname);
+      if (projectId) {
+        setProjects(prev => {
+          const proj = prev.find(p => p.id === projectId);
+          if (proj) { setActiveProject(proj); setPage('project-home'); setActiveTab('projects'); markVisited('project-home'); }
+          return prev;
+        });
+      } else {
+        setActiveProject(null);
+        markVisited(urlPage);
+        setPage(urlPage);
+        setActiveTab(tabFromPage(urlPage));
+      }
+    };
+    window.addEventListener('popstate', handlePop);
+    return () => window.removeEventListener('popstate', handlePop);
+  }, []);
+
+  useEffect(() => {
+    const token      = localStorage.getItem('ps_token');
+    const cachedUser = (() => { try { return JSON.parse(localStorage.getItem('ps_user')); } catch { return null; } })();
+
     if (!token) { setLoading(false); return; }
+
+    if (cachedUser) {
+      // User already verified this session — skip /auth/me entirely
+      setUser(cachedUser);
+      loadProjects(cachedUser.role);
+      return;
+    }
+
+    // First load this session — call /auth/me exactly once, then cache
     api.get('/auth/me').then(({ data }) => {
+      localStorage.setItem('ps_user', JSON.stringify(data.user));
       setUser(data.user);
-      loadProjects();
+      loadProjects(data.user.role);
     }).catch(() => {
       localStorage.removeItem('ps_token');
+      localStorage.removeItem('ps_user');
       setLoading(false);
     });
   }, []);
 
-  async function loadProjects() {
+  async function loadProjects(callerRole) {
     const { data } = await api.get('/projects');
-    const ps = data.projects;
-    for (const p of ps) {
-      try {
-        const [cols, rules] = await Promise.all([
-          api.get(`/projects/${p.id}/collections`),
-          api.get(`/projects/${p.id}/rules`),
-        ]);
-        p.collections = cols.data.collections;
-        p.rules = rules.data.rules;
-      } catch {
-        p.collections = [];
-        p.rules = [];
-      }
-    }
+    const ps = (data.projects || []).map(p => ({
+      ...p,
+      collections: p.collections || [],
+      rules: p.rules || [],
+    }));
     setProjects(ps);
     setLoading(false);
+
+    const isSuperAdmin = callerRole === 'super_admin';
+
+    // Restore state from the current browser URL (e.g. user refreshed or shared a link)
+    const { page: urlPage, projectId } = urlToPageState(window.location.pathname);
+    if (projectId && !isSuperAdmin) {
+      const proj = ps.find(p => p.id === projectId);
+      if (proj) {
+        setActiveProject(proj);
+        markVisited('project-home');
+        setPage('project-home');
+        setActiveTab('projects');
+        // Fetch collections + rules for the restored project (same as selectProject())
+        Promise.all([
+          api.get(`/projects/${projectId}/collections`),
+          api.get(`/projects/${projectId}/rules`),
+        ]).then(([colsRes, rulesRes]) => {
+          const enriched = {
+            ...proj,
+            collections: colsRes.data.collections || [],
+            rules: rulesRes.data.rules || [],
+          };
+          setProjects(prev => prev.map(p => p.id === projectId ? enriched : p));
+          setActiveProject(enriched);
+        }).catch(() => {});
+      } else {
+        // Project not found or not accessible — reset URL to dashboard
+        window.history.replaceState(null, '', '/dashboard');
+      }
+    } else if (urlPage && urlPage !== 'dashboard' && !isSuperAdmin) {
+      markVisited(urlPage);
+      setPage(urlPage);
+      setActiveTab(tabFromPage(urlPage));
+    } else if (isSuperAdmin && urlPage && urlPage.startsWith('settings-')) {
+      // super_admin: restore settings page from URL
+      markVisited(urlPage);
+      setPage(urlPage);
+      setActiveTab('settings');
+    }
+    // Redirect to default landing page after login
+    if (['/', '', '/sign-in', '/dashboard'].includes(window.location.pathname) || isSuperAdmin) {
+      if (isSuperAdmin) {
+        const settingsUrl = urlPage && urlPage.startsWith('settings-') ? pageToUrl(urlPage) : '/settings/users';
+        const settingsPage = urlPage && urlPage.startsWith('settings-') ? urlPage : 'settings-users';
+        window.history.replaceState(null, '', settingsUrl);
+        markVisited(settingsPage);
+        setPage(settingsPage);
+        setActiveTab('settings');
+      } else if (['/', '', '/sign-in'].includes(window.location.pathname)) {
+        window.history.replaceState(null, '', '/dashboard');
+      }
+    }
+
     return ps;
   }
 
@@ -197,6 +310,10 @@ function AppInner() {
     markVisited(p);
     setPage(p);
     setActiveTab(tabFromPage(p));
+    // Update browser URL
+    window.history.pushState(null, '', pageToUrl(p, activeProject?.id));
+    // Scroll window to top — rAF ensures it fires after KeepAlive switches
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'instant' }));
     // Reset modal triggers so re-navigating to a page never auto-opens its form
     setCollectionModalTrigger(0);
     setRuleModalTrigger(0);
@@ -212,21 +329,41 @@ function AppInner() {
     else if (tab === 'execution') target = 'runner';
     else if (tab === 'settings') {
       const isAdmin = user?.role === 'super_admin' || user?.role === 'org_admin';
-      target = isAdmin ? 'settings-users' : 'settings-appearance';
+      target = isAdmin ? 'settings-users' : 'settings-smtp';
     }
     else if (tab === 'projects') target = 'dashboard';
     else if (tab === 'profile')  target = 'profile';
     if (target) { markVisited(target); setPage(target); }
   }
 
-  function selectProject(id) {
-    const p = projects.find(pr => pr.id === id);
+  async function selectProject(id) {
+    const p = projects.find(pr => pr.id === id) || { id };
     setActiveProject(p);
     setActiveCollection(null);
     setActiveEnv(null);
     setActiveTab('projects');
     markVisited('project-home');
     setPage('project-home');
+    window.history.pushState(null, '', `/projects/${id}`);
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'instant' }));
+    // Fetch all 4 project-scoped APIs in parallel
+    try {
+      const [colsRes, rulesRes, suitesRes, dataRes] = await Promise.all([
+        api.get(`/projects/${id}/collections`),
+        api.get(`/projects/${id}/rules`),
+        api.get(`/projects/${id}/test-suites`),
+        api.get(`/projects/${id}/test-data`),
+      ]);
+      const enriched = {
+        ...p,
+        collections:     colsRes.data.collections   || [],
+        rules:           rulesRes.data.rules          || [],
+        test_plan_count: suitesRes.data.suites?.length || 0,
+        test_data_count: dataRes.data.files?.length   || 0,
+      };
+      setProjects(prev => prev.map(pr => pr.id === id ? enriched : pr));
+      setActiveProject(enriched);
+    } catch {}
   }
 
   function selectCollection(collection, env, targetPage) {
@@ -240,6 +377,7 @@ function AppInner() {
     const dest = targetPage || 'test-suites';
     markVisited(dest);
     setPage(dest);
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'instant' }));
     setActiveTab('projects');
     setCollectionModalTrigger(0);
   }
@@ -277,15 +415,20 @@ function AppInner() {
   }
 
   function handleLogin(u) {
+    localStorage.setItem('ps_user', JSON.stringify(u)); // cache — no /auth/me needed until tab closes
     setUser(u);
-    loadProjects().then(ps => { if (ps.length) setActiveProject(ps[0]); });
+    loadProjects(u.role).then(ps => {
+      if (ps.length && u.role !== 'super_admin') setActiveProject(ps[0]);
+    });
   }
 
   function logout() {
     localStorage.removeItem('ps_token');
+    localStorage.removeItem('ps_user'); // clear cache on logout
     setUser(null); setProjects([]); setActiveProject(null);
     setPage('dashboard'); setActiveTab('dashboard');
     setEverVisited(new Set(['dashboard']));
+    window.history.replaceState(null, '', '/sign-in');
   }
 
   function renderTopbarActions() {
@@ -323,6 +466,10 @@ function AppInner() {
 
   // Pages where the user picks an env via the selector bar (not rules — that's global)
   const ENV_PAGES = new Set(['test-data', 'config', 'test-suites', 'alerts', 'runner', 'analytics', 'reports']);
+
+  // Show ProjectWorkspace when a project is selected and page is project-related
+  const collections = activeProject?.collections || [];
+  const showWorkspace = !!(activeProject && PROJECT_PAGES.includes(page));
 
   // Derive envs list from the active collection
   const collectionEnvs = (() => {
@@ -366,99 +513,118 @@ function AppInner() {
     return <ResetPassword token={resetMatch[1]} />;
   }
 
-  if (!user) return <Auth onLogin={handleLogin} />;
+  if (!user) {
+    // Ensure URL shows /sign-in while on the login screen
+    if (!['/sign-in', '/forgot-password'].includes(window.location.pathname) &&
+        !window.location.pathname.startsWith('/reset-password') &&
+        !window.location.pathname.startsWith('/accept-invite')) {
+      window.history.replaceState(null, '', '/sign-in');
+    }
+    return <Auth onLogin={handleLogin} />;
+  }
+
+  // ── Project Workspace — replaces entire layout (banner + sidebar + content) ──
+  if (showWorkspace) {
+    return (
+      <>
+      <Toast />
+      <ProjectWorkspace
+        key={activeProject.id}
+        project={{ ...activeProject, collections }}
+        user={user}
+        projects={projects}
+        onBack={() => { setActiveProject(null); setPage('dashboard'); window.history.pushState(null, '', '/dashboard'); window.scrollTo({ top: 0, behavior: 'instant' }); }}
+        onProjectUpdated={refreshProject}
+        theme={theme}
+        onThemeChange={setTheme}
+      />
+      </>
+    );
+  }
 
   return (
     <div>
       {/* Banner */}
       <div className="app-banner">
-        <img
-          src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-          alt="QTSolv"
-          style={{ height: '40px', width: 'auto', objectFit: 'contain', position: 'absolute', left: '18px', zIndex: 1 }}
-        />
-        <i className="ti ti-activity-heartbeat app-banner-icon" />
-        <span className="app-banner-title">AI-Powered Performance Test Studio</span>
-      </div>
-
-      <Sidebar
-        user={user}
-        projects={projects}
-        activeProject={activeProject}
-        activeCollection={activeCollection}
-        activeEnv={activeEnv}
-        page={page}
-        activeTab={activeTab}
-        onNav={nav}
-        onSelectProject={selectProject}
-        onSelectCollection={selectCollection}
-        onNewProject={openNewProject}
-        onAddCollection={openAddCollection}
-        onLogout={logout}
-        onTabChange={changeTab}
-      />
-
-      <div className="main">
-        <div className="topbar">
-          <div className="topbar-title">{pageTitle}</div>
-          <div className="topbar-actions">{renderTopbarActions()}</div>
+        {/* Left: Quarks logo + subtitle — left aligned */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <img
+            src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
+            alt="QTSolv"
+            style={{ height: '30px', width: 'auto', objectFit: 'contain', flexShrink: 0 }}
+          />
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', fontWeight: 500, letterSpacing: '.3px' }}>
+            AI-Powered Performance Test Studio
+          </span>
         </div>
 
-        <KeepAlive active={page === 'dashboard'}    everVisited={everVisited.has('dashboard')}>
-          <Dashboard projects={projects} user={user} onSelectProject={selectProject}
-            onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
-            onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
-            onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
-        </KeepAlive>
-        <KeepAlive active={page === 'project-home'}  everVisited={everVisited.has('project-home')}>
-          <ProjectHome project={activeProject} onNav={nav}
-            onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
-            onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
-        </KeepAlive>
-        <KeepAlive active={page === 'collections'}   everVisited={everVisited.has('collections')}>
-          <Collections project={activeProject} {...sharedProps} openModalTrigger={collectionModalTrigger} />
-        </KeepAlive>
-        <KeepAlive active={page === 'rules'}         everVisited={everVisited.has('rules')}>
-          <Rules project={activeProject} {...sharedProps} openModalTrigger={ruleModalTrigger} />
-        </KeepAlive>
-        <KeepAlive active={page === 'test-suites'}   everVisited={everVisited.has('test-suites')}>
-          <TestSuites project={activeProject} {...sharedProps} openModalTrigger={testSuiteModalTrigger} />
-        </KeepAlive>
-        <KeepAlive active={page === 'test-data'}     everVisited={everVisited.has('test-data')}>
-          <TestData project={activeProject} {...sharedProps} uploadTrigger={testDataUploadTrigger} generateTrigger={generateDataTrigger} />
-        </KeepAlive>
-        <KeepAlive active={page === 'config'}        everVisited={everVisited.has('config')}>
-          {/* key forces remount when env changes so all state (sysChecks, docker) resets cleanly */}
-          <Config key={`config-${activeProject?.id}-${activeCollection?.id}-${activeEnv}`} project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
-        </KeepAlive>
-        <KeepAlive active={page.startsWith('settings')} everVisited={[...everVisited].some(p => p.startsWith('settings'))}>
-          <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} projects={projects} />
-        </KeepAlive>
-        <KeepAlive active={page === 'ai-config'} everVisited={everVisited.has('ai-config')}>
-          <Settings page="settings-ai" theme={theme} onThemeChange={setTheme} user={user} />
-        </KeepAlive>
-        <KeepAlive active={page === 'alerts'} everVisited={everVisited.has('alerts')}>
-          <Alerts project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
-        </KeepAlive>
-        <KeepAlive active={page === 'profile'}       everVisited={everVisited.has('profile')}>
-          <Profile user={user} onUserUpdated={u => setUser(u)} />
-        </KeepAlive>
-        <KeepAlive active={page === 'runner'}        everVisited={everVisited.has('runner')}>
-          <ErrorBoundary><Runner projects={projects} activeProject={activeProject} activeCollection={activeCollection} activeEnv={activeEnv} onNav={nav} /></ErrorBoundary>
-        </KeepAlive>
-        <KeepAlive active={page === 'reports'}       everVisited={everVisited.has('reports')}>
-          <Reports project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
-        </KeepAlive>
-        <KeepAlive active={page === 'analytics'}     everVisited={everVisited.has('analytics')}>
-          <Analytics project={activeProject} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
-        </KeepAlive>
-        <KeepAlive active={page === 'git'}           everVisited={everVisited.has('git')}>
-          <GitPanel project={activeProject} user={user} />
+        {/* Right: Profile + Logout */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button className="banner-action-btn" onClick={() => nav('profile')}>
+            <i className="ti ti-user-circle" style={{ fontSize: 14 }} />
+            {user?.name || 'Profile'}
+          </button>
+          <button className="banner-action-btn" onClick={logout}
+            style={{ background: 'rgba(239,68,68,0.15)', color: '#fca5a5' }}>
+            <i className="ti ti-logout" style={{ fontSize: 14 }} />
+            Logout
+          </button>
+        </div>
+      </div>
+
+      {/* Sidebar only for org_admin and super_admin — regular users go straight to dashboard */}
+      {user?.role !== 'user' && (
+        <Sidebar
+          user={user}
+          projects={projects}
+          activeProject={activeProject}
+          activeCollection={activeCollection}
+          activeEnv={activeEnv}
+          page={page}
+          activeTab={activeTab}
+          onNav={nav}
+          onSelectProject={selectProject}
+          onSelectCollection={selectCollection}
+          onNewProject={openNewProject}
+          onAddCollection={openAddCollection}
+          onLogout={logout}
+          onTabChange={changeTab}
+        />
+      )}
+
+      {/* Main content area — no left margin for regular users (no sidebar) */}
+      <div className={`main${user?.role === 'user' ? ' no-topbar' : ''}`}
+        style={user?.role === 'user' ? { marginLeft: 0, width: '100%' } : {}}>
+        {/* Topbar only for admin roles */}
+        {user?.role !== 'user' && (
+          <div className="topbar" style={user?.role === 'user' ? { left: 0 } : {}}>
+            <div className="topbar-title">{pageTitle}</div>
+            <div className="topbar-actions">{renderTopbarActions()}</div>
+          </div>
+        )}
+
+        {user?.role !== 'super_admin' && (
+          <KeepAlive active={page === 'dashboard'} everVisited={everVisited.has('dashboard')}>
+            <Dashboard projects={projects} user={user} onSelectProject={selectProject}
+              onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
+              onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
+              onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
+          </KeepAlive>
+        )}
+
+        {/* Settings only for admin roles */}
+        {user?.role !== 'user' && (
+          <KeepAlive active={page.startsWith('settings')} everVisited={[...everVisited].some(p => p.startsWith('settings'))}>
+            <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} projects={projects} />
+          </KeepAlive>
+        )}
+        {/* NOTE: all project-related pages (project-home, collections, rules, etc.)
+             are now handled inside ProjectWorkspace which renders as a full-screen root.
+             Only dashboard, settings, profile remain here. */}
+        <KeepAlive active={page === 'profile'} everVisited={everVisited.has('profile')}>
+          <Profile user={user} onUserUpdated={u => { setUser(u); localStorage.setItem('ps_user', JSON.stringify(u)); }} onBack={() => nav('dashboard')} />
         </KeepAlive>
 
-        <footer className="app-footer">
-          &copy; Quarks Technosoft PVT. LTD. All rights reserved.
-        </footer>
       </div>
 
       <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />

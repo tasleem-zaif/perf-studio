@@ -54,7 +54,17 @@ router.post('/', (req, res) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(req.params.projectId, name, test_type || 'load', collection_id || null, env || null, primaryId,
     JSON.stringify(idsArr), engine || 'jmeter', JSON.stringify(config || {}), vusers||50, rampup||30, iter_mode||'duration', loops||1, duration||300);
-  if (collection_id) setImmediate(() => updateCollectionConfigs(collection_id));
+  if (collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(collection_id, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ suite: db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
 });
 
@@ -82,7 +92,17 @@ router.put('/:id', (req, res) => {
       duration !== undefined ? duration : suite.duration,
       req.params.id);
   const updatedSuite = db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
-  if (updatedSuite?.collection_id) setImmediate(() => updateCollectionConfigs(updatedSuite.collection_id));
+  if (updatedSuite?.collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId, _cid = updatedSuite.collection_id;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ suite: updatedSuite });
 });
 
@@ -92,7 +112,17 @@ router.delete('/:id', (req, res) => {
   if (!suite) return res.status(404).json({ error: 'Not found' });
   db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
   resetSequence('test_suites');
-  if (suite.collection_id) setImmediate(() => updateCollectionConfigs(suite.collection_id));
+  if (suite.collection_id) {
+    const _uid = req.userId, _pid = req.params.projectId, _cid = suite.collection_id;
+    setImmediate(() => {
+      try {
+        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const { getUserProjectPath } = require('../utils/projectFolders');
+        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+      } catch (_) {}
+    });
+  }
   res.json({ ok: true });
 });
 
@@ -133,7 +163,11 @@ router.post('/:id/generate', async (req, res) => {
   const cfg = { ...DEFAULT_CONFIG, ...globalCfg, ...projCfg, ...envCfg, ...suiteCfg };
 
   const endpoints = collection ? (() => { try { return JSON.parse(collection.json_content); } catch { return []; } })() : [];
-  const preRunData = req.body.preRunData || null;
+  // Use pre-run data from request body (legacy) or from collection row (new flow)
+  const preRunData = req.body.preRunData || (() => {
+    if (!collection?.pre_run_data) return null;
+    try { return JSON.parse(collection.pre_run_data); } catch { return null; }
+  })();
 
   const engine = suite.engine || 'jmeter';
   const testType = suite.test_type || 'load';
@@ -153,20 +187,23 @@ router.post('/:id/generate', async (req, res) => {
     let filePath = '';
 
     let scriptBaseDir = null;
-    if (collection && proj.folder_path) {
-      // Determine target env: suite.env → collection's first env → 'Default'
+    const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
+    const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
+    const userProjPath = getUserProjectPath(req.userId, callerRole, proj.name);
+
+    // Admin workspace holds only empty folders — skip script generation for admin
+    if (isAdminWorkspace(userProjPath)) {
+      return res.status(400).json({ error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.' });
+    }
+    if (collection && userProjPath) {
       let targetEnv = suite.env;
       if (!targetEnv && collection) {
-        try {
-          const envs = JSON.parse(collection.environments || '[]');
-          targetEnv = envs[0] || collection.environment || 'Default';
-        } catch { targetEnv = collection.environment || 'Default'; }
+        try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
       }
-      const { getCollectionPath } = require('../utils/projectFolders');
-      const envPath = getCollectionPath(proj.folder_path, collection.name, collection.id, targetEnv);
+      const envPath = getCollectionPath(userProjPath, collection.name, targetEnv);
       scriptBaseDir = require('path').join(envPath, 'script');
-    } else if (proj.folder_path) {
-      scriptBaseDir = require('path').join(proj.folder_path, 'script');
+    } else if (userProjPath) {
+      scriptBaseDir = require('path').join(userProjPath, 'script');
     }
 
     if (scriptBaseDir) {

@@ -127,13 +127,17 @@ router.post('/', auth, async (req, res) => {
   const { email, name, role } = req.body;
   if (!email || !role) return res.status(400).json({ error: 'email and role required' });
 
-  // Super admin can invite org_admin; org_admin can invite user
+  // Super admin can invite org_admin; org_admin can invite user OR another org_admin (same org)
   if (inviter.role === 'super_admin' && role !== 'org_admin')
     return res.status(403).json({ error: 'Super admin can only invite org admins' });
-  if (inviter.role === 'org_admin' && role !== 'user')
-    return res.status(403).json({ error: 'Org admin can only invite regular users' });
+  if (inviter.role === 'org_admin' && !['user', 'org_admin'].includes(role))
+    return res.status(403).json({ error: 'Org admin can only invite regular users or other org admins' });
   if (inviter.role === 'user')
     return res.status(403).json({ error: 'Regular users cannot send invites' });
+
+  // Org admin inviting another org_admin must belong to an org themselves
+  if (inviter.role === 'org_admin' && role === 'org_admin' && !inviter.org_id)
+    return res.status(400).json({ error: 'You must belong to an organization to invite another Org Admin' });
 
   // Super admin MUST assign an organization when inviting org admin
   if (inviter.role === 'super_admin' && role === 'org_admin' && !req.body.org_id)
