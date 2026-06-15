@@ -388,7 +388,6 @@ flowchart TD
     SA -->|"Invite org admins"| SA2[Email invite with token]
     SA -->|"Suspend / activate users"| SA3[User management]
     SA -->|"Configure platform SMTP"| SA4[Global SMTP settings]
-    SA -->|"No project access\n(UI shows Settings only)"| SA5[Hidden: Dashboard · Projects]
 
     OA -->|"CRUD projects in own org"| OA1[Projects]
     OA -->|"Configure AI key"| OA2[OpenAI / Claude API key]
