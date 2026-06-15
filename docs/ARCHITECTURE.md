@@ -43,7 +43,7 @@ graph TB
         CIWebhook["CI Webhook\nGitHub Actions · GitLab CI"]
         Email["Alert Engine\nNodemailer + PDF reports"]
         Enc["Encryption\nAES-256-CBC"]
-        Exec["Test Executor\ndocker run JMeter / K6"]
+        Exec["Test Executor\ndocker run perf-studio-runner"]
     end
 
     subgraph Storage["Persistence"]
@@ -52,8 +52,7 @@ graph TB
     end
 
     subgraph Execution["Test Execution Containers"]
-        JMeter["JMeter\njustb4/jmeter"]
-        K6["K6\ngrafana/k6"]
+        Runner["perf-studio-runner\nJava · JMeter · K6 · Node.js\nPython · curl · jq"]
     end
 
     subgraph External["External Services"]
@@ -69,9 +68,8 @@ graph TB
     API --> DB
     API --> FS
     AIEngine --> GPT & Claude
-    Exec -->|"docker run"| JMeter & K6
-    JMeter -->|"results.jtl + HTML report"| FS
-    K6 -->|"results.json"| FS
+    Exec -->|"docker run"| Runner
+    Runner -->|"results.jtl + HTML report / results.json"| FS
     Healer --> AIEngine
     Healer -->|"re-run fixed script"| Exec
     Email --> SMTP
@@ -519,8 +517,8 @@ flowchart TD
     E --> F[ruleEvaluator.js — load rules\nfor pass/fail evaluation]
 
     F --> G{Engine}
-    G -->|JMeter| H["docker run -v project_path:/data\njustb4/jmeter:latest\n-n -t /data/script.jmx\n-l /data/results.jtl\n-e -o /data/report/"]
-    G -->|K6| I["docker run -v project_path:/data\ngrafana/k6 run /data/script.js"]
+    G -->|JMeter| H["docker run -v project_path:/data\nperf-studio-runner\njmeter -n -t /data/script.jmx\n-l /data/results.jtl -e -o /data/report/"]
+    G -->|K6| I["docker run -v project_path:/data\nperf-studio-runner\nk6 run /data/script.js"]
 
     H & I --> J["SSE stream → frontend\ndata: {type, message} per log line\nheartbeat ping every 1s"]
 
@@ -833,7 +831,7 @@ flowchart LR
 | **Backend** | Node.js, Express 4, nodemon (dev) |
 | **Database** | SQLite via `node:sqlite` (built-in, no native deps) |
 | **AI Generation** | OpenAI GPT-4o (`openai` SDK) · Anthropic Claude (`@anthropic-ai/sdk`) |
-| **Test Engines** | Apache JMeter (`justb4/jmeter` Docker) · Grafana K6 (`grafana/k6` Docker) |
+| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `perf-studio-runner` Docker image (Java · Node.js · Python · curl · jq pre-installed) |
 | **Git Integration** | `simple-git` (local ops) · `@octokit/rest` (GitHub API) · GitLab REST API |
 | **Email** | `nodemailer` (SMTP transport, TLS) |
 | **PDF Reports** | `puppeteer` (HTML → PDF) · `pdfkit` |
