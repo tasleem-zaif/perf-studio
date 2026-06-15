@@ -86,14 +86,14 @@ function getK6Bin(customPath) {
 const resetSequence = require('../utils/resetSequence');
 
 function cleanStaleRuns(projectId) {
-  // Only remove runs that are older than 24h AND have a missing result_dir.
-  // Never remove recent runs — they may be in-progress or synced from CI.
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  // Remove any non-running run whose result_dir no longer exists on disk.
+  // Skip 'running' status to avoid cleaning up in-progress or CI-synced runs.
   const runs = db.prepare(
-    "SELECT id, result_dir FROM execution_runs WHERE project_id = ? AND started_at < ?"
-  ).all(projectId, cutoff);
+    "SELECT id, result_dir, status FROM execution_runs WHERE project_id = ?"
+  ).all(projectId);
   let deleted = false;
   for (const run of runs) {
+    if (run.status === 'running') continue;
     if (run.result_dir && !fs.existsSync(run.result_dir)) {
       db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
       deleted = true;

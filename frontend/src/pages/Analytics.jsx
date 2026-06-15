@@ -983,7 +983,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   );
 
   const selectedRun = runs.find(r=>String(r.id)===selectedId);
-  const runNum = selectedRun?.result_dir?.match(/Run_(\d+)/)?.[1];
+  const runNum = selectedRun?.id;
 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
@@ -1002,8 +1002,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
             <CustomSelect value={selectedId} onChange={e=>{ setSelectedId(e.target.value); setActiveTab('summary'); }} style={{ width:'100%', maxWidth:520 }}>
               <option value="">— Select a run —</option>
               {runs.map(r=>{
-                const n = r.result_dir?.match(/Run_(\d+)/)?.[1] || r.id;
-                return <option key={r.id} value={r.id}>{`Run ${n} — ${r.suite_name||'Unknown'} — ${r.status} — ${new Date(r.started_at).toLocaleString()}`}</option>;
+                return <option key={r.id} value={r.id}>{`Run ${r.id} — ${r.suite_name||'Unknown'} — ${r.status} — ${new Date(r.started_at).toLocaleString()}`}</option>;
               })}
             </CustomSelect>
           )}
