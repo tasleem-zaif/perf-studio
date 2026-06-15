@@ -147,13 +147,32 @@ router.post('/:id/run', auth, async (req, res) => {
     saveSteps();
     send({ step_update: { index: i, status: 'running', name: step.name } });
 
+    // Create execution_runs record so Analytics can track this step
+    const stepEngine = step.engine || 'jmeter';
+    const execRow = db.prepare(
+      `INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at)
+       VALUES (?, ?, ?, 'running', NULL, NULL, '[]', datetime('now'))`
+    ).run(req.params.projectId, step.suite_id, stepEngine);
+    const execRunId = execRow.lastInsertRowid;
+    stepsResult[i].execution_run_id = execRunId;
+    saveSteps();
+
+    const stepLogs = [];
+    const stepLogFn = (type, msg) => { stepLogs.push({ type, message: msg }); log(type, msg); };
+
     try {
       const result = await runSuite({
         suiteId:   step.suite_id,
         projectId: parseInt(req.params.projectId),
         userId:    req.userId,
-        logFn:     (type, msg) => log(type, msg),
+        logFn:     stepLogFn,
       });
+
+      const resultDir  = result.jtlPath ? require('path').dirname(result.jtlPath) : null;
+      const reportPath = resultDir ? (() => {
+        const p = require('path').join(resultDir, 'report', 'index.html');
+        return require('fs').existsSync(p) ? p : null;
+      })() : null;
 
       if (result.error) {
         stepsResult[i].status = 'failed';
@@ -162,6 +181,9 @@ router.post('/:id/run', auth, async (req, res) => {
         finalStatus = 'failed';
         send({ step_update: { index: i, status: 'failed', name: step.name, error: result.error } });
         saveSteps();
+        db.prepare(
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
 
       } else if (result.passed) {
@@ -169,6 +191,9 @@ router.post('/:id/run', auth, async (req, res) => {
         log('ok',  `└─ ✔ PASSED`);
         send({ step_update: { index: i, status: 'completed', name: step.name } });
         saveSteps();
+        db.prepare(
+          `UPDATE execution_runs SET status='completed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
 
       } else {
         stepsResult[i].status = 'failed';
@@ -176,6 +201,9 @@ router.post('/:id/run', auth, async (req, res) => {
         finalStatus = 'failed';
         send({ step_update: { index: i, status: 'failed', name: step.name } });
         saveSteps();
+        db.prepare(
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
       }
     } catch (e) {
@@ -185,6 +213,9 @@ router.post('/:id/run', auth, async (req, res) => {
       finalStatus = 'failed';
       send({ step_update: { index: i, status: 'failed', name: step.name, error: e.message } });
       saveSteps();
+      db.prepare(
+        `UPDATE execution_runs SET status='failed', logs=?, finished_at=datetime('now') WHERE id=?`
+      ).run(JSON.stringify(stepLogs), execRunId);
       if (pipeline.stop_on_failure) { stoppedAt = i; break; }
     }
   }
