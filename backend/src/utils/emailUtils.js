@@ -12,16 +12,37 @@ const db = require('../db');
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function getAlertConfig(userId) {
+  // Try the triggering user's own SMTP config first
   const row = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
-  return row || null;
+  if (row?.smtp_host) return row;
+
+  // Fallback: use any org_admin or super_admin's SMTP config
+  // This means regular users benefit from the admin's email setup automatically
+  const adminCfg = db.prepare(`
+    SELECT ac.* FROM alert_configs ac
+    JOIN users u ON u.id = ac.user_id
+    WHERE u.role IN ('org_admin', 'super_admin')
+      AND ac.smtp_host IS NOT NULL AND ac.smtp_host != ''
+    ORDER BY CASE u.role WHEN 'super_admin' THEN 0 ELSE 1 END
+    LIMIT 1
+  `).get();
+  return adminCfg || null;
 }
 
 function getRecipients(userId, projectId) {
+  // Collect ALL relevant recipients:
+  // 1. Global recipients configured by this user
+  // 2. Global recipients configured by any admin (so admin-configured lists apply to all runs)
+  // 3. Project-specific recipients (tied to projectId regardless of who configured them)
   return db.prepare(`
-    SELECT DISTINCT email, name FROM alert_recipients
-    WHERE (user_id = ? AND project_id IS NULL)
-       OR (project_id = ?)
-    ORDER BY email
+    SELECT DISTINCT ar.email, ar.name FROM alert_recipients ar
+    LEFT JOIN users u ON u.id = ar.user_id
+    WHERE (
+      ar.project_id IS NULL
+      AND (ar.user_id = ? OR u.role IN ('org_admin', 'super_admin'))
+    )
+    OR ar.project_id = ?
+    ORDER BY ar.email
   `).all(userId, projectId);
 }
 
@@ -173,11 +194,36 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
     </p>
 
     <!-- Verdict banner -->
-    <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:20px;">
+    <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:${rulesPassed ? '20px' : '12px'};">
       <span style="font-size:16px;margin-right:8px;">${verdictIcon}</span>
       <span style="font-weight:700;color:${verdictBdr};font-size:13px;">Status: ${status}</span>
       <span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>
     </div>
+    ${!rulesPassed ? `
+    <!-- Rule violations detail -->
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
+      <div style="font-weight:700;color:#ef4444;font-size:13px;margin-bottom:10px;">⚠ Breached Rules</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr style="background:rgba(0,0,0,0.2);">
+          <th style="padding:6px 10px;text-align:left;color:#8b949e;font-weight:600;">Metric</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Threshold</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Actual Value</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Severity</th>
+        </tr>
+        ${(runData.rule_violations||[]).map(v => {
+          const sevColor = v.rule?.severity === 'error' ? '#ef4444' : '#f59e0b';
+          const thresholdLabel = v.rule?.operator === 'between'
+            ? `between ${v.rule.value_min}–${v.rule.value_max} ${v.rule.unit}`
+            : `${v.rule?.operator || ''} ${v.rule?.value || ''} ${v.rule?.unit || ''}`;
+          return `<tr style="border-top:1px solid rgba(255,255,255,0.05);">
+            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">${v.rule?.metric || 'Unknown'}</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${thresholdLabel}</td>
+            <td style="padding:7px 10px;text-align:center;color:#ef4444;font-weight:700;font-family:monospace;">${v.actual ?? '—'} ${v.rule?.unit || ''}</td>
+            <td style="padding:7px 10px;text-align:center;"><span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:${sevColor}22;color:${sevColor};border:1px solid ${sevColor};">${(v.rule?.severity||'error').toUpperCase()}</span></td>
+          </tr>`;
+        }).join('')}
+      </table>
+    </div>` : ''}
   </div>
 
   <!-- KPI Grid -->

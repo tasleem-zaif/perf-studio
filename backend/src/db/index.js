@@ -165,6 +165,12 @@ const migrations = [
   "ALTER TABLE rules ADD COLUMN value_max TEXT DEFAULT NULL",
   "ALTER TABLE pipeline_runs ADD COLUMN logs TEXT DEFAULT '[]'",
   "ALTER TABLE pipeline_runs ADD COLUMN triggered_by INTEGER DEFAULT NULL",
+  // CI config becomes per-user — add user_id so each user has their own row
+  "ALTER TABLE ci_pipeline_configs ADD COLUMN user_id INTEGER DEFAULT NULL",
+  // SSH auth support
+  "ALTER TABLE git_configs ADD COLUMN auth_method TEXT DEFAULT 'pat'",
+  "ALTER TABLE user_git_configs ADD COLUMN auth_method TEXT DEFAULT 'pat'",
+  "ALTER TABLE user_git_configs ADD COLUMN ssh_key TEXT DEFAULT ''",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (_) { /* column already exists */ }
@@ -214,6 +220,10 @@ for (const sql of alterStatements) {
 
 // Add environments array to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN environments TEXT DEFAULT '[]'"); } catch {}
+
+// Pre-run data on collections (migrated from test_suites)
+try { db.exec("ALTER TABLE collections ADD COLUMN pre_run_data TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE collections ADD COLUMN pre_run_collection_hash TEXT DEFAULT NULL"); } catch {}
 
 // Per-env configuration (each collection env has its own URL/config)
 try {

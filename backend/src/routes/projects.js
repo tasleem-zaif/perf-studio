@@ -22,33 +22,45 @@ router.get('/', (req, res) => {
   let projects;
   if (caller.role === 'super_admin') {
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       ORDER BY o.name ASC, p.created_at DESC
     `).all();
   } else if (caller.role === 'org_admin') {
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       WHERE u.org_id = ?
       ORDER BY p.created_at DESC
     `).all(caller.org_id);
   } else if (caller.role === 'user') {
     // Regular users see only projects explicitly assigned to them
     projects = db.prepare(`
-      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id
+      SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
+             COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       JOIN project_assignments pa ON pa.project_id = p.id AND pa.user_id = ?
       JOIN users u ON p.user_id = u.id
       LEFT JOIN organizations o ON u.org_id = o.id
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
       ORDER BY p.created_at DESC
     `).all(req.userId);
   } else {
-    projects = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC').all(req.userId);
+    projects = db.prepare(`
+      SELECT p.*, COALESCE(gc.is_initialized, 0) as git_initialized
+      FROM projects p
+      LEFT JOIN git_configs gc ON gc.project_id = p.id
+      WHERE p.user_id = ?
+      ORDER BY p.created_at DESC
+    `).all(req.userId);
   }
 
   res.json({ projects });

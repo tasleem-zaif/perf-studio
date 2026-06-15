@@ -900,8 +900,10 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   }, [project?.id, collection?.id, env]);
 
   useEffect(() => {
-    if (!selectedId) { setData(null); return; }
-    setLoadingData(true); setError('');
+    // Always clear previous run data immediately so the old charts don't linger
+    setData(null); setError('');
+    if (!selectedId) return;
+    setLoadingData(true);
     api.get(`/execution/runs/${selectedId}/report-data`)
       .then(({ data: d }) => setData(d))
       .catch(e => setError(e.response?.data?.error || 'Failed to load analytics data'))

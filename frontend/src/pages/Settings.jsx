@@ -50,6 +50,112 @@ function StatusBadge({ status }) {
   );
 }
 
+/* ── Standalone Organizations panel (super_admin only) ─────────────────── */
+function OrganizationsPanel({ user }) {
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
+  const { toast } = useToast();
+  const [orgs,        setOrgs]        = useState([]);
+  const [newOrgName,  setNewOrgName]  = useState('');
+  const [savingOrg,   setSavingOrg]   = useState(false);
+  const [editingOrg,  setEditingOrg]  = useState(null);
+
+  useEffect(() => {
+    api.get('/orgs').then(r => setOrgs(r.data.orgs || [])).catch(() => {});
+  }, []);
+
+  async function createOrg() {
+    if (!newOrgName.trim()) return;
+    setSavingOrg(true);
+    try {
+      const { data } = await api.post('/orgs', { name: newOrgName.trim() });
+      setOrgs(prev => [data.org, ...prev]);
+      setNewOrgName('');
+      toast(`Organization "${data.org.name}" created`, 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Create failed', 'error'); }
+    finally { setSavingOrg(false); }
+  }
+
+  async function saveOrgEdit() {
+    if (!editingOrg?.name?.trim()) return;
+    try {
+      await api.put(`/orgs/${editingOrg.id}`, { name: editingOrg.name });
+      setOrgs(prev => prev.map(o => o.id === editingOrg.id ? { ...o, name: editingOrg.name } : o));
+      setEditingOrg(null);
+      toast('Organization updated', 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Update failed', 'error'); }
+  }
+
+  async function deleteOrg(org) {
+    const ok = await confirm(`Delete "${org.name}"? All associated users will lose access.`, 'Delete Organization');
+    if (!ok) return;
+    try {
+      await api.delete(`/orgs/${org.id}`);
+      setOrgs(prev => prev.filter(o => o.id !== org.id));
+      toast('Organization deleted', 'success');
+    } catch (e) { toast(e.response?.data?.error || 'Delete failed', 'error'); }
+  }
+
+  return (
+    <div className="page fade-in">
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '16px' }}>
+        Create and manage organizations. Invite Org Admins under a specific organization.
+      </div>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px', maxWidth: 480 }}>
+        <input type="text" value={newOrgName} onChange={e => setNewOrgName(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && createOrg()}
+          placeholder="New organization name…" style={{ flex: 1 }} autoComplete="off" />
+        <button className="btn-primary" onClick={createOrg} disabled={savingOrg || !newOrgName.trim()}>
+          {savingOrg ? <span className="spinner" /> : <i className="ti ti-plus" />} Add
+        </button>
+      </div>
+      {orgs.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--color-text-tertiary)' }}>
+          No organizations yet. Create one above.
+        </div>
+      ) : orgs.map(org => (
+        <div key={org.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', background: 'var(--color-background-secondary)', borderRadius: '8px', border: '1px solid var(--color-border-secondary)', marginBottom: '8px' }}>
+          <div style={{ width: 36, height: 36, borderRadius: '8px', background: 'rgba(73,204,61,0.12)', border: '1px solid rgba(73,204,61,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <i className="ti ti-building" style={{ color: 'var(--accent)', fontSize: '16px' }} />
+          </div>
+          {editingOrg?.id === org.id ? (
+            <input type="text" value={editingOrg.name}
+              onChange={e => setEditingOrg(o => ({ ...o, name: e.target.value }))}
+              onKeyDown={e => { if (e.key === 'Enter') saveOrgEdit(); if (e.key === 'Escape') setEditingOrg(null); }}
+              style={{ flex: 1, fontSize: '13px' }} autoFocus />
+          ) : (
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--color-text-primary)' }}>{org.name}</div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
+                {org.member_count || 0} member{(org.member_count || 0) !== 1 ? 's' : ''}
+                {org.admins && <span> · Admin: {org.admins}</span>}
+              </div>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+            {editingOrg?.id === org.id ? (
+              <>
+                <button className="btn-primary btn-sm" onClick={saveOrgEdit}><i className="ti ti-check" /> Save</button>
+                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg(null)}>Cancel</button>
+              </>
+            ) : (
+              <>
+                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg({ id: org.id, name: org.name })}>
+                  <i className="ti ti-pencil" />
+                </button>
+                <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={() => deleteOrg(org)}>
+                  <i className="ti ti-trash" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ── User Management panel ────────────────────────────────────────────── */
 function UserManagementPanel({ user, projects = [] }) {
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -224,7 +330,6 @@ function UserManagementPanel({ user, projects = [] }) {
   }
 
   const TABS = [
-    ...(user?.role === 'super_admin' ? [{ id: 'organizations', label: 'Organizations', icon: 'ti-building' }] : []),
     { id: 'invites', label: 'Send Invite', icon: 'ti-mail-forward' },
     { id: 'pending', label: 'Pending Invites', icon: 'ti-clock', count: invites.filter(i => i.status === 'pending').length },
     { id: 'members', label: 'Active Members', icon: 'ti-users', count: users.filter(u => u.status === 'active' && u.role !== 'super_admin').length },
@@ -328,7 +433,7 @@ function UserManagementPanel({ user, projects = [] }) {
           <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
             {user?.role === 'super_admin'
               ? 'Invite Organization Admins. They will receive an email to set up their account.'
-              : 'Invite team members to your organization. They will receive an email to set up their account.'}
+              : 'Invite team members or additional Org Admins to your organization. They will receive an email to set up their account.'}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <div className="form-group" style={{ marginBottom: 0 }}>
@@ -346,6 +451,7 @@ function UserManagementPanel({ user, projects = [] }) {
               <select value={inviteForm.role} onChange={e => setInviteForm(f => ({ ...f, role: e.target.value }))}
                 style={{ width: '100%', padding: '8px 10px', borderRadius: '6px', border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
                 {user?.role === 'super_admin' && <option value="org_admin">Organization Admin</option>}
+                {user?.role === 'org_admin' && <option value="org_admin">Organization Admin</option>}
                 {user?.role === 'org_admin' && <option value="user">Regular User</option>}
               </select>
             </div>
@@ -929,7 +1035,8 @@ function SMTPConfigPanel({ currentUser }) {
 
 export default function Settings({ page, theme, onThemeChange, user, projects }) {
   if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
-  if (page === 'settings-ai') return <AIConfigPanel user={user} />;
-  if (page === 'settings-smtp') return <SMTPConfigPanel currentUser={user} />;
+  if (page === 'settings-orgs')  return <OrganizationsPanel user={user} />;
+  if (page === 'settings-ai')    return <AIConfigPanel user={user} />;
+  if (page === 'settings-smtp')  return <SMTPConfigPanel currentUser={user} />;
   return null;
 }

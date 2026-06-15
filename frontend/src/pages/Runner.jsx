@@ -148,13 +148,23 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     setCheckingDeps(true);
     setDepsChecked(false);
     try {
-      const { data } = await api.get('/execution/check-deps');
-      setDeps(data.deps || []);
+      // Only check Docker — JMeter/K6/Java run inside the custom CI image
+      const { data } = await api.get('/execution/check-docker');
+      const dockerOk = data.status === 'ok';
+      const dockerDep = {
+        name:    'docker',
+        status:  dockerOk ? 'ok' : 'missing',
+        version: data.version || null,
+        path:    null,
+      };
+      setDeps([dockerDep]);
       setDepsChecked(true);
-      const allOk = (data.deps || []).every(d => d.status === 'ok');
-      addLog(allOk ? 'ok' : 'warn', allOk ? 'Docker is running — ready to execute.' : 'Docker is not running. Start Docker Desktop and re-check.');
+      addLog(dockerOk ? 'ok' : 'warn',
+        dockerOk
+          ? '✔ Docker is installed and running — ready to execute.'
+          : '✘ Docker is not running. Start Docker Desktop and re-check.');
     } catch (e) {
-      addLog('err', 'Dependency check failed: ' + (e.response?.data?.error || e.message));
+      addLog('err', 'Docker check failed: ' + (e.response?.data?.error || e.message));
     } finally { setCheckingDeps(false); }
   }
 
@@ -308,12 +318,35 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
+  const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
+  const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
+  const ciStepsPollerRef = useRef(null);
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
     api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => setCiConfig(data.config)).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
   }, [selectedProjectId]);
+
+  // Poll live steps when a terminal is expanded
+  useEffect(() => {
+    if (ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; }
+    if (!ciExpandedRun || !selectedProjectId) return;
+
+    const fetchSteps = async () => {
+      try {
+        const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${ciExpandedRun}/steps`);
+        setCiSteps(prev => ({ ...prev, [ciExpandedRun]: data }));
+        // Stop polling when run is done
+        const done = ['completed','failed','cancelled','success','failure'].includes(data.status);
+        if (done && ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; }
+      } catch {}
+    };
+
+    fetchSteps(); // immediate first fetch
+    ciStepsPollerRef.current = setInterval(fetchSteps, 4000); // then every 4s
+    return () => { if (ciStepsPollerRef.current) { clearInterval(ciStepsPollerRef.current); ciStepsPollerRef.current = null; } };
+  }, [ciExpandedRun, selectedProjectId]);
 
   async function triggerCiPipeline() {
     setCiTriggering(true);
@@ -447,10 +480,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Run mode tabs ─────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
-          { id: 'single',      icon: 'ti-player-play',   label: 'Single Test Run'  },
-          { id: 'pipeline',    icon: 'ti-git-merge',      label: 'Pipeline Run'     },
-          { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'      },
-        ].map(t => (
+          { id: 'single',      icon: 'ti-player-play',   label: 'Local Test Run' },
+          // { id: 'pipeline', icon: 'ti-git-merge', label: 'Pipeline Run' },  // hidden — keep for future use
+          { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'    },
+        ].filter(t => t).map(t => (
           <button key={t.id} onClick={() => setRunTab(t.id)}
             style={{
               display: 'flex', alignItems: 'center', gap: 7,
@@ -466,8 +499,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         ))}
       </div>
 
-      {/* ── Pipeline Run tab ─────────────────────────────────────────────── */}
-      {runTab === 'pipeline' && (
+      {/* ── Pipeline Run tab — hidden, keep code for future use ────────── */}
+      {false && runTab === 'pipeline' && (
         <div>
           {/* Pipeline selector */}
           <div className="card" style={{ marginBottom: 14 }}>
@@ -624,40 +657,48 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
-                {/* Script */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Script filename <span style={{ fontWeight: 400, color: '#94a3b8' }}>(e.g. test.jmx)</span></label>
-                    <input type="text" value={ciScriptName} onChange={e => setCiScriptName(e.target.value)} placeholder="MyLoadTest.jmx" />
-                  </div>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Full script path <span style={{ fontWeight: 400, color: '#94a3b8' }}>(relative to repo root, optional)</span></label>
-                    <input type="text" value={ciScriptPath} onChange={e => setCiScriptPath(e.target.value)} placeholder="projects/Demo1/QA/script/test.jmx" />
-                  </div>
-                </div>
-
-                {/* Suites quick-pick */}
-                {suites.filter(s => s.jmx_path || s.js_path).length > 0 && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: .5 }}>Quick pick from generated test plans</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                      {suites.filter(s => s.jmx_path || s.js_path).map(s => {
-                        const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
-                        // path relative to git root (user workspace root)
-                        const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
-                        const fileName = file.split('/').pop();
-                        return (
-                          <button key={s.id} onClick={() => { setCiScriptName(fileName); setCiScriptPath(relPath); }}
-                            style={{ padding: '4px 10px', border: '1px solid #e2e8f0', borderRadius: 20, background: '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, color: '#475569', transition: 'all .12s' }}
-                            onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
-                            onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.color = '#475569'; }}>
-                            <i className="ti ti-file-code" style={{ marginRight: 4, fontSize: 10 }}/>{s.name}
-                          </button>
-                        );
-                      })}
+                {/* Script — dropdown only, filename/path calculated automatically */}
+                <div className="form-group" style={{ marginBottom: 14 }}>
+                  <label className="form-label">Test Plan</label>
+                  {suites.filter(s => s.jmx_path || s.js_path).length === 0 ? (
+                    <div style={{ fontSize: 12, color: '#94a3b8', padding: '8px 0' }}>
+                      <i className="ti ti-alert-triangle" style={{ marginRight: 5, color: '#f59e0b' }}/>
+                      No generated scripts found. Go to Test Plans and generate a script first.
                     </div>
-                  </div>
-                )}
+                  ) : (
+                    <>
+                      <CustomSelect
+                        value={ciScriptName}
+                        onChange={e => {
+                          const selected = suites.find(s => {
+                            const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                            return file.split('/').pop() === e.target.value;
+                          });
+                          if (selected) {
+                            const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
+                            const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
+                            const fileName = file.split('/').pop();
+                            setCiScriptName(fileName);
+                            setCiScriptPath(relPath);
+                          }
+                        }}
+                      >
+                        <option value="">— Select a test plan —</option>
+                        {suites.filter(s => s.jmx_path || s.js_path).map(s => {
+                          const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                          const fileName = file.split('/').pop();
+                          return <option key={s.id} value={fileName}>{s.name}</option>;
+                        })}
+                      </CustomSelect>
+                      {ciScriptName && (
+                        <div style={{ marginTop: 6, fontSize: 11, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <i className="ti ti-file-code" style={{ fontSize: 11, color: '#4338ca' }}/>
+                          <code style={{ fontSize: 10, color: '#475569' }}>{ciScriptPath || ciScriptName}</code>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
 
                 {/* Variables */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
@@ -706,40 +747,127 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                     {ciRuns.map(r => {
                       const statusMap = { pending: ['#dbeafe','#1d4ed8'], queued: ['#dbeafe','#1d4ed8'], running: ['#fef9c3','#b45309'], in_progress: ['#fef9c3','#b45309'], completed: ['#dcfce7','#16a34a'], success: ['#dcfce7','#16a34a'], failed: ['#fee2e2','#dc2626'], failure: ['#fee2e2','#dc2626'], cancelled: ['#f1f5f9','#64748b'] };
                       const [bg, color] = statusMap[r.status] || statusMap.pending;
-                      const isPolling = ciPolling === r.id;
+                      const isPolling  = ciPolling === r.id;
+                      const isExpanded = ciExpandedRun === r.id;
+                      const vars = (() => { try { return JSON.parse(r.variables || '{}'); } catch { return {}; } })();
                       return (
-                        <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                          <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
-                          <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
-                          <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
-                          <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
-                            {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
-                          </span>
-                          {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
-                            <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
-                              <i className="ti ti-refresh"/>
+                        <div key={r.id} style={{ borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+                          {/* Run row */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
+                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
+                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
+                            <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
+                              {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
+                            </span>
+                            {/* Terminal toggle */}
+                            <button className="btn-secondary btn-sm" onClick={() => setCiExpandedRun(isExpanded ? null : r.id)}
+                              style={{ padding: '2px 8px', fontSize: 11 }} title="Show/hide execution log">
+                              <i className={`ti ${isExpanded ? 'ti-chevron-up' : 'ti-terminal-2'}`} style={{ fontSize: 11 }}/>
                             </button>
-                          )}
-                          {/* Sync Results — only for completed runs */}
-                          {['completed','success'].includes(r.status) && (
-                            <button className="btn-secondary btn-sm"
-                              style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
-                              title="Download artifacts and save to local env results folder"
-                              onClick={async () => {
-                                try {
-                                  const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
-                                  toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
-                                } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
-                              }}>
-                              <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
-                            </button>
-                          )}
-                          {r.web_url && (
-                            <a href={r.web_url} target="_blank" rel="noreferrer"
-                              style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
-                              <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
-                            </a>
-                          )}
+                            {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
+                              <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
+                                <i className="ti ti-refresh"/>
+                              </button>
+                            )}
+                            {['completed','success'].includes(r.status) && (
+                              <button className="btn-secondary btn-sm"
+                                style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
+                                onClick={async () => {
+                                  try {
+                                    const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
+                                    toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
+                                  } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
+                                }}>
+                                <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
+                              </button>
+                            )}
+                            {r.web_url && (
+                              <a href={r.web_url} target="_blank" rel="noreferrer"
+                                style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
+                                <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Expandable terminal */}
+                          {isExpanded && (() => {
+                            const stepsData = ciSteps[r.id];
+                            const steps     = stepsData?.steps || [];
+                            const job       = stepsData?.job;
+                            const stepIcon  = s => {
+                              if (s.status === 'in_progress') return { icon: '⟳', color: '#f59e0b' };
+                              if (s.conclusion === 'success')  return { icon: '✔', color: '#3fb950' };
+                              if (s.conclusion === 'failure')  return { icon: '✘', color: '#f85149' };
+                              if (s.conclusion === 'skipped')  return { icon: '⊘', color: '#8b949e' };
+                              return { icon: '○', color: '#484f58' };
+                            };
+                            return (
+                              <div style={{ borderTop: '1px solid #21262d', background: '#0d1117', padding: '10px 14px', fontFamily: '"Fira Mono",Consolas,monospace', fontSize: 11, maxHeight: 320, overflowY: 'auto' }}>
+                                {/* Header */}
+                                <div style={{ color: '#58a6ff', marginBottom: 8, fontSize: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  <span>── CI Pipeline Execution Log ──</span>
+                                  {['running','in_progress'].includes(r.status) && (
+                                    <span style={{ color: '#f59e0b', animation: 'pulse 1s infinite' }}>● LIVE</span>
+                                  )}
+                                </div>
+
+                                {/* Trigger info */}
+                                <div style={{ color: '#8b949e', marginBottom: 6 }}>
+                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</span></div>
+                                  {r.external_id && <div>Run ID: <span style={{ color: '#58a6ff' }}>#{r.external_id}</span>  {job?.runner_name ? `· Runner: ${job.runner_name}` : ''}</div>}
+                                </div>
+
+                                {/* Test params */}
+                                {vars.jmeter_users && (
+                                  <div style={{ color: '#8b949e', borderLeft: '2px solid #21262d', paddingLeft: 8, marginBottom: 8 }}>
+                                    <div>Script   <span style={{ color: '#e6edf3' }}>{r.script_name}</span></div>
+                                    <div>Users    <span style={{ color: '#e6edf3' }}>{vars.jmeter_users}</span>  Ramp <span style={{ color: '#e6edf3' }}>{vars.jmeter_rampup}s</span>  {vars.jmeter_duration > 0 ? <>Duration <span style={{ color: '#e6edf3' }}>{vars.jmeter_duration}s</span></> : <>Loops <span style={{ color: '#e6edf3' }}>{vars.jmeter_loops}</span></>}</div>
+                                  </div>
+                                )}
+
+                                {/* Live steps */}
+                                {steps.length > 0 ? (
+                                  <div style={{ marginBottom: 8 }}>
+                                    <div style={{ color: '#484f58', fontSize: 10, marginBottom: 4 }}>── Steps ──</div>
+                                    {steps.map((s, i) => {
+                                      const ic = stepIcon(s);
+                                      const dur = s.duration_s != null ? ` (${s.duration_s}s)` : '';
+                                      const startTs = s.started_at ? s.started_at.replace('T',' ').slice(0,19) : '';
+                                      return (
+                                        <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 2 }}>
+                                          <span style={{ color: ic.color, width: 12, flexShrink: 0 }}>{ic.icon}</span>
+                                          <span style={{ color: '#e6edf3', flex: 1 }}>{s.name}</span>
+                                          {startTs && <span style={{ color: '#484f58', fontSize: 10 }}>{startTs}{dur}</span>}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <div style={{ color: '#484f58', marginBottom: 8 }}>
+                                    {['running','in_progress','queued','pending'].includes(r.status)
+                                      ? '⟳ Fetching live steps from GitHub…'
+                                      : 'No step details available'}
+                                  </div>
+                                )}
+
+                                {/* Status + finish time */}
+                                <div style={{ color: '#8b949e', borderTop: '1px solid #21262d', paddingTop: 6 }}>
+                                  <span>Status: </span><span style={{ color }}>{r.status.toUpperCase()}</span>
+                                  {r.finished_at && <span style={{ color: '#484f58' }}>  · Finished: {r.finished_at?.replace('T',' ').slice(0,19)}</span>}
+                                </div>
+
+                                {/* GitHub link */}
+                                {(r.web_url || job?.html_url) && (
+                                  <div style={{ marginTop: 6 }}>
+                                    <a href={job?.html_url || r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
+                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
+                                    </a>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       );
                     })}
@@ -751,7 +879,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         </div>
       )}
 
-      {/* ── Single Test Run tab ──────────────────────────────────────────── */}
+      {/* ── Local Test Run tab ───────────────────────────────────────────── */}
       {runTab === 'single' && <>
 
       {/* Concurrent runs banner */}
@@ -945,18 +1073,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             <button className="btn-secondary btn-sm" onClick={checkDeps} disabled={checkingDeps}>
               {checkingDeps ? <><span className="spinner" />Checking...</> : <><i className="ti ti-brand-docker" />Check Docker</>}
             </button>
-            {depsChecked && missingDeps.length > 0 && missingDeps.map(d => (
-              <button
-                key={d.name}
-                className="btn-primary btn-sm"
-                onClick={() => installDep(d.name)}
-                disabled={!!installingDep}
-              >
-                {installingDep === d.name
+            {depsChecked && missingDeps.length > 0 && (
+              <button className="btn-primary btn-sm" onClick={() => installDep('docker')} disabled={!!installingDep}>
+                {installingDep === 'docker'
                   ? <><span className="spinner" />Installing...</>
-                  : <><i className="ti ti-download" />Install {d.name}</>}
+                  : <><i className="ti ti-download" />Install Docker</>}
               </button>
-            ))}
+            )}
           </div>
         </div>
 
@@ -965,11 +1088,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             {deps.map(d => (
               <div key={d.name} className="dep-row">
                 <i className={`ti ${d.status === 'ok' ? 'ti-circle-check dep-ok' : 'ti-circle-x dep-missing'}`} style={{ fontSize: '16px' }} />
-                <div className="dep-name">{d.name}</div>
+                <div className="dep-name">
+                  <i className="ti ti-brand-docker" style={{ marginRight: 5, color: '#2496ed', fontSize: 13 }}/>
+                  Docker Desktop
+                </div>
                 {d.version && <div className="dep-version">{d.version}</div>}
-                {d.path && <div className="dep-version" style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.path}</div>}
                 <span className={`badge ${d.status === 'ok' ? 'tag-green' : 'tag-red'}`}>
-                  {d.status === 'ok' ? 'Installed' : 'Missing'}
+                  {d.status === 'ok' ? 'Running' : 'Not Running'}
                 </span>
               </div>
             ))}

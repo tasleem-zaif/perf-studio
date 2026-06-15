@@ -47,31 +47,31 @@ function StatusBadge({ status }) {
 }
 
 export default function Reports({ project, collection, env, envs, onEnvChange }) {
-  const [runs, setRuns] = useState([]);
+  const [runs,     setRuns]     = useState([]);
   const [selectedId, setSelectedId] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState(null); // explicit state — avoids timing bugs
+  const [loading,  setLoading]  = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // Load ALL runs once when project changes
   useEffect(() => {
     if (!project) return;
     setLoading(true);
     setSelectedId('');
+    setSelected(null);
     api.get('/execution/runs', { params: { project_id: project.id } })
-      .then(({ data }) => {
-        let filtered = data.runs || [];
-        // Filter by collection
-        if (collection?.id) {
-          filtered = filtered.filter(r => String(r.collection_id) === String(collection.id));
-        }
-        // Soft env filter — show runs for this env OR untagged runs
-        if (env) {
-          filtered = filtered.filter(r => !r.suite_env || r.suite_env === env);
-        }
-        setRuns(filtered);
-      })
+      .then(({ data }) => setRuns(data.runs || []))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [project?.id, collection?.id, env]);
+  }, [project?.id]);
+
+  // Update selected run whenever selectedId or runs change
+  // Compare both as strings — CustomSelect may pass value as number or string
+  useEffect(() => {
+    if (!selectedId) { setSelected(null); return; }
+    const found = runs.find(r => String(r.id) === String(selectedId));
+    setSelected(found || null);
+  }, [selectedId, runs]);
 
   if (!project) {
     return (
@@ -84,7 +84,6 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
     );
   }
 
-  const selected = runs.find(r => String(r.id) === selectedId);
   const jmeterRuns = runs.filter(r => r.engine === 'jmeter');
   const runNum = selected?.result_dir?.match(/Run_(\d+)/)?.[1];
 
@@ -179,8 +178,8 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
       {selectedId && !selected && (
         <div className="empty" style={{ flex: 1 }}>
           <i className="ti ti-refresh" style={{ fontSize: '36px', color: 'var(--warn)', marginBottom: '10px' }} />
-          <div className="empty-title">Run not found</div>
-          <div className="empty-desc">The selected run may have been filtered out. Try clearing the environment filter.</div>
+          <div className="empty-title">Loading run…</div>
+          <div className="empty-desc">Please wait or try selecting the run again.</div>
         </div>
       )}
 

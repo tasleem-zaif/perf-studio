@@ -16,7 +16,7 @@ const TEST_TYPES = [
 
 const DEFAULT_FORM = { name: '', test_type: 'load', collection_id: '', env: '', test_data_ids: [], engine: 'jmeter', config: {}, vusers: 50, rampup: 30, iter_mode: 'duration', loops: 1, duration: 300 };
 
-// Must match the simpleHash in ai.js exactly
+// Must match simpleHash in ai.js exactly
 function simpleHash(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -34,11 +34,8 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   const [error, setError] = useState('');
   const [generating, setGenerating] = useState(null);
   const [genError, setGenError] = useState({});
-  const [preRunData, setPreRunData] = useState({});
-  const [preRunning, setPreRunning] = useState(null);
-  const [showLogs, setShowLogs] = useState({});
-  const [expandedLog, setExpandedLog] = useState({});
   const [testDataFiles, setTestDataFiles] = useState([]);
+  const [testDataSearch, setTestDataSearch] = useState('');
   const [ownCollections, setOwnCollections] = useState(project?.collections || []);
   const [filterCollectionId, setFilterCollectionId] = useState('');
   const [filterEnv,          setFilterEnv]          = useState('');
@@ -97,7 +94,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       setForm({ ...DEFAULT_FORM, collection_id: initCol, env: initEnv });
       setError('');
       setModal('add');
-      loadTestDataFiles(initCol, initEnv); // filter by initial env
+      loadTestDataFiles(initCol, initEnv);
     }
   }, [openModalTrigger]);
 
@@ -108,14 +105,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     const qs = params.toString() ? `?${params.toString()}` : '';
     const { data } = await api.get(`/projects/${project.id}/test-suites${qs}`);
     setSuites(data.suites || []);
-    // Restore persisted pre-run data so logs survive page refresh
-    const restored = {};
-    for (const s of suites) {
-      if (s.pre_run_data) {
-        try { restored[s.id] = JSON.parse(s.pre_run_data); } catch {}
-      }
-    }
-    setPreRunData(prev => ({ ...prev, ...restored }));
   }
 
   if (!project) return <div className="page"><div className="empty"><i className="ti ti-folder-off" /><div className="empty-title">Select a project first</div></div></div>;
@@ -135,7 +124,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       else await api.put(`/projects/${project.id}/test-suites/${modal.id}`, payload);
       await loadSuites();
       setModal(null);
-      if (onAfterSave) onAfterSave(); // notify parent (e.g. to show JMeter Report in sidebar)
+      if (onAfterSave) onAfterSave();
     } catch (e) {
       setError(e.response?.data?.error || 'Save failed');
     } finally { setSaving(false); }
@@ -144,7 +133,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   async function del(id) {
     const suite = suites.find(s => s.id === id);
     const ok = await confirm(
-      `Delete "${suite?.name || 'this test suite'}"? Any generated scripts will also be removed. This cannot be undone.`,
+      `Delete "${suite?.name || 'this test suite'}\"? Any generated scripts will also be removed. This cannot be undone.`,
       'Delete Test Plan'
     );
     if (!ok) return;
@@ -156,9 +145,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     const wasGenerated = suite.jmx_path || suite.js_path;
     setGenerating(suite.id); setGenError(prev => ({ ...prev, [suite.id]: '' }));
     try {
-      await api.post(`/projects/${project.id}/test-suites/${suite.id}/generate`, {
-        preRunData: preRunData[suite.id] || null,
-      });
+      await api.post(`/projects/${project.id}/test-suites/${suite.id}/generate`, {});
       await loadSuites();
       const ext = suite.engine === 'jmeter' ? '.jmx' : '.js';
       toast(`Script ${wasGenerated ? 're-generated' : 'generated'} successfully — ${suite.name}${ext} is ready to download`, 'success');
@@ -167,30 +154,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       setGenError(prev => ({ ...prev, [suite.id]: msg }));
       toast(msg, 'error');
     } finally { setGenerating(null); }
-  }
-
-  async function preRun(suite) {
-    if (!suite.collection_id) return toast('Assign a collection to this suite first', 'warn');
-    setPreRunning(suite.id);
-    setShowLogs(prev => ({ ...prev, [suite.id]: false }));
-    try {
-      const { data } = await api.post('/ai/pre-run', { collection_id: suite.collection_id, project_id: project.id, suite_id: suite.id });
-      setPreRunData(prev => ({ ...prev, [suite.id]: data.responses }));
-      setShowLogs(prev => ({ ...prev, [suite.id]: true }));
-      const failed = data.responses.filter(r => r.error || !r.success).length;
-      if (failed > 0) toast(`Pre-run complete — ${failed} endpoint(s) failed. Check logs.`, 'warn');
-      else toast(`Pre-run complete — all ${data.responses.length} endpoint(s) succeeded`, 'success');
-      await loadSuites(); // reload so pre_run_collection_hash is up to date
-    } catch (e) {
-      toast(e.response?.data?.error || 'Pre-run failed', 'error');
-    } finally { setPreRunning(null); }
-  }
-
-  function toggleLog(suiteId) {
-    setShowLogs(prev => ({ ...prev, [suiteId]: !prev[suiteId] }));
-  }
-  function toggleEndpoint(key) {
-    setExpandedLog(prev => ({ ...prev, [key]: !prev[key] }));
   }
 
   function download(suite, type) {
@@ -206,17 +169,10 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     if (!dataIds.length && s.test_data_id) dataIds = [s.test_data_id];
     setForm({ name: s.name, test_type: s.test_type, collection_id: s.collection_id || '', env: s.env || '', test_data_ids: dataIds, engine: s.engine, config: JSON.parse(s.config_json || '{}'), vusers: s.vusers || 50, rampup: s.rampup || 30, iter_mode: s.iter_mode || 'duration', loops: s.loops || 1, duration: s.duration || 300 });
     setError(''); setModal(s);
-    loadTestDataFiles(); // refresh in case files were added/removed
+    loadTestDataFiles();
   }
 
   const typeInfo = t => TEST_TYPES.find(x => x.value === t) || TEST_TYPES[0];
-
-  function isPreRunFresh(suite) {
-    if (!suite.pre_run_data || !suite.pre_run_collection_hash) return false;
-    const col = project.collections?.find(c => String(c.id) === String(suite.collection_id));
-    if (!col) return false;
-    return simpleHash(col.json_content || '') === suite.pre_run_collection_hash;
-  }
 
   function envTagClass(env) {
     const e = (env || '').toLowerCase();
@@ -278,14 +234,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
         const ti = typeInfo(s.test_type);
         const isGenerating = generating === s.id;
         const hasScript = s.jmx_path || s.js_path;
-        const linkedCollection = project.collections?.find(c => String(c.id) === String(s.collection_id));
-        const responses = preRunData[s.id] || null;
-        const preRunFresh = isPreRunFresh(s);
-        const successCount = responses ? responses.filter(r => r.success).length : 0;
-        const failCount = responses ? responses.filter(r => r.error || r.skipped || !r.success).length : 0;
-        const logsVisible = showLogs[s.id];
-
-        const METHOD_COLOR = { GET: 'var(--accent)', POST: '#00c896', PUT: '#f0a732', PATCH: '#8b5cf6', DELETE: '#f75464' };
+        // Use ownCollections so pre_run_collection_hash is available
+        const linkedCollection = ownCollections.find(c => String(c.id) === String(s.collection_id));
+        const collectionPreRunFresh = linkedCollection
+          ? (!!linkedCollection.pre_run_collection_hash && simpleHash(linkedCollection.json_content || '') === linkedCollection.pre_run_collection_hash)
+          : !s.collection_id; // no collection assigned → don't block generate
 
         return (
           <div key={s.id} style={{ marginBottom: '12px' }}>
@@ -318,169 +271,44 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                 </div>
               </div>
 
-              {/* Pre-run / Generate action bar */}
+              {/* Generate action bar */}
               <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--color-border-tertiary)' }}>
-                {preRunning === s.id ? (
-                  /* ── Running spinner ── */
+                {isGenerating ? (
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)', padding: '6px 0' }}>
-                    <span className="spinner" /> Running pre-run against collection endpoints...
+                    <span className="spinner" /> Generating script...
                   </div>
-                ) : !preRunFresh ? (
-                  /* ── Pre-run required / stale ── */
+                ) : !collectionPreRunFresh ? (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', padding: '10px 14px', background: 'rgba(240,167,50,0.08)', border: '1px solid rgba(240,167,50,0.25)', borderRadius: '8px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--warn)' }}>
                       <i className="ti ti-alert-triangle" style={{ fontSize: '15px' }} />
-                      {responses && !preRunFresh
-                        ? <span><strong>Collection changed</strong> — Re-run pre-run to reflect the latest endpoints before generating.</span>
-                        : <span><strong>Pre-run required</strong> — Run a pre-run against your collection endpoints before generating the script.</span>
+                      {linkedCollection
+                        ? <span><strong>Pre-run required</strong> — Run a pre-run on the <strong>{linkedCollection.name}</strong> API Source before generating the script.</span>
+                        : <span><strong>No API Source assigned</strong> — Assign a collection to this test plan to enable script generation.</span>
                       }
                     </div>
-                    <button className="btn-primary btn-sm" style={{ flexShrink: 0 }} onClick={() => preRun(s)}>
-                      <i className="ti ti-player-play" />{responses ? 'Re-run Pre-run' : 'Run Pre-run'}
-                    </button>
+                    {linkedCollection && (
+                      <button className="btn-secondary btn-sm" style={{ flexShrink: 0 }} onClick={() => onNav('collections')}>
+                        <i className="ti ti-braces" /> Go to API Sources
+                      </button>
+                    )}
                   </div>
                 ) : (
-                  /* ── Pre-run fresh ── */
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <span style={{ fontSize: '12px', color: '#00c896', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                        <i className="ti ti-circle-check" /> {successCount} passed
-                      </span>
-                      {failCount > 0 && (
-                        <span style={{ fontSize: '12px', color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                          <i className="ti ti-circle-x" /> {failCount} failed
-                        </span>
-                      )}
-                      <button className="btn-secondary btn-sm" onClick={() => toggleLog(s.id)}>
-                        <i className={`ti ti-${logsVisible ? 'chevron-up' : 'chevron-down'}`} /> {logsVisible ? 'Hide Logs' : 'View Logs'}
-                      </button>
-                    </div>
-                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                      {failCount > 0 ? (
-                        <span style={{ fontSize: '12px', color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                          <i className="ti ti-lock" /> Fix failed endpoints and re-run to generate
-                        </span>
-                      ) : (
-                        <>
-                          <button className="btn-primary btn-sm" onClick={() => generate(s)} disabled={isGenerating}>
-                            {isGenerating ? <><span className="spinner" />Generating...</> : <><i className="ti ti-sparkles" />{hasScript ? 'Re-generate Script' : 'Generate Script'}</>}
-                          </button>
-                          {hasScript && s.engine === 'jmeter' && s.jmx_path && (
-                            <button className="btn-secondary btn-sm" onClick={() => download(s, 'jmx')}><i className="ti ti-download" />.jmx</button>
-                          )}
-                          {hasScript && s.engine === 'k6' && s.js_path && (
-                            <button className="btn-secondary btn-sm" onClick={() => download(s, 'js')}><i className="ti ti-download" />.js</button>
-                          )}
-                        </>
-                      )}
-                    </div>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button className="btn-primary btn-sm" onClick={() => generate(s)}>
+                      <i className="ti ti-sparkles" />{hasScript ? 'Re-generate Script' : 'Generate Script'}
+                    </button>
+                    {hasScript && s.engine === 'jmeter' && s.jmx_path && (
+                      <button className="btn-secondary btn-sm" onClick={() => download(s, 'jmx')}><i className="ti ti-download" />.jmx</button>
+                    )}
+                    {hasScript && s.engine === 'k6' && s.js_path && (
+                      <button className="btn-secondary btn-sm" onClick={() => download(s, 'js')}><i className="ti ti-download" />.js</button>
+                    )}
                   </div>
                 )}
               </div>
 
               {genError[s.id] && <div className="auth-error" style={{ marginTop: '10px' }}>{genError[s.id]}</div>}
             </div>
-
-            {/* ── Pre-run log panel ── */}
-            {responses && logsVisible && (
-              <div style={{ border: '1px solid var(--color-border-secondary)', borderTop: 'none', borderRadius: '0 0 10px 10px', background: 'var(--color-background-secondary)', overflow: 'hidden' }}>
-                <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--color-border-tertiary)', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', color: 'var(--color-text-tertiary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <i className="ti ti-list-details" /> Pre-run Logs — {responses.length} endpoint{responses.length !== 1 ? 's' : ''}
-                </div>
-                {responses.map((r, idx) => {
-                  const key = `${s.id}_${idx}`;
-                  const expanded = expandedLog[key];
-                  const isErr = r.error || r.skipped;
-                  const statusColor = !r.status ? 'var(--color-text-tertiary)' : r.status < 300 ? '#00c896' : r.status < 400 ? 'var(--accent)' : 'var(--danger)';
-                  return (
-                    <div key={idx} style={{ borderBottom: idx < responses.length - 1 ? '1px solid var(--color-border-tertiary)' : 'none' }}>
-                      {/* Endpoint summary row */}
-                      <div onClick={() => toggleEndpoint(key)} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 14px', cursor: 'pointer', userSelect: 'none' }}
-                        onMouseEnter={e => e.currentTarget.style.background = 'var(--color-background-hover)'}
-                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                        <i className={`ti ti-chevron-${expanded ? 'down' : 'right'}`} style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
-                        {r.method && (
-                          <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: `${METHOD_COLOR[r.method] || '#888'}22`, color: METHOD_COLOR[r.method] || '#888', flexShrink: 0 }}>{r.method}</span>
-                        )}
-                        <span style={{ fontSize: '12px', flex: 1, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.url || r.endpoint}</span>
-                        {r.tokenExtracted && (
-                          <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(0,200,150,0.15)', color: '#00c896', flexShrink: 0 }}>TOKEN EXTRACTED</span>
-                        )}
-                        {r.tokenInjected && (
-                          <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(78,158,255,0.15)', color: 'var(--accent)', flexShrink: 0 }}>AUTH INJECTED</span>
-                        )}
-                        {r.endpoint !== r.url && r.endpoint && (
-                          <span style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', flexShrink: 0 }}>{r.endpoint}</span>
-                        )}
-                        {r.status ? (
-                          <span style={{ fontSize: '11px', fontWeight: 700, color: statusColor, flexShrink: 0 }}>{r.status} {r.statusText}</span>
-                        ) : isErr ? (
-                          <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--danger)', flexShrink: 0 }}>{r.skipped ? 'SKIPPED' : 'ERROR'}</span>
-                        ) : null}
-                      </div>
-
-                      {/* Expanded detail */}
-                      {expanded && (
-                        <div style={{ padding: '0 14px 10px 36px', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                          {isErr ? (
-                            <div style={{ padding: '8px 12px', background: 'rgba(247,84,100,0.08)', borderRadius: '6px', color: 'var(--danger)', fontFamily: 'monospace', fontSize: '12px' }}>
-                              <i className="ti ti-alert-circle" style={{ marginRight: '6px' }} />{r.error || r.reason}
-                            </div>
-                          ) : (
-                            <>
-                              {r.requestHeaders && (() => {
-                                const open = expandedLog[`${key}_hdrs`];
-                                return (
-                                  <div style={{ border: '1px solid var(--color-border-tertiary)', borderRadius: '6px', overflow: 'hidden' }}>
-                                    <div onClick={() => toggleEndpoint(`${key}_hdrs`)} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 10px', cursor: 'pointer', background: 'var(--color-background-secondary)', userSelect: 'none' }}
-                                      onMouseEnter={e => e.currentTarget.style.opacity = '0.8'} onMouseLeave={e => e.currentTarget.style.opacity = '1'}>
-                                      <i className={`ti ti-chevron-${open ? 'down' : 'right'}`} style={{ fontSize: '10px', color: 'var(--color-text-tertiary)' }} />
-                                      <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--color-text-tertiary)' }}>Request Headers</span>
-                                      <span style={{ fontSize: '10px', color: 'var(--color-text-tertiary)', marginLeft: 'auto' }}>{Object.keys(r.requestHeaders).length} keys</span>
-                                    </div>
-                                    {open && <pre style={{ margin: 0, padding: '8px 10px', fontSize: '11px', overflowX: 'auto', color: 'var(--color-text-secondary)' }}>{JSON.stringify(r.requestHeaders, null, 2)}</pre>}
-                                  </div>
-                                );
-                              })()}
-
-                              {r.requestBody && (() => {
-                                const open = expandedLog[`${key}_rbody`];
-                                return (
-                                  <div style={{ border: '1px solid var(--color-border-tertiary)', borderRadius: '6px', overflow: 'hidden' }}>
-                                    <div onClick={() => toggleEndpoint(`${key}_rbody`)} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 10px', cursor: 'pointer', background: 'var(--color-background-secondary)', userSelect: 'none' }}
-                                      onMouseEnter={e => e.currentTarget.style.opacity = '0.8'} onMouseLeave={e => e.currentTarget.style.opacity = '1'}>
-                                      <i className={`ti ti-chevron-${open ? 'down' : 'right'}`} style={{ fontSize: '10px', color: 'var(--color-text-tertiary)' }} />
-                                      <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--color-text-tertiary)' }}>Request Body</span>
-                                    </div>
-                                    {open && <pre style={{ margin: 0, padding: '8px 10px', fontSize: '11px', overflowX: 'auto', color: 'var(--color-text-secondary)' }}>{r.requestBody}</pre>}
-                                  </div>
-                                );
-                              })()}
-
-                              {(() => {
-                                const open = expandedLog[`${key}_resp`];
-                                const bodyStr = typeof r.body === 'string' ? r.body : JSON.stringify(r.body, null, 2);
-                                return (
-                                  <div style={{ border: '1px solid var(--color-border-tertiary)', borderRadius: '6px', overflow: 'hidden' }}>
-                                    <div onClick={() => toggleEndpoint(`${key}_resp`)} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 10px', cursor: 'pointer', background: 'var(--color-background-secondary)', userSelect: 'none' }}
-                                      onMouseEnter={e => e.currentTarget.style.opacity = '0.8'} onMouseLeave={e => e.currentTarget.style.opacity = '1'}>
-                                      <i className={`ti ti-chevron-${open ? 'down' : 'right'}`} style={{ fontSize: '10px', color: 'var(--color-text-tertiary)' }} />
-                                      <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--color-text-tertiary)' }}>Response Body</span>
-                                      <span style={{ fontSize: '10px', color: statusColor, marginLeft: 'auto', fontWeight: 600 }}>{r.status} {r.statusText}</span>
-                                    </div>
-                                    {open && <pre style={{ margin: 0, padding: '8px 10px', fontSize: '11px', overflowX: 'auto', maxHeight: '220px', color: 'var(--color-text-secondary)' }}>{bodyStr}</pre>}
-                                  </div>
-                                );
-                              })()}
-                            </>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
           </div>
         );
       }) : (
@@ -516,10 +344,18 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
             </div>
             <div className="form-group">
               <label className="form-label">Engine</label>
-              <CustomSelect value={form.engine} onChange={e => setForm(f => ({ ...f, engine: e.target.value }))}>
+              <CustomSelect
+                value={form.engine}
+                onChange={e => { if (e.target.value !== 'k6') setForm(f => ({ ...f, engine: e.target.value })); }}
+              >
                 <option value="jmeter">Apache JMeter (.jmx)</option>
-                <option value="k6">Grafana K6 (.js)</option>
+                <option value="k6" disabled>Grafana K6 (.js) — Coming Soon</option>
               </CustomSelect>
+              {form.engine === 'k6' && (
+                <div style={{ marginTop: 6, fontSize: 11, color: '#b45309', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <i className="ti ti-clock" style={{ fontSize: 11 }}/> K6 support is coming soon. Please use Apache JMeter for now.
+                </div>
+              )}
             </div>
           </div>
 
@@ -529,6 +365,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
               <CustomSelect value={form.collection_id} onChange={e => {
                 const newCol = e.target.value;
                 setForm(f => ({ ...f, collection_id: newCol, env: '', test_data_ids: [] }));
+                setTestDataSearch('');
                 loadTestDataFiles(newCol, '');
               }}>
                 <option value="">— None —</option>
@@ -546,6 +383,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                   <CustomSelect value={form.env || ''} onChange={e => {
                     const newEnv = e.target.value;
                     setForm(f => ({ ...f, env: newEnv, test_data_ids: [] }));
+                    setTestDataSearch('');
                     loadTestDataFiles(form.collection_id, newEnv);
                   }}>
                     <option value="">— Select environment —</option>
@@ -563,31 +401,69 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                   <i className="ti ti-refresh" style={{ fontSize: 12 }} /> Refresh
                 </button>
               </label>
-              <div style={{ border: '1px solid var(--color-border, #3a3c42)', borderRadius: '6px', maxHeight: '110px', overflowY: 'auto', padding: '4px 2px', background: 'var(--color-background)' }}>
-                {!form.env
-                  ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>Select an environment first to see available test data files</div>
-                  : testDataFiles.length === 0
-                  ? <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No CSV files uploaded for {form.env}</div>
-                  : testDataFiles.map(f => {
-                      const checked = form.test_data_ids.includes(f.id) || form.test_data_ids.includes(String(f.id));
-                      return (
-                        <label key={f.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 10px', cursor: 'pointer', borderRadius: '4px', fontSize: '13px' }}
-                          onMouseEnter={e => e.currentTarget.style.background = 'var(--color-background-secondary)'}
-                          onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                        >
-                          <input type="checkbox" checked={checked} onChange={e => setForm(prev => ({
-                            ...prev,
-                            test_data_ids: e.target.checked
-                              ? [...prev.test_data_ids, f.id]
-                              : prev.test_data_ids.filter(id => String(id) !== String(f.id))
-                          }))} style={{ accentColor: 'var(--accent)', width: '14px', height: '14px', flexShrink: 0 }} />
-                          <i className="ti ti-table" style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
-                          {f.original_name}
-                        </label>
-                      );
-                    })
-                }
+              {/* Search input — only shown when there are files to search */}
+              {form.env && testDataFiles.length > 0 && (
+                <div style={{ position: 'relative', marginBottom: '4px' }}>
+                  <i className="ti ti-search" style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', fontSize: 13, color: 'var(--color-text-tertiary)', pointerEvents: 'none' }} />
+                  <input
+                    type="text"
+                    value={testDataSearch}
+                    onChange={e => setTestDataSearch(e.target.value)}
+                    placeholder="Search files…"
+                    style={{ width: '100%', paddingLeft: 28, paddingRight: testDataSearch ? 28 : 8, paddingTop: 6, paddingBottom: 6, fontSize: 12, borderRadius: 6, border: '1px solid var(--color-border, #3a3c42)', background: 'var(--color-background)', color: 'var(--color-text-primary)', fontFamily: 'inherit', boxSizing: 'border-box' }}
+                  />
+                  {testDataSearch && (
+                    <button type="button" onClick={() => setTestDataSearch('')}
+                      style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-tertiary)', padding: 2, lineHeight: 1 }}>
+                      <i className="ti ti-x" style={{ fontSize: 11 }} />
+                    </button>
+                  )}
+                </div>
+              )}
+              <div style={{ border: '1px solid var(--color-border, #3a3c42)', borderRadius: '6px', maxHeight: '130px', overflowY: 'auto', padding: '4px 2px', background: 'var(--color-background)' }}>
+                {!form.env ? (
+                  <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>Select an environment first to see available test data files</div>
+                ) : testDataFiles.length === 0 ? (
+                  <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No CSV files uploaded for {form.env}</div>
+                ) : (() => {
+                  const q = testDataSearch.trim().toLowerCase();
+                  const filtered = q ? testDataFiles.filter(f => f.original_name.toLowerCase().includes(q)) : testDataFiles;
+                  if (!filtered.length) return (
+                    <div style={{ padding: '6px 10px', fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No files match "{testDataSearch}"</div>
+                  );
+                  return filtered.map(f => {
+                    const checked = form.test_data_ids.includes(f.id) || form.test_data_ids.includes(String(f.id));
+                    // Highlight matching portion of the filename
+                    const name = f.original_name;
+                    const idx = q ? name.toLowerCase().indexOf(q) : -1;
+                    const nameNode = idx >= 0
+                      ? <span>{name.slice(0, idx)}<mark style={{ background: 'rgba(74,158,255,0.25)', color: 'inherit', borderRadius: 2, padding: '0 1px' }}>{name.slice(idx, idx + q.length)}</mark>{name.slice(idx + q.length)}</span>
+                      : name;
+                    return (
+                      <label key={f.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 10px', cursor: 'pointer', borderRadius: '4px', fontSize: '13px' }}
+                        onMouseEnter={e => e.currentTarget.style.background = 'var(--color-background-secondary)'}
+                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                      >
+                        <input type="checkbox" checked={checked} onChange={e => setForm(prev => ({
+                          ...prev,
+                          test_data_ids: e.target.checked
+                            ? [...prev.test_data_ids, f.id]
+                            : prev.test_data_ids.filter(id => String(id) !== String(f.id))
+                        }))} style={{ accentColor: 'var(--accent)', width: '14px', height: '14px', flexShrink: 0 }} />
+                        <i className="ti ti-table" style={{ fontSize: '12px', color: checked ? 'var(--accent)' : 'var(--color-text-tertiary)', flexShrink: 0 }} />
+                        {nameNode}
+                        {checked && <i className="ti ti-check" style={{ fontSize: '11px', color: 'var(--accent)', marginLeft: 'auto' }} />}
+                      </label>
+                    );
+                  });
+                })()}
               </div>
+              {/* Selected count summary */}
+              {form.test_data_ids.length > 0 && (
+                <div style={{ marginTop: 4, fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <i className="ti ti-check" style={{ fontSize: 11 }} /> {form.test_data_ids.length} file{form.test_data_ids.length !== 1 ? 's' : ''} selected
+                </div>
+              )}
             </div>
           </div>
 

@@ -26,8 +26,14 @@ router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function getConfig(projectId) {
-  return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ?').get(projectId) || null;
+// Per-user CI config: first try (project_id, user_id), fall back to legacy (project_id, NULL)
+function getConfig(projectId, userId) {
+  if (userId) {
+    const own = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId);
+    if (own) return own;
+  }
+  // Legacy shared config (user_id IS NULL) — used as read-only template if the user hasn't saved their own yet
+  return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId) || null;
 }
 
 function decryptConfig(cfg) {
@@ -70,19 +76,18 @@ function apiRequest(urlStr, method, body, headers = {}) {
   });
 }
 
-// ── GET /config ───────────────────────────────────────────────────────────────
+// ── GET /config — returns the CALLING USER's own CI config ───────────────────
 router.get('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getConfig(req.params.projectId);
+  const cfg = getConfig(req.params.projectId, req.userId);
   if (!cfg) return res.json({ config: null });
 
-  // Mask tokens — never return raw tokens to frontend
   res.json({
     config: {
       ...cfg,
-      gitlab_token:         cfg.gitlab_token         ? '••••••••' : '',
-      gitlab_trigger_token: cfg.gitlab_trigger_token ? '••••••••' : '',
-      github_token:         cfg.github_token         ? '••••••••' : '',
+      gitlab_token:             cfg.gitlab_token         ? '••••••••' : '',
+      gitlab_trigger_token:     cfg.gitlab_trigger_token ? '••••••••' : '',
+      github_token:             cfg.github_token         ? '••••••••' : '',
       gitlab_token_set:         !!cfg.gitlab_token,
       gitlab_trigger_token_set: !!cfg.gitlab_trigger_token,
       github_token_set:         !!cfg.github_token,
@@ -90,17 +95,24 @@ router.get('/config', (req, res) => {
   });
 });
 
+// ── Helper: project owner check ───────────────────────────────────────────────
+function isProjectOwner(userId, projectId) {
+  const proj = db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
+  return proj && String(proj.user_id) === String(userId);
+}
+
 // ── PUT /config ───────────────────────────────────────────────────────────────
 router.put('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
     github_enabled, github_repo, github_token, github_workflow_file, github_ref,
   } = req.body;
 
-  const existing = getConfig(req.params.projectId);
+  // Look up THIS user's own config row (project_id + user_id)
+  const existing = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(req.params.projectId, req.userId);
 
-  // Only encrypt + store token if a new value was provided (not the masked placeholder)
   const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'         ? encrypt(gitlab_token)         : existing?.gitlab_token         || '';
   const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••' ? encrypt(gitlab_trigger_token) : existing?.gitlab_trigger_token || '';
   const encGithubToken        = github_token && github_token !== '••••••••'         ? encrypt(github_token)         : existing?.github_token         || '';
@@ -111,21 +123,21 @@ router.put('/config', (req, res) => {
       gitlab_trigger_token=?, gitlab_ref=?,
       github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?,
       updated_at=datetime('now')
-      WHERE project_id=?`
+      WHERE project_id=? AND user_id=?`
     ).run(
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
       github_workflow_file || 'perf-test.yml', github_ref || 'main',
-      req.params.projectId
+      req.params.projectId, req.userId
     );
   } else {
     db.prepare(`INSERT INTO ci_pipeline_configs
-      (project_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
+      (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
        github_enabled, github_repo, github_token, github_workflow_file, github_ref)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
-      req.params.projectId,
+      req.params.projectId, req.userId,
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
@@ -140,7 +152,7 @@ router.put('/config', (req, res) => {
 router.post('/config/test', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { provider } = req.body;
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'Save CI configuration first.' });
 
   try {
@@ -172,7 +184,7 @@ router.post('/config/test', async (req, res) => {
 // ── POST /config/trigger-token — create GitLab trigger token ─────────────────
 router.post('/config/trigger-token', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg?.gitlab_token)         return res.status(400).json({ error: 'Save GitLab access token first.' });
   if (!cfg?.gitlab_project_id)    return res.status(400).json({ error: 'GitLab project ID/path not set.' });
 
@@ -203,18 +215,20 @@ router.post('/config/trigger-token', async (req, res) => {
 // ── POST /generate-yaml — generate + commit YAML files ───────────────────────
 router.post('/generate-yaml', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg     = decryptConfig(getConfig(req.params.projectId));
+  const cfg     = decryptConfig(getConfig(req.params.projectId, req.userId));
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
-  // YAML files (.github/workflows/*, .gitlab-ci.yml) must ALWAYS go into the
-  // ADMIN workspace. GitHub requires the `workflow` PAT scope to push workflow
-  // files — regular users don't have this scope. The org admin pushes these
-  // files once, after which all users can trigger the pipeline.
+  // Determine workspace: org/super admins write to shared admin workspace;
+  // regular users write to their own workspace so they can push to their branch.
+  const callerRow = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
   const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
-  const gitRoot = path.join(GIT_WORKSPACES_ROOT, 'admin'); // git-workspaces/admin/
+  const userFolder = isAdmin ? 'admin' : `user-${req.userId}`;
+  const gitRoot    = path.join(GIT_WORKSPACES_ROOT, userFolder);
+  fs.mkdirSync(gitRoot, { recursive: true }); // ensure dir exists even before first git init
 
   // Get all generated test plans for this project to include as YAML comments
   const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
@@ -375,6 +389,38 @@ jobs:
           echo "=== Enabled elements ==="
           grep "enabled=" "\$SCRIPT" | head -10
 
+      - name: Cache PerfStudio Docker image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache
+          key: docker-perfstudio-\${{ runner.os }}
+          restore-keys: docker-perfstudio-
+
+      - name: Load cached image or pull
+        run: |
+          if [ -f /tmp/docker-cache/perfstudio.tar ]; then
+            echo "Loading PerfStudio image from cache..."
+            docker load -i /tmp/docker-cache/perfstudio.tar
+          else
+            echo "Pulling PerfStudio image (first run on this runner)..."
+            docker pull tasleemzaif/perfstudio:latest
+            mkdir -p /tmp/docker-cache
+            docker save tasleemzaif/perfstudio:latest -o /tmp/docker-cache/perfstudio.tar
+          fi
+
+      - name: Verify patch and CSV files
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          echo "=== ThreadGroup after patch ==="
+          grep -E "num_threads|ramp_time|scheduler|duration|continue_forever|LoopController.loops" "\$SCRIPT" || echo "WARN: no matches found"
+          echo "=== CSV paths in JMX ==="
+          grep -i "CSV_PATH\\|Argument.value.*testData\\|filename.*CSV\\|CSVDataSet" "\$SCRIPT" | head -10
+          echo "=== CSV files in workspace ==="
+          TESTDATA="\$(grep -o 'Argument.value>[^<]*testData' \$SCRIPT | head -1 | sed 's/Argument.value>//')"
+          [ -n "\$TESTDATA" ] && ls -la "\$TESTDATA/" 2>/dev/null || echo "testData dir: \$TESTDATA (checking /workspace prefix)"
+          ls -la "/workspace/projects/Demo1/Demo1_API_Collection/QA/testData/" 2>/dev/null || echo "Path not found"
+
       - name: Run JMeter
         run: |
           SCRIPT="\${{ inputs.script_path }}"
@@ -383,10 +429,14 @@ jobs:
           docker run --rm \\
             -v "\${{ github.workspace }}":/workspace \\
             -v "\${{ github.workspace }}/reports":/output \\
-            justb4/jmeter \\
+            tasleemzaif/perfstudio:latest \\
+            jmeter \\
             -n -t "/workspace/\$SCRIPT" \\
+            -j /output/jmeter.log \\
             -l /output/results.jtl \\
-            -e -o /output/html
+            -e -o /output/html || true
+          echo "=== JMeter Log (last 50 lines) ==="
+          tail -50 reports/jmeter.log 2>/dev/null || echo "No jmeter.log found"
 
       - name: Validate results
         run: |
@@ -422,6 +472,18 @@ def sp(xml, name, val):
     new, n = re.subn(pat, r'\\g<1>' + str(val), xml)
     print(("  SET " if n else "  WARN ") + name + "=" + str(val))
     return new
+
+# Fix absolute local paths -> CI workspace paths
+# Replaces Windows paths like C:/Users/.../git-workspaces/user-X/ with /workspace/
+# so JMeter finds CSV test data files inside the Docker container
+path_pattern = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]'
+fixed_content, path_fixes = re.subn(path_pattern, '/workspace/', content)
+if path_fixes:
+    fixed_content = fixed_content.replace('\\\\', '/')
+    content = fixed_content
+    print("  FIXED " + str(path_fixes) + " absolute path(s) -> /workspace/")
+else:
+    print("  No absolute paths to fix")
 
 content = sp(content, "ThreadGroup.num_threads", users)
 content = sp(content, "ThreadGroup.ramp_time", rampup)
@@ -461,13 +523,14 @@ print("Patch complete")
   }
 
   if (created.length === 0) return res.status(500).json({ error: errors.join('; ') || 'Nothing generated' });
-  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}. Commit and push these files to your branch.` });
+  const branchHint = isAdmin ? 'main' : (db.prepare('SELECT branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId)?.branch_name || 'your branch');
+  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}. Go to Configuration → Git, commit and push these files to ${branchHint}.` });
 });
 
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
 router.post('/trigger', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not saved yet.' });
 
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
@@ -677,7 +740,7 @@ router.get('/runs/:runId/status', async (req, res) => {
   const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!run.external_id || !cfg) return res.json({ run });
 
   try {
@@ -737,7 +800,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId));
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
 
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
@@ -1000,6 +1063,94 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   } catch (e) {
     try { if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip); } catch {}
     res.status(500).json({ error: `Failed to sync results: ${e.message}` });
+  }
+});
+
+// ── GET /runs/:runId/steps — live step details from GitHub/GitLab ─────────────
+router.get('/runs/:runId/steps', async (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (!run.external_id) return res.json({ steps: [], status: run.status });
+
+  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  if (!cfg) return res.json({ steps: [], status: run.status });
+
+  try {
+    if (run.provider === 'github') {
+      if (!cfg.github_token) return res.json({ steps: [], status: run.status });
+      const ghHeaders = {
+        Authorization: `token ${cfg.github_token}`,
+        'User-Agent': 'PerfStudio',
+        Accept: 'application/vnd.github+json',
+      };
+
+      // Get jobs for this run
+      const jobsResp = await apiRequest(
+        `https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/jobs`,
+        'GET', null, ghHeaders
+      );
+
+      if (jobsResp.status !== 200) return res.json({ steps: [], status: run.status });
+
+      const job = jobsResp.body?.jobs?.[0];
+      if (!job) return res.json({ steps: [], status: run.status });
+
+      const steps = (job.steps || []).map(s => ({
+        number:       s.number,
+        name:         s.name,
+        status:       s.status,       // queued | in_progress | completed
+        conclusion:   s.conclusion,   // success | failure | skipped | cancelled | null
+        started_at:   s.started_at,
+        completed_at: s.completed_at,
+        duration_s:   s.started_at && s.completed_at
+          ? Math.round((new Date(s.completed_at) - new Date(s.started_at)) / 1000)
+          : null,
+      }));
+
+      // Job-level details
+      const jobInfo = {
+        id:           job.id,
+        name:         job.name,
+        status:       job.status,
+        conclusion:   job.conclusion,
+        started_at:   job.started_at,
+        completed_at: job.completed_at,
+        html_url:     job.html_url,
+        runner_name:  job.runner_name,
+      };
+
+      return res.json({ steps, job: jobInfo, status: run.status, provider: 'github' });
+    }
+
+    if (run.provider === 'gitlab') {
+      if (!cfg.gitlab_token) return res.json({ steps: [], status: run.status });
+      const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
+      const encodedId = encodeURIComponent(cfg.gitlab_project_id);
+
+      const jobsResp = await apiRequest(
+        `${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`,
+        'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token }
+      );
+
+      if (jobsResp.status !== 200) return res.json({ steps: [], status: run.status });
+
+      const steps = (jobsResp.body || []).map(j => ({
+        number:       j.id,
+        name:         j.name,
+        status:       j.status,
+        conclusion:   j.status === 'success' ? 'success' : j.status === 'failed' ? 'failure' : null,
+        started_at:   j.started_at,
+        completed_at: j.finished_at,
+        duration_s:   j.duration ? Math.round(j.duration) : null,
+      }));
+
+      return res.json({ steps, status: run.status, provider: 'gitlab' });
+    }
+
+    res.json({ steps: [], status: run.status });
+  } catch (e) {
+    res.json({ steps: [], status: run.status, error: e.message });
   }
 });
 

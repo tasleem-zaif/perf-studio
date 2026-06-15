@@ -84,8 +84,9 @@ router.post('/:id/run', auth, async (req, res) => {
   if (res.socket) res.socket.setNoDelay(true);
 
   const allLogs = [];
+  function ts() { return new Date().toLocaleTimeString('en-GB', { hour12: false }); }
   function log(type, message) {
-    const entry = { type, message };
+    const entry = { type, message: `${ts()} ${message}` };
     allLogs.push(entry);
     res.write('data: ' + JSON.stringify(entry) + '\n\n');
     if (typeof res.flush === 'function') res.flush();
@@ -126,6 +127,8 @@ router.post('/:id/run', auth, async (req, res) => {
 
   // Notify frontend of run_id immediately so it can poll status
   send({ run_id: runId, total_steps: steps.length });
+  log('ok', `Pipeline queued — Run #${runId} | ${steps.length} step(s)`);
+  log('info', `Started at: ${new Date().toLocaleString()}`);
 
   // ── Execute steps sequentially ────────────────────────────────────────────
   let finalStatus = 'completed';
@@ -135,9 +138,12 @@ router.post('/:id/run', auth, async (req, res) => {
     const step = steps[i];
     log('info', '');
     log('info', `┌─ Step ${i + 1}/${steps.length}: ${step.name} ─────────────────────────`);
+    log('info', `│  Engine: ${step.engine?.toUpperCase() || 'JMETER'} · Type: ${step.test_type || 'load'}`);
+    log('info', `│  Status: RUNNING`);
 
     // Mark step as running
     stepsResult[i].status = 'running';
+    stepsResult[i].started_at = new Date().toISOString();
     saveSteps();
     send({ step_update: { index: i, status: 'running', name: step.name } });
 
@@ -210,6 +216,40 @@ router.post('/:id/run', auth, async (req, res) => {
   clearInterval(heartbeat);
   db.prepare(`UPDATE pipeline_runs SET status=?, finished_at=datetime('now'), logs=?, steps_result=? WHERE id=?`)
     .run(finalStatus, JSON.stringify(allLogs), JSON.stringify(stepsResult), runId);
+
+  // ── Send pipeline completion alert email ──────────────────────────────────
+  setImmediate(async () => {
+    try {
+      const { sendAlertEmail, getAlertConfig, getRecipients } = require('../utils/emailUtils');
+      const cfg        = getAlertConfig(req.userId);
+      const recipients = getRecipients(req.userId, req.params.projectId);
+      if (!cfg?.smtp_host || !cfg?.from_email || !recipients.length) return;
+
+      const project  = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+      const userRow  = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(req.userId);
+      const orgName  = userRow?.org_name || userRow?.name || 'Performance Studio';
+      const finished = new Date().toLocaleString();
+
+      // Build summary report data for the email template
+      const reportData = {
+        meta: {
+          suite_name: `Pipeline: ${pipeline.name}`,
+          started_at: new Date(Date.now() - (Date.now() % 1000)).toISOString(),
+          duration_s: null,
+          status: finalStatus,
+        },
+        summary: { total_requests: 0, total_failed: failed, total_success: passed },
+        rule_violations: stepsResult
+          .filter(s => s.status === 'failed' && s.error)
+          .map(s => ({ rule: { metric: s.name, severity: 'error' }, label: s.error })),
+      };
+
+      await sendAlertEmail(runId, req.userId, req.params.projectId, reportData, null, null);
+      console.log(`[Pipeline] Alert email sent for pipeline run #${runId}`);
+    } catch (e) {
+      console.error('[Pipeline] Failed to send alert email:', e.message);
+    }
+  });
 
   done({ ok: true, run_id: runId, status: finalStatus, passed, failed, skipped });
 });

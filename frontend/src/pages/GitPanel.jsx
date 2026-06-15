@@ -98,6 +98,8 @@ function parseStatusFiles(status) {
 export default function GitPanel({ project, user, workflowOnly = false, setupOnly = false, drawerWidth = 700 }) {
   const { toast } = useToast();
   const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
+  // Only the project owner can modify shared git/CI config
+  const isProjectOwner = project && user && String(project.user_id) === String(user.id);
   const pid = project?.id;
   const termInputRef = useRef(null);
 
@@ -106,7 +108,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── Repo config ───────────────────────────────────────────────────────────
   const [cfg,         setCfg]         = useState(null);
-  const [cfgForm,     setCfgForm]     = useState({ provider: 'github', remote_url: '', base_branch: 'main', username: '', email: '', auth_token: '' });
+  const [cfgForm,     setCfgForm]     = useState({ provider: 'github', remote_url: '', base_branch: 'main', username: '', email: '', auth_token: '', auth_method: 'pat' });
   const [cfgEditMode, setCfgEditMode] = useState(false);   // locked / edit toggle
   const [savingCfg,   setSavingCfg]   = useState(false);
   const [initing,     setIniting]     = useState(false);
@@ -115,7 +117,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── Identity ──────────────────────────────────────────────────────────────
   const [identity,       setIdentity]       = useState(null);
-  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '' });
+  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '', auth_method: 'pat', ssh_key: '' });
   const [savingId,       setSavingId]       = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [autoIniting,    setAutoIniting]    = useState(false);
@@ -176,20 +178,20 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
     if (!pid) return;
     try {
       const [cfgRes, idRes, prsRes, statusRes] = await Promise.all([
-        api.get(`/projects/${pid}/git/config`),
-        api.get(`/projects/${pid}/git/identity`),
-        api.get(`/projects/${pid}/git/prs`),
+        api.get(`/projects/${pid}/git/config`).catch(() => ({ data: { config: null } })),
+        api.get(`/projects/${pid}/git/identity`).catch(() => ({ data: { identity: null } })),
+        api.get(`/projects/${pid}/git/prs`).catch(() => ({ data: { prs: [] } })),
         api.get(`/projects/${pid}/git/status`).catch(() => ({ data: { initialized: false } })),
       ]);
       const c = cfgRes.data.config;
       setCfg(c);
       if (c) {
-        setCfgForm({ provider: c.provider||'github', remote_url: c.remote_url||'', base_branch: c.base_branch||'main', username: c.username||'', email: c.email||'', auth_token: '' });
+        setCfgForm({ provider: c.provider||'github', remote_url: c.remote_url||'', base_branch: c.base_branch||'main', username: c.username||'', email: c.email||'', auth_token: '', auth_method: c.auth_method||'pat' });
         setCfgEditMode(!c.remote_url); // start in edit mode only if not yet configured
       }
       const id = idRes.data.identity;
       setIdentity(id);
-      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '' }));
+      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '', auth_method: id.auth_method||'pat', ssh_key: '' }));
       setPrs(prsRes.data.prs || []);
       setStatus(statusRes.data);
       if (statusRes.data?.initialized) {
@@ -620,13 +622,26 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
               title="Repository"
               subtitle="Shared remote repository for this project."
               extra={
-                cfg?.remote_url && !cfgEditMode ? (
+                // Lock after init — no editing allowed
+                cfg?.remote_url && !cfgEditMode && isProjectOwner && !initialized ? (
                   <button className="btn-secondary btn-sm" onClick={() => { setCfgEditMode(true); setTestResult(null); }}>
                     <i className="ti ti-pencil" style={{ fontSize:12 }} /> Edit
                   </button>
                 ) : null
               }
             >
+              {/* Permanently locked after initialization */}
+              {initialized ? (
+                <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 12px', background:'#f0fdf4', border:'1px solid #86efac', borderRadius:8, marginBottom:12, fontSize:12, color:'#15803d' }}>
+                  <i className="ti ti-lock" style={{ fontSize:14, flexShrink:0 }}/>
+                  <span>Repository initialized — settings are <strong>locked</strong>. The remote URL and branch configuration cannot be changed after initialization.</span>
+                </div>
+              ) : !isProjectOwner ? (
+                <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 12px', background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, marginBottom:12, fontSize:12, color:'#92400e' }}>
+                  <i className="ti ti-lock" style={{ fontSize:14, flexShrink:0 }}/>
+                  <span>Only the <strong>project owner</strong> can configure the repository. You can view but not modify it.</span>
+                </div>
+              ) : null}
               {/* Locked display */}
               {cfg?.remote_url && !cfgEditMode ? (
                 <>
@@ -640,7 +655,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                     <button className="btn-secondary" onClick={testConnection} disabled={testing}>
                       {testing ? <><span className="spinner"/>Testing…</> : <><i className="ti ti-wifi"/>Test Connection</>}
                     </button>
-                    {!initialized && cfg.remote_url && (
+                    {!initialized && cfg.remote_url && isProjectOwner && (
                       <button className="btn-secondary" onClick={initRepo} disabled={initing}>
                         {initing ? <><span className="spinner"/>Initializing…</> : <><i className="ti ti-git-branch"/>Initialize repository</>}
                       </button>
@@ -669,16 +684,26 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                       {PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
                     </select>
                   </Field>
-                  <Field label="Remote URL" required>
-                    <input type="url" value={cfgForm.remote_url} onChange={e => setCfgForm(f => ({ ...f, remote_url: e.target.value }))}
-                      placeholder={PROVIDERS.find(p => p.value === cfgForm.provider)?.placeholder}
+                  <Field label="Authentication Method">
+                    <div style={{ display:'flex', gap:8 }}>
+                      {[{ v:'pat', label:'Personal Access Token (HTTPS)' }, { v:'ssh', label:'SSH Key' }].map(opt => (
+                        <label key={opt.v} style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', padding:'7px 14px', borderRadius:8, border:`1px solid ${cfgForm.auth_method===opt.v ? '#22c55e' : '#e2e8f0'}`, background: cfgForm.auth_method===opt.v ? '#f0fdf4' : 'transparent', fontSize:13, fontWeight: cfgForm.auth_method===opt.v ? 600 : 400, color: cfgForm.auth_method===opt.v ? '#15803d' : '#374151' }}>
+                          <input type="radio" value={opt.v} checked={cfgForm.auth_method===opt.v} onChange={() => setCfgForm(f => ({ ...f, auth_method: opt.v }))} style={{ display:'none' }} />
+                          <i className={`ti ${opt.v==='ssh' ? 'ti-key' : 'ti-lock'}`} style={{ fontSize:14 }} /> {opt.label}
+                        </label>
+                      ))}
+                    </div>
+                  </Field>
+                  <Field label="Remote URL" required hint={cfgForm.auth_method==='ssh' ? 'Use SSH format: git@github.com:owner/repo.git' : 'Use HTTPS format: https://github.com/owner/repo.git'}>
+                    <input type="text" value={cfgForm.remote_url} onChange={e => setCfgForm(f => ({ ...f, remote_url: e.target.value }))}
+                      placeholder={cfgForm.auth_method==='ssh' ? 'git@github.com:owner/repo.git' : PROVIDERS.find(p => p.value === cfgForm.provider)?.placeholder}
                       style={{ width:'100%',boxSizing:'border-box' }} />
                   </Field>
                   <Field label="Base branch" hint="All feature branches merge into this branch.">
                     <input type="text" value={cfgForm.base_branch} onChange={e => setCfgForm(f => ({ ...f, base_branch: e.target.value }))} placeholder="main" style={{ width:200 }} />
                   </Field>
                   <div style={{ display:'flex',gap:8 }}>
-                    <button type="submit" className="btn-primary" disabled={savingCfg}>
+                    <button type="submit" className="btn-primary" disabled={savingCfg || !isProjectOwner}>
                       {savingCfg && <span className="spinner"/>}<i className="ti ti-device-floppy"/> Save repository settings
                     </button>
                     {cfg?.remote_url && (
@@ -720,23 +745,56 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                   <input type="email" value={idForm.author_email} onChange={e => setIdForm(f => ({ ...f, author_email: e.target.value }))} placeholder="jane@yourorg.com" />
                 </Field>
               </div>
-              <Field label="Personal access token" required hint="GitHub PAT starting with ghp_ or github_pat_ — never your login password.">
-                <input
-                  type="text"
-                  value={idForm.auth_token}
-                  onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
-                  placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : 'ghp_xxxxxxxxxxxxxxxxxxxx'}
-                  autoComplete="off"
-                  spellCheck={false}
-                  style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
-                />
-                {idForm.auth_token && !idForm.auth_token.startsWith('ghp_') && !idForm.auth_token.startsWith('github_pat_') && (
-                  <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
-                    <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
-                    This doesn't look like a GitHub PAT. It should start with <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>ghp_</code> or <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>github_pat_</code>
-                  </div>
-                )}
+              <Field label="Authentication Method">
+                <div style={{ display:'flex', gap:8 }}>
+                  {[{ v:'pat', label:'Personal Access Token' }, { v:'ssh', label:'SSH Key' }].map(opt => (
+                    <label key={opt.v} style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', padding:'7px 14px', borderRadius:8, border:`1px solid ${idForm.auth_method===opt.v ? '#22c55e' : '#e2e8f0'}`, background: idForm.auth_method===opt.v ? '#f0fdf4' : 'transparent', fontSize:13, fontWeight: idForm.auth_method===opt.v ? 600 : 400, color: idForm.auth_method===opt.v ? '#15803d' : '#374151' }}>
+                      <input type="radio" value={opt.v} checked={idForm.auth_method===opt.v} onChange={() => setIdForm(f => ({ ...f, auth_method: opt.v }))} style={{ display:'none' }} />
+                      <i className={`ti ${opt.v==='ssh' ? 'ti-key' : 'ti-lock'}`} style={{ fontSize:14 }} /> {opt.label}
+                    </label>
+                  ))}
+                </div>
               </Field>
+
+              {idForm.auth_method === 'ssh' ? (
+                <Field label="SSH Private Key" required hint="Paste your private key (-----BEGIN ... PRIVATE KEY-----). The public key must be added to your GitHub/GitLab account.">
+                  <textarea
+                    value={idForm.ssh_key}
+                    onChange={e => setIdForm(f => ({ ...f, ssh_key: e.target.value }))}
+                    placeholder={identity?.ssh_key_set ? '(SSH key saved — paste new key to replace)' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'}
+                    rows={6}
+                    autoComplete="off"
+                    spellCheck={false}
+                    style={{ fontFamily:'monospace', fontSize:12, width:'100%', boxSizing:'border-box', resize:'vertical', letterSpacing:'0.3px' }}
+                  />
+                  <div style={{ marginTop:8, padding:'10px 12px', background:'#eff6ff', border:'1px solid #bfdbfe', borderRadius:8, fontSize:12, color:'#1d4ed8' }}>
+                    <strong>How to set up SSH:</strong>
+                    <ol style={{ margin:'6px 0 0 16px', padding:0, lineHeight:1.8 }}>
+                      <li>Generate a key: <code style={{ background:'#dbeafe', padding:'1px 5px', borderRadius:3 }}>ssh-keygen -t ed25519 -C "your@email.com"</code></li>
+                      <li>Copy the <strong>public</strong> key (<code>~/.ssh/id_ed25519.pub</code>) to GitHub → Settings → SSH Keys</li>
+                      <li>Paste the <strong>private</strong> key (<code>~/.ssh/id_ed25519</code>) above</li>
+                    </ol>
+                  </div>
+                </Field>
+              ) : (
+                <Field label="Personal access token" required hint="GitHub PAT starting with ghp_ or github_pat_ — never your login password.">
+                  <input
+                    type="text"
+                    value={idForm.auth_token}
+                    onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
+                    placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : 'ghp_xxxxxxxxxxxxxxxxxxxx'}
+                    autoComplete="off"
+                    spellCheck={false}
+                    style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
+                  />
+                  {idForm.auth_token && !idForm.auth_token.startsWith('ghp_') && !idForm.auth_token.startsWith('github_pat_') && (
+                    <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
+                      This doesn't look like a GitHub PAT. It should start with <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>ghp_</code> or <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>github_pat_</code>
+                    </div>
+                  )}
+                </Field>
+              )}
               <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
                 <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
                   {(savingId || autoIniting) && <span className="spinner"/>}
@@ -827,7 +885,8 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                   <span style={{ fontSize:12,color:'#64748b' }}>Select all ({statusFiles.length} files)</span>
                 </div>
 
-                {/* File rows */}
+                {/* File rows — fixed height so Commit & Push stays visible */}
+                <div style={{ maxHeight:320,overflowY:'auto' }}>
                 {statusFiles.map((f, i) => {
                   const ft = FILE_TYPE[f.type] || FILE_TYPE['?'];
                   const isSelected = selectedFiles.has(f.path);
@@ -859,6 +918,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                     </div>
                   );
                 })}
+                </div>
               </>
             )}
           </div>

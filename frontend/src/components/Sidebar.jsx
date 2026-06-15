@@ -8,6 +8,7 @@ const IC = {
   'ai-config':           { icon: 'ti-brain',                  bg: '#fef3c7', color: '#d97706', sub: 'Script generation AI' },
   settings:              { icon: 'ti-adjustments',            bg: '#f1f5f9', color: '#475569', sub: 'System configuration' },
   'settings-smtp':       { icon: 'ti-mail-cog',               bg: '#fef9c3', color: '#ca8a04', sub: 'Email config' },
+  'settings-orgs':       { icon: 'ti-building',               bg: '#e0e7ff', color: '#4338ca', sub: 'Manage organizations' },
   'settings-users':      { icon: 'ti-users',                  bg: '#dbeafe', color: '#2563eb', sub: 'Users & orgs' },
   'settings-appearance': { icon: 'ti-palette',                bg: '#ede9fe', color: '#7c3aed', sub: 'Themes & display' },
   profile:               { icon: 'ti-user-circle',            bg: '#cffafe', color: '#0891b2', sub: 'My account' },
@@ -35,7 +36,7 @@ const COL_STEPS = [
   { id: 'alerts',      label: 'Alerts' },
   { id: 'runner',      label: 'Run Test' },
   { id: 'analytics',   label: 'Analytics' },
-  { id: 'reports',     label: 'JMeter Report' },
+  // { id: 'reports', label: 'JMeter Report' },  // hidden — keep for future use
 ];
 
 /* ── Size tiers (0=top-level … 4=deepest step) ────────────────────────── */
@@ -295,7 +296,7 @@ export default function Sidebar({
    * - Parent highlights ONLY when the current page belongs to it.
    * - Opening/closing a group does NOT trigger highlight by itself.
    */
-  const SETTINGS_PAGES = ['settings-smtp', 'settings-users'];
+  const SETTINGS_PAGES = ['settings-smtp', 'settings-users', 'settings-orgs'];
   const PROJECT_PAGES  = ['project-home', 'ai-config', 'git', 'collections',
                           'test-data', 'rules', 'config', 'test-suites',
                           'alerts', 'runner', 'analytics', 'reports'];
@@ -324,36 +325,52 @@ export default function Sidebar({
       {/* ── Navigation ───────────────────────────────────── */}
       <div className="sidebar-scroll">
 
-        {/* Dashboard — clicking here shows the projects overview page */}
-        <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
-          active={page === 'dashboard'} depth={0}
-          onClick={() => onNav('dashboard')} />
+        {user?.role === 'super_admin' ? (
+          <>
+            <CardBtn iconKey="settings-orgs" label="Organizations" sub="Manage organizations"
+              active={page === 'settings-orgs'} depth={0}
+              onClick={() => onNav('settings-orgs')} />
+            <CardBtn iconKey="settings-users" label="User Management" sub="Users & roles"
+              active={page === 'settings-users'} depth={0}
+              onClick={() => onNav('settings-users')} />
+            <CardBtn iconKey="settings-smtp" label="SMTP Configuration" sub="Email config"
+              active={page === 'settings-smtp'} depth={0}
+              onClick={() => onNav('settings-smtp')} />
+          </>
+        ) : (
+          <>
+            {/* Dashboard — clicking here shows the projects overview page */}
+            <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
+              active={page === 'dashboard'} depth={0}
+              onClick={() => onNav('dashboard')} />
 
-        <Divider />
+            <Divider />
 
-        {/* Settings group header */}
-        <CardBtn iconKey="settings" label="Settings" sub="System configuration"
-          depth={0}
-          active={settingsActive}
-          chevronOpen={settingsOpen}
-          onClick={() => setSettingsOpen(o => !o)} />
+            {/* Settings group header */}
+            <CardBtn iconKey="settings" label="Settings" sub="System configuration"
+              depth={0}
+              active={settingsActive}
+              chevronOpen={settingsOpen}
+              onClick={() => setSettingsOpen(o => !o)} />
 
-        {settingsOpen && (
-          <ChildGroup ml={20} borderColor="#e2e8f0">
-            {(user?.role === 'super_admin' || user?.role === 'org_admin') && (
-              <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
-                active={page === 'settings-smtp'} depth={1}
-                onClick={() => onNav('settings-smtp')} />
+            {settingsOpen && (
+              <ChildGroup ml={20} borderColor="#e2e8f0">
+                {isAdmin && (
+                  <CardBtn iconKey="settings-users" label="User Management"
+                    active={page === 'settings-users'} depth={1}
+                    onClick={() => onNav('settings-users')} />
+                )}
+                {user?.role === 'org_admin' && (
+                  <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
+                    active={page === 'settings-smtp'} depth={1}
+                    onClick={() => onNav('settings-smtp')} />
+                )}
+              </ChildGroup>
             )}
-            {isAdmin && (
-              <CardBtn iconKey="settings-users" label="User Management"
-                active={page === 'settings-users'} depth={1}
-                onClick={() => onNav('settings-users')} />
-            )}
-          </ChildGroup>
+
+            <Divider />
+          </>
         )}
-
-        <Divider />
 
         {/* Profile and Logout moved to banner top-right */}
 

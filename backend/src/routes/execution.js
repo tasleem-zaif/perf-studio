@@ -86,7 +86,12 @@ function getK6Bin(customPath) {
 const resetSequence = require('../utils/resetSequence');
 
 function cleanStaleRuns(projectId) {
-  const runs = db.prepare('SELECT id, result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
+  // Only remove runs that are older than 24h AND have a missing result_dir.
+  // Never remove recent runs — they may be in-progress or synced from CI.
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const runs = db.prepare(
+    "SELECT id, result_dir FROM execution_runs WHERE project_id = ? AND started_at < ?"
+  ).all(projectId, cutoff);
   let deleted = false;
   for (const run of runs) {
     if (run.result_dir && !fs.existsSync(run.result_dir)) {
@@ -751,7 +756,8 @@ router.post('/run', auth, async (req, res) => {
       const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
       if (suiteCol) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suiteCol.id, suite.env);
+        // getCollectionPath(path, colName, env) — 3 args only, no colId
+        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suite.env);
         resultDir = path.join(envPath, 'results', `Run_${runNumber}`);
       }
     } catch (_) {}
@@ -817,7 +823,7 @@ router.post('/run', auth, async (req, res) => {
 
       if (suiteCollection && suiteEnvName && projectFolderPath) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteCollection.id, suiteEnvName);
+        const envPath = getCollectionPath(projectFolderPath, suiteCollection.name, suiteEnvName);
         const envTestDataDir = path.join(envPath, 'testData');
         if (fs.existsSync(envTestDataDir)) {
           testDataHostDir = toHostPath(envTestDataDir);
@@ -1199,6 +1205,7 @@ router.post('/run', auth, async (req, res) => {
     //                             or the final failed run if all 3 attempts exhausted
     // • Failed + auto-heal OFF  → send immediately with failed status
     const sendEmailForRun = async (targetRunId) => {
+      console.log(`[Alerts] sendEmailForRun started for run #${targetRunId}`);
       try {
         const { sendAlertEmail }             = require('../utils/emailUtils');
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
@@ -1211,10 +1218,12 @@ router.post('/run', auth, async (req, res) => {
         if (!runRow) return;
 
         const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
+        console.log('[Alerts] Checking JTL at:', jtlPath);
         if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found, skipping email:', jtlPath);
+          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
           return;
         }
+        console.log('[Alerts] JTL found, building report data for email...');
 
         const content = fs.readFileSync(jtlPath, 'utf8');
         const lines   = content.trim().split('\n').filter(Boolean);
@@ -1314,6 +1323,13 @@ router.post('/run', auth, async (req, res) => {
           errMap[k].count++;
         });
 
+        // Evaluate rules against this run's JTL so violations appear in the email
+        let ruleViolationsForEmail = [];
+        try {
+          const rr = evaluateRules(runRow.project_id, jtlPath);
+          ruleViolationsForEmail = rr?.violations || [];
+        } catch (_) {}
+
         const reportData = {
           meta: {
             run_id: runRow.id, suite_name: runRow.suite_name || 'Test Plan',
@@ -1322,16 +1338,21 @@ router.post('/run', auth, async (req, res) => {
             duration_s: parseFloat(durS2.toFixed(1)),
           },
           summary, by_api, timeline, errors: Object.values(errMap), logs: [],
+          rule_violations: ruleViolationsForEmail,
         };
 
-        // PDF to temp file
+        // Generate PDF — save to result_dir for permanent storage AND send via email
         let pdfPath = null;
         try {
-          const runNum = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
-          const tmpPdf = path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
-          await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-          pdfPath = tmpPdf;
-          console.log('[Alerts] PDF generated:', pdfPath);
+          const runNum    = (runRow.result_dir || '').match(/Run_(\d+)/)?.[1] || runRow.id;
+          const suiteName = (runRow.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
+          // Primary: save directly to result_dir so it persists
+          const resultPdf = runRow.result_dir && fs.existsSync(runRow.result_dir)
+            ? path.join(runRow.result_dir, `${suiteName}_Run${runNum}_Analytics.pdf`)
+            : path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
+          await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
+          pdfPath = resultPdf;
+          console.log('[Alerts] Analytics PDF saved:', pdfPath);
         } catch (pdfErr) {
           console.error('[Alerts] PDF generation failed:', pdfErr.message);
         }
@@ -1348,17 +1369,19 @@ router.post('/run', auth, async (req, res) => {
       }
     };
 
+    // PDF is saved inside sendEmailForRun which builds the full reportData
+    // (with by_api, timeline, errors) required by generateAnalyticsPdfToFile.
+    // The separate minimal-reportData approach was removed because it crashed.
+
     if (shouldHeal) {
       log('warn', '');
       log('warn', '[Auto Healer] Starting automatic diagnosis and repair...');
-      // Pass onComplete so email waits for final result
       startAutoHeal(req.userId, runId, (finalRunId, succeeded) => {
         console.log(`[Alerts] Auto-heal finished. Final run: ${finalRunId}, succeeded: ${succeeded}`);
         log('info', `[Alerts] Sending ${succeeded ? 'success' : 'failure'} report email for run ${finalRunId}`);
         sendEmailForRun(finalRunId);
       });
     } else {
-      // No auto-heal — send immediately (passed or failed without healer)
       setImmediate(() => sendEmailForRun(runId));
     }
 
@@ -1402,11 +1425,27 @@ router.get('/runs', auth, (req, res) => {
     ORDER BY r.started_at DESC
   `).all(project_id);
 
+  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
-      const rel = path.relative(PROJECTS_ROOT, r.report_path).replace(/\\/g, '/');
-      report_url = `/projects-files/${rel}`;
+      // Use lower-case comparison to handle Windows case-insensitive paths
+      const absReport  = path.resolve(r.report_path).toLowerCase().replace(/\\/g, '/');
+      const absWS      = path.resolve(GIT_WORKSPACES_ROOT).toLowerCase().replace(/\\/g, '/');
+      const absAdmin   = path.resolve(PROJECTS_ROOT).toLowerCase().replace(/\\/g, '/');
+      if (absReport.startsWith(absWS)) {
+        const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+        report_url = `/workspace-files/${rel}`;
+      } else if (absReport.startsWith(absAdmin)) {
+        const rel = path.relative(path.resolve(PROJECTS_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+        report_url = `/projects-files/${rel}`;
+      } else {
+        // Absolute path outside known roots — serve relative to GIT_WORKSPACES_ROOT as best-effort
+        try {
+          const rel = path.relative(path.resolve(GIT_WORKSPACES_ROOT), path.resolve(r.report_path)).replace(/\\/g, '/');
+          if (!rel.startsWith('..')) report_url = `/workspace-files/${rel}`;
+        } catch {}
+      }
     }
     return { ...r, logs: JSON.parse(r.logs || '[]'), report_url, heal_status: r.heal_status, heal_run_id: r.heal_run_id };
   });
