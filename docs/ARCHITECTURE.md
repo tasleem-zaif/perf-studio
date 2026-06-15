@@ -332,20 +332,21 @@ flowchart TD
 
     F -->|6 Configure AI provider| G["AI key saved AES-256-CBC encrypted\nOpenAI GPT-4o or Anthropic Claude"]
 
-    G -->|7 Add API Source collection| H{Import method}
+    G -->|7 Invite regular users| Q[Users assigned to project]
+
+    Q -->|8 Add API Source collection| H{Import method}
     H -->|Postman JSON upload| I[Postman v2.1 parser → endpoints]
     H -->|Swagger / OpenAPI| J[OpenAPI 3 / Swagger 2 parser → endpoints]
     H -->|cURL paste| K[cURL parser → single endpoint]
     H -->|Raw JSON| L[Manual endpoint array]
     I & J & K & L --> M[Collection saved to DB\njson_content = normalized endpoint array]
 
-    M -->|8 Run Pre-run on API Source| N["POST /api/ai/pre-run\nFire all endpoints live · 5s timeout · SSRF-safe"]
+    M -->|9 Run Pre-run on API Source| N["POST /api/ai/pre-run\nFire all endpoints live · 5s timeout · SSRF-safe"]
     N -->|Capture auth tokens\n401 retry with extracted token| O["Pre-run responses saved\nto collections.pre_run_data\nHash stored for freshness check"]
 
-    O -->|9 Upload CSV test data| P["CSV tagged by collection + env\nColumns parsed & stored"]
+    O -->|10 Upload CSV test data| P["CSV tagged by collection + env\nColumns parsed & stored"]
 
-    P -->|10 Invite regular users| Q[Users assigned to project]
-    Q -->|11 Configure env URLs| R[Per-env URL/port config saved]
+    P -->|11 Configure env URLs| R[Per-env URL/port config saved]
 
     R -->|12 Create Test Plan| S["Test suite record created\nLinked to collection + env + test data\nvusers · rampup · duration configured"]
 
@@ -353,7 +354,7 @@ flowchart TD
 
     T -->|Script written to disk| U["git-workspaces/user-id/Project/Collection/ENV/script/suite_load.jmx"]
 
-    U -->|14 Run test| V["docker run justb4/jmeter\nSSE stream to frontend"]
+    U -->|14 Run test| V["docker run perf-studio-runner\nSSE stream to frontend"]
 
     V -->|Pass| W["Results saved · HTML report generated\nEmail alert with analytics PDF"]
     V -->|Fail| X["Auto Healer:\nRead errors → AI fix → Re-run up to 3 times"]
