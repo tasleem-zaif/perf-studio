@@ -356,13 +356,20 @@ flowchart TD
 
     T -->|Script written to disk| U["git-workspaces/user-id/Project/Collection/ENV/script/suite_load.jmx"]
 
-    U -->|15 Run test| V["docker run perf-studio-runner\nSSE stream to frontend"]
+    U -->|15 Run test| V{Execution mode}
+    V -->|Direct run| V1["docker run perf-studio-runner\nSSE log stream to frontend"]
+    V -->|CI Pipeline| V2["Sequential pipeline steps\nstop_on_failure · per-step pass/fail\nSSE progress stream to frontend"]
 
-    V -->|Pass| W["Results saved · HTML report generated\nEmail alert with analytics PDF"]
-    V -->|Fail| X["Auto Healer:\nRead errors → AI fix → Re-run up to 3 times"]
-    X --> W
+    V1 & V2 --> HEAL{Rules passed?}
+    HEAL -->|Fail — auto heal on| X["Auto Healer:\nRead errors → AI fix → Re-run up to 3 times"]
+    HEAL -->|Pass| W1
+    X --> W1
 
-    W -->|16 Commit & push to Git| Y{Role}
+    W1["Results persisted to DB\nHTML report generated"]
+    W1 -->|16 View Analytics| W2["Analytics dashboard:\nResponse time · Throughput\nError rate · Rule violations"]
+    W1 -->|Rules-based alerts| W3["Email report dispatched\nto all recipients\nPDF analytics + HTML report ZIP\n(only on rule violation or failure)"]
+
+    W2 & W3 -->|17 Commit & push to Git| Y{Role}
     Y -->|Org Admin| Z[Push direct to main branch]
     Y -->|Regular user| AA[Push to users/name branch\nRaise PR → Org Admin merges]
 ```
