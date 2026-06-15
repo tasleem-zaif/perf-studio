@@ -52,7 +52,7 @@ graph TB
     end
 
     subgraph Execution["Test Execution Containers"]
-        Runner["perf-studio-runner\nJava · JMeter · K6 · Node.js\nPython · curl · jq"]
+        Runner["perf-studio-runner\nJava · JMeter · K6 · Node.js"]
     end
 
     subgraph External["External Services"]
@@ -831,7 +831,7 @@ flowchart LR
 | **Backend** | Node.js, Express 4, nodemon (dev) |
 | **Database** | SQLite via `node:sqlite` (built-in, no native deps) |
 | **AI Generation** | OpenAI GPT-4o (`openai` SDK) · Anthropic Claude (`@anthropic-ai/sdk`) |
-| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `perf-studio-runner` Docker image (Java · Node.js · Python · curl · jq pre-installed) |
+| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `perf-studio-runner` Docker image (Java · Node.js pre-installed) |
 | **Git Integration** | `simple-git` (local ops) · `@octokit/rest` (GitHub API) · GitLab REST API |
 | **Email** | `nodemailer` (SMTP transport, TLS) |
 | **PDF Reports** | `puppeteer` (HTML → PDF) · `pdfkit` |
