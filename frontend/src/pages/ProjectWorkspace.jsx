@@ -168,8 +168,8 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
 
   // Pages that require git to be initialized (folder_path must exist)
   const GIT_REQUIRED_PAGES = ['test-suites', 'test-data', 'runner', 'analytics', 'reports'];
-  const gitNotInitialized = !project?.folder_path;
-  const initialized = !!project?.folder_path;
+  const gitNotInitialized = !project?.git_initialized && !project?.folder_path;
+  const initialized = !!(project?.git_initialized || project?.folder_path);
 
   function GitNotInitializedBanner() {
     return (

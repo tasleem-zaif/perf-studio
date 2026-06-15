@@ -325,41 +325,52 @@ export default function Sidebar({
       {/* ── Navigation ───────────────────────────────────── */}
       <div className="sidebar-scroll">
 
-        {/* Dashboard — clicking here shows the projects overview page */}
-        <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
-          active={page === 'dashboard'} depth={0}
-          onClick={() => onNav('dashboard')} />
+        {user?.role === 'super_admin' ? (
+          <>
+            <CardBtn iconKey="settings-orgs" label="Organizations" sub="Manage organizations"
+              active={page === 'settings-orgs'} depth={0}
+              onClick={() => onNav('settings-orgs')} />
+            <CardBtn iconKey="settings-users" label="User Management" sub="Users & roles"
+              active={page === 'settings-users'} depth={0}
+              onClick={() => onNav('settings-users')} />
+            <CardBtn iconKey="settings-smtp" label="SMTP Configuration" sub="Email config"
+              active={page === 'settings-smtp'} depth={0}
+              onClick={() => onNav('settings-smtp')} />
+          </>
+        ) : (
+          <>
+            {/* Dashboard — clicking here shows the projects overview page */}
+            <CardBtn iconKey="dashboard" label="Dashboard" sub="Overview & metrics"
+              active={page === 'dashboard'} depth={0}
+              onClick={() => onNav('dashboard')} />
 
-        <Divider />
+            <Divider />
 
-        {/* Settings group header */}
-        <CardBtn iconKey="settings" label="Settings" sub="System configuration"
-          depth={0}
-          active={settingsActive}
-          chevronOpen={settingsOpen}
-          onClick={() => setSettingsOpen(o => !o)} />
+            {/* Settings group header */}
+            <CardBtn iconKey="settings" label="Settings" sub="System configuration"
+              depth={0}
+              active={settingsActive}
+              chevronOpen={settingsOpen}
+              onClick={() => setSettingsOpen(o => !o)} />
 
-        {settingsOpen && (
-          <ChildGroup ml={20} borderColor="#e2e8f0">
-            {user?.role === 'super_admin' && (
-              <CardBtn iconKey="settings-orgs" label="Organizations"
-                active={page === 'settings-orgs'} depth={1}
-                onClick={() => onNav('settings-orgs')} />
+            {settingsOpen && (
+              <ChildGroup ml={20} borderColor="#e2e8f0">
+                {isAdmin && (
+                  <CardBtn iconKey="settings-users" label="User Management"
+                    active={page === 'settings-users'} depth={1}
+                    onClick={() => onNav('settings-users')} />
+                )}
+                {user?.role === 'org_admin' && (
+                  <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
+                    active={page === 'settings-smtp'} depth={1}
+                    onClick={() => onNav('settings-smtp')} />
+                )}
+              </ChildGroup>
             )}
-            {isAdmin && (
-              <CardBtn iconKey="settings-users" label="User Management"
-                active={page === 'settings-users'} depth={1}
-                onClick={() => onNav('settings-users')} />
-            )}
-            {(user?.role === 'super_admin' || user?.role === 'org_admin') && (
-              <CardBtn iconKey="settings-smtp" label="SMTP Configuration"
-                active={page === 'settings-smtp'} depth={1}
-                onClick={() => onNav('settings-smtp')} />
-            )}
-          </ChildGroup>
+
+            <Divider />
+          </>
         )}
-
-        <Divider />
 
         {/* Profile and Logout moved to banner top-right */}
 

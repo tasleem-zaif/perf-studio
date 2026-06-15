@@ -25,6 +25,8 @@ const simpleGit     = require('simple-git');
 const { Octokit }   = require('@octokit/rest');
 const path          = require('path');
 const fs            = require('fs');
+const os            = require('os');
+const { randomBytes } = require('crypto');
 const db            = require('../db');
 const auth          = require('../middleware/auth');
 const ownsProject   = require('../utils/ownsProject');
@@ -52,8 +54,50 @@ function getBranchForUser(user, project) {
   return `users/${safe}`;
 }
 
-function gitInstance(projectPath) {
+function gitInstance(projectPath, extraEnv = {}) {
+  if (Object.keys(extraEnv).length > 0) {
+    return simpleGit({ baseDir: projectPath, env: { ...process.env, ...extraEnv } });
+  }
   return simpleGit(projectPath);
+}
+
+// Write SSH private key to a temp file and return GIT_SSH_COMMAND env + cleanup fn
+function createSshEnv(privateKey) {
+  if (!privateKey?.trim()) return { env: {}, cleanup: () => {} };
+  const tmpPath = path.join(os.tmpdir(), `ps_ssh_${randomBytes(8).toString('hex')}`);
+  fs.writeFileSync(tmpPath, privateKey.trim() + '\n', { mode: 0o600 });
+  // Use forward slashes — required for ssh on Windows with Git for Windows
+  const sshPath = tmpPath.replace(/\\/g, '/');
+  const env = { GIT_SSH_COMMAND: `ssh -i "${sshPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` };
+  const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };
+  return { env, cleanup };
+}
+
+// Resolve effective auth (SSH or PAT) for a user on a project
+function getAuth(cfg, userId, projectId) {
+  const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+    .get(userId, projectId);
+  const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
+
+  if (authMethod === 'ssh') {
+    const rawKey = identity?.ssh_key ? decrypt(identity.ssh_key) : '';
+    if (rawKey) {
+      const { env, cleanup } = createSshEnv(rawKey);
+      return { isSSH: true, remoteUrl: cfg.remote_url, sshEnv: env, cleanup };
+    }
+    return { isSSH: true, remoteUrl: cfg.remote_url, sshEnv: {}, cleanup: () => {} };
+  }
+
+  // PAT mode
+  const projectToken  = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
+  const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : '';
+  const effectiveToken = personalToken || projectToken;
+  return {
+    isSSH: false,
+    remoteUrl: buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken),
+    sshEnv: {},
+    cleanup: () => {},
+  };
 }
 
 // ── Per-user workspace path ───────────────────────────────────────────────────
@@ -87,54 +131,61 @@ function getUserWorkspace(proj, user) {
 
 // Clone or pull-update a user's workspace from the remote
 async function ensureUserWorkspace(gitRoot, cfg, user) {
-  const token  = cfg.auth_token ? decrypt(cfg.auth_token) : '';
-
-  // Use user's personal PAT if available, otherwise fall back to project config token
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(user.id, cfg.project_id);
-  const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : token;
-  const effectiveToken = personalToken || token;
 
-  const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken);
+  const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
+  const isSSHMode  = authMethod === 'ssh';
+
+  let remoteForOps, sshEnv = {}, sshCleanup = () => {};
+
+  if (isSSHMode) {
+    const rawKey = identity?.ssh_key ? decrypt(identity.ssh_key) : '';
+    if (rawKey) {
+      const r = createSshEnv(rawKey);
+      sshEnv    = r.env;
+      sshCleanup = r.cleanup;
+    }
+    remoteForOps = cfg.remote_url;
+  } else {
+    const token         = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
+    const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : token;
+    remoteForOps = buildRemoteWithAuth(cfg.remote_url, cfg.username, personalToken || token);
+  }
 
   if (!fs.existsSync(path.join(gitRoot, '.git'))) {
     const dirExists = fs.existsSync(gitRoot);
     const isEmpty   = !dirExists || fs.readdirSync(gitRoot).length === 0;
+    const cloneGit  = Object.keys(sshEnv).length > 0
+      ? simpleGit({ env: { ...process.env, ...sshEnv } })
+      : simpleGit();
 
     if (isEmpty) {
-      // Empty or missing — clone directly
       fs.mkdirSync(gitRoot, { recursive: true });
-      const git = simpleGit();
-      await git.clone(remoteWithAuth, gitRoot);
+      await cloneGit.clone(remoteForOps, gitRoot);
     } else {
-      // Directory has pre-existing files (e.g. collection folders created before clone)
-      // Save them, clone into temp, move .git across, then restore files
       const tmpDir = gitRoot + '_clone_tmp';
       if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
-      const git = simpleGit();
-      await git.clone(remoteWithAuth, tmpDir);
-      // Move .git from temp clone into existing workspace
+      await cloneGit.clone(remoteForOps, tmpDir);
       fs.renameSync(path.join(tmpDir, '.git'), path.join(gitRoot, '.git'));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   }
 
-  const git = gitInstance(gitRoot);
+  const git = gitInstance(gitRoot, sshEnv);
 
-  // Set user identity
   const authorName  = identity?.author_name  || user.name;
   const authorEmail = identity?.author_email || user.email || cfg.email || 'noreply@perfstudio.com';
   await git.addConfig('user.name',  authorName);
   await git.addConfig('user.email', authorEmail);
   await git.addConfig('core.longpaths', 'true');
 
-  // Update remote URL with latest token
   const remotes = await git.getRemotes();
   if (remotes.find(r => r.name === 'origin')) {
-    await git.remote(['set-url', 'origin', remoteWithAuth]);
+    await git.remote(['set-url', 'origin', remoteForOps]);
   }
 
-  return { git, remoteWithAuth, authorName, authorEmail, identity };
+  return { git, remoteWithAuth: remoteForOps, authorName, authorEmail, identity, sshCleanup };
 }
 
 function buildRemoteWithAuth(url, username, token) {
@@ -211,8 +262,9 @@ router.get('/config', (req, res) => {
   res.json({
     config: {
       ...cfg,
-      auth_token: cfg.auth_token ? '••••••••' : '',
+      auth_token:   cfg.auth_token ? '••••••••' : '',
       token_preview: tokenPreview,
+      auth_method:  cfg.auth_method || 'pat',
     }
   });
 });
@@ -241,7 +293,7 @@ router.put('/config', (req, res) => {
     });
   }
 
-  const { provider, remote_url, username, email, auth_token } = req.body;
+  const { provider, remote_url, username, email, auth_token, auth_method } = req.body;
   const existing = getGitConfig(req.params.projectId);
 
   // Repo is permanently locked after initialization — cannot change remote_url or base_branch
@@ -256,12 +308,14 @@ router.put('/config', (req, res) => {
     ? encrypt(auth_token)
     : (existing?.auth_token || '');
 
+  const finalMethod = auth_method || existing?.auth_method || 'pat';
+
   if (existing) {
-    db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=? WHERE project_id=?`)
-      .run(provider||'github', remote_url||'', username||'', email||'', finalToken, req.params.projectId);
+    db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=?,auth_method=? WHERE project_id=?`)
+      .run(provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, req.params.projectId);
   } else {
-    db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token) VALUES (?,?,?,?,?,?)`)
-      .run(req.params.projectId, provider||'github', remote_url||'', username||'', email||'', finalToken);
+    db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token,auth_method) VALUES (?,?,?,?,?,?,?)`)
+      .run(req.params.projectId, provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod);
   }
   res.json({ ok: true });
 });
@@ -291,19 +345,23 @@ router.post('/init', async (req, res) => {
   // The project folder will be created inside git-workspaces during this init.
 
   try {
-    // Prefer the user's personal PAT over the project-level token.
-    // This is critical when an org admin initialises a repo they own —
-    // their PAT must be used so GitHub attributes the push to their account.
-    const projectToken  = cfg.auth_token       ? decrypt(cfg.auth_token)       : '';
-    const identity      = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
-    const personalToken = identity?.auth_token  ? decrypt(identity.auth_token)  : '';
-    const token         = personalToken || projectToken;
+    const { isSSH, remoteUrl: remoteWithAuth, sshEnv, cleanup: sshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
 
-    if (!token) return res.status(400).json({
-      error: 'No Personal Access Token found. Save your PAT in Git Identity (Configuration → Git → Your Git Identity) before initializing.',
-    });
-
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, token);
+    if (!isSSH) {
+      // PAT mode — require a token
+      const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+      const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : '';
+      const projectToken  = cfg.auth_token       ? decrypt(cfg.auth_token)       : '';
+      if (!personalToken && !projectToken) {
+        return res.status(400).json({
+          error: 'No Personal Access Token found. Save your PAT in Git Identity (Configuration → Git → Your Git Identity) before initializing.',
+        });
+      }
+    } else if (!sshEnv.GIT_SSH_COMMAND) {
+      return res.status(400).json({
+        error: 'No SSH key found. Paste your private key in Git Identity (Configuration → Git → Your Git Identity) before initializing.',
+      });
+    }
 
     // ── Resolve workspace paths ───────────────────────────────────────────────
     // Workspaces live in a DEDICATED isolated directory:
@@ -351,7 +409,7 @@ router.post('/init', async (req, res) => {
     // Update folder_path in DB to point to git-workspaces/admin/projects/<name>/
     db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitProjectPath, proj.id);
 
-    const git = gitInstance(gitRoot);
+    const git = gitInstance(gitRoot, sshEnv);
 
     // Init git at workspace root (not inside project subfolder)
     const isRepo = fs.existsSync(path.join(gitRoot, '.git'));
@@ -571,6 +629,8 @@ ${proj.name}/
   } catch (e) {
     console.error('[Git] Init error:', e.message);
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -645,10 +705,13 @@ router.post('/commit', async (req, res) => {
   const { message } = req.body;
   if (!message?.trim()) return res.status(400).json({ error: 'Commit message required.' });
 
+  let sshCleanup = () => {};
   try {
     const gitDir = getUserWorkspace(proj, caller);
     // Auto-clone repo into user's workspace if this is their first commit
-    const { git, identity } = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
+    const result = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
+    const { git, identity } = result;
+    sshCleanup = result.sshCleanup || (() => {});
     const branch = identity?.branch_name || getBranchForUser(caller, proj);
 
     // Pull latest main then switch to user's branch
@@ -668,8 +731,8 @@ router.post('/commit', async (req, res) => {
       return res.json({ ok: true, message: 'Nothing to commit — working tree clean.', hash: null });
     }
 
-    const result = await git.commit(message.trim());
-    const hash = result.commit || '';
+    const commitResult = await git.commit(message.trim());
+    const hash = commitResult.commit || '';
 
     db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,hash) VALUES (?,?,?,?,?)')
       .run(req.params.projectId, req.userId, branch, message.trim(), hash);
@@ -678,6 +741,8 @@ router.post('/commit', async (req, res) => {
   } catch (e) {
     console.error('[Git] Commit error:', e.message);
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -692,18 +757,12 @@ router.post('/push', async (req, res) => {
 
   const caller = getCaller(req.userId);
 
+  const { remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, caller.id, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const git = gitInstance(gitDir);
+    const git = gitInstance(gitDir, sshEnv);
     const userIdentity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
 
-    // Prefer user's personal PAT over the project-level token so that
-    // token updates in Git Identity are picked up immediately on next push.
-    const projectToken  = cfg.auth_token          ? decrypt(cfg.auth_token)          : '';
-    const personalToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : '';
-    const effectiveToken = personalToken || projectToken;
-
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken);
     const branch = userIdentity?.branch_name || getBranchForUser(caller, proj);
     await git.addConfig('user.name',  userIdentity?.author_name  || caller.name);
     await git.addConfig('user.email', userIdentity?.author_email || caller.email || cfg.email || 'noreply@perfstudio.com');
@@ -713,8 +772,8 @@ router.post('/push', async (req, res) => {
       await git.checkout(['-b', branch, 'main']).catch(() => git.checkout(['-b', branch]));
     });
 
-    // Update remote URL with the effective token
-    await git.remote(['set-url', 'origin', remoteWithAuth]);
+    // Update remote URL
+    await git.remote(['set-url', 'origin', remoteUrl]);
 
     // Push
     await git.push(['--set-upstream', 'origin', branch]);
@@ -727,6 +786,8 @@ router.post('/push', async (req, res) => {
   } catch (e) {
     console.error('[Git] Push error:', e.message);
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -741,14 +802,13 @@ router.post('/pull', async (req, res) => {
 
   const caller = getCaller(req.userId);
 
+  const { remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, caller.id, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const git = gitInstance(gitDir);
-    const token = cfg.auth_token ? decrypt(cfg.auth_token) : '';
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, token);
+    const git = gitInstance(gitDir, sshEnv);
     const branch = getBranchForUser(caller, proj);
 
-    await git.remote(['set-url', 'origin', remoteWithAuth]);
+    await git.remote(['set-url', 'origin', remoteUrl]);
 
     // Check if the user's branch exists on the remote
     let remoteBranches = [];
@@ -794,6 +854,8 @@ router.post('/pull', async (req, res) => {
     }
   } catch (e) {
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -930,15 +992,14 @@ router.put('/prs/:prId/merge', async (req, res) => {
 
   const cfg = getGitConfig(req.params.projectId);
 
+  const { remoteUrl: mergeRemoteUrl, sshEnv: mergeSshEnv, cleanup: mergeSshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const git = gitInstance(gitDir);
-    const token = cfg.auth_token ? decrypt(cfg.auth_token) : '';
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, token);
+    const git = gitInstance(gitDir, mergeSshEnv);
 
     await git.addConfig('user.name', cfg.username || caller.name);
     await git.addConfig('user.email', cfg.email || caller.email || 'noreply@perfstudio.com');
-    await git.remote(['set-url', 'origin', remoteWithAuth]);
+    await git.remote(['set-url', 'origin', mergeRemoteUrl]);
 
     // Fetch the feature branch
     await git.fetch('origin', pr.from_branch);
@@ -984,6 +1045,8 @@ router.put('/prs/:prId/merge', async (req, res) => {
   } catch (e) {
     console.error('[Git] Merge error:', e.message);
     res.status(500).json({ error: e.message });
+  } finally {
+    mergeSshCleanup();
   }
 });
 
@@ -1050,6 +1113,8 @@ router.get('/identity', (req, res) => {
       author_name:  identity?.author_name  || caller.name,
       author_email: identity?.author_email || caller.email || '',
       auth_token:   identity?.auth_token   ? '••••••••' : '',
+      auth_method:  identity?.auth_method  || 'pat',
+      ssh_key_set:  !!(identity?.ssh_key),
     }
   });
 });
@@ -1058,18 +1123,27 @@ router.get('/identity', (req, res) => {
 router.put('/identity', (req, res) => {
   const proj = getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const { branch_name, author_name, author_email, auth_token } = req.body;
+  const { branch_name, author_name, author_email, auth_token, auth_method, ssh_key } = req.body;
   const existing = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
+
   const finalToken = (auth_token && auth_token !== '••••••••')
     ? encrypt(auth_token)
     : (existing?.auth_token || '');
+
+  const finalMethod = auth_method || existing?.auth_method || 'pat';
+
+  // SSH key: encrypt new value if provided, keep existing otherwise
+  const finalSshKey = (ssh_key && ssh_key !== '••••••••')
+    ? encrypt(ssh_key)
+    : (existing?.ssh_key || '');
+
   if (existing) {
-    db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=? WHERE user_id=? AND project_id=?')
-      .run(branch_name||'', author_name||'', author_email||'', finalToken, req.userId, req.params.projectId);
+    db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=?,auth_method=?,ssh_key=? WHERE user_id=? AND project_id=?')
+      .run(branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, req.userId, req.params.projectId);
   } else {
-    db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token) VALUES (?,?,?,?,?,?)')
-      .run(req.userId, req.params.projectId, branch_name||'', author_name||'', author_email||'', finalToken);
+    db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token,auth_method,ssh_key) VALUES (?,?,?,?,?,?,?,?)')
+      .run(req.userId, req.params.projectId, branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey);
   }
   res.json({ ok: true });
 });
@@ -1089,12 +1163,18 @@ router.post('/branch', async (req, res) => {
   const branchName = (req.body.branch_name || '').trim() || identity?.branch_name;
   if (!branchName) return res.status(400).json({ error: 'Enter a branch name in Git Identity first.' });
 
-  // For regular users, require a personal PAT so the push is attributed to their
-  // own GitHub account — not the org admin's account.
+  // For regular users, require a personal PAT/SSH key so the push is attributed to their account
   const isAdmin = caller.role === 'org_admin' || caller.role === 'super_admin';
   if (!isAdmin) {
+    const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
     const hasPersonalToken = identity?.auth_token && identity.auth_token.trim();
-    if (!hasPersonalToken) {
+    const hasPersonalSshKey = identity?.ssh_key && identity.ssh_key.trim();
+    if (authMethod === 'ssh' && !hasPersonalSshKey) {
+      return res.status(400).json({
+        error: 'Please save your SSH key in Git Identity before creating a branch.',
+      });
+    }
+    if (authMethod !== 'ssh' && !hasPersonalToken) {
       return res.status(400).json({
         error: 'Please save your Personal Access Token in Git Identity before creating a branch. Without it, the branch would be pushed under the org admin\'s GitHub account.',
       });
@@ -1103,8 +1183,11 @@ router.post('/branch', async (req, res) => {
 
   // Use the per-user workspace (clones from remote if not yet set up)
   const gitRoot = getUserWorkspace(proj, caller);
+  let sshCleanup = () => {};
   try {
-    const { git } = await ensureUserWorkspace(gitRoot, { ...cfg, project_id: req.params.projectId }, caller);
+    const r = await ensureUserWorkspace(gitRoot, { ...cfg, project_id: req.params.projectId }, caller);
+    const { git } = r;
+    sshCleanup = r.sshCleanup || (() => {});
 
     const branchSummary = await git.branchLocal();
     if (branchSummary.all.includes(branchName)) {
@@ -1124,6 +1207,8 @@ router.post('/branch', async (req, res) => {
   } catch (err) {
     console.error('Branch error:', err);
     res.status(500).json({ error: err.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -1331,13 +1416,17 @@ router.post('/fetch', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
   const caller = getCaller(req.userId);
+  let sshCleanup = () => {};
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const { git, remoteWithAuth } = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
-    const result = await git.fetch(remoteWithAuth);
+    const r = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
+    sshCleanup = r.sshCleanup || (() => {});
+    const result = await r.git.fetch(r.remoteWithAuth);
     res.json({ ok: true, message: 'Fetched latest from remote successfully.', output: result });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -1347,18 +1436,30 @@ router.post('/test', async (req, res) => {
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.remote_url) return res.status(400).json({ error: 'Remote URL not configured.' });
-  const caller = getCaller(req.userId);
+
+  const { isSSH, remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
+
   try {
-    const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
-    const rawToken = identity?.auth_token ? decrypt(identity.auth_token) : (cfg.auth_token ? decrypt(cfg.auth_token) : '');
-    if (!rawToken) return res.status(400).json({ error: 'No authentication token configured.' });
-    const remoteWithAuth = buildRemoteWithAuth(cfg.remote_url, cfg.username, rawToken);
-    const git = simpleGit();
-    await git.listRemote(['--heads', remoteWithAuth]);
-    const tokenPreview = rawToken.length > 8 ? rawToken.slice(0, 4) + '••••' + rawToken.slice(-4) : '••••••••';
-    res.json({ ok: true, message: 'Connection successful! Repository is accessible.', token_preview: tokenPreview });
+    if (isSSH) {
+      if (!sshEnv.GIT_SSH_COMMAND) {
+        return res.status(400).json({ error: 'No SSH key configured. Add your private key in Git Identity first.' });
+      }
+      const git = simpleGit({ env: { ...process.env, ...sshEnv } });
+      await git.listRemote(['--heads', remoteUrl]);
+      res.json({ ok: true, message: 'SSH connection successful! Repository is accessible.', token_preview: 'SSH key' });
+    } else {
+      const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+      const rawToken = identity?.auth_token ? decrypt(identity.auth_token) : (cfg.auth_token ? decrypt(cfg.auth_token) : '');
+      if (!rawToken) return res.status(400).json({ error: 'No authentication token configured.' });
+      const git = simpleGit();
+      await git.listRemote(['--heads', remoteUrl]);
+      const tokenPreview = rawToken.length > 8 ? rawToken.slice(0, 4) + '••••' + rawToken.slice(-4) : '••••••••';
+      res.json({ ok: true, message: 'Connection successful! Repository is accessible.', token_preview: tokenPreview });
+    }
   } catch (e) {
     res.status(400).json({ ok: false, error: 'Connection failed: ' + (e.message || 'Unable to reach remote.') });
+  } finally {
+    sshCleanup();
   }
 });
 
@@ -1369,20 +1470,24 @@ router.post('/sync', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
   const caller = getCaller(req.userId);
+  let sshCleanup = () => {};
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const { git, remoteWithAuth, identity } = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
-    const branch = identity?.branch_name || getBranchForUser(caller, proj);
-    await git.fetch(remoteWithAuth, 'main');
-    const currentBranch = (await git.status()).current;
+    const r = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
+    sshCleanup = r.sshCleanup || (() => {});
+    const branch = r.identity?.branch_name || getBranchForUser(caller, proj);
+    await r.git.fetch(r.remoteWithAuth, 'main');
+    const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
-      const branches = await git.branchLocal();
-      if (branches.all.includes(branch)) await git.checkout(branch);
+      const branches = await r.git.branchLocal();
+      if (branches.all.includes(branch)) await r.git.checkout(branch);
     }
-    await git.merge(['origin/main', '--no-edit', '--allow-unrelated-histories']);
+    await r.git.merge(['origin/main', '--no-edit', '--allow-unrelated-histories']);
     res.json({ ok: true, message: `Branch "${branch}" synced with latest main.` });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  } finally {
+    sshCleanup();
   }
 });
 

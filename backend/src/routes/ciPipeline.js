@@ -221,12 +221,14 @@ router.post('/generate-yaml', async (req, res) => {
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
-  // YAML files (.github/workflows/*, .gitlab-ci.yml) must ALWAYS go into the
-  // ADMIN workspace. GitHub requires the `workflow` PAT scope to push workflow
-  // files — regular users don't have this scope. The org admin pushes these
-  // files once, after which all users can trigger the pipeline.
+  // Determine workspace: org/super admins write to shared admin workspace;
+  // regular users write to their own workspace so they can push to their branch.
+  const callerRow = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
   const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
-  const gitRoot = path.join(GIT_WORKSPACES_ROOT, 'admin'); // git-workspaces/admin/
+  const userFolder = isAdmin ? 'admin' : `user-${req.userId}`;
+  const gitRoot    = path.join(GIT_WORKSPACES_ROOT, userFolder);
+  fs.mkdirSync(gitRoot, { recursive: true }); // ensure dir exists even before first git init
 
   // Get all generated test plans for this project to include as YAML comments
   const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
@@ -521,7 +523,8 @@ print("Patch complete")
   }
 
   if (created.length === 0) return res.status(500).json({ error: errors.join('; ') || 'Nothing generated' });
-  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}. Commit and push these files to your branch.` });
+  const branchHint = isAdmin ? 'main' : (db.prepare('SELECT branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId)?.branch_name || 'your branch');
+  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}. Go to Configuration → Git, commit and push these files to ${branchHint}.` });
 });
 
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────

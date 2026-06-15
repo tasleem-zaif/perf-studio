@@ -163,7 +163,11 @@ router.post('/:id/generate', async (req, res) => {
   const cfg = { ...DEFAULT_CONFIG, ...globalCfg, ...projCfg, ...envCfg, ...suiteCfg };
 
   const endpoints = collection ? (() => { try { return JSON.parse(collection.json_content); } catch { return []; } })() : [];
-  const preRunData = req.body.preRunData || null;
+  // Use pre-run data from request body (legacy) or from collection row (new flow)
+  const preRunData = req.body.preRunData || (() => {
+    if (!collection?.pre_run_data) return null;
+    try { return JSON.parse(collection.pre_run_data); } catch { return null; }
+  })();
 
   const engine = suite.engine || 'jmeter';
   const testType = suite.test_type || 'load';

@@ -433,7 +433,7 @@ function UserManagementPanel({ user, projects = [] }) {
           <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
             {user?.role === 'super_admin'
               ? 'Invite Organization Admins. They will receive an email to set up their account.'
-              : 'Invite team members to your organization. They will receive an email to set up their account.'}
+              : 'Invite team members or additional Org Admins to your organization. They will receive an email to set up their account.'}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <div className="form-group" style={{ marginBottom: 0 }}>
@@ -451,6 +451,7 @@ function UserManagementPanel({ user, projects = [] }) {
               <select value={inviteForm.role} onChange={e => setInviteForm(f => ({ ...f, role: e.target.value }))}
                 style={{ width: '100%', padding: '8px 10px', borderRadius: '6px', border: '1px solid var(--color-border-secondary)', background: 'var(--input-bg)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
                 {user?.role === 'super_admin' && <option value="org_admin">Organization Admin</option>}
+                {user?.role === 'org_admin' && <option value="org_admin">Organization Admin</option>}
                 {user?.role === 'org_admin' && <option value="user">Regular User</option>}
               </select>
             </div>

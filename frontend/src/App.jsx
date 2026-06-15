@@ -182,7 +182,7 @@ function AppInner() {
     if (cachedUser) {
       // User already verified this session — skip /auth/me entirely
       setUser(cachedUser);
-      loadProjects();
+      loadProjects(cachedUser.role);
       return;
     }
 
@@ -190,7 +190,7 @@ function AppInner() {
     api.get('/auth/me').then(({ data }) => {
       localStorage.setItem('ps_user', JSON.stringify(data.user));
       setUser(data.user);
-      loadProjects();
+      loadProjects(data.user.role);
     }).catch(() => {
       localStorage.removeItem('ps_token');
       localStorage.removeItem('ps_user');
@@ -198,7 +198,7 @@ function AppInner() {
     });
   }, []);
 
-  async function loadProjects() {
+  async function loadProjects(callerRole) {
     const { data } = await api.get('/projects');
     const ps = (data.projects || []).map(p => ({
       ...p,
@@ -208,9 +208,11 @@ function AppInner() {
     setProjects(ps);
     setLoading(false);
 
+    const isSuperAdmin = callerRole === 'super_admin';
+
     // Restore state from the current browser URL (e.g. user refreshed or shared a link)
     const { page: urlPage, projectId } = urlToPageState(window.location.pathname);
-    if (projectId) {
+    if (projectId && !isSuperAdmin) {
       const proj = ps.find(p => p.id === projectId);
       if (proj) {
         setActiveProject(proj);
@@ -234,14 +236,28 @@ function AppInner() {
         // Project not found or not accessible — reset URL to dashboard
         window.history.replaceState(null, '', '/dashboard');
       }
-    } else if (urlPage && urlPage !== 'dashboard') {
+    } else if (urlPage && urlPage !== 'dashboard' && !isSuperAdmin) {
       markVisited(urlPage);
       setPage(urlPage);
       setActiveTab(tabFromPage(urlPage));
+    } else if (isSuperAdmin && urlPage && urlPage.startsWith('settings-')) {
+      // super_admin: restore settings page from URL
+      markVisited(urlPage);
+      setPage(urlPage);
+      setActiveTab('settings');
     }
-    // Redirect bare / or /sign-in to /dashboard after projects load
-    if (['/', '', '/sign-in'].includes(window.location.pathname)) {
-      window.history.replaceState(null, '', '/dashboard');
+    // Redirect to default landing page after login
+    if (['/', '', '/sign-in', '/dashboard'].includes(window.location.pathname) || isSuperAdmin) {
+      if (isSuperAdmin) {
+        const settingsUrl = urlPage && urlPage.startsWith('settings-') ? pageToUrl(urlPage) : '/settings/users';
+        const settingsPage = urlPage && urlPage.startsWith('settings-') ? urlPage : 'settings-users';
+        window.history.replaceState(null, '', settingsUrl);
+        markVisited(settingsPage);
+        setPage(settingsPage);
+        setActiveTab('settings');
+      } else if (['/', '', '/sign-in'].includes(window.location.pathname)) {
+        window.history.replaceState(null, '', '/dashboard');
+      }
     }
 
     return ps;
@@ -401,7 +417,9 @@ function AppInner() {
   function handleLogin(u) {
     localStorage.setItem('ps_user', JSON.stringify(u)); // cache — no /auth/me needed until tab closes
     setUser(u);
-    loadProjects().then(ps => { if (ps.length) setActiveProject(ps[0]); });
+    loadProjects(u.role).then(ps => {
+      if (ps.length && u.role !== 'super_admin') setActiveProject(ps[0]);
+    });
   }
 
   function logout() {
@@ -544,7 +562,7 @@ function AppInner() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button className="banner-action-btn" onClick={() => nav('profile')}>
             <i className="ti ti-user-circle" style={{ fontSize: 14 }} />
-            {user?.name?.split(' ')[0] || 'Profile'}
+            {user?.name || 'Profile'}
           </button>
           <button className="banner-action-btn" onClick={logout}
             style={{ background: 'rgba(239,68,68,0.15)', color: '#fca5a5' }}>
@@ -585,12 +603,14 @@ function AppInner() {
           </div>
         )}
 
-        <KeepAlive active={page === 'dashboard'} everVisited={everVisited.has('dashboard')}>
-          <Dashboard projects={projects} user={user} onSelectProject={selectProject}
-            onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
-            onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
-            onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
-        </KeepAlive>
+        {user?.role !== 'super_admin' && (
+          <KeepAlive active={page === 'dashboard'} everVisited={everVisited.has('dashboard')}>
+            <Dashboard projects={projects} user={user} onSelectProject={selectProject}
+              onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
+              onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
+              onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
+          </KeepAlive>
+        )}
 
         {/* Settings only for admin roles */}
         {user?.role !== 'user' && (

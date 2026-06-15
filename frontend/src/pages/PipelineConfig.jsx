@@ -50,28 +50,47 @@ export default function PipelineConfig({ project, envs, user }) {
   const [ciCreatingToken, setCiCreatingToken] = useState(false);
   const [ciGenerating, setCiGenerating] = useState(false);
   const [ciConfig,     setCiConfig]     = useState(null); // loaded from DB
+  const [userBranch,   setUserBranch]   = useState('main');
 
   useEffect(() => {
     if (!project?.id) return;
     load();
     api.get(`/projects/${project.id}/test-suites`).then(r => setSuites(r.data.suites || [])).catch(() => {});
-    api.get(`/projects/${project.id}/ci/config`)
-      .then(({ data }) => {
-        if (data.config) {
-          setCiConfig(data.config);
-          setCiForm(f => ({
-            ...f,
-            gitlab_enabled: !!data.config.gitlab_enabled,
-            gitlab_url: data.config.gitlab_url || 'https://gitlab.com',
-            gitlab_project_id: data.config.gitlab_project_id || '',
-            gitlab_ref: data.config.gitlab_ref || 'main',
-            github_enabled: !!data.config.github_enabled,
-            github_repo: data.config.github_repo || '',
-            github_workflow_file: data.config.github_workflow_file || 'perf-test.yml',
-            github_ref: data.config.github_ref || 'main',
-          }));
-        }
-      }).catch(() => {});
+
+    // Load git identity to get the user's actual branch name
+    const isRegularUser = user?.role === 'user';
+    const branchPromise = isRegularUser
+      ? api.get(`/projects/${project.id}/git/identity`).then(r => r.data.identity?.branch_name || '').catch(() => '')
+      : Promise.resolve('main');
+
+    branchPromise.then(branch => {
+      // Fallback: derive from user name (same logic as getBranchForUser in backend)
+      const resolved = branch || (isRegularUser && user?.name
+        ? `users/${user.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-')}`
+        : 'main');
+      setUserBranch(resolved);
+
+      api.get(`/projects/${project.id}/ci/config`)
+        .then(({ data }) => {
+          if (data.config) {
+            setCiConfig(data.config);
+            setCiForm(f => ({
+              ...f,
+              gitlab_enabled: !!data.config.gitlab_enabled,
+              gitlab_url: data.config.gitlab_url || 'https://gitlab.com',
+              gitlab_project_id: data.config.gitlab_project_id || '',
+              gitlab_ref: data.config.gitlab_ref || resolved,
+              github_enabled: !!data.config.github_enabled,
+              github_repo: data.config.github_repo || '',
+              github_workflow_file: data.config.github_workflow_file || 'perf-test.yml',
+              github_ref: data.config.github_ref || resolved,
+            }));
+          } else {
+            // No saved config yet — pre-fill refs with user's branch
+            setCiForm(f => ({ ...f, gitlab_ref: resolved, github_ref: resolved }));
+          }
+        }).catch(() => {});
+    });
   }, [project?.id]);
 
   function load() {
@@ -201,7 +220,7 @@ export default function PipelineConfig({ project, envs, user }) {
           {/* Per-user info banner */}
           <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px', background:'#f0fdf4', border:'1px solid #86efac', borderRadius:8, marginBottom:16, fontSize:12, color:'#15803d' }}>
             <i className="ti ti-user-check" style={{ fontSize:14, flexShrink:0 }}/>
-            <span>This is <strong>your personal CI/CD configuration</strong>. Each team member has their own independent setup — pipelines run on your own branch.</span>
+            <span>This is <strong>your personal CI/CD configuration</strong>. Each team member has their own independent setup — pipelines run on{user?.role === 'user' ? <strong> {userBranch}</strong> : ' main'}.</span>
           </div>
           <div style={{ marginBottom: 16, padding: '12px 16px', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, fontSize: 13, color: '#1d4ed8' }}>
             <i className="ti ti-info-circle" style={{ marginRight: 6 }}/>
@@ -342,8 +361,11 @@ export default function PipelineConfig({ project, envs, user }) {
           </div>
           <div style={{ marginTop: 10, padding: '10px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, fontSize: 12, color: '#92400e' }}>
             <i className="ti ti-alert-triangle" style={{ marginRight: 6 }}/>
-            <strong>Important:</strong> YAML files are generated into the <strong>admin workspace</strong> and must be committed and pushed by an <strong>Org Admin</strong> whose GitHub PAT has the <strong>"workflow" scope</strong> enabled.
-            Regular user PATs will be rejected by GitHub when pushing <code>.github/workflows/</code> files.
+            <strong>Important:</strong> Pushing <code>.github/workflows/</code> files requires the <strong>"workflow" scope</strong> on your GitHub Personal Access Token.
+            {user?.role === 'user'
+              ? <> YAML is generated into <strong>your workspace</strong> — commit and push it to <strong>{userBranch}</strong> from Configuration → Git.</>
+              : <> YAML is generated into the <strong>admin workspace</strong> — commit and push it to <strong>main</strong> from Configuration → Git.</>
+            }
             <br/><br/>
             To add workflow scope: GitHub → Settings → Developer Settings → Personal Access Tokens → edit token → tick <strong>workflow</strong> → Save → update your PAT in Git Identity.
           </div>
