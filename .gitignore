@@ -10,7 +10,12 @@ frontend/.vite/
 .env
 .env.local
 .env.production
+.env.docker
+backend/.env
 *.env
+
+# User workspace data (git-managed separately per project)
+git-workspaces/
 
 # Database (user data — not committed)
 backend/data/
