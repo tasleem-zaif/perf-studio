@@ -46,10 +46,12 @@ function buildHtml({ summary, by_api, timeline, errors, meta, rule_violations },
   const finAt     = meta.finished_at ? new Date(meta.finished_at).toLocaleString() : '—';
   const durS      = `${safeN(meta.duration_s).toFixed(1)}s`;
   const engine    = (meta.engine || 'JMeter').toUpperCase();
-  const isOk      = meta.status === 'completed';
-  const statusBg  = isOk ? '#14532d' : '#7f1d1d';
-  const statusFg  = isOk ? '#4ade80' : '#f87171';
-  const statusTxt = (meta.status || 'unknown').toUpperCase();
+  const hasViolations = Array.isArray(rule_violations) && rule_violations.length > 0;
+  const isBadStatus   = meta.status === 'failed' || meta.status === 'error';
+  const isPassed      = !isBadStatus && !hasViolations;
+  const statusBg  = isPassed ? '#14532d' : '#7f1d1d';
+  const statusFg  = isPassed ? '#4ade80' : '#f87171';
+  const statusTxt = isPassed ? 'PASSED' : 'FAILED';
   const errPct    = safeN(summary.error_rate).toFixed(2);
   const errColor  = summary.error_rate > 5 ? '#ef4444' : summary.error_rate > 0 ? '#f59e0b' : '#22c55e';
   const hasLat    = safeN(summary.avg_latency) > 0 || safeN(summary.avg_connect) > 0;

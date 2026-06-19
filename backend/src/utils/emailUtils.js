@@ -155,6 +155,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
   const verdictBg   = isSuccess ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)';
   const verdictBdr  = isSuccess ? '#22c55e' : '#ef4444';
   const verdictIcon = isSuccess ? '✅' : '❌';
+  const verdictStatus = isSuccess ? 'PASSED' : 'FAILED';
   const verdictText = isFailed && rulesPassed
     ? deriveFailureReason(runData)
     : rulesPassed
@@ -216,7 +217,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
     <!-- Verdict banner -->
     <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:12px;">
       <span style="font-size:16px;margin-right:8px;">${verdictIcon}</span>
-      <span style="font-weight:700;color:${verdictBdr};font-size:13px;">Status: ${status}</span>
+      <span style="font-weight:700;color:${verdictBdr};font-size:13px;">Status: ${verdictStatus}</span>
       ${isSuccess ? `<span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>` : ''}
     </div>
     ${isFailed ? `

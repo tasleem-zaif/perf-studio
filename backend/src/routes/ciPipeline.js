@@ -1122,6 +1122,32 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       engine: 'jmeter', started_at: run.started_at,
     }) : null;
 
+    // Evaluate rule violations before PDF so the PDF shows correct PASSED/FAILED status
+    let autoViolations = [];
+    if (fs.existsSync(jtlPath)) {
+      try {
+        const { evaluateRules } = require('../utils/ruleEvaluator');
+        const rr = evaluateRules(projectId, jtlPath);
+        autoViolations = rr?.violations || [];
+      } catch (_) {}
+    }
+    if (reportData) reportData.rule_violations = autoViolations;
+
+    // Generate analytics PDF
+    let autoPdfPath = null;
+    if (reportData && fs.existsSync(jtlPath)) {
+      try {
+        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+        const runNum = (resultDir.match(/Run_?(\d+)/) || [])[1] || run.id;
+        const tmpPdf = path.join(resultDir, `Analytics_CI_Run_${runNum}.pdf`);
+        await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
+        autoPdfPath = tmpPdf;
+        console.log(`[Auto-sync] PDF generated: ${path.basename(tmpPdf)}`);
+      } catch (e) {
+        console.error('[Auto-sync] PDF generation failed:', e.message);
+      }
+    }
+
     const execInsert = db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
       VALUES (?, ?, 'jmeter', 'completed', ?, ?, ?, ?, datetime('now'), ?, ?)
@@ -1141,15 +1167,6 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     setImmediate(async () => {
       try {
         const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
-        const { evaluateRules } = require('../utils/ruleEvaluator');
-
-        let violations = [];
-        if (fs.existsSync(jtlPath)) {
-          try {
-            const rr = evaluateRules(projectId, jtlPath);
-            violations = rr?.violations || [];
-          } catch (_) {}
-        }
 
         const suiteLookup = suiteId ? db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
         const emailData = {
@@ -1158,14 +1175,14 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
             summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
             by_api: [], timeline: [], errors: [],
           }),
-          rule_violations: violations,
+          rule_violations: autoViolations,
         };
         if (suiteLookup?.name) emailData.meta.suite_name = suiteLookup.name;
 
-        if (violations.length > 0) {
-          await sendRuleViolationEmail(newRunId, userId, projectId, violations, emailData.meta.suite_name, project.name);
+        if (autoViolations.length > 0) {
+          await sendRuleViolationEmail(newRunId, userId, projectId, autoViolations, emailData.meta.suite_name, project.name);
         }
-        await sendAlertEmail(newRunId, userId, projectId, emailData, null, null);
+        await sendAlertEmail(newRunId, userId, projectId, emailData, autoPdfPath, null);
         console.log(`[Auto-sync] Emails sent for CI run #${run.id} → exec run #${newRunId}`);
       } catch (e) {
         console.error('[Auto-sync] Email failed:', e.message);
@@ -1526,6 +1543,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
             by_api, timeline: [], errors: [], rule_violations: [],
           };
 
+          // Evaluate rules now so the PDF shows correct PASSED/FAILED status
+          try {
+            const { evaluateRules } = require('../utils/ruleEvaluator');
+            const rr = evaluateRules(req.params.projectId, jtlPath);
+            reportData.rule_violations = rr?.violations || [];
+          } catch (_) {}
+
           await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
           pdfPath = tmpPdf;
           console.log('[CI Sync] Analytics PDF generated:', pdfPath);
@@ -1583,16 +1607,9 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           if (sRow?.name) { emailData.meta.suite_name = sRow.name; resolvedSuiteName = sRow.name; }
         }
         emailData.meta.run_id = newRunId;
-        // Evaluate rules against JTL for violation summary in email
-        let violations = [];
-        if (fs.existsSync(jtlPath)) {
-          try {
-            const { evaluateRules } = require('../utils/ruleEvaluator');
-            const rr = evaluateRules(req.params.projectId, jtlPath);
-            violations = rr?.violations || [];
-            emailData.rule_violations = violations;
-          } catch (_) {}
-        }
+        // Reuse violations already evaluated before PDF generation
+        const violations = reportData?.rule_violations || [];
+        emailData.rule_violations = violations;
         // Send rule violation email first (as soon as violations are known, before full report)
         if (violations.length > 0) {
           const proj = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
