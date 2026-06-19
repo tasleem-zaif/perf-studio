@@ -48,17 +48,55 @@ function getGitConfig(projectId) {
   return db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
 }
 
-function getBranchForUser(user, project) {
-  if (user.role === 'org_admin' || user.role === 'super_admin') return 'main';
+function getBaseBranch(cfg) {
+  return cfg?.base_branch || 'main';
+}
+
+function getBranchForUser(user, cfg) {
+  if (user.role === 'org_admin' || user.role === 'super_admin') return getBaseBranch(cfg);
   const safe = user.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-');
   return `users/${safe}`;
 }
 
+// Always suppress git credential prompts — failures surface as errors, never as OS popups
+const NO_PROMPT_ENV = {
+  // Suppress terminal credential prompts
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_ASKPASS: 'echo',
+  GIT_SSH_ASKPASS: 'echo',
+  // Suppress Windows Git Credential Manager (GCM) GUI account-picker dialogs.
+  // GCM shows these even when a PAT is embedded in the URL unless we explicitly
+  // tell it to never open interactive windows.
+  GCM_INTERACTIVE: 'never',
+  GCM_NO_INTERACTIVE: '1',
+  // Override credential.helper to empty via git env config (Git 2.31+).
+  // This prevents GCM from intercepting HTTPS operations where the PAT is
+  // already present in the remote URL — so git uses the URL credentials directly.
+  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_KEY_0: 'credential.helper',
+  GIT_CONFIG_VALUE_0: '',
+};
+
 function gitInstance(projectPath, extraEnv = {}) {
-  if (Object.keys(extraEnv).length > 0) {
-    return simpleGit({ baseDir: projectPath, env: { ...process.env, ...extraEnv } });
-  }
-  return simpleGit(projectPath);
+  return simpleGit({
+    baseDir: projectPath,
+    env: { ...process.env, ...NO_PROMPT_ENV, ...extraEnv },
+  });
+}
+
+/**
+ * Write credential.helper='' into the repo's local .git/config.
+ * This overrides Windows Git Credential Manager (GCM) at every config level
+ * (system → global → local) so git uses the PAT already embedded in the
+ * remote URL without ever opening the GCM account-picker GUI.
+ * Call this once after init and once at the start of every push flow.
+ */
+async function disableGcm(git) {
+  try {
+    await git.addConfig('credential.helper', '', false, 'local');
+    // Also kill the GitHub-specific helper entry GCM sometimes writes
+    await git.addConfig('credential.https://github.com.helper', '', false, 'local');
+  } catch {}
 }
 
 // Write SSH private key to a temp file and return GIT_SSH_COMMAND env + cleanup fn
@@ -100,33 +138,39 @@ function getAuth(cfg, userId, projectId) {
   };
 }
 
-// ── Per-user workspace path ───────────────────────────────────────────────────
+// ── Per-project, per-user workspace path ─────────────────────────────────────
+// Each project has its own isolated git workspace — pushing never leaks other projects.
 // Structure:
 //   git-workspaces/
-//   ├── admin/          ← org admin workspace
-//   │   ├── .git/
-//   │   └── projects/
-//   │       └── Demo-1/
-//   ├── user-3/         ← regular user ID 3
-//   │   ├── .git/
-//   │   └── projects/
-//   │       └── Demo-1/
-//   └── user-7/         ← regular user ID 7
-//       ├── .git/
-//       └── projects/
-//           └── Demo-1/
+//   ├── Project_Demo/
+//   │   ├── admin/          ← org admin workspace (main branch)
+//   │   │   ├── .git/
+//   │   │   ├── Collection1/
+//   │   │   └── README.md
+//   │   └── user-3/         ← user-3's clone (users/<name> branch)
+//   │       ├── .git/
+//   │       └── Collection1/
+//   └── Demo1/
+//       ├── admin/
+//       └── user-3/
 const GIT_WORKSPACES_ROOT = path.join(__dirname, '..', '..', '..', 'git-workspaces');
 
 function getCleanProjectName(proj) {
   return proj.name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
 }
 
+function userNameSlug(name) {
+  return (name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || null;
+}
+
 function getUserWorkspace(proj, user) {
-  // No project-name level — workspace is per user only
-  const userFolder = (user.role === 'org_admin' || user.role === 'super_admin')
-    ? 'admin'
-    : `user-${user.id}`;
-  return path.join(GIT_WORKSPACES_ROOT, userFolder);
+  const userFolder = userNameSlug(user.name) || `user-${user.id}`;
+  const cleanProjectName = getCleanProjectName(proj);
+  return path.join(GIT_WORKSPACES_ROOT, cleanProjectName, userFolder);
 }
 
 // Clone or pull-update a user's workspace from the remote
@@ -156,9 +200,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   if (!fs.existsSync(path.join(gitRoot, '.git'))) {
     const dirExists = fs.existsSync(gitRoot);
     const isEmpty   = !dirExists || fs.readdirSync(gitRoot).length === 0;
-    const cloneGit  = Object.keys(sshEnv).length > 0
-      ? simpleGit({ env: { ...process.env, ...sshEnv } })
-      : simpleGit();
+    const cloneGit  = simpleGit({ env: { ...process.env, ...NO_PROMPT_ENV, ...sshEnv } });
 
     if (isEmpty) {
       fs.mkdirSync(gitRoot, { recursive: true });
@@ -184,6 +226,44 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   if (remotes.find(r => r.name === 'origin')) {
     await git.remote(['set-url', 'origin', remoteForOps]);
   }
+
+  // Rebuild collection folder structure from DB — the remote may not have these
+  // folders if they were created after the last push, or this is a fresh clone.
+  try {
+    const { ensureAllEnvFolders, cleanName: cn } = require('../utils/projectFolders');
+    const projectRow = db.prepare('SELECT folder_path, name FROM projects WHERE id = ?').get(cfg.project_id);
+    // Collections go inside the project subfolder within the git workspace root:
+    // gitRoot/<ProjectName>/<CollectionName>/<Env>/
+    const gitProjectPath = path.join(gitRoot, cn(projectRow?.name || ''));
+    const collections = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
+    for (const col of collections) {
+      let envs = [];
+      try { envs = JSON.parse(col.environments || '[]'); } catch {}
+      if (!envs.length && col.environment) envs = [col.environment];
+      if (!envs.length) envs = ['Default'];
+      ensureAllEnvFolders(gitProjectPath, col.name, envs);
+    }
+
+    // Copy JMX/JS scripts from admin workspace if they don't exist here yet.
+    // Scripts are generated into the admin workspace; users need them locally
+    // so they can commit to their branch and CI can find the file.
+    const adminWorkspace = path.join(GIT_WORKSPACES_ROOT, getCleanProjectName({ name: cfg.project_id_name || '' }), 'admin');
+    const adminRoot  = projectRow?.folder_path || '';
+    if (adminRoot && fs.existsSync(adminRoot)) {
+      const suites = db.prepare("SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(cfg.project_id);
+      for (const suite of suites) {
+        const srcAbs = suite.jmx_path || suite.js_path;
+        if (!srcAbs || !fs.existsSync(srcAbs)) continue;
+        // Map admin path to equivalent user workspace path
+        const relToAdmin = path.relative(adminRoot, srcAbs);
+        const destAbs    = path.join(gitRoot, relToAdmin);
+        if (!fs.existsSync(destAbs)) {
+          fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+          fs.copyFileSync(srcAbs, destAbs);
+        }
+      }
+    }
+  } catch (_) { /* non-fatal — workspace still usable */ }
 
   return { git, remoteWithAuth: remoteForOps, authorName, authorEmail, identity, sshCleanup };
 }
@@ -293,7 +373,7 @@ router.put('/config', (req, res) => {
     });
   }
 
-  const { provider, remote_url, username, email, auth_token, auth_method } = req.body;
+  const { provider, remote_url, username, email, auth_token, auth_method, base_branch } = req.body;
   const existing = getGitConfig(req.params.projectId);
 
   // Repo is permanently locked after initialization — cannot change remote_url or base_branch
@@ -309,13 +389,14 @@ router.put('/config', (req, res) => {
     : (existing?.auth_token || '');
 
   const finalMethod = auth_method || existing?.auth_method || 'pat';
+  const finalBaseBranch = base_branch || existing?.base_branch || 'main';
 
   if (existing) {
-    db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=?,auth_method=? WHERE project_id=?`)
-      .run(provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, req.params.projectId);
+    db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=?,auth_method=?,base_branch=? WHERE project_id=?`)
+      .run(provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, finalBaseBranch, req.params.projectId);
   } else {
-    db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token,auth_method) VALUES (?,?,?,?,?,?,?)`)
-      .run(req.params.projectId, provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod);
+    db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token,auth_method,base_branch) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(req.params.projectId, provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, finalBaseBranch);
   }
   res.json({ ok: true });
 });
@@ -344,8 +425,10 @@ router.post('/init', async (req, res) => {
   // folder_path is null before first init — that's expected.
   // The project folder will be created inside git-workspaces during this init.
 
+  let sshCleanup = () => {};
   try {
-    const { isSSH, remoteUrl: remoteWithAuth, sshEnv, cleanup: sshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
+    const { isSSH, remoteUrl: remoteWithAuth, sshEnv, cleanup } = getAuth(cfg, req.userId, req.params.projectId);
+    sshCleanup = cleanup;
 
     if (!isSSH) {
       // PAT mode — require a token
@@ -364,37 +447,31 @@ router.post('/init', async (req, res) => {
     }
 
     // ── Resolve workspace paths ───────────────────────────────────────────────
-    // Workspaces live in a DEDICATED isolated directory:
-    //   <perf-studio-root>/git-workspaces/<projectId>/
+    // Each project has its own isolated workspace:
+    //   git-workspaces/<ProjectName>/admin/
     //
-    // This is completely separate from project data folders — no nesting possible,
-    // safe to re-init any number of times.
+    // Project files go DIRECTLY at the workspace root — no projects/ subdirectory.
+    // This means pushing to GitHub only includes THIS project's files.
     //
     // GitHub structure:
     //   <repo_root>/
-    //   ├── projects/
-    //   │   └── <ProjectName>/   ← clean name, no IDs
+    //   ├── <CollectionName>/
+    //   │   └── <Env>/
+    //   │       ├── config/
+    //   │       ├── script/
+    //   │       ├── testData/
+    //   │       └── results/  (gitignored)
     //   ├── .gitignore
     //   └── README.md
     const cleanProjectName = getCleanProjectName(proj);
-    // Admin always uses the 'admin' workspace for init
-    const gitRoot        = getUserWorkspace(proj, caller);
-    const gitProjectsDir = path.join(gitRoot, 'projects');
-    const gitProjectPath = path.join(gitProjectsDir, cleanProjectName);
+    const gitRoot = getUserWorkspace(proj, caller);  // git-workspaces/<ProjectName>/admin/
+    const gitProjectPath = path.join(gitRoot, cleanProjectName);  // project content in named subfolder
 
-    // Create the workspace → projects/ → project subfolder
+    // Create the workspace directories (gitRoot = repo root, gitProjectPath = content subfolder)
+    fs.mkdirSync(gitRoot, { recursive: true });
     fs.mkdirSync(gitProjectPath, { recursive: true });
 
-    // Add a README.md in projects/ so git tracks it as a real folder
-    // (git ignores empty directories — without this GitHub collapses the path)
-    fs.writeFileSync(path.join(gitProjectsDir, 'README.md'),
-      `# Projects\n\nAll PerfStudio performance test projects are stored here.\nEach sub-folder is one project managed by PerfStudio.\n`
-    );
-
-    // Create the project folder structure in the git workspace
-    const { ensureProjectFolders, ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
-    fs.mkdirSync(gitProjectPath, { recursive: true });
-    ensureProjectFolders(proj.name); // creates gitProjectPath with .gitkeep
+    const { ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
 
     // Create collection subfolders for all existing collections
     const existingCols = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
@@ -406,7 +483,7 @@ router.post('/init', async (req, res) => {
       ensureAllEnvFolders(gitProjectPath, col.name, envs);
     }
 
-    // Update folder_path in DB to point to git-workspaces/admin/projects/<name>/
+    // Update folder_path in DB to the project workspace root
     db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitProjectPath, proj.id);
 
     const git = gitInstance(gitRoot, sshEnv);
@@ -416,6 +493,7 @@ router.post('/init', async (req, res) => {
     if (!isRepo) {
       await git.init();
     }
+    await disableGcm(git);
 
     // Enable long paths — required on Windows where default limit is 260 chars
     await git.addConfig('core.longpaths', 'true');
@@ -427,8 +505,7 @@ router.post('/init', async (req, res) => {
     // Create .gitignore at workspace root
     const gitignore = path.join(gitRoot, '.gitignore');
     fs.writeFileSync(gitignore, [
-      '# PerfStudio — ignore large run artifacts',
-      `projects/${cleanProjectName}/results/`,
+      '# PerfStudio — ignore large binary files and temp artifacts',
       '*_workspace/',
       '*.log',
       '*.tmp',
@@ -547,8 +624,8 @@ ${proj.name}/
         if (fs.statSync(full).isDirectory()) ensureGitkeepAll(full);
       });
     }
-    // Apply to the full workspace tree (covers project, collections, envs, and all subfolders)
-    ensureGitkeepAll(gitProjectsDir);
+    // Apply to the full workspace tree (covers collections, envs, and all subfolders)
+    ensureGitkeepAll(gitRoot);
 
     // Set or update remote
     const remotes = await git.getRemotes();
@@ -582,8 +659,15 @@ ${proj.name}/
     }
     cleanNestedGit(gitRoot, true); // true = don't remove the top-level .git
 
-    // Stage everything and make initial commit on main
-    await git.checkout(['-B', 'main']);
+    // Clean up any in-progress merge/rebase left over from a previous failed attempt.
+    // Without this, git add/checkout fails with "needs merge — resolve index first".
+    try { await git.raw(['merge', '--abort']); } catch {}
+    try { await git.raw(['reset', '--hard', 'HEAD']); } catch {}
+
+    const baseBranch = getBaseBranch(cfg);
+
+    // Stage everything and make initial commit on base branch
+    await git.checkout(['-B', baseBranch]);
     await git.add('.');
     const status = await git.status();
     if (status.staged.length > 0 || status.not_added.length > 0 || status.modified.length > 0) {
@@ -600,16 +684,37 @@ ${proj.name}/
     if (parsed && rawToken && cfg.provider === 'github') {
       try {
         const octokit = new Octokit({ auth: rawToken });
-        await octokit.repos.deleteBranchProtection({ owner: parsed.owner, repo: parsed.repo, branch: 'main' });
+        await octokit.repos.deleteBranchProtection({ owner: parsed.owner, repo: parsed.repo, branch: baseBranch });
       } catch (_) { /* branch may not be protected yet — that's fine */ }
     }
 
-    // 2. Force-push (needed on re-init when remote has diverged history)
-    try {
-      await git.push(['--force', '--set-upstream', 'origin', 'main']);
-    } catch (pushErr) {
-      // Fallback: try regular push (first-time init, no remote history)
-      await git.push(['--set-upstream', 'origin', 'main']);
+    // 2. Push — handle remote that was created with a README or other initial content.
+    //    Strategy:
+    //      a) If remote already has the base branch: fetch + merge (--allow-unrelated-histories).
+    //         If the merge produces conflicts (e.g. both sides have README/.gitignore),
+    //         resolve by keeping our version, then regular push.
+    //      b) If remote is empty: force-push to seed it.
+    let pushed = false;
+    const remoteRefs = await git.raw(['ls-remote', '--heads', 'origin']).catch(() => '');
+    if (remoteRefs.includes(`refs/heads/${baseBranch}`)) {
+      // Remote already has the base branch — must use merge path
+      await git.fetch(['origin', baseBranch]);
+      try {
+        await git.merge(['FETCH_HEAD', '--allow-unrelated-histories', '--no-edit', '-m', 'Initialize: merge remote state']);
+      } catch (_mergeErr) {
+        // Merge produced conflicts — keep our version
+        await git.raw(['checkout', '--ours', '--', '.']);
+        await git.add('.');
+        await git.commit('Initialize: PerfStudio project structure (resolved merge)');
+      }
+      await disableGcm(git);
+      await git.push(['--set-upstream', 'origin', baseBranch]);
+      pushed = true;
+    }
+
+    if (!pushed) {
+      // Remote is empty — seed it with a force-push
+      await git.raw(['push', '--force', '--set-upstream', 'origin', baseBranch]);
     }
 
     // 3. Apply branch protection after push
@@ -620,15 +725,15 @@ ${proj.name}/
       .run(gitRoot, req.params.projectId);
 
     db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
-      .run(req.params.projectId, req.userId, 'main', 'Initial commit: PerfStudio project structure', 1);
+      .run(req.params.projectId, req.userId, baseBranch, 'Initial commit: PerfStudio project structure', 1);
 
     const protectionWarning = protectionResult?.ok === false
       ? ` Note: Branch protection could not be applied (${protectionResult.error}). Add "Administration: Read & Write" permission to your GitHub token and re-initialize.`
       : '';
-    res.json({ ok: true, message: `Repository initialized and pushed to main.${protectionWarning}`, branch_protection: protectionResult?.ok !== false });
+    res.json({ ok: true, message: `Repository initialized and pushed to ${baseBranch}.${protectionWarning}`, branch_protection: protectionResult?.ok !== false });
   } catch (e) {
     console.error('[Git] Init error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Repository initialization failed: ${e.message}. Verify your remote URL, access token, and that the repository exists and is accessible.` });
   } finally {
     sshCleanup();
   }
@@ -688,7 +793,7 @@ router.get('/status', async (req, res) => {
       deletions: totalDeleted,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to read git status: ${e.message}. The workspace may need to be re-initialized.` });
   }
 });
 
@@ -712,15 +817,16 @@ router.post('/commit', async (req, res) => {
     const result = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
     const { git, identity } = result;
     sshCleanup = result.sshCleanup || (() => {});
-    const branch = identity?.branch_name || getBranchForUser(caller, proj);
+    const branch = identity?.branch_name || getBranchForUser(caller, cfg);
 
-    // Pull latest main then switch to user's branch
-    try { await git.fetch('origin', 'main'); } catch {}
+    const baseBranch = getBaseBranch(cfg);
+    // Pull latest base branch then switch to user's branch
+    try { await git.fetch('origin', baseBranch); } catch {}
     const branches = await git.branchLocal();
     if (branches.all.includes(branch)) {
       await git.checkout(branch);
     } else {
-      await git.checkout(['-b', branch, 'origin/main']).catch(() => git.checkout(['-b', branch]));
+      await git.checkout(['-b', branch, `origin/${baseBranch}`]).catch(() => git.checkout(['-b', branch]));
     }
 
     // Stage all changes
@@ -740,7 +846,7 @@ router.post('/commit', async (req, res) => {
     res.json({ ok: true, hash, branch, message: `Committed to branch "${branch}".` });
   } catch (e) {
     console.error('[Git] Commit error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Commit failed: ${e.message}. Ensure there are staged changes and your Git identity (name/email) is configured in Git Identity settings.` });
   } finally {
     sshCleanup();
   }
@@ -763,19 +869,20 @@ router.post('/push', async (req, res) => {
     const git = gitInstance(gitDir, sshEnv);
     const userIdentity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
 
-    const branch = userIdentity?.branch_name || getBranchForUser(caller, proj);
+    const branch = userIdentity?.branch_name || getBranchForUser(caller, cfg);
     await git.addConfig('user.name',  userIdentity?.author_name  || caller.name);
     await git.addConfig('user.email', userIdentity?.author_email || caller.email || cfg.email || 'noreply@perfstudio.com');
 
+    const baseBranch = getBaseBranch(cfg);
     // Ensure on correct branch
     await git.checkout(branch).catch(async () => {
-      await git.checkout(['-b', branch, 'main']).catch(() => git.checkout(['-b', branch]));
+      await git.checkout(['-b', branch, baseBranch]).catch(() => git.checkout(['-b', branch]));
     });
 
     // Update remote URL
     await git.remote(['set-url', 'origin', remoteUrl]);
 
-    // Push
+    await disableGcm(git);
     await git.push(['--set-upstream', 'origin', branch]);
 
     // Mark commits as pushed
@@ -785,7 +892,7 @@ router.post('/push', async (req, res) => {
     res.json({ ok: true, branch, message: `Pushed to origin/${branch} successfully.` });
   } catch (e) {
     console.error('[Git] Push error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Push failed: ${e.message}. Check that your access token has write permission to the repository and is not expired.` });
   } finally {
     sshCleanup();
   }
@@ -806,7 +913,7 @@ router.post('/pull', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir, sshEnv);
-    const branch = getBranchForUser(caller, proj);
+    const branch = getBranchForUser(caller, cfg);
 
     await git.remote(['set-url', 'origin', remoteUrl]);
 
@@ -828,20 +935,22 @@ router.post('/pull', async (req, res) => {
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
     } else {
       // Branch doesn't exist on remote yet:
-      // 1. Fetch latest main from remote
-      // 2. Create local branch from main (or sync if it already exists locally)
+      // 1. Fetch latest base branch from remote
+      // 2. Create local branch from it (or sync if it already exists locally)
       // 3. Push the branch to remote immediately — so it exists for future pulls
-      await git.fetch('origin', 'main');
+      const baseBranch = getBaseBranch(cfg);
+      await git.fetch('origin', baseBranch);
 
       const localBranches = await git.branchLocal();
       if (!localBranches.all.includes(branch)) {
-        await git.checkout(['-b', branch, 'origin/main']);
+        await git.checkout(['-b', branch, `origin/${baseBranch}`]);
       } else {
         await git.checkout(branch);
-        await git.merge(['origin/main', '--no-edit']).catch(() => {});
+        await git.merge([`origin/${baseBranch}`, '--no-edit']).catch(() => {});
       }
 
       // Auto-push to create the remote branch so future pulls work seamlessly
+      await disableGcm(git);
       await git.push(['--set-upstream', 'origin', branch]);
 
       // Protect feature branch: no force-push, no deletion (but no PR review required)
@@ -849,11 +958,11 @@ router.post('/pull', async (req, res) => {
 
       res.json({
         ok: true,
-        message: `Branch "${branch}" created from main and pushed to remote. Branch protection applied.`,
+        message: `Branch "${branch}" created from ${baseBranch} and pushed to remote. Branch protection applied.`,
       });
     }
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Branch setup failed: ${e.message}. Verify the branch name is valid and the repository is accessible with your access token.` });
   } finally {
     sshCleanup();
   }
@@ -876,7 +985,7 @@ router.get('/branches', async (req, res) => {
     // Only return LOCAL branches — no remotes/origin/... tracking refs.
     // Also exclude the base branch (main) since users never work directly on it.
     const summary = await git.branchLocal();
-    const baseBranch = cfg.base_branch || 'main';
+    const baseBranch = getBaseBranch(cfg);
     const userBranches = summary.all.filter(b => b !== baseBranch);
 
     res.json({
@@ -884,7 +993,7 @@ router.get('/branches', async (req, res) => {
       current: summary.current,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to list branches: ${e.message}. The git workspace may need to be re-initialized.` });
   }
 });
 
@@ -904,7 +1013,7 @@ router.get('/log', async (req, res) => {
     const log = await git.log(['--max-count=20']);
     res.json({ commits: log.all });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to load commit log: ${e.message}.` });
   }
 });
 
@@ -936,8 +1045,9 @@ router.post('/prs', async (req, res) => {
   const cfg = getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
 
-  const branch = getBranchForUser(caller, proj);
-  if (branch === 'main') return res.status(400).json({ error: 'Org admins push directly to main — no PR needed.' });
+  const baseBranch = getBaseBranch(cfg);
+  const branch = getBranchForUser(caller, cfg);
+  if (branch === baseBranch) return res.status(400).json({ error: `Org admins push directly to ${baseBranch} — no PR needed.` });
 
   let remotePrUrl = '';
 
@@ -956,7 +1066,7 @@ router.post('/prs', async (req, res) => {
           title: title.trim(),
           body: description || '',
           head: branch,
-          base: 'main',
+          base: baseBranch,
         });
         remotePrUrl = pr.data.html_url;
       }
@@ -969,7 +1079,7 @@ router.post('/prs', async (req, res) => {
   const result = db.prepare(`
     INSERT INTO git_prs (project_id, title, description, from_branch, to_branch, created_by, remote_pr_url)
     VALUES (?,?,?,?,?,?,?)
-  `).run(req.params.projectId, title.trim(), description||'', branch, 'main', req.userId, remotePrUrl);
+  `).run(req.params.projectId, title.trim(), description||'', branch, baseBranch, req.userId, remotePrUrl);
 
   const pr = db.prepare('SELECT * FROM git_prs WHERE id = ?').get(result.lastInsertRowid);
   res.json({ ok: true, pr, remote_pr_url: remotePrUrl });
@@ -1004,15 +1114,17 @@ router.put('/prs/:prId/merge', async (req, res) => {
     // Fetch the feature branch
     await git.fetch('origin', pr.from_branch);
 
-    // Switch to main
-    await git.checkout('main');
-    await git.pull('origin', 'main', { '--rebase': 'false' });
+    const baseBranch = getBaseBranch(cfg);
+    // Switch to base branch
+    await git.checkout(baseBranch);
+    await git.pull('origin', baseBranch, { '--rebase': 'false' });
 
     // Merge feature branch
     await git.merge([`origin/${pr.from_branch}`, '--no-ff', '--allow-unrelated-histories', '-m', `Merge PR: ${pr.title}`]);
 
-    // Push merged main
-    await git.push('origin', 'main');
+    // Push merged base branch
+    await disableGcm(git);
+    await git.push('origin', baseBranch);
 
     // ── Also merge on GitHub if PR has a remote URL ─────────────────────────
     if (pr.remote_pr_url) {
@@ -1039,12 +1151,12 @@ router.put('/prs/:prId/merge', async (req, res) => {
     db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
 
     db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
-      .run(req.params.projectId, req.userId, 'main', `Merge PR: ${pr.title}`, 1);
+      .run(req.params.projectId, req.userId, baseBranch, `Merge PR: ${pr.title}`, 1);
 
-    res.json({ ok: true, message: `PR "${pr.title}" merged into main.` });
+    res.json({ ok: true, message: `PR "${pr.title}" merged into ${baseBranch}.` });
   } catch (e) {
     console.error('[Git] Merge error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Merge failed: ${e.message}. There may be merge conflicts or your token lacks write access to the ${getBaseBranch(cfg)} branch.` });
   } finally {
     mergeSshCleanup();
   }
@@ -1194,19 +1306,21 @@ router.post('/branch', async (req, res) => {
       await git.checkout(branchName);
       return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
     }
-    // Create from latest main
-    try { await git.fetch('origin', 'main'); } catch {}
-    try { await git.checkout('main'); } catch {}
+    const baseBranch = getBaseBranch(cfg);
+    // Create from latest base branch
+    try { await git.fetch('origin', baseBranch); } catch {}
+    try { await git.checkout(baseBranch); } catch {}
     await git.checkoutLocalBranch(branchName);
 
     // Push branch to remote and apply protection
+    await disableGcm(git);
     await git.push(['--set-upstream', 'origin', branchName]);
     await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
 
-    res.json({ message: `Branch "${branchName}" created from main and pushed to remote.`, branch: branchName });
+    res.json({ message: `Branch "${branchName}" created from ${baseBranch} and pushed to remote.`, branch: branchName });
   } catch (err) {
     console.error('Branch error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: `Failed to create user branch: ${err.message}. Verify the repository is accessible and the branch does not already exist remotely.` });
   } finally {
     sshCleanup();
   }
@@ -1247,7 +1361,7 @@ router.put('/prs/:prId/push-close', async (req, res) => {
     res.json({ ok: true, message: 'PR closed on GitHub.' });
   } catch (e) {
     console.error('[Git] push-close error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to close PR on GitHub: ${e.message}. Verify your GitHub token has pull request write permissions.` });
   }
 });
 
@@ -1357,7 +1471,7 @@ router.get('/diff', async (req, res) => {
 
     res.json({ diff, path: filePath, isNewFile });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to generate diff: ${e.message}.` });
   }
 });
 
@@ -1405,7 +1519,7 @@ router.post('/discard', async (req, res) => {
 
     res.json({ ok: true, message: `Discarded changes in ${paths.length} file(s)` });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Failed to discard changes: ${e.message}. Some files may be locked or the workspace may be in an inconsistent state.` });
   }
 });
 
@@ -1424,7 +1538,7 @@ router.post('/fetch', async (req, res) => {
     const result = await r.git.fetch(r.remoteWithAuth);
     res.json({ ok: true, message: 'Fetched latest from remote successfully.', output: result });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Fetch failed: ${e.message}. Verify your access token and network connectivity.` });
   } finally {
     sshCleanup();
   }
@@ -1475,17 +1589,18 @@ router.post('/sync', async (req, res) => {
     const gitDir = getUserWorkspace(proj, caller);
     const r = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
     sshCleanup = r.sshCleanup || (() => {});
-    const branch = r.identity?.branch_name || getBranchForUser(caller, proj);
-    await r.git.fetch(r.remoteWithAuth, 'main');
+    const branch = r.identity?.branch_name || getBranchForUser(caller, cfg);
+    const baseBranch = getBaseBranch(cfg);
+    await r.git.fetch(r.remoteWithAuth, baseBranch);
     const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
       const branches = await r.git.branchLocal();
       if (branches.all.includes(branch)) await r.git.checkout(branch);
     }
-    await r.git.merge(['origin/main', '--no-edit', '--allow-unrelated-histories']);
-    res.json({ ok: true, message: `Branch "${branch}" synced with latest main.` });
+    await r.git.merge([`origin/${baseBranch}`, '--no-edit', '--allow-unrelated-histories']);
+    res.json({ ok: true, message: `Branch "${branch}" synced with latest ${baseBranch}.` });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Sync failed: ${e.message}. There may be merge conflicts between your branch and the base branch — resolve conflicts manually or contact your admin.` });
   } finally {
     sshCleanup();
   }

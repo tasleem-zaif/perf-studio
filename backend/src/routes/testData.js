@@ -199,7 +199,7 @@ router.post('/', upload.single('csv'), (req, res) => {
 router.get('/:id/content', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!file) return res.status(404).json({ error: 'Not found' });
+  if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   // Check file exists on disk before attempting to read
   const fs = require('fs');
@@ -225,7 +225,7 @@ router.get('/:id/content', (req, res) => {
 router.put('/:id/content', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!file) return res.status(404).json({ error: 'Not found' });
+  if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   const { headers, rows } = req.body;
   if (!Array.isArray(headers) || !Array.isArray(rows)) return res.status(400).json({ error: 'headers and rows arrays required' });
@@ -243,7 +243,7 @@ router.put('/:id/content', (req, res) => {
 router.post('/:id/open-external', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!file) return res.status(404).json({ error: 'Not found' });
+  if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   const fs   = require('fs');
   const { exec } = require('child_process');
@@ -279,7 +279,7 @@ router.delete('/:id', (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const file = db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!file) return res.status(404).json({ error: 'Not found' });
+  if (!file) return res.status(404).json({ error: 'Test data file not found — it may have already been deleted.' });
 
   // Delete the actual file — path is now always the correct env-specific location
   try { unlinkSync(file.path); } catch (_) { /* already gone */ }

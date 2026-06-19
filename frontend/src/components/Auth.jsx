@@ -30,17 +30,25 @@ export default function Auth({ onLogin }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [sessionActive, setSessionActive] = useState(false);
 
-  async function submit(e) {
-    e.preventDefault(); setError(''); setLoading(true);
+  async function doLogin(force = false) {
+    setError(''); setLoading(true); setSessionActive(false);
     try {
-      const { data } = await api.post('/auth/login', { email, password });
+      const { data } = await api.post('/auth/login', { email, password, ...(force && { force: true }) });
       localStorage.setItem('ps_token', data.token);
       onLogin(data.user);
     } catch (err) {
-      setError(err.response?.data?.error || 'Something went wrong');
+      if (err.response?.data?.code === 'SESSION_ACTIVE') {
+        setSessionActive(true);
+        setError(err.response.data.error);
+      } else {
+        setError(err.response?.data?.error || 'Login failed — the server may be unreachable. Check your network connection and try again.');
+      }
     } finally { setLoading(false); }
   }
+
+  function submit(e) { e.preventDefault(); doLogin(false); }
 
   return (
     <div id="auth-screen" style={{ alignItems: 'stretch', padding: 0 }}>
@@ -117,7 +125,39 @@ export default function Auth({ onLogin }) {
               <div className="auth-sub" style={{ fontSize: 13 }}>Sign in to manage your performance tests</div>
             </div>
 
-            {error && <div className="auth-error" style={{ marginBottom: 16 }}>{error}</div>}
+            {error && (
+              <div style={{
+                marginBottom: 16,
+                padding: '12px 14px',
+                background: sessionActive ? 'rgba(245,158,11,0.08)' : 'rgba(247,84,100,0.08)',
+                border: `1px solid ${sessionActive ? 'rgba(245,158,11,0.35)' : 'rgba(247,84,100,0.3)'}`,
+                borderRadius: 10,
+                fontSize: 13,
+                color: sessionActive ? '#b45309' : '#dc2626',
+                lineHeight: 1.5,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                  <i className={`ti ${sessionActive ? 'ti-alert-triangle' : 'ti-circle-x'}`}
+                    style={{ fontSize: 15, flexShrink: 0, marginTop: 1 }} />
+                  <span>{error}</span>
+                </div>
+                {sessionActive && (
+                  <button
+                    onClick={() => doLogin(true)}
+                    disabled={loading}
+                    style={{
+                      marginTop: 10, width: '100%', padding: '8px 0',
+                      background: '#f59e0b', color: '#fff', border: 'none',
+                      borderRadius: 8, fontSize: 13, fontWeight: 600,
+                      cursor: 'pointer', display: 'flex', alignItems: 'center',
+                      justifyContent: 'center', gap: 6,
+                    }}>
+                    {loading ? <span className="spinner" /> : <i className="ti ti-logout" />}
+                    Sign out other session &amp; sign in here
+                  </button>
+                )}
+              </div>
+            )}
 
             <form onSubmit={submit}>
               <div className="form-group">

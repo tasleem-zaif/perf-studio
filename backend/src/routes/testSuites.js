@@ -72,7 +72,7 @@ router.put('/:id', (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!suite) return res.status(404).json({ error: 'Not found' });
+  if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted in another session.' });
   const { name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config, vusers, rampup, iter_mode, loops, duration } = req.body;
   const normalId = v => (v === '' || v === undefined) ? null : v;
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids !== undefined ? JSON.parse(test_data_ids || '[]') : null);
@@ -109,7 +109,7 @@ router.put('/:id', (req, res) => {
 router.delete('/:id', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!suite) return res.status(404).json({ error: 'Not found' });
+  if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have already been deleted.' });
   db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
   resetSequence('test_suites');
   if (suite.collection_id) {
@@ -183,7 +183,7 @@ router.post('/:id/generate', async (req, res) => {
 
     // Write script to collection/env/script/ — use suite.env or derive from collection
     const ext = engine === 'jmeter' ? 'jmx' : 'js';
-    const filename = `${safeName}_${testType}.${ext}`;
+    const filename = `${safeName}.${ext}`;
     let filePath = '';
 
     let scriptBaseDir = null;
@@ -219,7 +219,7 @@ router.post('/:id/generate', async (req, res) => {
     if (suite.collection_id) setImmediate(() => updateCollectionConfigs(suite.collection_id));
     res.json({ ok: true, filename, path: filePath });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Script generation failed: ${e.message}. Check your AI API key in Settings and that the collection has valid endpoints.` });
   }
 });
 
@@ -227,7 +227,7 @@ router.get('/:id/download/:type', (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!suite) return res.status(404).json({ error: 'Not found' });
+  if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted. Try regenerating the script.' });
 
   const filePath = req.params.type === 'jmx' ? suite.jmx_path : suite.js_path;
   if (!filePath) return res.status(404).json({ error: 'Script not generated yet' });

@@ -58,7 +58,7 @@ router.get('/collections', auth, (req, res) => {
     res.json({ collections, total: collections.length });
   } catch (err) {
     console.error('GET /api/collections', err);
-    res.status(500).json({ error: 'Failed to load collections' });
+    res.status(500).json({ error: `Failed to load collections: ${err.message}. The database may be temporarily unavailable — reload the page.` });
   }
 });
 
@@ -79,7 +79,7 @@ router.get('/rules', auth, (req, res) => {
     res.json({ rules, total: rules.length });
   } catch (err) {
     console.error('GET /api/rules', err);
-    res.status(500).json({ error: 'Failed to load rules' });
+    res.status(500).json({ error: `Failed to load performance rules: ${err.message}. The database may be temporarily unavailable — reload the page.` });
   }
 });
 
@@ -100,7 +100,7 @@ router.get('/test-plans', auth, (req, res) => {
     res.json({ test_plans: testPlans, total: testPlans.length });
   } catch (err) {
     console.error('GET /api/test-plans', err);
-    res.status(500).json({ error: 'Failed to load test plans' });
+    res.status(500).json({ error: `Failed to load test plans: ${err.message}. The database may be temporarily unavailable — reload the page.` });
   }
 });
 
@@ -121,7 +121,7 @@ router.get('/test-data', auth, (req, res) => {
     res.json({ test_data: files, total: files.length });
   } catch (err) {
     console.error('GET /api/test-data', err);
-    res.status(500).json({ error: 'Failed to load test data' });
+    res.status(500).json({ error: `Failed to load test data files: ${err.message}. The database may be temporarily unavailable — reload the page.` });
   }
 });
 

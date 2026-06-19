@@ -9,6 +9,8 @@ export default function Dashboard({ projects: propProjects, user, onSelectProjec
   const [projects, setProjects] = useState(propProjects || []);
   const [stats,    setStats]    = useState({});
   const [loading,  setLoading]  = useState(true);
+  const [backups,  setBackups]  = useState([]);
+  const [backupsDir, setBackupsDir] = useState('');
 
   // Keep local projects in sync if parent refreshes the list
   useEffect(() => { if (propProjects?.length) setProjects(propProjects); }, [propProjects]);
@@ -50,11 +52,19 @@ export default function Dashboard({ projects: propProjects, user, onSelectProjec
           total_orgs:        orgCount,
         });
       })
-      .catch(() => {})
+      .catch(e => console.error('Dashboard stats load failed:', e?.message))
       .finally(() => setLoading(false));
   }
 
   useEffect(() => { fetchStats(); }, [propProjects?.length]);
+
+  useEffect(() => {
+    if (!isOrgAdmin && !isSuperAdmin) return;
+    api.get('/projects/backups').then(r => {
+      setBackups(r.data.backups || []);
+      setBackupsDir(r.data.backups_dir || '');
+    }).catch(() => {});
+  }, []);
 
   const orgCount = isSuperAdmin ? (stats.total_orgs || 0) : null;
 
@@ -222,6 +232,46 @@ export default function Dashboard({ projects: propProjects, user, onSelectProjec
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             {projects.map(p => <ProjectRow key={p.id} p={p} />)}
+          </div>
+        </div>
+      )}
+
+      {/* Deleted-project backups — admin only */}
+      {(isOrgAdmin || isSuperAdmin) && backups.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <div className="section-hdr" style={{ marginBottom: 10 }}>
+            <div className="section-title">
+              <i className="ti ti-archive" style={{ marginRight: 8, color: 'var(--accent)' }} />
+              Deleted Project Backups
+              <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--color-text-tertiary)', marginLeft: 8 }}>
+                {backups.length} backup{backups.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+          </div>
+          {backupsDir && (
+            <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 8, fontFamily: 'monospace', background: 'var(--color-bg-secondary)', padding: '4px 8px', borderRadius: 4 }}>
+              Stored at: {backupsDir}
+            </div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {backups.map(b => (
+              <div key={b.filename} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: 'var(--color-bg-secondary)', borderRadius: 8, border: '1px solid var(--color-border)' }}>
+                <i className="ti ti-file-zip" style={{ fontSize: 16, color: '#8b5cf6', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.filename}</div>
+                  <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
+                    {(b.size_bytes / 1024 / 1024).toFixed(2)} MB &nbsp;·&nbsp; {new Date(b.created_at).toLocaleString()}
+                  </div>
+                </div>
+                <a
+                  href={`/api/projects/backups/${encodeURIComponent(b.filename)}`}
+                  download={b.filename}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, background: 'var(--accent)', color: '#fff', fontSize: 12, fontWeight: 500, textDecoration: 'none' }}
+                >
+                  <i className="ti ti-download" style={{ fontSize: 12 }} /> Download
+                </a>
+              </div>
+            ))}
           </div>
         </div>
       )}
