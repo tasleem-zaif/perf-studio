@@ -767,7 +767,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           {/* Run row */}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
                             <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
-                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.run_name || r.script_name || '—'}</span>
+                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.exec_result_dir ? r.exec_result_dir.replace(/\\/g, '/').split('/').pop() : (r.run_name || r.script_name || '—')}</span>
                             <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
                             <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
                               {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}

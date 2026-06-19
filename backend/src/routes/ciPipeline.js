@@ -995,7 +995,14 @@ router.post('/trigger', async (req, res) => {
 // ── GET /runs — run history ───────────────────────────────────────────────────
 router.get('/runs', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const runs = db.prepare('SELECT * FROM ci_pipeline_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT 30').all(req.params.projectId);
+  const runs = db.prepare(`
+    SELECT c.*, e.result_dir AS exec_result_dir
+    FROM ci_pipeline_runs c
+    LEFT JOIN execution_runs e ON e.ci_run_id = c.id
+    WHERE c.project_id = ?
+    ORDER BY c.started_at DESC
+    LIMIT 30
+  `).all(req.params.projectId);
   res.json({ runs });
 });
 
@@ -1133,6 +1140,30 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
     if (reportData) reportData.rule_violations = autoViolations;
 
+    const suiteLookup = suiteId ? db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
+    const emailData = {
+      ...(reportData || {
+        meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'completed' },
+        summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
+        by_api: [], timeline: [], errors: [],
+      }),
+      rule_violations: autoViolations,
+    };
+    if (suiteLookup?.name) emailData.meta.suite_name = suiteLookup.name;
+
+    // Fire rule violation alert immediately — before PDF generation so it arrives early
+    if (autoViolations.length > 0) {
+      setImmediate(async () => {
+        try {
+          const { sendRuleViolationEmail } = require('../utils/emailUtils');
+          await sendRuleViolationEmail(null, userId, projectId, autoViolations, emailData.meta.suite_name, project.name);
+          console.log(`[Auto-sync] Rule violation email sent for CI run #${run.id}`);
+        } catch (e) {
+          console.error('[Auto-sync] Rule violation email failed:', e.message);
+        }
+      });
+    }
+
     // Generate analytics PDF
     let autoPdfPath = null;
     if (reportData && fs.existsSync(jtlPath)) {
@@ -1163,29 +1194,14 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
 
-    // Send emails non-blocking — rule violation alert first, then full report
+    // Send final report email (with PDF) after run is fully processed
     setImmediate(async () => {
       try {
-        const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
-
-        const suiteLookup = suiteId ? db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
-        const emailData = {
-          ...(reportData || {
-            meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'completed' },
-            summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
-            by_api: [], timeline: [], errors: [],
-          }),
-          rule_violations: autoViolations,
-        };
-        if (suiteLookup?.name) emailData.meta.suite_name = suiteLookup.name;
-
-        if (autoViolations.length > 0) {
-          await sendRuleViolationEmail(newRunId, userId, projectId, autoViolations, emailData.meta.suite_name, project.name);
-        }
+        const { sendAlertEmail } = require('../utils/emailUtils');
         await sendAlertEmail(newRunId, userId, projectId, emailData, autoPdfPath, null);
-        console.log(`[Auto-sync] Emails sent for CI run #${run.id} → exec run #${newRunId}`);
+        console.log(`[Auto-sync] Final report email sent for CI run #${run.id} → exec run #${newRunId}`);
       } catch (e) {
-        console.error('[Auto-sync] Email failed:', e.message);
+        console.error('[Auto-sync] Final report email failed:', e.message);
       }
     });
   } catch (e) {
@@ -1479,71 +1495,17 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         const runNum  = (resultDir.match(/Run_(\d+)/) || [])[1] || run.id;
         const tmpPdf  = path.join(resultDir, `Analytics_CI_Run_${runNum}.pdf`);
 
-        // Build reportData structure expected by generateAnalyticsPdfToFile
-        const content   = fs.readFileSync(jtlPath, 'utf8');
-        const lines     = content.trim().split('\n').filter(Boolean);
-        if (lines.length >= 2) {
-          const HNORM = { Latency:'latency', Connect:'connect', Bytes:'bytes', SentBytes:'sentBytes' };
-          const hdrs  = lines[0].split(',').map(h => { const c = h.trim().replace(/^"|"$/g,''); return HNORM[c]||c; });
-          const splitCsvLine = line => {
-            const cells = []; let cur = '', inQ = false;
-            for (const ch of line) {
-              if (ch === '"') inQ = !inQ;
-              else if (ch === ',' && !inQ) { cells.push(cur.trim()); cur = ''; }
-              else cur += ch;
-            } cells.push(cur.trim()); return cells;
-          };
-          const parseRow = ln => { const p=splitCsvLine(ln),r={}; hdrs.forEach((h,i)=>{r[h]=(p[i]||'').replace(/^"|"$/g,'').trim();}); return r; };
-          const pct = (arr,p) => { if(!arr.length)return null; const s=[...arr].sort((a,b)=>a-b); return s[Math.max(0,Math.ceil(p/100*s.length)-1)]; };
-
-          const allRows   = lines.slice(1).map(parseRow);
-          const elapsed   = allRows.map(r=>parseInt(r.elapsed)||0);
-          const totalReqs = allRows.length;
-          const totalFail = allRows.filter(r=>r.success==='false').length;
-          const tsList    = allRows.map(r=>parseInt(r.timeStamp)||0).filter(Boolean);
-          const durS      = tsList.length ? (Math.max(...tsList) - Math.min(...tsList))/1000 : 1;
-
-          const suite = db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
-
-          const byLabel = {};
-          allRows.forEach(r => {
-            const lbl = r.label || 'Unknown';
-            if (!byLabel[lbl]) byLabel[lbl] = { elapsed:[], success:0, failed:0 };
-            byLabel[lbl].elapsed.push(parseInt(r.elapsed)||0);
-            if (r.success === 'true') byLabel[lbl].success++; else byLabel[lbl].failed++;
-          });
-          const by_api = Object.entries(byLabel).map(([label, d]) => ({
-            label, total: d.elapsed.length, success: d.success, failed: d.failed,
-            error_rate: parseFloat(((d.failed / d.elapsed.length) * 100).toFixed(2)),
-            avg: parseFloat((d.elapsed.reduce((a,b)=>a+b,0) / d.elapsed.length).toFixed(1)),
-            p90: pct(d.elapsed, 90), p95: pct(d.elapsed, 95),
-            tps: parseFloat((d.elapsed.length / durS).toFixed(3)),
-          }));
-
-          reportData = {
-            meta: {
-              suite_name: suite?.name || run.script_name || 'CI Run',
-              engine: 'jmeter',
-              started_at: run.started_at,
-              duration_s: Math.round(durS),
-              status:     'completed',
-            },
-            summary: {
-              total_requests:    totalReqs,
-              total_failed:      totalFail,
-              total_success:     totalReqs - totalFail,
-              error_rate: parseFloat(((totalFail / (totalReqs || 1)) * 100).toFixed(2)),
-              avg_response_time: elapsed.length ? elapsed.reduce((a,b)=>a+b,0)/elapsed.length : 0,
-              min_response_time: elapsed.length ? Math.min(...elapsed.filter(v=>v>0)) : 0,
-              max_response_time: elapsed.length ? Math.max(...elapsed) : 0,
-              p90:               pct(elapsed, 90) || 0,
-              p95:               pct(elapsed, 95) || 0,
-              overall_tps:       durS > 0 ? totalReqs / durS : 0,
-            },
-            by_api, timeline: [], errors: [], rule_violations: [],
-          };
-
-          // Evaluate rules now so the PDF shows correct PASSED/FAILED status
+        // Parse JTL with the full parser (timeline, errors, bytes, latency, connect)
+        const { parseJtl } = require('../utils/parseJtl');
+        const suite = db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
+        reportData = parseJtl(jtlPath, {
+          suite_name: suite?.name || run.script_name || 'CI Run',
+          engine: 'jmeter',
+          started_at: run.started_at,
+          status: 'completed',
+        });
+        if (reportData) {
+          // Evaluate rules so PDF shows PASSED/FAILED correctly
           try {
             const { evaluateRules } = require('../utils/ruleEvaluator');
             const rr = evaluateRules(req.params.projectId, jtlPath);

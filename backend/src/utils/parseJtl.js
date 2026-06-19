@@ -71,6 +71,11 @@ function parseJtl(jtlPath, runMeta = {}) {
 
   const totalDuration = minTs < maxTs ? (maxTs - minTs) / 1000 : 1;
 
+  // Enrich meta with timing computed from JTL data if not already set
+  if (!runMeta.started_at  && minTs < Infinity) runMeta.started_at  = new Date(minTs).toISOString();
+  if (!runMeta.finished_at && maxTs > -Infinity) runMeta.finished_at = new Date(maxTs).toISOString();
+  if (!runMeta.duration_s)  runMeta.duration_s = Math.round(totalDuration);
+
   const by_api = Object.entries(byLabel).map(([label, d]) => {
     const total    = d.elapsed.length;
     const sum      = d.elapsed.reduce((a, b) => a + b, 0);

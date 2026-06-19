@@ -43,8 +43,16 @@ function buildHtml({ summary, by_api, timeline, errors, meta, rule_violations },
   const suiteName = meta.suite_name || 'Unknown';
   const runLabel  = `Run ${runNum || meta.run_id}`;
   const startedAt = meta.started_at  ? new Date(meta.started_at).toLocaleString()  : '—';
-  const finAt     = meta.finished_at ? new Date(meta.finished_at).toLocaleString() : '—';
-  const durS      = `${safeN(meta.duration_s).toFixed(1)}s`;
+
+  // Derive duration from timeline if not stored in meta (covers old cached report_data)
+  const tlLastSec     = timeline.length ? Math.max(...timeline.map(t => safeN(t.second))) : 0;
+  const effectiveDurS = safeN(meta.duration_s) || (tlLastSec > 0 ? tlLastSec + 1 : 0);
+  // Approximate finished_at from started_at + effective duration if not in meta
+  const effectiveFinAt = meta.finished_at ||
+    (meta.started_at && effectiveDurS > 0 ? new Date(new Date(meta.started_at).getTime() + effectiveDurS * 1000).toISOString() : null);
+
+  const finAt     = effectiveFinAt ? new Date(effectiveFinAt).toLocaleString() : '—';
+  const durS      = `${effectiveDurS.toFixed(1)}s`;
   const engine    = (meta.engine || 'JMeter').toUpperCase();
   const hasViolations = Array.isArray(rule_violations) && rule_violations.length > 0;
   const isBadStatus   = meta.status === 'failed' || meta.status === 'error';
@@ -240,7 +248,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
 
 <!-- ═══ PAGE 1: SUMMARY ═══════════════════════════════════════════════════ -->
 <div class="page">
-  ${hdr('Performance Analytics Report', `${suiteName} · ${runLabel} · ${startedAt}`)}
+  ${hdr('Summary Report', `${suiteName} · ${runLabel} · ${startedAt}`)}
   <div class="meta-row">
     <div class="meta-item"><div class="meta-lbl">Started</div><div class="meta-val">${esc(startedAt)}</div></div>
     <div class="meta-item"><div class="meta-lbl">Finished</div><div class="meta-val">${esc(finAt)}</div></div>
