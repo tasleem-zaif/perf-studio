@@ -14,7 +14,7 @@ export default function ForgotPassword() {
       await api.post('/auth/forgot-password', { email });
       setDone(true);
     } catch (err) {
-      setError(err.response?.data?.error || 'Something went wrong');
+      setError(err.response?.data?.error || 'Failed to send reset link — the server may be unreachable. Check your network connection and try again.');
     } finally { setLoading(false); }
   }
 

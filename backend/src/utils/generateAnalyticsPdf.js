@@ -364,13 +364,13 @@ ${CHARTJS_SRC}
 
   const baseOpts = (yFmt, y2, mode) => ({
     responsive:true, maintainAspectRatio:false,
-    animation:{ onComplete: chartDone },
+    animation:{ duration:0, onComplete: chartDone },
     interaction:{ mode: mode||'index', intersect:false },
     plugins:{ legend:{ display:false }, tooltip:{ ...TIPBG, callbacks: yFmt?{ label: ctx=>' '+yFmt(ctx.parsed.y) }:undefined } },
     scales: axes(yFmt, y2),
   });
 
-  // chart-ready counter
+  // chart-ready counter — duration:0 ensures onComplete fires even with empty data
   let total = 0, ready = 0;
   function chartDone() { if(++ready >= total) window.__chartsReady = true; }
 
@@ -378,7 +378,7 @@ ${CHARTJS_SRC}
     const el = document.getElementById(id);
     if (!el) { chartDone(); return; }
     total++;
-    try { new Chart(el, { type, data, options:{ ...opts, animation:{ onComplete: chartDone } } }); }
+    try { new Chart(el, { type, data, options:{ ...opts, animation:{ duration:0, onComplete: chartDone } } }); }
     catch(e) { chartDone(); }
   }
 
@@ -509,29 +509,60 @@ ${CHARTJS_SRC}
 
   // If no charts registered at all, mark ready immediately
   if (total === 0) window.__chartsReady = true;
+  // Fallback: force ready after 3s in case any chart fails to fire onComplete
+  setTimeout(() => { window.__chartsReady = true; }, 3000);
 })();
 </script>
 </html>`;
 }
 
 // ── shared Puppeteer PDF renderer ────────────────────────────────────────────
+// Strategy: screenshot each .page div individually then stitch with pdfkit.
+// This avoids CSS print-layout distortion and produces pixel-perfect pages.
 async function renderPdf(data, runNum) {
+  const PDFDocument = require('pdfkit');
+  const os = require('os');
   let browser;
+  const tmpFiles = [];
   try {
     browser = await puppeteer.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
-    await page.setViewport({ width: 1122, height: 794, deviceScaleFactor: 2 });
-    await page.setContent(buildHtml(data, runNum), { waitUntil: 'load' });
-    await page.waitForFunction(() => window.__chartsReady === true, { timeout: 20000 });
-    return await page.pdf({
-      format: 'A4', landscape: true, printBackground: true,
-      margin: { top: 0, right: 0, bottom: 0, left: 0 },
-    });
+    // A4 landscape at 96 DPI: 297mm × 210mm = 1122 × 794 px
+    // deviceScaleFactor:1.5 gives 1.5× resolution screenshots for crisp text/charts
+    await page.setViewport({ width: 1122, height: 794, deviceScaleFactor: 1.5 });
+    await page.setContent(buildHtml(data, runNum), { waitUntil: 'networkidle0' });
+    await page.waitForFunction(() => window.__chartsReady === true, { timeout: 8000 });
+
+    // Screenshot each .page div — write to temp files (pdfkit requires file path or stream, not raw Buffer)
+    const pageEls = await page.$$('.page');
+    for (let i = 0; i < pageEls.length; i++) {
+      const el = pageEls[i];
+      // Force page height to exactly 794px (A4 landscape) so screenshots are uniform
+      await page.evaluate(e => { e.style.minHeight = '794px'; e.style.height = '794px'; e.style.overflow = 'hidden'; }, el);
+      const tmpPath = path.join(os.tmpdir(), `perfstudio_page_${process.pid}_${i}.jpg`);
+      await el.screenshot({ type: 'jpeg', quality: 95, path: tmpPath });
+      tmpFiles.push(tmpPath);
+    }
+
+    // Build PDF: A4 landscape = 841.89 × 595.28 pt
+    const chunks = [];
+    const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0, autoFirstPage: false });
+    doc.on('data', c => chunks.push(c));
+    const done = new Promise((res, rej) => { doc.on('end', res); doc.on('error', rej); });
+    for (const tmpPath of tmpFiles) {
+      doc.addPage({ size: 'A4', layout: 'landscape', margin: 0 });
+      doc.image(tmpPath, 0, 0, { width: doc.page.width, height: doc.page.height });
+    }
+    doc.end();
+    await done;
+    return Buffer.concat(chunks);
   } finally {
     if (browser) await browser.close().catch(() => {});
+    // Clean up temp screenshot files
+    for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch (_) {} }
   }
 }
 

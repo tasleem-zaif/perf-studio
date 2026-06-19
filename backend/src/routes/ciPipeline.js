@@ -76,15 +76,74 @@ function apiRequest(urlStr, method, body, headers = {}) {
   });
 }
 
+// ── Helper: parse "owner/repo" from any GitHub remote URL ────────────────────
+function parseOwnerRepo(url) {
+  if (!url) return '';
+  // HTTPS: https://github.com/owner/repo.git  (may have token@ prefix)
+  const m = url.match(/github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?(?:\s|$)/);
+  return m ? m[1] : '';
+}
+
+// ── Helper: get github_repo from git config remote URL (fallback) ─────────────
+function getRepoFromGit(projectId) {
+  const gitCfg = db.prepare('SELECT remote_url FROM git_configs WHERE project_id = ?').get(projectId);
+  return gitCfg?.remote_url ? parseOwnerRepo(gitCfg.remote_url) : '';
+}
+
+// ── Helper: extract PAT from the git remote URL (ghp_... embedded in URL) ─────
+function getTokenFromGitRemote(projectId) {
+  try {
+    const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
+    const proj = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
+    if (!proj) return null;
+    // Check both admin and any user-N workspace for a remote URL with an embedded token
+    const wsBase = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name));
+    const dirs = [path.join(wsBase, 'admin')];
+    const fs2 = require('fs');
+    if (fs2.existsSync(wsBase)) {
+      for (const d of fs2.readdirSync(wsBase)) {
+        const full = path.join(wsBase, d);
+        if (d !== 'admin' && fs2.statSync(full).isDirectory()) dirs.push(full);
+      }
+    }
+    for (const dir of dirs) {
+      const configPath = path.join(dir, '.git', 'config');
+      if (!fs2.existsSync(configPath)) continue;
+      const content = fs2.readFileSync(configPath, 'utf8');
+      const m = content.match(/https?:\/\/(ghp_[^@\s]+|github_pat_[^@\s]+)@github\.com/);
+      if (m) return m[1];
+    }
+  } catch {}
+  return null;
+}
+
+// ── Helper: sanitise and validate a github_repo value ─────────────────────────
+// Accepts:  "owner/repo"  or  "https://github.com/owner/repo.git"
+// Rejects:  email addresses, bare names without a slash, etc.
+function sanitizeGithubRepo(raw) {
+  if (!raw) return '';
+  let v = raw.trim();
+  // Strip full URL down to owner/repo
+  v = v.replace(/^https?:\/\/[^@]*@?github\.com\//, '').replace(/\.git$/, '').trim();
+  // Must look like  word/word  — no @ signs allowed
+  return /^[\w.-]+\/[\w.-]+$/.test(v) ? v : '';
+}
+
 // ── GET /config — returns the CALLING USER's own CI config ───────────────────
 router.get('/config', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const cfg = getConfig(req.params.projectId, req.userId);
   if (!cfg) return res.json({ config: null });
 
+  // Auto-derive github_repo from the project's git remote URL if the stored
+  // value is missing or invalid (e.g. user accidentally entered their email).
+  let github_repo = sanitizeGithubRepo(cfg.github_repo);
+  if (!github_repo) github_repo = getRepoFromGit(req.params.projectId);
+
   res.json({
     config: {
       ...cfg,
+      github_repo,
       gitlab_token:             cfg.gitlab_token         ? '••••••••' : '',
       gitlab_trigger_token:     cfg.gitlab_trigger_token ? '••••••••' : '',
       github_token:             cfg.github_token         ? '••••••••' : '',
@@ -107,11 +166,17 @@ router.put('/config', (req, res) => {
   // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
-    github_enabled, github_repo, github_token, github_workflow_file, github_ref,
+    github_enabled, github_token, github_workflow_file, github_ref,
   } = req.body;
+
+  // Sanitize github_repo: strip full URLs, reject email addresses
+  const github_repo = sanitizeGithubRepo(req.body.github_repo)
+    || getRepoFromGit(req.params.projectId);
 
   // Look up THIS user's own config row (project_id + user_id)
   const existing = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(req.params.projectId, req.userId);
+  const gitCfgDefault = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const defaultBranch = gitCfgDefault?.base_branch || 'main';
 
   const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'         ? encrypt(gitlab_token)         : existing?.gitlab_token         || '';
   const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••' ? encrypt(gitlab_trigger_token) : existing?.gitlab_trigger_token || '';
@@ -126,9 +191,9 @@ router.put('/config', (req, res) => {
       WHERE project_id=? AND user_id=?`
     ).run(
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
-      encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
+      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
-      github_workflow_file || 'perf-test.yml', github_ref || 'main',
+      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch,
       req.params.projectId, req.userId
     );
   } else {
@@ -139,9 +204,9 @@ router.put('/config', (req, res) => {
     ).run(
       req.params.projectId, req.userId,
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
-      encGitlabToken, encGitlabTriggerToken, gitlab_ref || 'main',
+      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
-      github_workflow_file || 'perf-test.yml', github_ref || 'main'
+      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch
     );
   }
 
@@ -221,17 +286,20 @@ router.post('/generate-yaml', async (req, res) => {
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
-  // Determine workspace: org/super admins write to shared admin workspace;
-  // regular users write to their own workspace so they can push to their branch.
-  const callerRow = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  // Use per-project workspace (new structure: git-workspaces/<ProjectName>/admin/)
+  const callerRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
-  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
-  const userFolder = isAdmin ? 'admin' : `user-${req.userId}`;
-  const gitRoot    = path.join(GIT_WORKSPACES_ROOT, userFolder);
-  fs.mkdirSync(gitRoot, { recursive: true }); // ensure dir exists even before first git init
+  const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder } = require('../utils/projectFolders');
+  const userFolder   = resolveUserFolder(req.userId);
+  const cleanProject = (project.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+  const gitRoot      = path.join(GIT_WORKSPACES_ROOT, cleanProject, userFolder);
+  fs.mkdirSync(gitRoot, { recursive: true });
 
   // Get all generated test plans for this project to include as YAML comments
   const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
+
+  const gitCfgBase = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const baseBranch = gitCfgBase?.base_branch || 'main';
 
   const created = [];
   const errors  = [];
@@ -241,7 +309,7 @@ router.post('/generate-yaml', async (req, res) => {
     const defaultScript = suites.length > 0
       ? path.basename(suites[0].jmx_path || suites[0].js_path || 'test.jmx')
       : 'test.jmx';
-    const ref = cfg?.gitlab_ref || 'main';
+    const ref = cfg?.gitlab_ref || baseBranch;
 
     const scriptList = suites.map(s => {
       const file = path.basename(s.jmx_path || s.js_path || '');
@@ -323,6 +391,10 @@ run_jmeter:
       ? path.basename(suites[0].jmx_path || suites[0].js_path || 'test.jmx')
       : 'test.jmx';
 
+    // The branch where user scripts live — passed as a workflow input so the
+    // checkout step fetches the right branch even when the workflow file lives on main.
+    const userBranch = cfg?.github_ref || (isAdmin ? baseBranch : `feature/${(callerRow?.name || 'user').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
+
     const scriptList = suites.map(s => {
       const relPath = s.jmx_path
         ? path.relative(gitRoot, s.jmx_path).replace(/\\/g, '/')
@@ -364,6 +436,10 @@ on:
         description: 'Test duration in seconds'
         required: true
         default: '300'
+      branch:
+        description: 'Branch containing the test scripts (user workspace branch)'
+        required: false
+        default: '${userBranch}'
 
 # Available test scripts:
 ${scriptList || '      # (no generated scripts yet)'}
@@ -375,6 +451,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: \${{ inputs.branch || github.ref_name }}
 
       - name: Patch JMX parameters
         run: |
@@ -474,16 +552,24 @@ def sp(xml, name, val):
     return new
 
 # Fix absolute local paths -> CI workspace paths
-# Replaces Windows paths like C:/Users/.../git-workspaces/user-X/ with /workspace/
-# so JMeter finds CSV test data files inside the Docker container
-path_pattern = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]'
+# Strips Windows paths up to and including git-workspaces/<project>/<user>/
+# so JMeter finds files relative to /workspace (the Docker-mounted repo root).
+path_pattern = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\][^/\\\\]+[/\\\\]'
 fixed_content, path_fixes = re.subn(path_pattern, '/workspace/', content)
 if path_fixes:
     fixed_content = fixed_content.replace('\\\\', '/')
     content = fixed_content
     print("  FIXED " + str(path_fixes) + " absolute path(s) -> /workspace/")
 else:
-    print("  No absolute paths to fix")
+    # Fallback: old single-level structure git-workspaces/<user>/
+    path_pattern_old = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]'
+    fixed_content, path_fixes = re.subn(path_pattern_old, '/workspace/', content)
+    if path_fixes:
+        fixed_content = fixed_content.replace('\\\\', '/')
+        content = fixed_content
+        print("  FIXED " + str(path_fixes) + " absolute path(s) (old structure) -> /workspace/")
+    else:
+        print("  No absolute paths to fix")
 
 content = sp(content, "ThreadGroup.num_threads", users)
 content = sp(content, "ThreadGroup.ramp_time", rampup)
@@ -523,8 +609,51 @@ print("Patch complete")
   }
 
   if (created.length === 0) return res.status(500).json({ error: errors.join('; ') || 'Nothing generated' });
-  const branchHint = isAdmin ? 'main' : (db.prepare('SELECT branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId)?.branch_name || 'your branch');
-  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}. Go to Configuration → Git, commit and push these files to ${branchHint}.` });
+
+  // Auto-commit and push to remote so the workflow is immediately available on GitHub.
+  // The perf-test.yml MUST be on the remote default branch (main) for workflow_dispatch to work.
+  let pushMessage = '';
+  try {
+    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+    if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
+      const simpleGit = require('simple-git');
+      const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
+
+      // Build authenticated remote URL
+      const { decrypt: dec } = require('../utils/encryption');
+      const rawToken  = gitCfg.auth_token ? dec(gitCfg.auth_token) : '';
+      const remoteUrl = rawToken
+        ? gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawToken)}@`)
+        : gitCfg.remote_url;
+
+      const git = simpleGit({ baseDir: gitRoot, env: { ...process.env, ...NO_PROMPT } });
+
+      // Configure identity
+      await git.addConfig('user.name',  callerRow.name  || 'PerfStudio');
+      await git.addConfig('user.email', callerRow.email || 'noreply@perfstudio.com');
+
+      // Checkout base branch (workflow must be on default branch for workflow_dispatch to work)
+      const autoCommitBranch = gitCfg?.base_branch || baseBranch;
+      try { await git.checkout(autoCommitBranch); } catch {}
+      await git.remote(['set-url', 'origin', remoteUrl]);
+
+      // Stage and commit only the generated CI files
+      await git.add(created.map(f => path.join(gitRoot, f)));
+      const status = await git.status();
+      if (status.staged.length > 0) {
+        await git.commit('ci: add PerfStudio performance test workflow [auto]');
+        try { await git.addConfig('credential.helper', '', false, 'local'); await git.addConfig('credential.https://github.com.helper', '', false, 'local'); } catch {}
+        await git.push(['--set-upstream', 'origin', autoCommitBranch]);
+        pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
+      } else {
+        pushMessage = ` Files unchanged — already up to date on ${autoCommitBranch}.`;
+      }
+    }
+  } catch (pushErr) {
+    errors.push(`Auto-push failed: ${pushErr.message} — go to Configuration → Git and push manually.`);
+  }
+
+  res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}.${pushMessage}` });
 });
 
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
@@ -536,6 +665,16 @@ router.post('/trigger', async (req, res) => {
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
+  // Build human-readable run_name: {SuiteName}_{N}Users_{D}sDuration (no Run# yet — added on sync)
+  const { buildRunDirName } = require('../utils/buildRunName');
+  const scriptFile2 = (script_name || '').replace(/\\/g, '/').split('/').pop();
+  const matchedSuite2 = db.prepare("SELECT name FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+    .get(req.params.projectId, `%${scriptFile2}`, `%${scriptFile2}`);
+  const ciRunDisplayName = buildRunDirName(
+    matchedSuite2?.name || scriptFile2.replace(/\.jmx$|\.js$/, ''),
+    jmeter_users, 'duration', jmeter_loops, jmeter_duration, ''
+  ).replace(/_Run$/, ''); // strip trailing _Run (no seq# at trigger time)
+
   // Token priority for CI triggers:
   // 1. CI config token (saved specifically for CI/CD under Configuration → Pipeline)
   // 2. User's Git Identity PAT as fallback
@@ -544,10 +683,108 @@ router.post('/trigger', async (req, res) => {
     .get(req.userId, req.params.projectId);
   const userToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : null;
 
-  const effectiveGithubToken = cfg.github_token || userToken;
+  const effectiveGithubToken = cfg.github_token || userToken || getTokenFromGitRemote(req.params.projectId);
   const effectiveGitlabToken = cfg.gitlab_token || cfg.gitlab_trigger_token || userToken;
 
   const variables = { script_name, script_path: script_path || '', jmeter_users: String(jmeter_users || 10), jmeter_rampup: String(jmeter_rampup || 30), jmeter_loops: String(jmeter_loops || 1), jmeter_duration: String(jmeter_duration || 300) };
+
+  // ── Compute targetRef here so it is in scope for both auto-push and dispatch ─
+  const callerRow2  = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const isAdmin2    = ['org_admin', 'super_admin'].includes(callerRow2?.role);
+  const gitCfgTrigger = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const baseBranch2 = gitCfgTrigger?.base_branch || 'main';
+  const targetRef   = cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
+
+  // ── Auto-push script file to the target branch before dispatching ──────────
+  // The CI runner checks out the branch from GitHub — the JMX file must exist
+  // there or the Patch JMX step will fail with FileNotFoundError.
+  try {
+    const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder: resolveUF } = require('../utils/projectFolders');
+    const projectRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+    const userFolder  = resolveUF(req.userId);
+    const wsRoot      = path.join(GIT_WORKSPACES_ROOT, cleanName(projectRow?.name || ''), userFolder);
+
+    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+    if (gitCfg?.is_initialized && fs.existsSync(path.join(wsRoot, '.git'))) {
+      const simpleGit2 = require('simple-git');
+      const NO_PROMPT2 = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
+
+      // Use user's PAT to push to their branch
+      const rawTok  = userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
+      const authUrl = rawTok
+        ? gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawTok)}@`)
+        : gitCfg.remote_url;
+
+      const git2 = simpleGit2({ baseDir: wsRoot, env: { ...process.env, ...NO_PROMPT2 } });
+      await git2.addConfig('user.name',  callerRow2?.name  || 'PerfStudio');
+      await git2.addConfig('user.email', callerRow2?.email || 'noreply@perfstudio.com');
+      await git2.remote(['set-url', 'origin', authUrl]);
+      await git2.fetch(['origin']).catch(() => {});
+      try {
+        await git2.checkout(targetRef);
+      } catch {
+        // Branch may exist on remote but not locally — try to track it
+        try { await git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]); }
+        catch { await git2.checkoutLocalBranch(targetRef); }
+      }
+      // Sync with remote BEFORE committing new files so the push is fast-forward.
+      // Without this, if origin/main has new commits (workflow file updates, CI artifacts, etc.)
+      // the push would be rejected as non-fast-forward and the JMX would never reach GitHub.
+      try { await git2.raw(['merge', '--ff-only', `origin/${targetRef}`]); } catch {}
+      try { await git2.raw(['reset', '--hard', `origin/${targetRef}`]); } catch {}
+
+      // Copy the JMX/JS file into the workspace if it only exists in admin workspace.
+      // Look up the absolute path from test_suites (jmx_path / js_path) — don't rely on
+      // project.folder_path + script_path which points to the wrong location for new plans.
+      if (script_name) {
+        const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
+        const suiteRow   = db.prepare(
+          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+
+        // Determine the absolute source path from the suite record
+        let srcAbs = suiteRow?.jmx_path || suiteRow?.js_path || '';
+        // Fallback: search all workspace roots for the file
+        if (!srcAbs || !fs.existsSync(srcAbs)) {
+          const { GIT_WORKSPACES_ROOT: _wsRoot2, cleanName: _cn2 } = require('../utils/projectFolders');
+          const pName   = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId)?.name || '';
+          const pFolder = path.join(_wsRoot2, _cn2(pName));
+          try {
+            const allDirs = fs.readdirSync(pFolder, { withFileTypes: true })
+              .filter(d => d.isDirectory()).map(d => path.join(pFolder, d.name));
+            for (const d of allDirs) {
+              const candidate = path.join(d, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
+              if (fs.existsSync(candidate)) { srcAbs = candidate; break; }
+            }
+          } catch {}
+        }
+
+        const destAbs = path.join(wsRoot, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
+        if (srcAbs && fs.existsSync(srcAbs) && !fs.existsSync(destAbs)) {
+          fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+          fs.copyFileSync(srcAbs, destAbs);
+        }
+      }
+
+      // Stage everything new and push
+      await git2.add('.');
+      const st2 = await git2.status();
+      if (st2.staged.length > 0 || st2.not_added.length > 0) {
+        await git2.add('.');
+        await git2.commit(`ci: sync scripts for pipeline run [auto]`);
+      }
+      // Disable GCM account picker in local .git/config before every push
+      try {
+        await git2.addConfig('credential.helper', '', false, 'local');
+        await git2.addConfig('credential.https://github.com.helper', '', false, 'local');
+      } catch {}
+      // Push branch (set upstream if first time)
+      await git2.push(['--set-upstream', 'origin', targetRef]);
+    }
+  } catch (syncErr) {
+    console.warn('[CI trigger] Auto-push script failed:', syncErr.message);
+    // Non-fatal — proceed with dispatch anyway; user may have pushed manually
+  }
 
   try {
     // ── GitLab trigger ─────────────────────────────────────────────────────
@@ -557,7 +794,7 @@ router.post('/trigger', async (req, res) => {
 
       const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
       const encodedId = encodeURIComponent(cfg.gitlab_project_id);
-      const ref       = cfg.gitlab_ref || 'main';
+      const ref       = cfg.gitlab_ref || baseBranch2;
 
       // Build form-encoded body (GitLab trigger API uses form data)
       const params = new URLSearchParams();
@@ -593,9 +830,9 @@ router.post('/trigger', async (req, res) => {
       });
 
       if (r.status === 201) {
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?)')
-          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, JSON.stringify(variables), req.userId);
-        return res.json({ ok: true, run_id: run.lastInsertRowid, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
+        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
+          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId);
+        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
       }
       return res.status(400).json({ error: `GitLab returned ${r.status}: ${JSON.stringify(r.body)}` });
     }
@@ -603,10 +840,16 @@ router.post('/trigger', async (req, res) => {
     // ── GitHub Actions trigger ─────────────────────────────────────────────
     if (provider === 'github') {
       if (!effectiveGithubToken) return res.status(400).json({ error: 'No GitHub token available. Save your Personal Access Token in Git Identity (Configuration → Git).' });
-      if (!cfg.github_repo)      return res.status(400).json({ error: 'GitHub repo (owner/repo) not set in CI configuration.' });
+
+      // Sanitize at trigger time — catches any stale invalid values in the DB
+      const githubRepo = sanitizeGithubRepo(cfg.github_repo) || getRepoFromGit(req.params.projectId);
+      if (!githubRepo) return res.status(400).json({ error: 'GitHub repo not set. Open CI Configuration and set it to "owner/repo" (e.g. tasleemzaif85/Project-Demo).' });
+      cfg.github_repo = githubRepo;
 
       const workflowFile = cfg.github_workflow_file || 'perf-test.yml';
-      const ref          = cfg.github_ref || 'main';
+      // Dispatch to the base branch — perf-test.yml with workflow_dispatch trigger lives on the default branch.
+      // cfg.github_ref is the user's scripts branch, but the workflow file must be on the base branch.
+      const ref = baseBranch2;
       const ghHeaders    = {
         Authorization:          `token ${effectiveGithubToken}`,
         'User-Agent':           'PerfStudio',
@@ -614,7 +857,7 @@ router.post('/trigger', async (req, res) => {
         'X-GitHub-Api-Version': '2022-11-28',
       };
       const dispatchBody = {
-        ref,
+        ref,  // base branch — GitHub requires workflow_dispatch ref to be the branch where perf-test.yml lives
         inputs: {
           script_name:     script_name || 'test.jmx',
           script_path:     script_path || '',
@@ -622,6 +865,10 @@ router.post('/trigger', async (req, res) => {
           jmeter_rampup:   String(jmeter_rampup || 30),
           jmeter_loops:    String(jmeter_loops || 1),
           jmeter_duration: String(jmeter_duration || 300),
+          // Tell the workflow which branch to checkout for scripts/data.
+          // For regular users this is their personal branch (users/<name>);
+          // for admins it is the base branch. This is separate from the dispatch ref above.
+          branch: targetRef,
         },
       };
 
@@ -707,16 +954,34 @@ router.post('/trigger', async (req, res) => {
       }
 
       if (r.status === 204) {
-        await new Promise(r => setTimeout(r, 2000));
-        const runsResp = await apiRequest(
-          `https://api.github.com/repos/${cfg.github_repo}/actions/runs?event=workflow_dispatch&per_page=1`,
-          'GET', null,
-          { Authorization: `token ${effectiveGithubToken}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
-        );
-        const latestRun = runsResp.body?.workflow_runs?.[0];
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?)')
-          .run(req.params.projectId, 'github', latestRun ? String(latestRun.id) : null, latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, latestRun?.status || 'queued', script_name, JSON.stringify(variables), req.userId);
-        return res.json({ ok: true, run_id: run.lastInsertRowid, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions' });
+        // Wait for GitHub to create the run record, then look for it.
+        // We must verify the run was created AFTER we dispatched (within 30 s)
+        // to avoid picking up a stale completed run from the history.
+        const dispatchedAt = new Date();
+        let latestRun = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          const runsResp = await apiRequest(
+            `https://api.github.com/repos/${cfg.github_repo}/actions/runs?event=workflow_dispatch&per_page=5`,
+            'GET', null,
+            { Authorization: `token ${effectiveGithubToken}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+          );
+          const recentRun = (runsResp.body?.workflow_runs || []).find(wr => {
+            const createdAt = new Date(wr.created_at);
+            return createdAt >= new Date(dispatchedAt.getTime() - 5000); // allow 5 s clock skew
+          });
+          if (recentRun) { latestRun = recentRun; break; }
+        }
+
+        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
+          .run(
+            req.params.projectId, 'github',
+            latestRun ? String(latestRun.id) : null,
+            latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`,
+            latestRun?.status || 'queued',
+            script_name, ciRunDisplayName, JSON.stringify(variables), req.userId
+          );
+        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions' });
       }
       return res.status(400).json({ error: `GitHub returned ${r.status}: ${JSON.stringify(r.body)}` });
     }
@@ -733,6 +998,184 @@ router.get('/runs', (req, res) => {
   const runs = db.prepare('SELECT * FROM ci_pipeline_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT 30').all(req.params.projectId);
   res.json({ runs });
 });
+
+// ── Auto-sync helper — called when status poll detects completion ─────────────
+// Creates an execution_runs record from CI artifacts so Analytics shows the run.
+async function autoSyncCiRun(run, cfg, projectId, userId) {
+  const os      = require('os');
+  const AdmZip  = require('adm-zip');
+  const { parseJtl } = require('../utils/parseJtl');
+  const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  if (!project) return;
+
+  // Guard: never create duplicate execution_runs for the same CI run
+  const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  if (alreadySynced) { console.log(`[Auto-sync] CI run #${run.id} already synced → skipping`); return; }
+
+  const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(userId)?.role;
+  const userProjPath = getUserProjectPath(userId, callerRole, project.name);
+  const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
+
+  // Parse CI parameters for the run name
+  const ciVars    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+  const ciUsers   = ciVars.jmeter_users   || ciVars.script_users   || null;
+  const ciLoops   = ciVars.jmeter_loops   || null;
+  const ciDur     = ciVars.jmeter_duration|| null;
+
+  // Determine result directory
+  let resultDir = null;
+  let suiteName = null;
+  if (run.script_name) {
+    const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
+    const suite = db.prepare(`
+      SELECT ts.*, c.name as col_name FROM test_suites ts
+      LEFT JOIN collections c ON c.id = ts.collection_id
+      WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?) LIMIT 1
+    `).get(projectId, `%${scriptFile}`, `%${scriptFile}`);
+    suiteName = suite?.name || null;
+    if (suite?.col_name && suite?.env) {
+      const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
+      try { require('fs').mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
+      let nums = [];
+      try { nums = require('fs').readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
+      const runDirName = buildRunDirName(suiteName || scriptFile.replace(/\.jmx$/, ''), ciUsers, 'duration', ciLoops, ciDur, nextRun);
+      resultDir = path.join(envPath, 'results', runDirName);
+    }
+  }
+  if (!resultDir) {
+    try {
+      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const next = nums.length ? Math.max(...nums) + 1 : 1;
+      const scriptBase = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
+      resultDir = path.join(userProjPath, 'results', buildRunDirName(suiteName || scriptBase, ciUsers, 'duration', ciLoops, ciDur, next));
+    } catch {
+      resultDir = path.join(userProjPath, 'results', `CI_Run_${run.id}`);
+    }
+  }
+  fs.mkdirSync(resultDir, { recursive: true });
+
+  const tmpZip = path.join(os.tmpdir(), `ci_auto_${run.id}_${Date.now()}.zip`);
+
+  try {
+    if (run.provider === 'github') {
+      if (!cfg.github_token) throw new Error('No GitHub token');
+      const ghHeaders = { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' };
+      const artifactsResp = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`, 'GET', null, ghHeaders);
+      if (artifactsResp.status !== 200 || !artifactsResp.body?.artifacts?.length) throw new Error('No artifacts yet');
+      const artifact = artifactsResp.body.artifacts[0];
+      const dlResp = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/artifacts/${artifact.id}/zip`, 'GET', null, ghHeaders);
+      const downloadUrl = dlResp.headers?.location || dlResp.headers?.Location;
+      if (!downloadUrl) throw new Error('No download URL');
+      await new Promise((resolve, reject) => {
+        const fileStream = fs.createWriteStream(tmpZip);
+        https.get(downloadUrl, { rejectUnauthorized: false }, response => {
+          if (response.statusCode === 302 || response.statusCode === 301) {
+            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => { r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); }); }).on('error', reject);
+          } else { response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); }); }
+        }).on('error', reject);
+      });
+    } else if (run.provider === 'gitlab') {
+      if (!cfg.gitlab_token) throw new Error('No GitLab token');
+      const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
+      const encodedId = encodeURIComponent(cfg.gitlab_project_id);
+      const jobsResp = await apiRequest(`${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`, 'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token });
+      if (jobsResp.status !== 200 || !jobsResp.body?.length) throw new Error('No jobs found');
+      const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
+      if (!job?.id) throw new Error('No artifact job');
+      await new Promise((resolve, reject) => {
+        const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
+        const urlObj = new URL(artifactUrl);
+        const fileStream = fs.createWriteStream(tmpZip);
+        https.request({ hostname: urlObj.hostname, port: urlObj.port || 443, path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false }, response => {
+          response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+        }).on('error', reject).end();
+      });
+    }
+
+    if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) throw new Error('Empty zip');
+
+    const zip = new AdmZip(tmpZip);
+    zip.extractAllTo(resultDir, true);
+    fs.unlinkSync(tmpZip);
+
+    // Normalise html → report folder
+    const ciHtmlDir = path.join(resultDir, 'html');
+    const localHtmlDir = path.join(resultDir, 'report');
+    if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) fs.renameSync(ciHtmlDir, localHtmlDir);
+
+    const jtlPath    = path.join(resultDir, 'results.jtl');
+    const reportPath = path.join(localHtmlDir, 'index.html');
+
+    // Resolve suite_id
+    let suiteId = null;
+    if (run.script_name) {
+      const sf = run.script_name.split('/').pop();
+      const s = db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${sf}`, `%${sf}`);
+      suiteId = s?.id || null;
+    }
+
+    const reportData = fs.existsSync(jtlPath) ? parseJtl(jtlPath, {
+      suite_name: suiteId ? db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId)?.name : (run.script_name || 'CI Run'),
+      engine: 'jmeter', started_at: run.started_at,
+    }) : null;
+
+    const execInsert = db.prepare(`
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
+      VALUES (?, ?, 'jmeter', 'completed', ?, ?, ?, ?, datetime('now'), ?, ?)
+    `).run(
+      projectId, suiteId, resultDir,
+      fs.existsSync(reportPath) ? reportPath : null,
+      JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
+      run.started_at || new Date().toISOString(),
+      reportData ? JSON.stringify(reportData) : null,
+      run.id
+    );
+    const newRunId = execInsert.lastInsertRowid;
+
+    console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
+
+    // Send emails non-blocking — rule violation alert first, then full report
+    setImmediate(async () => {
+      try {
+        const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
+        const { evaluateRules } = require('../utils/ruleEvaluator');
+
+        let violations = [];
+        if (fs.existsSync(jtlPath)) {
+          try {
+            const rr = evaluateRules(projectId, jtlPath);
+            violations = rr?.violations || [];
+          } catch (_) {}
+        }
+
+        const suiteLookup = suiteId ? db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
+        const emailData = {
+          ...(reportData || {
+            meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'completed' },
+            summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
+            by_api: [], timeline: [], errors: [],
+          }),
+          rule_violations: violations,
+        };
+        if (suiteLookup?.name) emailData.meta.suite_name = suiteLookup.name;
+
+        if (violations.length > 0) {
+          await sendRuleViolationEmail(newRunId, userId, projectId, violations, emailData.meta.suite_name, project.name);
+        }
+        await sendAlertEmail(newRunId, userId, projectId, emailData, null, null);
+        console.log(`[Auto-sync] Emails sent for CI run #${run.id} → exec run #${newRunId}`);
+      } catch (e) {
+        console.error('[Auto-sync] Email failed:', e.message);
+      }
+    });
+  } catch (e) {
+    try { if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip); } catch {}
+    console.warn(`[Auto-sync] CI run #${run.id} failed: ${e.message}`);
+  }
+}
 
 // ── GET /runs/:runId/status — poll live status from provider ─────────────────
 router.get('/runs/:runId/status', async (req, res) => {
@@ -786,6 +1229,50 @@ router.get('/runs/:runId/status', async (req, res) => {
     db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=datetime('now')" : '') + ' WHERE id=?')
       .run(mappedStatus, webUrl, run.id);
 
+    // Auto-sync: first time this run reaches "completed", download artifacts and
+    // create an execution_runs record so it appears in Analytics automatically.
+    if (mappedStatus === 'completed' && run.status !== 'completed') {
+      const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+      if (!alreadySynced) {
+        const runSnapshot = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
+        setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId).catch(() => {}));
+      }
+    }
+
+    // Send email alert for failed / cancelled runs (completed runs get email via autoSyncCiRun)
+    const wasFinished = ['completed','failed','cancelled','skipped'].includes(run.status);
+    if (!wasFinished && ['failed','cancelled'].includes(mappedStatus)) {
+      setImmediate(async () => {
+        try {
+          const { sendAlertEmail } = require('../utils/emailUtils');
+          const ciVarsF = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+          const emailData = {
+            meta: {
+              suite_name: `${run.run_name || run.script_name || 'CI Run'} [${mappedStatus.toUpperCase()}]`,
+              engine: 'jmeter',
+              started_at: run.started_at,
+              duration_s: run.finished_at
+                ? Math.round((new Date(run.finished_at) - new Date(run.started_at)) / 1000)
+                : 0,
+              status: mappedStatus,
+              ci_provider: run.provider,
+              ci_web_url: webUrl,
+            },
+            summary: {
+              total_requests: 0, total_success: 0, total_failed: 0,
+              error_rate: 0, avg_response_time: 0, overall_tps: 0, p90: 0, p95: 0,
+            },
+            by_api: [], timeline: [], errors: [{ type: 'CI Pipeline', message: `Pipeline ${mappedStatus} on ${run.provider}` }],
+            rule_violations: [],
+          };
+          await sendAlertEmail(null, req.userId, req.params.projectId, emailData, null, null);
+          console.log(`[CI Status] Alert email sent for ${mappedStatus} run #${run.id}`);
+        } catch (e) {
+          console.error('[CI Status] Failed email for', mappedStatus, 'run:', e.message);
+        }
+      });
+    }
+
     res.json({ run: { ...run, status: mappedStatus, web_url: webUrl } });
   } catch (e) {
     res.json({ run, poll_error: e.message });
@@ -800,6 +1287,10 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
 
+  // Guard: don't create a second execution_runs record for the same CI run
+  const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  if (alreadySynced) return res.json({ ok: true, already_synced: true, execution_run_id: alreadySynced.id, message: 'Already synced — results are already in Analytics.' });
+
   const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
 
@@ -809,13 +1300,20 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const AdmZip = require('adm-zip');
   const os = require('os');
   const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+  const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
   // ── Determine results directory ────────────────────────────────────────────
-  // Find test suite by script name to get collection + env
   const callerRole  = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
   const userProjPath = getUserProjectPath(req.userId, callerRole, project.name);
 
+  // Parse CI parameters for the run name
+  const ciVars2  = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+  const ciUsers2 = ciVars2.jmeter_users    || null;
+  const ciLoops2 = ciVars2.jmeter_loops    || null;
+  const ciDur2   = ciVars2.jmeter_duration || null;
+
   let resultDir = null;
+  let syncSuiteName = null;
   if (run.script_name) {
     const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
     const suite = db.prepare(`
@@ -826,28 +1324,25 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       LIMIT 1
     `).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
 
+    syncSuiteName = suite?.name || null;
     if (suite?.col_name && suite?.env) {
       const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
-      // Get next run number
-      const existing = fs.readdirSync(path.join(envPath, 'results').replace(/\\/g, '/'), { withFileTypes: true })
-        .filter(d => d.isDirectory() && d.name.startsWith('Run_'))
-        .map(d => parseInt(d.name.replace('Run_', '')) || 0);
       try { fs.mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
-      let dirs = [];
-      try { dirs = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && d.name.startsWith('Run_')).map(d => parseInt(d.name.replace('Run_', '')) || 0); } catch {}
-      const nextRun = dirs.length ? Math.max(...dirs) + 1 : 1;
-      resultDir = path.join(envPath, 'results', `Run_${nextRun}`);
+      let nums = [];
+      try { nums = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
+      const syncScriptBase = scriptFile.replace(/\.jmx$/, '');
+      resultDir = path.join(envPath, 'results', buildRunDirName(syncSuiteName || syncScriptBase, ciUsers2, 'duration', ciLoops2, ciDur2, nextRun));
     }
   }
 
   // Fallback to project-level results
   if (!resultDir) {
     try {
-      const dirs = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true })
-        .filter(d => d.isDirectory() && d.name.startsWith('Run_'))
-        .map(d => parseInt(d.name.replace('Run_', '')) || 0);
-      const next = dirs.length ? Math.max(...dirs) + 1 : 1;
-      resultDir = path.join(userProjPath, 'results', `Run_${next}`);
+      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const next = nums.length ? Math.max(...nums) + 1 : 1;
+      const fb = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
+      resultDir = path.join(userProjPath, 'results', buildRunDirName(syncSuiteName || fb, ciUsers2, 'duration', ciLoops2, ciDur2, next));
     } catch {
       resultDir = path.join(userProjPath, 'results', `CI_Run_${run.id}`);
     }
@@ -960,6 +1455,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     // ── Generate analytics PDF from JTL ──────────────────────────────────────
     let pdfPath = null;
+    let reportData = null;
     if (fs.existsSync(jtlPath)) {
       try {
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
@@ -992,9 +1488,25 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
           const suite = db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
 
-          const reportData = {
+          const byLabel = {};
+          allRows.forEach(r => {
+            const lbl = r.label || 'Unknown';
+            if (!byLabel[lbl]) byLabel[lbl] = { elapsed:[], success:0, failed:0 };
+            byLabel[lbl].elapsed.push(parseInt(r.elapsed)||0);
+            if (r.success === 'true') byLabel[lbl].success++; else byLabel[lbl].failed++;
+          });
+          const by_api = Object.entries(byLabel).map(([label, d]) => ({
+            label, total: d.elapsed.length, success: d.success, failed: d.failed,
+            error_rate: parseFloat(((d.failed / d.elapsed.length) * 100).toFixed(2)),
+            avg: parseFloat((d.elapsed.reduce((a,b)=>a+b,0) / d.elapsed.length).toFixed(1)),
+            p90: pct(d.elapsed, 90), p95: pct(d.elapsed, 95),
+            tps: parseFloat((d.elapsed.length / durS).toFixed(3)),
+          }));
+
+          reportData = {
             meta: {
               suite_name: suite?.name || run.script_name || 'CI Run',
+              engine: 'jmeter',
               started_at: run.started_at,
               duration_s: Math.round(durS),
               status:     'completed',
@@ -1003,6 +1515,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
               total_requests:    totalReqs,
               total_failed:      totalFail,
               total_success:     totalReqs - totalFail,
+              error_rate: parseFloat(((totalFail / (totalReqs || 1)) * 100).toFixed(2)),
               avg_response_time: elapsed.length ? elapsed.reduce((a,b)=>a+b,0)/elapsed.length : 0,
               min_response_time: elapsed.length ? Math.min(...elapsed.filter(v=>v>0)) : 0,
               max_response_time: elapsed.length ? Math.max(...elapsed) : 0,
@@ -1010,7 +1523,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
               p95:               pct(elapsed, 95) || 0,
               overall_tps:       durS > 0 ? totalReqs / durS : 0,
             },
-            rule_violations: [],
+            by_api, timeline: [], errors: [], rule_violations: [],
           };
 
           await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
@@ -1018,7 +1531,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           console.log('[CI Sync] Analytics PDF generated:', pdfPath);
         }
       } catch (e) {
-        console.warn('[CI Sync] PDF generation failed:', e.message);
+        console.error('[CI Sync] PDF generation failed:', e.message, e.stack?.split('\n')[1] || '');
       }
     }
 
@@ -1033,8 +1546,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     const execRunRow = db.prepare(`
       INSERT INTO execution_runs
-        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
     `).run(
       req.params.projectId,
       suiteId,
@@ -1043,12 +1556,55 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
-      run.started_at || new Date().toISOString()
+      run.started_at || new Date().toISOString(),
+      reportData ? JSON.stringify(reportData) : null,
+      run.id
     );
 
     // Update ci_pipeline_run with result_dir reference
     db.prepare("UPDATE ci_pipeline_runs SET variables = ? WHERE id = ?")
       .run(JSON.stringify({ ...JSON.parse(run.variables || '{}'), result_dir: resultDir }), run.id);
+
+    // ── Send email alert for CI run ───────────────────────────────────────────
+    const newRunId = execRunRow.lastInsertRowid;
+    const suppressEmail = req.query.suppress_email === 'true';
+    if (!suppressEmail) setImmediate(async () => {
+      try {
+        const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
+        const emailData = reportData || {
+          meta: { suite_name: run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, duration_s: 0, status: 'completed' },
+          summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0, p90: 0, p95: 0 },
+          by_api: [], timeline: [], errors: [], rule_violations: [],
+        };
+        // Use the actual suite name from the test_suites table (suiteId resolved above)
+        let resolvedSuiteName = emailData.meta.suite_name;
+        if (suiteId) {
+          const sRow = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId);
+          if (sRow?.name) { emailData.meta.suite_name = sRow.name; resolvedSuiteName = sRow.name; }
+        }
+        emailData.meta.run_id = newRunId;
+        // Evaluate rules against JTL for violation summary in email
+        let violations = [];
+        if (fs.existsSync(jtlPath)) {
+          try {
+            const { evaluateRules } = require('../utils/ruleEvaluator');
+            const rr = evaluateRules(req.params.projectId, jtlPath);
+            violations = rr?.violations || [];
+            emailData.rule_violations = violations;
+          } catch (_) {}
+        }
+        // Send rule violation email first (as soon as violations are known, before full report)
+        if (violations.length > 0) {
+          const proj = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+          await sendRuleViolationEmail(newRunId, req.userId, req.params.projectId, violations, resolvedSuiteName, proj?.name || '');
+        }
+        // Send full report email
+        await sendAlertEmail(newRunId, req.userId, req.params.projectId, emailData, pdfPath, null);
+        console.log(`[CI Sync] Alert email sent for run #${newRunId}`);
+      } catch (e) {
+        console.error('[CI Sync] Alert email failed:', e.message);
+      }
+    });
 
     const savedFiles = fs.readdirSync(resultDir);
     res.json({

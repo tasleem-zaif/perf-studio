@@ -324,7 +324,11 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
-    api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => setCiConfig(data.config)).catch(() => {});
+    api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => {
+      setCiConfig(data.config);
+      if (data.config?.github_enabled && !data.config?.gitlab_enabled) setCiProvider('github');
+      else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
+    }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
   }, [selectedProjectId]);
 
@@ -362,7 +366,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
       });
       toast(`Pipeline triggered on ${ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'}`, 'success');
-      setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, started_at: new Date().toISOString() }, ...prev]);
+      setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, run_name: data.run_name, started_at: new Date().toISOString() }, ...prev]);
       // Start polling
       pollCiStatus(data.run_id);
     } catch (e) { toast(e.response?.data?.error || 'Trigger failed', 'error'); }
@@ -390,7 +394,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   }
 
   // ── Pipeline runner state ─────────────────────────────────────────────────
-  const [runTab,           setRunTab]           = useState('single'); // 'single' | 'pipeline'
+  const [runTab,           setRunTab]           = useState('ci-pipeline'); // 'single' | 'ci-pipeline'
   const [pipelines,        setPipelines]        = useState([]);
   const [selectedPipeline, setSelectedPipeline] = useState('');
   const [pipelineRunning,  setPipelineRunning]  = useState(false);
@@ -457,7 +461,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             if (msg.done) {
               setPipelineStatus(msg.status || 'completed');
               // Reload run history
-              api.get(`/projects/${selectedProjectId}/pipelines/${selectedPipeline}/runs`).catch(() => {});
+              api.get(`/projects/${selectedProjectId}/pipelines/${selectedPipeline}/runs`).catch(e => console.warn('Could not refresh pipeline run history:', e?.message));
             } else if (msg.type && msg.message) {
               startTransition(() => {
                 setPipelineLogs(prev => [...prev, { type: msg.type, message: msg.message }]);
@@ -480,9 +484,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Run mode tabs ─────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
-          { id: 'single',      icon: 'ti-player-play',   label: 'Local Test Run' },
-          // { id: 'pipeline', icon: 'ti-git-merge', label: 'Pipeline Run' },  // hidden — keep for future use
           { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'    },
+          { id: 'single',      icon: 'ti-player-play',   label: 'Local Test Run' },
         ].filter(t => t).map(t => (
           <button key={t.id} onClick={() => setRunTab(t.id)}
             style={{
@@ -676,10 +679,19 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           });
                           if (selected) {
                             const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
-                            const relPath = file.replace(/.*git-workspaces\/[^/]+\//, '');
+                            const relPath = file.replace(/.*git-workspaces\/[^/]+\/[^/]+\//, '');
                             const fileName = file.split('/').pop();
                             setCiScriptName(fileName);
                             setCiScriptPath(relPath);
+                            // Pre-fill load parameters from the saved test suite configuration
+                            setCiVars(v => ({
+                              ...v,
+                              jmeter_users:    selected.vusers    || v.jmeter_users,
+                              jmeter_rampup:   selected.rampup    || v.jmeter_rampup,
+                              jmeter_duration: selected.duration  || v.jmeter_duration,
+                              jmeter_loops:    selected.loops     || v.jmeter_loops,
+                              iter_mode:       selected.iter_mode || v.iter_mode,
+                            }));
                           }
                         }}
                       >
@@ -755,7 +767,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           {/* Run row */}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
                             <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
-                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.script_name || '—'}</span>
+                            <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.run_name || r.script_name || '—'}</span>
                             <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
                             <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
                               {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
@@ -776,7 +788,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 onClick={async () => {
                                   try {
                                     const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
-                                    toast(`Results saved to ${data.result_dir?.split(/[\\/]/).slice(-3).join('/')}`, 'success');
+                                    if (data.already_synced) {
+                                      toast('Already synced — results available in Analytics', 'info');
+                                    } else {
+                                      const shortPath = data.result_dir?.split(/[\\/]/).slice(-2).join('/') || data.message || 'disk';
+                                      toast(`Results saved to ${shortPath}`, 'success');
+                                    }
                                   } catch (e) { toast(e.response?.data?.error || 'Sync failed', 'error'); }
                                 }}>
                                 <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
@@ -821,7 +838,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 {/* Test params */}
                                 {vars.jmeter_users && (
                                   <div style={{ color: '#8b949e', borderLeft: '2px solid #21262d', paddingLeft: 8, marginBottom: 8 }}>
-                                    <div>Script   <span style={{ color: '#e6edf3' }}>{r.script_name}</span></div>
+                                    <div>Run      <span style={{ color: '#e6edf3' }}>{r.run_name || r.script_name}</span></div>
                                     <div>Users    <span style={{ color: '#e6edf3' }}>{vars.jmeter_users}</span>  Ramp <span style={{ color: '#e6edf3' }}>{vars.jmeter_rampup}s</span>  {vars.jmeter_duration > 0 ? <>Duration <span style={{ color: '#e6edf3' }}>{vars.jmeter_duration}s</span></> : <>Loops <span style={{ color: '#e6edf3' }}>{vars.jmeter_loops}</span></>}</div>
                                   </div>
                                 )}

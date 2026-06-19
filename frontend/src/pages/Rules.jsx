@@ -7,13 +7,13 @@ import api from '../api';
 
 // ── Metric config — drives operator list and unit automatically ───────────────
 const METRIC_CONFIG = {
-  'Response Time': { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 50  },
-  'Error Rate':    { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 1   },
-  'Throughput':    { unit: 'req/s', operators: ['<','<=','between'],          min: 0, max: 100000, step: 10 },
-  'Latency P95':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 50  },
-  'Latency P99':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000, step: 100 },
-  'CPU Usage':     { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 5   },
-  'Memory Usage':  { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,   step: 5   },
+  'Response Time': { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '500'  },
+  'Error Rate':    { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 1,   eg: '5',    egMin: '2',   egMax: '10'   },
+  'Throughput':    { unit: 'req/s', operators: ['<','<=','between'],          min: 0, max: 100000, step: 10,  eg: '50',   egMin: '20',  egMax: '100'  },
+  'Latency P95':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '1000' },
+  'Latency P99':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 100, eg: '1000', egMin: '500', egMax: '2000' },
+  'CPU Usage':     { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 5,   eg: '80',   egMin: '50',  egMax: '90'   },
+  'Memory Usage':  { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 5,   eg: '80',   egMin: '50',  egMax: '90'   },
 };
 
 const METRICS = Object.keys(METRIC_CONFIG);
@@ -223,7 +223,7 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
                   <input type="number"
                     value={form.value_min}
                     onChange={e => setForm(f => ({ ...f, value_min: e.target.value }))}
-                    placeholder="e.g. 200"
+                    placeholder={`e.g. ${metricCfg.egMin}`}
                     min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
                   />
                 </div>
@@ -233,7 +233,7 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
                   <input type="number"
                     value={form.value_max}
                     onChange={e => setForm(f => ({ ...f, value_max: e.target.value }))}
-                    placeholder="e.g. 500"
+                    placeholder={`e.g. ${metricCfg.egMax}`}
                     min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
                   />
                 </div>
@@ -245,7 +245,7 @@ export default function Rules({ project, onProjectUpdated, openModalTrigger }) {
                 <input type="number"
                   value={form.value}
                   onChange={e => setForm(f => ({ ...f, value: e.target.value }))}
-                  placeholder="e.g. 500"
+                  placeholder={`e.g. ${metricCfg.eg}`}
                   min={metricCfg.min} max={metricCfg.max} step={metricCfg.step}
                 />
               </div>

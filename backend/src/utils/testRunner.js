@@ -73,18 +73,39 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   // ── Resolve result directory ──────────────────────────────────────────────
   const callerRole  = db.prepare('SELECT role FROM users WHERE id = ?').get(userId)?.role;
   const userProjPath = getUserProjectPath(userId, callerRole, project.name);
-  const ts = Date.now();
+  const { buildRunDirName, extractRunNumber } = require('./buildRunName');
 
-  let resultDir = path.join(userProjPath, 'pipeline_results', `${suiteId}_${ts}`);
+  function nextRunNum(dir) {
+    try {
+      const nums = require('fs').readdirSync(dir, { withFileTypes: true })
+        .filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      return nums.length ? Math.max(...nums) + 1 : 1;
+    } catch { return 1; }
+  }
+
+  const trVusers   = suite.vusers    || 10;
+  const trLoops    = suite.loops     || 1;
+  const trDuration = suite.duration  || 300;
+  const trIterMode = suite.iter_mode || 'duration';
+
+  let resultDir;
   try {
     if (suite.collection_id && suite.env) {
       const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
       if (col) {
         const envPath = getCollectionPath(userProjPath, col.name, suite.env);
-        resultDir = path.join(envPath, 'pipeline_results', `${suiteId}_${ts}`);
+        fs.mkdirSync(path.join(envPath, 'results'), { recursive: true });
+        const n = nextRunNum(path.join(envPath, 'results'));
+        resultDir = path.join(envPath, 'results', buildRunDirName(suite.name, trVusers, trIterMode, trLoops, trDuration, n));
       }
     }
   } catch (_) {}
+
+  if (!resultDir) {
+    fs.mkdirSync(path.join(userProjPath, 'results'), { recursive: true });
+    const n = nextRunNum(path.join(userProjPath, 'results'));
+    resultDir = path.join(userProjPath, 'results', buildRunDirName(suite.name, trVusers, trIterMode, trLoops, trDuration, n));
+  }
 
   fs.mkdirSync(resultDir, { recursive: true });
   const jtlPath = path.join(resultDir, 'results.jtl');

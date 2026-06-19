@@ -97,18 +97,16 @@ function autoPopulateProjectConfig(projectId, jsonContent, collectionId) {
 function setupCollectionFolder(proj, colId, colName, env, sourceContent, sourceType, originalFilename, userId, userRole) {
   const caller = db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
   const role   = caller?.role || userRole;
+
+  // userProjectPath is: git-workspaces/<ProjectName>/<userName>/<ProjectName>/
   const userProjectPath = getUserProjectPath(userId, role, proj.name);
   if (!userProjectPath) return null;
 
-  // Admin workspace is completely empty (no folders, no files) — skip everything
-  const { isAdminWorkspace } = require('../utils/projectFolders');
-  if (isAdminWorkspace(userProjectPath)) return null;
-
-  // Ensure the workspace is a proper git repo (clone if .git missing)
-  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
-  const userFolder = (role === 'org_admin' || role === 'super_admin') ? 'admin' : `user-${userId}`;
-  const gitRoot    = path.join(GIT_WORKSPACES_ROOT, userFolder);
-  const gitDotDir  = path.join(gitRoot, '.git');
+  // gitRoot is one level up from userProjectPath — where .git lives
+  const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
+  const { resolveUserFolder } = require('../utils/projectFolders');
+  const gitRoot   = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name), resolveUserFolder(userId));
+  const gitDotDir = path.join(gitRoot, '.git');
 
   if (!fs.existsSync(gitDotDir)) {
     // No .git yet — try to clone from remote so git can track files
@@ -254,7 +252,7 @@ router.put('/:id', upload.single('file'), (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!col) return res.status(404).json({ error: 'Not found' });
+  if (!col) return res.status(404).json({ error: 'Collection not found — it may have been deleted in another session.' });
 
   const { name, description, source_type, tool_target } = req.body;
   const originalFilename = req.file?.originalname || '';
@@ -344,7 +342,7 @@ router.delete('/:id', (req, res) => {
   const proj = ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const col = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!col) return res.status(404).json({ error: 'Not found' });
+  if (!col) return res.status(404).json({ error: 'Collection not found — it may have already been deleted.' });
 
   // Delete the collection's folder from the current user's git workspace
   try {

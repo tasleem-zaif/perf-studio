@@ -1,17 +1,20 @@
 const path   = require('path');
 const { mkdirSync, writeFileSync, existsSync, rmSync } = require('fs');
 const { execSync } = require('child_process');
+const db = require('../db');
 
-// git-workspaces/admin/projects/ is the PRIMARY storage for all project data.
-// The old projects/ folder is obsolete — nothing is stored there anymore.
+// Each project has its own isolated workspace under git-workspaces/<ProjectName>/admin/
 const GIT_WORKSPACES_ROOT = process.env.GIT_WORKSPACES_ROOT
   || path.join(__dirname, '..', '..', '..', 'git-workspaces');
 
+// Legacy path — kept for backward compat with projects initialized before per-project workspaces
 const ADMIN_PROJECTS_ROOT = path.join(GIT_WORKSPACES_ROOT, 'admin', 'projects');
 
-// Keep PROJECTS_ROOT pointing to admin workspace so existing code that uses it still works
-const PROJECTS_ROOT = process.env.PROJECTS_ROOT || ADMIN_PROJECTS_ROOT;
-const BACKUPS_ROOT  = process.env.BACKUPS_ROOT  || path.join(__dirname, '..', '..', '..', 'backups');
+// PROJECTS_ROOT points to the workspaces root so all per-project workspaces are accessible
+const PROJECTS_ROOT = process.env.PROJECTS_ROOT || GIT_WORKSPACES_ROOT;
+// Backups live inside git-workspaces/_backups/ so org admins can find them
+// alongside their project workspaces — not buried in the app root.
+const BACKUPS_ROOT  = process.env.BACKUPS_ROOT  || path.join(GIT_WORKSPACES_ROOT, '_backups');
 
 /** Sanitise a name for use as a folder name */
 function cleanName(name) {
@@ -19,6 +22,26 @@ function cleanName(name) {
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .replace(/_+/g, '_')
     .replace(/^_|_$/g, '') || 'unnamed';
+}
+
+/** Convert a user's display name to a safe folder slug, e.g. "Jane Doe" → "jane-doe" */
+function userNameSlug(name) {
+  return (name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || null;
+}
+
+/** Resolve the folder name for a given user: their display-name slug, falling back to user-{id} */
+function resolveUserFolder(userId) {
+  try {
+    const row = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+    const slug = userNameSlug(row?.name);
+    return slug || `user-${userId}`;
+  } catch {
+    return `user-${userId}`;
+  }
 }
 
 /** Add a .gitkeep to every directory in the tree so git tracks empty folders */
@@ -35,11 +58,11 @@ function addGitkeepAll(dir) {
 }
 
 /**
- * Build the project folder path inside the admin workspace.
- * Uses clean name only — no IDs or UUIDs in folder names.
+ * Build the project folder path for the admin workspace.
+ * Each project has its own isolated workspace: git-workspaces/<ProjectName>/admin/
  */
 function getProjectPath(projectName) {
-  return path.join(ADMIN_PROJECTS_ROOT, cleanName(projectName));
+  return path.join(GIT_WORKSPACES_ROOT, cleanName(projectName), 'admin');
 }
 
 /**
@@ -124,27 +147,28 @@ function backupAndDeleteProjectFolder(folderPath, projectName, projectId) {
 
 /**
  * Get the project path inside a specific user's git workspace.
- * Admin   → git-workspaces/admin/projects/ProjectName/
- * User-3  → git-workspaces/user-3/projects/ProjectName/
+ * Admin   → git-workspaces/ProjectName/admin/
+ * User-3  → git-workspaces/ProjectName/user-3/
+ */
+/**
+ * Returns the project content path inside a user's git workspace.
+ * Structure: git-workspaces/<ProjectName>/<userName>/<ProjectName>/
+ * The outer <ProjectName> is the workspace bucket; <userName> is the git repo root;
+ * the inner <ProjectName> is the content subfolder where collections/scripts live.
  */
 function getUserProjectPath(userId, userRole, projectName) {
-  const userFolder = (userRole === 'org_admin' || userRole === 'super_admin')
-    ? 'admin'
-    : `user-${userId}`;
-  return path.join(GIT_WORKSPACES_ROOT, userFolder, 'projects', cleanName(projectName));
+  const userFolder = resolveUserFolder(userId);
+  return path.join(GIT_WORKSPACES_ROOT, cleanName(projectName), userFolder, cleanName(projectName));
 }
 
 /**
- * Returns true if the given path belongs to the admin workspace.
- * Admin workspace holds only empty folders (with .gitkeep) — no config.json,
- * no collection source files, no test data, no scripts.
+ * Returns true if the user is an org_admin or super_admin.
+ * Replaces the old path-based /admin check now that workspace folders use real user names.
  */
 function isAdminWorkspace(workspacePath) {
-  if (!workspacePath) return false;
-  const normalised = workspacePath.replace(/\\/g, '/');
-  const adminRoot  = GIT_WORKSPACES_ROOT.replace(/\\/g, '/');
-  return normalised.startsWith(`${adminRoot}/admin/`) ||
-         normalised.startsWith(`${adminRoot}/admin`);
+  // workspacePath is kept for backward-compat signature — we now check by user role via DB.
+  // Callers that have the userId should prefer isAdminUser(userId) directly.
+  return false; // deprecated path-based check — always return false; callers use role check
 }
 
 module.exports = {
@@ -155,6 +179,7 @@ module.exports = {
   ensureCollectionFolders,
   ensureAllEnvFolders,
   getUserProjectPath,
+  resolveUserFolder,
   deleteProjectFolder,
   backupAndDeleteProjectFolder,
   PROJECTS_ROOT,

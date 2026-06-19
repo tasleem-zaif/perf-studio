@@ -1,11 +1,13 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const db = require('../db');
 const auth = require('../middleware/auth');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'perf_studio_secret_change_in_prod';
 const JWT_EXPIRES = '7d';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function makeSlug(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -86,9 +88,42 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: 'Your account request was rejected. Please contact your administrator.' });
   }
 
+  // Single-session enforcement
+  db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run(); // purge expired first
+  const existing = db.prepare('SELECT id, last_used_at FROM user_sessions WHERE user_id = ?').get(user.id);
+  if (existing) {
+    const lastUsed = existing.last_used_at ? new Date(existing.last_used_at + 'Z') : null;
+    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+    const isActiveSession = lastUsed && lastUsed > thirtyMinutesAgo;
+
+    if (isActiveSession && !req.body.force) {
+      // A real active session exists in another browser — ask the user to confirm
+      return res.status(409).json({
+        error: 'You are already signed in from another location. Sign out there first, or click below to sign in here and end the other session.',
+        code: 'SESSION_ACTIVE',
+      });
+    }
+    // Orphaned/stale session (not used in 30+ min) or force override — clear it silently
+    db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
+  }
+
   const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+  const jti = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const token = jwt.sign({ userId: user.id, jti }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+  db.prepare('INSERT INTO user_sessions (user_id, jti, expires_at) VALUES (?, ?, ?)').run(user.id, jti, expiresAt);
+
   res.json({ token, user: userPayload(user, org) });
+});
+
+// POST /auth/logout
+router.post('/logout', auth, (req, res) => {
+  const header = req.headers.authorization;
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(req.userId, payload.jti);
+  } catch (_) {}
+  res.json({ ok: true });
 });
 
 // GET /auth/me

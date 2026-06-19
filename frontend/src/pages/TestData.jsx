@@ -283,7 +283,7 @@ export default function TestData({ project, collection, env, envs, onEnvChange, 
       await api.put(`/projects/${project.id}/test-data/${editing.fileId}/content`, { headers: editing.headers, rows: editing.rows });
       await loadFiles(); setDirty(false);
       toast('File saved successfully', 'success');
-    } catch (e) { toast(e.response?.data?.error || 'Save failed', 'error'); }
+    } catch (e) { toast(e.response?.data?.error || 'Failed to save test data changes — the file may be locked or contain invalid characters.', 'error'); }
     finally { setSaving(false); }
   }
 

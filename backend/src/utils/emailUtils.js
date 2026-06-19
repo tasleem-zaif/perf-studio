@@ -103,6 +103,22 @@ function kpiCell(label, value, sub, color) {
     </td>`;
 }
 
+function deriveFailureReason(runData) {
+  const s = runData.summary || {};
+  if (!s.total_requests || s.total_requests === 0) {
+    return 'No requests were executed. The JMeter process may have failed to start, the test script is invalid, or the CI pipeline failed to patch the JMX file before execution.';
+  }
+  if (runData.rule_violations && runData.rule_violations.length > 0) {
+    const errCount = runData.rule_violations.filter(v => v.rule?.severity === 'error').length;
+    return `${runData.rule_violations.length} performance rule${runData.rule_violations.length > 1 ? 's' : ''} violated (${errCount} error-level threshold${errCount !== 1 ? 's' : ''}). See the Breached Rules section below.`;
+  }
+  const errRate = s.total_requests > 0 ? (s.total_failed / s.total_requests) * 100 : 0;
+  if (errRate > 0) {
+    return `${errRate.toFixed(1)}% of requests failed — ${(s.total_failed || 0).toLocaleString()} HTTP errors or assertion failures recorded.`;
+  }
+  return 'Test execution completed with a failure status. Review the attached PDF report for details.';
+}
+
 /** Build HTML email body — dark Analytics-style KPI grid */
 function buildEmailBody(runData, orgName, recipientName, reportDir) {
   const m = runData.meta || {};
@@ -110,9 +126,9 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
 
   const suiteName = m.suite_name || 'Test Plan';
   const startedAt = m.started_at ? new Date(m.started_at).toLocaleString() : '—';
-  const durationS = m.duration_s != null ? `${m.duration_s}s` : '—';
+  const durationS = m.duration_s != null && m.duration_s > 0 ? `${m.duration_s}s` : '—';
   const status    = (m.status || 'completed').toUpperCase();
-  const isPassed  = status === 'COMPLETED' || status === 'passed';
+  const isFailed  = status === 'FAILED' || status === 'ERROR';
 
   const errRateNum  = s.total_requests > 0 ? (s.total_failed / s.total_requests) * 100 : 0;
   const errRateStr  = errRateNum.toFixed(2) + '%';
@@ -135,10 +151,15 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
   };
 
   const rulesPassed = !runData.rule_violations || runData.rule_violations.length === 0;
-  const verdictBg   = rulesPassed ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)';
-  const verdictBdr  = rulesPassed ? '#22c55e' : '#ef4444';
-  const verdictIcon = rulesPassed ? '✅' : '❌';
-  const verdictText = rulesPassed ? 'All performance rules passed' : `${(runData.rule_violations||[]).length} rule(s) violated`;
+  const isSuccess   = !isFailed && rulesPassed;
+  const verdictBg   = isSuccess ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)';
+  const verdictBdr  = isSuccess ? '#22c55e' : '#ef4444';
+  const verdictIcon = isSuccess ? '✅' : '❌';
+  const verdictText = isFailed && rulesPassed
+    ? deriveFailureReason(runData)
+    : rulesPassed
+      ? 'All performance rules passed'
+      : `${(runData.rule_violations||[]).length} rule(s) violated`;
 
   const greeting = recipientName ? `Dear ${recipientName},` : 'Dear Team,';
 
@@ -188,17 +209,23 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
     <p style="color:#f0f3fa;font-size:14px;margin:0 0 6px;">${greeting}</p>
     <p style="color:#b8c4d8;font-size:13px;line-height:1.6;margin:0 0 18px;">
       Your test plan <strong style="color:#f0f3fa;">${suiteName}</strong> was executed on
-      <strong style="color:#f0f3fa;">${startedAt}</strong>
-      (Duration: <strong style="color:#f0f3fa;">${durationS}</strong>).
+      <strong style="color:#f0f3fa;">${startedAt}</strong>${durationS !== '—' ? ` (Duration: <strong style="color:#f0f3fa;">${durationS}</strong>)` : ''}.
       Below is the analytics summary. Full report is attached.
     </p>
 
     <!-- Verdict banner -->
-    <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:${rulesPassed ? '20px' : '12px'};">
+    <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:12px;">
       <span style="font-size:16px;margin-right:8px;">${verdictIcon}</span>
       <span style="font-weight:700;color:${verdictBdr};font-size:13px;">Status: ${status}</span>
-      <span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>
+      ${isSuccess ? `<span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>` : ''}
     </div>
+    ${isFailed ? `
+    <!-- Failure reason -->
+    <div style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.25);border-radius:8px;padding:12px 16px;margin-bottom:12px;">
+      <div style="font-size:11px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;">Failure Reason</div>
+      <div style="font-size:13px;color:#e6edf3;line-height:1.6;">${deriveFailureReason(runData)}</div>
+    </div>` : ''}
+
     ${!rulesPassed ? `
     <!-- Rule violations detail -->
     <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
@@ -240,7 +267,6 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
   <!-- Attachments note -->
   <div style="margin:0 20px 20px;background:#1e2840;border:1px solid #2e3a55;border-radius:8px;padding:11px 14px;font-size:12px;color:#7a8eaa;">
     📎 <strong style="color:#b8c4d8;">Attached:</strong>&nbsp; Full Analytics Report (PDF)
-    ${reportDir ? `<br><span style="margin-top:5px;display:block;">📁 <strong style="color:#b8c4d8;">HTML Report:</strong>&nbsp;<code style="color:#58a6ff;font-size:11px;">${reportDir.replace(/\\/g, '/')}</code></span>` : ''}
   </div>
 
   <!-- Sign-off -->
@@ -319,7 +345,6 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
         `  Error Rate     : ${s.total_requests > 0 ? ((s.total_failed/s.total_requests)*100).toFixed(2)+'%' : '0.00%'}`,
         ``,
         `See attached PDF for the full analytics report.`,
-        reportDir ? `HTML Report (open in browser): ${reportDir.replace(/\\/g, '/')}` : '',
         ``,
         `Thanks,`,
         `${orgName}`,
@@ -514,4 +539,158 @@ async function sendBreachAlertEmail(runId, userId, projectId, params) {
   }
 }
 
-module.exports = { sendAlertEmail, sendBreachAlertEmail, getAlertConfig, getRecipients };
+// ── Post-run rule violation alert ─────────────────────────────────────────────
+
+function buildRuleViolationEmailBody(runId, suiteName, projectName, violations, orgName, recipientName) {
+  const greeting = recipientName ? `Dear ${recipientName},` : 'Dear Team,';
+
+  const violationRows = violations.map(v => {
+    const sevColor = v.rule?.severity === 'error' ? '#ef4444' : '#f59e0b';
+    const sevBg    = v.rule?.severity === 'error' ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)';
+    const icon     = v.rule?.severity === 'error' ? '🔴' : '⚠️';
+    const thresholdLabel = v.rule?.operator === 'between'
+      ? `between ${v.rule.value_min}–${v.rule.value_max} ${v.rule.unit || ''}`
+      : `${v.rule?.operator || ''} ${v.rule?.value || ''} ${v.rule?.unit || ''}`.trim();
+    return `
+      <tr style="border-top:1px solid #2e3a55;">
+        <td style="padding:10px 14px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:14px;">${icon}</span>
+            <div>
+              <div style="font-weight:700;color:#f0f3fa;font-size:13px;">${v.rule?.metric || 'Unknown'}</div>
+              <div style="font-size:11px;color:#7a8eaa;margin-top:2px;">Rule: ${thresholdLabel}</div>
+            </div>
+          </div>
+        </td>
+        <td style="padding:10px 14px;text-align:center;">
+          <span style="font-family:monospace;font-size:14px;font-weight:700;color:${sevColor};">${v.actual ?? '—'} ${v.rule?.unit || ''}</span>
+        </td>
+        <td style="padding:10px 14px;text-align:center;">
+          <span style="padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:${sevBg};color:${sevColor};border:1px solid ${sevColor};">${(v.rule?.severity || 'error').toUpperCase()}</span>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#111827;font-family:'Segoe UI',Arial,sans-serif;">
+<div style="max-width:640px;margin:0 auto;background:#1a2035;border-radius:12px;overflow:hidden;">
+
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#450a0a 0%,#1e3a5f 100%);padding:20px 24px;">
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <td style="vertical-align:middle;">
+        <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
+             alt="Quarks" height="32" style="height:32px;filter:brightness(0) invert(1);vertical-align:middle;margin-right:10px;"/>
+        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Performance Studio</span>
+        <span style="color:#fca5a5;font-size:12px;margin-left:8px;vertical-align:middle;">Rule Violation Alert</span>
+      </td>
+    </tr></table>
+  </div>
+
+  <!-- Body -->
+  <div style="padding:22px 24px 0;">
+    <p style="color:#f0f3fa;font-size:14px;margin:0 0 12px;">${greeting}</p>
+    <p style="color:#b8c4d8;font-size:13px;line-height:1.6;margin:0 0 18px;">
+      The following performance rules were violated in test plan
+      <strong style="color:#f0f3fa;">${suiteName}</strong>
+      ${projectName ? `in project <strong style="color:#f0f3fa;">${projectName}</strong>` : ''}.
+    </p>
+
+    <!-- Alert banner -->
+    <div style="background:rgba(239,68,68,0.12);border:1px solid #ef4444;border-radius:8px;padding:12px 16px;margin-bottom:20px;">
+      <span style="font-size:16px;margin-right:8px;">❌</span>
+      <span style="font-weight:700;color:#ef4444;font-size:13px;">${violations.length} rule${violations.length > 1 ? 's' : ''} violated — performance thresholds exceeded</span>
+    </div>
+
+    <!-- Violations table -->
+    <table style="width:100%;border-collapse:collapse;background:#1e2840;border-radius:8px;overflow:hidden;margin-bottom:20px;">
+      <thead>
+        <tr style="background:#0f172a;">
+          <th style="padding:10px 14px;text-align:left;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Metric / Rule</th>
+          <th style="padding:10px 14px;text-align:center;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Actual Value</th>
+          <th style="padding:10px 14px;text-align:center;font-size:11px;color:#7a8eaa;font-weight:700;text-transform:uppercase;letter-spacing:.5px;">Severity</th>
+        </tr>
+      </thead>
+      <tbody>${violationRows}</tbody>
+    </table>
+  </div>
+
+  <!-- Sign-off -->
+  <div style="padding:0 24px 22px;">
+    <p style="color:#b8c4d8;font-size:13px;margin:0 0 4px;">Thanks,</p>
+    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'Performance Studio Team'}</p>
+  </div>
+
+  <!-- Footer -->
+  <div style="background:#0f172a;padding:12px 24px;text-align:center;border-top:1px solid #2e3a55;">
+    <p style="color:#4b5563;font-size:11px;margin:0;">Post-run rule violation alert from Performance Studio &nbsp;·&nbsp; Run ID: ${runId}</p>
+  </div>
+
+</div>
+</body>
+</html>`;
+}
+
+/**
+ * Send post-run rule violation alert. Called once after a run completes if rules were violated.
+ * Sends a focused email with only the violated rules — no KPIs or run stats.
+ */
+async function sendRuleViolationEmail(runId, userId, projectId, violations, suiteName, projectName) {
+  try {
+    if (!violations || violations.length === 0) return;
+    const cfg = getAlertConfig(userId);
+    if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
+
+    const recipients = getRecipients(userId, projectId);
+    if (!recipients.length) return;
+
+    const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
+    const orgName = userRow?.org_name || userRow?.name || 'Performance Studio';
+
+    const runRow = db.prepare('SELECT result_dir FROM execution_runs WHERE id = ?').get(runId);
+    const runNum = (runRow?.result_dir?.match(/Run_?(\d+)/i) || [])[1] || runId;
+
+    const transport = createTransport(cfg);
+    const subject = `❌ [PerfStudio] Rule Violations — ${suiteName} (Run #${runNum})`;
+
+    for (const recipient of recipients) {
+      const html = buildRuleViolationEmailBody(runId, suiteName, projectName, violations, orgName, recipient.name);
+      const plain = [
+        `Performance Studio — Rule Violation Alert`,
+        ``,
+        `Hello ${recipient.name || 'Team'},`,
+        ``,
+        `Performance rules were violated after test plan "${suiteName}" completed.`,
+        ``,
+        `Violated Rules:`,
+        ...violations.map(v => {
+          const threshold = v.rule?.operator === 'between'
+            ? `between ${v.rule.value_min}–${v.rule.value_max} ${v.rule.unit || ''}`
+            : `${v.rule?.operator || ''} ${v.rule?.value || ''} ${v.rule?.unit || ''}`.trim();
+          return `  - ${v.rule?.metric || 'Unknown'}: actual ${v.actual} ${v.rule?.unit || ''} (rule: ${threshold}) [${v.rule?.severity || 'error'}]`;
+        }),
+        ``,
+        `Thanks,`,
+        `${orgName}`,
+      ].join('\n');
+
+      await transport.sendMail({
+        from:    `"${cfg.from_name || 'Performance Studio'}" <${cfg.from_email}>`,
+        to:      recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+        replyTo: cfg.from_email,
+        subject,
+        text:    plain,
+        html,
+        headers: { 'X-Mailer': 'Performance Studio', 'X-Priority': '2', 'Importance': 'High' },
+      });
+    }
+
+    console.log(`[Alerts] Rule violation email sent to ${recipients.length} recipient(s) — Run ${runId}, ${violations.length} violation(s)`);
+  } catch (e) {
+    console.error('[Alerts] Failed to send rule violation email:', e.message);
+  }
+}
+
+module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients };

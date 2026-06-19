@@ -53,7 +53,7 @@ export default function Alerts({ project, collection, env, envs, onEnvChange }) 
       await api.put('/alerts/config', cfg);
       toast('Alert configuration saved', 'success');
     } catch (e) {
-      toast(e.response?.data?.error || 'Save failed', 'error');
+      toast(e.response?.data?.error || 'Failed to save SMTP alert configuration — verify your host, port and credentials are correct.', 'error');
     } finally { setSaving(false); }
   }
 
@@ -89,7 +89,7 @@ export default function Alerts({ project, collection, env, envs, onEnvChange }) 
       await loadGlobalRecs();
       toast('Recipient added', 'success');
     } catch (e) {
-      toast(e.response?.data?.error || 'Failed', 'error');
+      toast(e.response?.data?.error || 'Failed to add recipient — the email address may already be in the list or be invalid.', 'error');
     } finally { setAddingG(false); }
   }
 
@@ -109,7 +109,7 @@ export default function Alerts({ project, collection, env, envs, onEnvChange }) 
       await loadProjectRecs();
       toast('Recipient added', 'success');
     } catch (e) {
-      toast(e.response?.data?.error || 'Failed', 'error');
+      toast(e.response?.data?.error || 'Failed to add project recipient — the email address may already be in the list or be invalid.', 'error');
     } finally { setAddingP(false); }
   }
 

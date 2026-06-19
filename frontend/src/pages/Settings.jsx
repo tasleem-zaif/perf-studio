@@ -738,7 +738,7 @@ function AIConfigPanel({ user }) {
       setKeySet(true); setApiKey(''); setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (e) {
-      setError(e.response?.data?.error || 'Save failed');
+      setError(e.response?.data?.error || 'Failed to save AI settings — verify the API key is valid and not expired for the selected provider.');
     } finally { setSaving(false); }
   }
 
@@ -911,7 +911,7 @@ function SMTPConfigPanel({ currentUser }) {
       await api.put('/alerts/config', cfg);
       toast('SMTP configuration saved', 'success');
     } catch (e) {
-      toast(e.response?.data?.error || 'Save failed', 'error');
+      toast(e.response?.data?.error || 'Failed to save SMTP configuration — check the host, port and credentials are correct.', 'error');
     } finally { setSaving(false); }
   }
 
