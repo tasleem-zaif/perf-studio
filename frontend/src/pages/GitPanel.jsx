@@ -112,6 +112,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
   const [cfgEditMode, setCfgEditMode] = useState(false);   // locked / edit toggle
   const [savingCfg,   setSavingCfg]   = useState(false);
   const [initing,     setIniting]     = useState(false);
+  const [reIniting,   setReIniting]   = useState(false);
   const [testing,     setTesting]     = useState(false);
   const [testResult,  setTestResult]  = useState(null);   // { ok, message }
 
@@ -217,7 +218,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       toast('Repository settings saved', 'success');
       setCfgEditMode(false);
       loadAll();
-    } catch (err) { toast(err.response?.data?.error || 'Save failed', 'error'); }
+    } catch (err) { toast(err.response?.data?.error || 'Failed to save repository settings — verify the remote URL and access token are correct.', 'error'); }
     finally { setSavingCfg(false); }
   }
 
@@ -247,6 +248,26 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       addLog(msg, 'error');
       toast(msg, 'error');
     } finally { setIniting(false); }
+  }
+
+  // ── Re-initialize repo (admin only — fixes workspace structure, re-pushes) ──
+  async function reInitRepo() {
+    if (!window.confirm(
+      'Re-initialize will rebuild the local workspace and force-push the project structure to the remote.\n\n' +
+      'This is safe to run — it will not delete any project data or GitHub history.\n\nContinue?'
+    )) return;
+    setReIniting(true);
+    addLog('Re-initializing repository…');
+    try {
+      const { data } = await api.post(`/projects/${pid}/git/init`);
+      addLog(data.message, 'success');
+      toast('Repository re-initialized successfully.', 'success');
+      loadAll();
+    } catch (err) {
+      const msg = err.response?.data?.error || 'Re-init failed';
+      addLog(msg, 'error');
+      toast(msg, 'error');
+    } finally { setReIniting(false); }
   }
 
   // ── Test connection using user's personal PAT ─────────────────────────────
@@ -289,7 +310,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
           addLog(err.response?.data?.error || 'Branch setup failed', 'error');
         } finally { setAutoIniting(false); }
       }
-    } catch (err) { toast(err.response?.data?.error || 'Save failed', 'error'); }
+    } catch (err) { toast(err.response?.data?.error || 'Failed to save Git identity — verify your branch name, author name, email and access token are all filled in correctly.', 'error'); }
     finally { setSavingId(false); }
   }
 
@@ -660,7 +681,20 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                         {initing ? <><span className="spinner"/>Initializing…</> : <><i className="ti ti-git-branch"/>Initialize repository</>}
                       </button>
                     )}
-                    {initialized && <span style={{ fontSize:12,color:'#16a34a',display:'flex',alignItems:'center',gap:4 }}><i className="ti ti-circle-check"/>Repository initialized</span>}
+                    {initialized && (
+                      <span style={{ display:'flex', alignItems:'center', gap:8 }}>
+                        <span style={{ fontSize:12, color:'#16a34a', display:'flex', alignItems:'center', gap:4 }}>
+                          <i className="ti ti-circle-check"/>Repository initialized
+                        </span>
+                        {isProjectOwner && (
+                          <button className="btn-secondary btn-sm" onClick={reInitRepo} disabled={reIniting}
+                            title="Rebuild workspace and re-push project structure to remote"
+                            style={{ fontSize:11, padding:'3px 10px' }}>
+                            {reIniting ? <><span className="spinner" style={{ width:10, height:10 }}/>Re-initializing…</> : <><i className="ti ti-refresh" style={{ fontSize:11 }}/>Re-initialize</>}
+                          </button>
+                        )}
+                      </span>
+                    )}
                   </div>
                   {testResult && (
                     <div style={{ marginTop:10 }}>

@@ -249,6 +249,64 @@ try { db.exec("ALTER TABLE ai_settings ADD COLUMN heal_model TEXT DEFAULT ''"); 
 // Add uuid column to projects (for directory naming)
 try { db.exec("ALTER TABLE projects ADD COLUMN uuid TEXT DEFAULT ''"); } catch {}
 
+// Cache parsed JTL report data so Analytics doesn't require the JTL file on disk
+try { db.exec("ALTER TABLE execution_runs ADD COLUMN report_data TEXT DEFAULT NULL"); } catch {}
+
+// Link execution_runs back to the ci_pipeline_run that created them (for re-sync fallback)
+try { db.exec("ALTER TABLE execution_runs ADD COLUMN ci_run_id INTEGER DEFAULT NULL"); } catch {}
+
+// Soft-delete: archived=1 hides the run from the dropdown but keeps the record recoverable
+try { db.exec("ALTER TABLE execution_runs ADD COLUMN archived INTEGER DEFAULT 0"); } catch {}
+
+// ── Migrate ci_pipeline_configs: change UNIQUE(project_id) → UNIQUE(project_id, user_id) ──
+// The original table only allowed one config per project (admin-only).
+// Regular users need their own row for their PAT and branch.
+try {
+  const hasBadUnique = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='ci_pipeline_configs'"
+  ).get()?.sql || '';
+  // Only run if the old UNIQUE(project_id) schema is still in place
+  if (hasBadUnique.includes('project_id INTEGER NOT NULL UNIQUE') || hasBadUnique.includes('NOT NULL UNIQUE')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ci_pipeline_configs_v2 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        user_id INTEGER DEFAULT NULL,
+        gitlab_enabled INTEGER DEFAULT 0,
+        gitlab_url TEXT DEFAULT 'https://gitlab.com',
+        gitlab_project_id TEXT DEFAULT '',
+        gitlab_token TEXT DEFAULT '',
+        gitlab_trigger_token TEXT DEFAULT '',
+        gitlab_ref TEXT DEFAULT 'main',
+        github_enabled INTEGER DEFAULT 0,
+        github_repo TEXT DEFAULT '',
+        github_token TEXT DEFAULT '',
+        github_workflow_file TEXT DEFAULT 'perf-test.yml',
+        github_ref TEXT DEFAULT 'main',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(project_id, user_id),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      );
+      INSERT INTO ci_pipeline_configs_v2 SELECT * FROM ci_pipeline_configs;
+      DROP TABLE ci_pipeline_configs;
+      ALTER TABLE ci_pipeline_configs_v2 RENAME TO ci_pipeline_configs;
+    `);
+  }
+} catch (_) {}
+
+// ── User Sessions (single-session enforcement) ───────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS user_sessions (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL,
+  jti          TEXT    NOT NULL UNIQUE,
+  expires_at   DATETIME NOT NULL,
+  last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+)`);
+// Backfill last_used_at for existing rows
+try { db.exec("ALTER TABLE user_sessions ADD COLUMN last_used_at DATETIME"); } catch (_) {}
+
 // ── Password Reset ───────────────────────────────────────────────────────────
 db.exec(`CREATE TABLE IF NOT EXISTS password_resets (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,6 +333,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS git_configs (
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 )`);
 try { db.exec("ALTER TABLE git_configs ADD COLUMN git_root TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE git_configs ADD COLUMN base_branch TEXT DEFAULT 'main'"); } catch {}
 
 db.exec(`CREATE TABLE IF NOT EXISTS git_prs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,6 +433,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
   finished_at DATETIME,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 )`);
+
+// run_name: formatted execution name e.g. "APILoadTest_5Users_60sDuration"
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN run_name TEXT DEFAULT NULL"); } catch {}
 
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}

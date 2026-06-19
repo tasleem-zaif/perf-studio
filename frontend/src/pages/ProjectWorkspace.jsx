@@ -15,8 +15,8 @@ import PipelineConfig from './PipelineConfig';
 
 const NAV_ITEMS = [
   { id: 'overview',    icon: 'ti-layout-dashboard',       label: 'Overview',       sub: 'Project summary',              color: '#22c55e', bg: '#dcfce7' },
-  { id: 'collections', icon: 'ti-braces',                 label: 'API Sources',    sub: 'Import API endpoints',         color: '#0d9488', bg: '#f0fdfa' },
   { id: 'config',      icon: 'ti-settings-2',             label: 'Configuration',  sub: 'Environment, AI & Pipeline',   color: '#475569', bg: '#f1f5f9' },
+  { id: 'collections', icon: 'ti-braces',                 label: 'API Sources',    sub: 'Import API endpoints',         color: '#0d9488', bg: '#f0fdfa' },
   { id: 'test-data',   icon: 'ti-table',                  label: 'Test Data',      sub: 'CSV datasets per env',         color: '#7c3aed', bg: '#ede9fe' },
   { id: 'rules',       icon: 'ti-adjustments-horizontal', label: 'Rule Engine',    sub: 'Performance thresholds',       color: '#ea580c', bg: '#ffedd5' },
   { id: 'test-suites', icon: 'ti-test-pipe',              label: 'Test Plans',     sub: 'Create & generate scripts',    color: '#4338ca', bg: '#e0e7ff' },

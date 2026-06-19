@@ -126,7 +126,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       setModal(null);
       if (onAfterSave) onAfterSave();
     } catch (e) {
-      setError(e.response?.data?.error || 'Save failed');
+      setError(e.response?.data?.error || 'Failed to save test plan — verify the name, collection, and environment fields are correct.');
     } finally { setSaving(false); }
   }
 

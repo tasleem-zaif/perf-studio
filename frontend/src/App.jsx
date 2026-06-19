@@ -423,8 +423,10 @@ function AppInner() {
   }
 
   function logout() {
+    // Revoke server-side session so the old token is immediately invalid
+    api.post('/auth/logout').catch(() => {});
     localStorage.removeItem('ps_token');
-    localStorage.removeItem('ps_user'); // clear cache on logout
+    localStorage.removeItem('ps_user');
     setUser(null); setProjects([]); setActiveProject(null);
     setPage('dashboard'); setActiveTab('dashboard');
     setEverVisited(new Set(['dashboard']));

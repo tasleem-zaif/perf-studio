@@ -152,7 +152,7 @@ export default function Collections({ project, collection: activeCollection, onN
       }).catch(() => {});
       setModal(null); setSelectedFile(null); setParsedCurl(null);
     } catch (e) {
-      setError(e.response?.data?.error || 'Save failed');
+      setError(e.response?.data?.error || 'Failed to save API source — check the file format, collection name, and selected environments, then try again.');
     } finally { setSaving(false); }
   }
 
@@ -297,7 +297,7 @@ export default function Collections({ project, collection: activeCollection, onN
             <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--color-border-tertiary)' }}>
               {preRunning === c.id ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)', padding: '6px 0' }}>
-                  <span className="spinner" /> Running pre-run against collection endpoints...
+                  <span className="spinner" /> Running Pre-run against collection endpoints...
                 </div>
               ) : !preRunFresh ? (
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', padding: '10px 14px', background: 'rgba(240,167,50,0.08)', border: '1px solid rgba(240,167,50,0.25)', borderRadius: '8px' }}>
@@ -315,7 +315,7 @@ export default function Collections({ project, collection: activeCollection, onN
                       </button>
                     )}
                     <button className="btn-primary btn-sm" onClick={() => preRun(c)}>
-                      <i className="ti ti-player-play" />{responses ? 'Re-run Pre-run' : 'Run Pre-run'}
+                      <i className="ti ti-player-play" />Pre-run
                     </button>
                   </div>
                 </div>
@@ -335,7 +335,7 @@ export default function Collections({ project, collection: activeCollection, onN
                     </button>
                   </div>
                   <button className="btn-secondary btn-sm" onClick={() => preRun(c)}>
-                    <i className="ti ti-refresh" /> Re-run Pre-run
+                    <i className="ti ti-refresh" /> Pre-run
                   </button>
                 </div>
               )}

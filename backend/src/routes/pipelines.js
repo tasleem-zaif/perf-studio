@@ -3,6 +3,7 @@ const db     = require('../db');
 const auth   = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
 const { runSuite } = require('../utils/testRunner');
+const { parseJtl } = require('../utils/parseJtl');
 
 router.use(auth);
 
@@ -174,6 +175,15 @@ router.post('/:id/run', auth, async (req, res) => {
         return require('fs').existsSync(p) ? p : null;
       })() : null;
 
+      // Parse JTL now so Analytics never needs to read from disk later
+      const jtlPath    = result.jtlPath || null;
+      const stepSuite  = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(step.suite_id);
+      const cachedData = jtlPath ? parseJtl(jtlPath, {
+        run_id: execRunId, suite_name: stepSuite?.name || step.name,
+        engine: stepEngine, started_at: stepsResult[i].started_at,
+      }) : null;
+      const reportDataJson = cachedData ? JSON.stringify(cachedData) : null;
+
       if (result.error) {
         stepsResult[i].status = 'failed';
         stepsResult[i].error  = result.error;
@@ -182,8 +192,8 @@ router.post('/:id/run', auth, async (req, res) => {
         send({ step_update: { index: i, status: 'failed', name: step.name, error: result.error } });
         saveSteps();
         db.prepare(
-          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
-        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
 
       } else if (result.passed) {
@@ -192,8 +202,8 @@ router.post('/:id/run', auth, async (req, res) => {
         send({ step_update: { index: i, status: 'completed', name: step.name } });
         saveSteps();
         db.prepare(
-          `UPDATE execution_runs SET status='completed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
-        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
+          `UPDATE execution_runs SET status='completed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
 
       } else {
         stepsResult[i].status = 'failed';
@@ -202,8 +212,8 @@ router.post('/:id/run', auth, async (req, res) => {
         send({ step_update: { index: i, status: 'failed', name: step.name } });
         saveSteps();
         db.prepare(
-          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, finished_at=datetime('now') WHERE id=?`
-        ).run(resultDir, reportPath, JSON.stringify(stepLogs), execRunId);
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
       }
     } catch (e) {

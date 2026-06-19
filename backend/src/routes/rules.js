@@ -58,7 +58,7 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const rule = db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!rule) return res.status(404).json({ error: 'Not found' });
+  if (!rule) return res.status(404).json({ error: 'Performance rule not found — it may have been deleted by another user.' });
   const { metric, operator, value, value_min, value_max, unit, severity } = req.body;
   db.prepare('UPDATE rules SET metric=?, operator=?, value=?, value_min=?, value_max=?, unit=?, severity=? WHERE id=?')
     .run(
@@ -78,7 +78,7 @@ router.put('/:id', (req, res) => {
 router.delete('/:id', (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const rule = db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!rule) return res.status(404).json({ error: 'Not found' });
+  if (!rule) return res.status(404).json({ error: 'Performance rule not found — it may have already been deleted.' });
   db.prepare('DELETE FROM rules WHERE id = ?').run(req.params.id);
   resetSequence('rules');
   syncRules(req.params.projectId, req.userId);

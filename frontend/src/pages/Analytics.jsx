@@ -12,7 +12,7 @@ import EnvBar from '../components/EnvBar';
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Title, Tooltip, Legend, Filler);
 
 const PALETTE  = ['#49CC3D','#22c55e','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316','#ec4899','#14b8a6','#a855f7'];
-const ERR_PAL  = ['#ef4444','#f97316','#f59e0b','#eab308','#dc2626','#b91c1c','#7f1d1d','#fca5a5'];
+const ERR_PAL  = ['#ef4444','#f97316','#f59e0b','#8b5cf6','#06b6d4','#ec4899','#14b8a6','#3b82f6'];
 const chartFont = { family: "'Inter','Segoe UI',sans-serif", size: 11 };
 
 const TABS = [
@@ -22,7 +22,6 @@ const TABS = [
   { id: 'trend',       label: 'Trend Analysis',        icon: 'ti-trending-up' },
   { id: 'resource',    label: 'Resource Utilization',  icon: 'ti-cpu' },
   { id: 'errors',      label: 'Error Analysis',        icon: 'ti-alert-triangle' },
-  { id: 'logs',        label: 'Logs / Traces',         icon: 'ti-terminal-2' },
 ];
 
 // ── Chart theme — always dark to match the Analytics dark page ───────────────
@@ -125,7 +124,8 @@ function fmtB(b)   {
   return `${n} B`;
 }
 function safeN(v, fallback = 0) { const n = Number(v); return isNaN(n) || !isFinite(n) ? fallback : n; }
-function fmtDate(d){ return d ? new Date(d).toLocaleString() : '—'; }
+function parseDbDate(d) { if (!d) return null; const s = String(d).replace(' ', 'T'); return new Date(s.endsWith('Z') ? s : s + 'Z'); }
+function fmtDate(d){ if (!d) return '—'; const dt = parseDbDate(d); return isNaN(dt) ? String(d) : dt.toLocaleString(); }
 function trunc(s, n=20){ return s && s.length > n ? s.slice(0,n-1)+'…' : (s||''); }
 
 // ── Analytics dark theme palette (always dark regardless of app theme) ───────
@@ -308,10 +308,18 @@ function LatencyPatchPrompt() {
   );
 }
 
-function SummaryTab({ data, runNum }) {
+function SummaryTab({ data, runNum, selectedRun }) {
   const s = data.summary;
   const errRate  = safeN(s.error_rate);
   const errColor = errRate === 0 ? '#22c55e' : errRate < 5 ? '#f59e0b' : '#ef4444';
+
+  // Prefer DB row values — JTL meta may have duration_s=0 or missing finished_at
+  const finishedAt = data.meta.finished_at || selectedRun?.finished_at || null;
+  const durationS  = data.meta.duration_s > 0
+    ? data.meta.duration_s
+    : (selectedRun?.finished_at && selectedRun?.started_at
+        ? Math.round((parseDbDate(selectedRun.finished_at) - parseDbDate(selectedRun.started_at)) / 1000)
+        : null);
 
   // detect whether latency/bytes columns were present in the JTL
   const hasLatency = safeN(s.avg_latency) > 0 || safeN(s.avg_connect) > 0;
@@ -359,10 +367,9 @@ function SummaryTab({ data, runNum }) {
           <i className="ti ti-chart-dots-3" style={{ fontSize:18, color:'#49CC3D' }} />
           <span style={{ fontSize:17, fontWeight:700, color:D.textPri }}>{data.meta.suite_name}</span>
           <span className={`badge ${data.meta.status==='completed'?'tag-green':'tag-red'}`}>{data.meta.status}</span>
-          <span className="badge tag-blue" style={{ fontFamily:'var(--font-mono)', fontSize:11 }}>Run {runNum}</span>
         </div>
         <div style={{ display:'flex', gap:18, flexWrap:'wrap' }}>
-          {[['ti-clock-play','#22c55e','Start',fmtDate(data.meta.started_at)],['ti-clock-stop','#ef4444','End',fmtDate(data.meta.finished_at)],['ti-hourglass','#f59e0b','Duration',`${safeN(data.meta.duration_s)}s`]].map(([ic,cl,lbl,val])=>(
+          {[['ti-clock-play','#22c55e','Start',fmtDate(data.meta.started_at)],['ti-clock-stop','#ef4444','End',finishedAt ? fmtDate(finishedAt) : '—'],['ti-hourglass','#f59e0b','Duration',durationS != null ? `${durationS}s` : '—']].map(([ic,cl,lbl,val])=>(
             <div key={lbl} style={{ fontSize:12, color:D.textSec, display:'flex', alignItems:'center', gap:5 }}>
               <i className={`ti ${ic}`} style={{ fontSize:13, color:cl }} />
               <span style={{ color:D.textSec }}>{lbl}:</span> {val}
@@ -440,7 +447,7 @@ function DashboardTab({ data }) {
     labels: tlLabels,
     datasets: [
       { label:'Avg RT (ms)', data: data.timeline.map(t=>t.avg_rt), borderColor:'#49CC3D', backgroundColor:'#49CC3D20', borderWidth:2, pointRadius:1, tension:.3, fill:true, yAxisID:'y' },
-      { label:'Req/s', data: data.timeline.map(t=>t.tps), borderColor:'#22c55e', backgroundColor:'#22c55e20', borderWidth:2, pointRadius:1, tension:.3, fill:false, yAxisID:'y2' },
+      { label:'Req/s', data: data.timeline.map(t=>t.tps), borderColor:'#06b6d4', backgroundColor:'#06b6d420', borderWidth:2, pointRadius:1, tension:.3, fill:false, yAxisID:'y2' },
     ],
   };
 
@@ -529,7 +536,7 @@ function TransactionTab({ data }) {
           <input value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Filter by name…" style={{ fontSize:12, padding:'4px 10px', width:200 }} />
         </div>
         <div style={{ overflowX:'auto' }}>
-          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+          <table className="dark-table" style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
             <thead>
               <tr style={{ background:'rgba(255,255,255,0.03)' }}>
                 {cols.map(c=>(
@@ -679,7 +686,7 @@ function ResourceTab({ data }) {
       <Card>
         <SectionLabel icon="ti-table-column" color="#49CC3D">Per-API Timing Breakdown</SectionLabel>
         <div style={{ overflowX:'auto', marginTop:12 }}>
-          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+          <table className="dark-table" style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
             <thead>
               <tr style={{ background:'rgba(255,255,255,0.03)' }}>
                 {['API / Sampler','Avg RT','Avg TTFB','Avg Connect','Processing','Avg Bytes'].map(h=>(
@@ -759,7 +766,7 @@ function ErrorsTab({ data }) {
     labels: data.timeline.map(t=>`${t.second}s`),
     datasets: [
       { label:'Errors/s', data: data.timeline.map(t=>t.errors||0), borderColor:'#ef4444', backgroundColor:'#ef444425', borderWidth:2, pointRadius:1, tension:.3, fill:true, yAxisID:'y' },
-      { label:'Error Rate %', data: data.timeline.map(t=>t.error_rate||0), borderColor:'#f97316', backgroundColor:'transparent', borderWidth:1.5, pointRadius:0, tension:.3, borderDash:[4,3], yAxisID:'y2' },
+      { label:'Error Rate %', data: data.timeline.map(t=>t.error_rate||0), borderColor:'#a78bfa', backgroundColor:'transparent', borderWidth:1.5, pointRadius:0, tension:.3, borderDash:[4,3], yAxisID:'y2' },
     ],
   };
 
@@ -800,7 +807,7 @@ function ErrorsTab({ data }) {
       <Card>
         <SectionLabel icon="ti-table" color="#f59e0b">Error Details</SectionLabel>
         <div style={{ overflowX:'auto', marginTop:12 }}>
-          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+          <table className="dark-table" style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
             <thead>
               <tr style={{ background:'rgba(255,255,255,0.03)' }}>
                 {['API / Sampler','Response Code','Count','Response Message','Failure Message'].map(h=>(
@@ -811,15 +818,15 @@ function ErrorsTab({ data }) {
             <tbody>
               {errors.map((e,i)=>(
                 <tr key={i} style={{ borderBottom:'1px solid rgba(255,255,255,0.04)', background: i%2===0?'transparent':'rgba(255,255,255,0.015)' }}>
-                  <td style={{ padding:'7px 10px', color:D.textPri, fontWeight:500, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{e.label}</td>
-                  <td style={{ padding:'7px 10px' }}>
-                    <span style={{ padding:'2px 7px', borderRadius:4, background: String(e.response_code).startsWith('5')?'rgba(239,68,68,0.15)':'rgba(249,115,22,0.15)', color: String(e.response_code).startsWith('5')?'#f87171':'#fb923c', fontFamily:'var(--font-mono)', fontSize:11, fontWeight:600 }}>
+                  <td style={{ padding:'7px 10px', color:D.textPri, fontWeight:500, minWidth:120 }}>{e.label}</td>
+                  <td style={{ padding:'7px 10px', minWidth:80 }}>
+                    <span style={{ padding:'2px 7px', borderRadius:4, background: String(e.response_code).startsWith('5')?'rgba(239,68,68,0.15)':'rgba(249,115,22,0.15)', color: String(e.response_code).startsWith('5')?'#f87171':'#fb923c', fontFamily:'var(--font-mono)', fontSize:11, fontWeight:600, whiteSpace:'pre-wrap', wordBreak:'break-word', display:'inline-block' }}>
                       {e.response_code}
                     </span>
                   </td>
-                  <td style={{ padding:'7px 10px', textAlign:'right', fontFamily:'var(--font-mono)', color:'#f87171', fontWeight:700 }}>{e.count}</td>
-                  <td style={{ padding:'7px 10px', color:D.textTer, maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{e.response_message||'—'}</td>
-                  <td style={{ padding:'7px 10px', color:D.textTer, maxWidth:220, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{e.failure_message||'—'}</td>
+                  <td style={{ padding:'7px 10px', textAlign:'right', fontFamily:'var(--font-mono)', color:'#f87171', fontWeight:700, minWidth:60 }}>{e.count}</td>
+                  <td style={{ padding:'7px 10px', color:D.textTer, minWidth:180, whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{e.response_message||'—'}</td>
+                  <td style={{ padding:'7px 10px', color:D.textTer, minWidth:180, whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{e.failure_message||'—'}</td>
                 </tr>
               ))}
             </tbody>
@@ -830,9 +837,8 @@ function ErrorsTab({ data }) {
   );
 }
 
-function LogsTab({ data }) {
+function LogsTab({ data, ciWebUrl, ciProvider, ciExternalId }) {
   const logs = data.logs || [];
-  if (!logs.length) return <div className="empty"><div className="empty-title">No execution logs stored for this run</div></div>;
 
   const typeStyle = {
     ok:   { color:'#4ade80', icon:'ti-check' },
@@ -841,26 +847,65 @@ function LogsTab({ data }) {
     info: { color:'#93c5fd', icon:'ti-info-circle' },
   };
 
+  const providerIcon = ciProvider === 'gitlab' ? 'ti-brand-gitlab' : 'ti-brand-github';
+  const providerLabel = ciProvider === 'gitlab' ? 'GitLab' : 'GitHub';
+
   return (
-    <Card style={{ padding:0 }}>
-      <div style={{ padding:'12px 16px', borderBottom:`1px solid ${D.border}`, display:'flex', alignItems:'center', gap:8 }}>
-        <i className="ti ti-terminal-2" style={{ color:D.accent }} />
-        <span style={{ fontWeight:600, fontSize:12, color:D.textSec }}>Execution Logs</span>
-        <span className="badge tag-gray">{logs.length} entries</span>
-      </div>
-      <div style={{ fontFamily:'var(--font-mono)', fontSize:11.5, lineHeight:1.7, maxHeight:600, overflowY:'auto', padding:'10px 0' }}>
-        {logs.map((l,i)=>{
-          const ts = typeStyle[l.type] || typeStyle.info;
-          const isBanner = l.message && l.message.includes('━━━');
-          return (
-            <div key={i} style={{ padding:'1px 16px', display:'flex', gap:10, alignItems:'flex-start', background: isBanner?'rgba(255,255,255,0.04)':'transparent' }}>
-              {!isBanner && <i className={`ti ${ts.icon}`} style={{ color:ts.color, fontSize:11, marginTop:2, flexShrink:0 }} />}
-              <span style={{ color: isBanner?'#7d8390': ts.color, whiteSpace:'pre-wrap', wordBreak:'break-all', flex:1 }}>{l.message}</span>
+    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+      {/* CI pipeline link */}
+      {ciWebUrl && (
+        <Card style={{ padding:'14px 18px' }}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, flexWrap:'wrap' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+              <i className={`ti ${providerIcon}`} style={{ fontSize:18, color: ciProvider === 'gitlab' ? '#fc6d26' : '#9ca3af' }} />
+              <div>
+                <div style={{ fontSize:12, fontWeight:700, color:D.textPri }}>
+                  {providerLabel} CI Pipeline Run
+                  {ciExternalId && <span style={{ marginLeft:8, fontSize:11, color:D.textTer, fontWeight:400 }}>#{ciExternalId}</span>}
+                </div>
+                <div style={{ fontSize:11, color:D.textTer, marginTop:2 }}>View the complete build logs, test artifacts and workflow details</div>
+              </div>
             </div>
-          );
-        })}
-      </div>
-    </Card>
+            <a
+              href={ciWebUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'7px 14px', borderRadius:6, border:`1px solid ${ciProvider === 'gitlab' ? 'rgba(252,109,38,0.4)' : 'rgba(139,148,158,0.4)'}`, background: ciProvider === 'gitlab' ? 'rgba(252,109,38,0.08)' : 'rgba(139,148,158,0.08)', color: ciProvider === 'gitlab' ? '#fc6d26' : '#9ca3af', fontSize:12, fontWeight:600, textDecoration:'none', whiteSpace:'nowrap' }}
+            >
+              <i className="ti ti-external-link" style={{ fontSize:13 }} />
+              View on {providerLabel}
+            </a>
+          </div>
+        </Card>
+      )}
+
+      {/* Execution logs */}
+      {logs.length > 0 && (
+        <Card style={{ padding:0 }}>
+          <div style={{ padding:'12px 16px', borderBottom:`1px solid ${D.border}`, display:'flex', alignItems:'center', gap:8 }}>
+            <i className="ti ti-terminal-2" style={{ color:D.accent }} />
+            <span style={{ fontWeight:600, fontSize:12, color:D.textSec }}>Execution Logs</span>
+            <span className="badge tag-gray">{logs.length} entries</span>
+          </div>
+          <div style={{ fontFamily:'var(--font-mono)', fontSize:11.5, lineHeight:1.7, maxHeight:600, overflowY:'auto', padding:'10px 0' }}>
+            {logs.map((l,i)=>{
+              const ts = typeStyle[l.type] || typeStyle.info;
+              const isBanner = l.message && l.message.includes('━━━');
+              return (
+                <div key={i} style={{ padding:'1px 16px', display:'flex', gap:10, alignItems:'flex-start', background: isBanner?'rgba(255,255,255,0.04)':'transparent' }}>
+                  {!isBanner && <i className={`ti ${ts.icon}`} style={{ color:ts.color, fontSize:11, marginTop:2, flexShrink:0 }} />}
+                  <span style={{ color: isBanner?'#7d8390': ts.color, whiteSpace:'pre-wrap', wordBreak:'break-all', flex:1 }}>{l.message}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {!ciWebUrl && !logs.length && (
+        <div className="empty"><div className="empty-title">No execution logs stored for this run</div></div>
+      )}
+    </div>
   );
 }
 
@@ -872,101 +917,162 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const [loading, setLoading] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
   const [error, setError] = useState('');
+  const [errorMeta, setErrorMeta] = useState(null); // { ci_run_id } when not_cached
   const [activeTab, setActiveTab] = useState('summary');
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState('');
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [restoring, setRestoring] = useState(null); // run id being restored
+  const [syncingCi, setSyncingCi] = useState(false); // CI results being auto-synced
   const analyticsRef = useRef(null);
+  const syncPollRef = useRef(null);
 
-
-  useEffect(() => {
+  function fetchRuns(includeArchived = false) {
     if (!project) return;
     setLoading(true);
     setSelectedId('');
     setData(null);
-    api.get('/execution/runs', { params: { project_id: project.id } })
+    api.get('/execution/runs', { params: { project_id: project.id, include_archived: includeArchived ? 'true' : 'false' } })
       .then(({ data: d }) => {
-        let runs = (d.runs||[]).filter(r=>r.engine==='jmeter');
-        // Filter by active collection
-        if (collection?.id) {
-          runs = runs.filter(r => String(r.collection_id) === String(collection.id));
+        let list = (d.runs || []).filter(r => r.engine === 'jmeter');
+        if (collection?.id) list = list.filter(r => String(r.collection_id) === String(collection.id));
+        if (env) list = list.filter(r => r.suite_env === env);
+        // Sort by run number extracted from result_dir descending so the dropdown
+        // order matches the directory sequence (Run 6 > Run 5 > Run 4 > …)
+        list.sort((a, b) => {
+          const na = parseInt((a.result_dir?.split(/[/\\]/).pop()?.match(/Run_?(\d+)$/)||[])[1] || 0);
+          const nb = parseInt((b.result_dir?.split(/[/\\]/).pop()?.match(/Run_?(\d+)$/)||[])[1] || 0);
+          return nb - na;
+        });
+        setRuns(list);
+
+        // If backend is syncing CI results, poll every 5 s until they appear
+        if (d.syncing_count > 0) {
+          setSyncingCi(true);
+          if (!syncPollRef.current) {
+            syncPollRef.current = setInterval(() => {
+              api.get('/execution/runs', { params: { project_id: project.id, include_archived: includeArchived ? 'true' : 'false' } })
+                .then(({ data: pd }) => {
+                  if (pd.syncing_count === 0) {
+                    clearInterval(syncPollRef.current);
+                    syncPollRef.current = null;
+                    setSyncingCi(false);
+                  }
+                  let plist = (pd.runs || []).filter(r => r.engine === 'jmeter');
+                  if (collection?.id) plist = plist.filter(r => String(r.collection_id) === String(collection.id));
+                  if (env) plist = plist.filter(r => r.suite_env === env);
+                  plist.sort((a, b) => {
+                    const na = parseInt((a.result_dir?.split(/[/\\]/).pop()?.match(/Run_?(\d+)$/)||[])[1] || 0);
+                    const nb = parseInt((b.result_dir?.split(/[/\\]/).pop()?.match(/Run_?(\d+)$/)||[])[1] || 0);
+                    return nb - na;
+                  });
+                  setRuns(plist);
+                })
+                .catch(() => {});
+            }, 5000);
+          }
+        } else {
+          setSyncingCi(false);
+          if (syncPollRef.current) { clearInterval(syncPollRef.current); syncPollRef.current = null; }
         }
-        // Filter by active env — strict match, no cross-env bleed
-        if (env) {
-          runs = runs.filter(r => r.suite_env === env);
-        }
-        setRuns(runs);
       })
-      .catch(()=>{})
-      .finally(()=>setLoading(false));
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    setShowArchived(false);
+    fetchRuns(false);
+    return () => { if (syncPollRef.current) { clearInterval(syncPollRef.current); syncPollRef.current = null; } };
   }, [project?.id, collection?.id, env]);
+
+  function toggleArchived() {
+    const next = !showArchived;
+    setShowArchived(next);
+    fetchRuns(next);
+  }
 
   useEffect(() => {
     // Always clear previous run data immediately so the old charts don't linger
-    setData(null); setError('');
+    setData(null); setError(''); setErrorMeta(null);
     if (!selectedId) return;
     setLoadingData(true);
     api.get(`/execution/runs/${selectedId}/report-data`)
       .then(({ data: d }) => setData(d))
-      .catch(e => setError(e.response?.data?.error || 'Failed to load analytics data'))
+      .catch(e => {
+        const resp = e.response?.data || {};
+        if (resp.error === 'not_cached') {
+          setError(resp.message || 'Report data not available.');
+          setErrorMeta({ ci_run_id: resp.ci_run_id });
+        } else {
+          setError(resp.error || resp.message || 'Failed to load analytics data');
+          setErrorMeta(null);
+        }
+      })
       .finally(() => setLoadingData(false));
   }, [selectedId]);
 
+  async function handleDeleteRun(deleteFiles) {
+    if (!selectedId) return;
+    setDeleting(true);
+    try {
+      const { data: r } = await api.delete(`/execution/runs/${selectedId}`, { params: { delete_files: deleteFiles ? 'true' : 'false' } });
+      if (r.archived) {
+        // Soft delete — mark archived in local list so it appears/disappears correctly
+        setRuns(prev => prev.map(run => String(run.id) === String(selectedId) ? { ...run, archived: 1 } : run));
+      } else {
+        // Hard delete — remove from list entirely
+        setRuns(prev => prev.filter(run => String(run.id) !== String(selectedId)));
+      }
+      setSelectedId('');
+      setData(null);
+      setError('');
+      setErrorMeta(null);
+    } catch (e) {
+      alert(`Delete failed: ${e.response?.data?.error || e.message}`);
+    } finally {
+      setDeleting(false);
+      setDeleteConfirm(false);
+    }
+  }
+
+  async function handleRestore(runId) {
+    setRestoring(runId);
+    try {
+      await api.patch(`/execution/runs/${runId}/restore`);
+      setRuns(prev => prev.map(r => String(r.id) === String(runId) ? { ...r, archived: 0 } : r));
+    } catch (e) {
+      alert(`Restore failed: ${e.response?.data?.error || e.message}`);
+    } finally {
+      setRestoring(null);
+    }
+  }
+
   async function handleExportPDF() {
-    if (!data || !selectedId || !analyticsRef.current) return;
+    if (!data || !selectedId) return;
     setExporting(true);
+    setExportProgress('Generating PDF on server…');
 
     const suiteName = (data?.meta?.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const savedTab  = activeTab;
-    const tabsToExport = TABS.filter(t => t.id !== 'logs');
 
     try {
-      const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
-        import('jspdf'),
-        import('html2canvas'),
-      ]);
-
-      const pdf       = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-      const pageW     = pdf.internal.pageSize.getWidth();
-      const pageH     = pdf.internal.pageSize.getHeight();
-
-      for (let i = 0; i < tabsToExport.length; i++) {
-        const tab = tabsToExport[i];
-        setExportProgress(`Capturing ${tab.label} (${i + 1}/${tabsToExport.length})…`);
-
-        // Switch tab and wait for React render + Chart.js animation to finish
-        setActiveTab(tab.id);
-        await new Promise(r => setTimeout(r, 900));
-
-        const canvas = await html2canvas(analyticsRef.current, {
-          scale: 2,
-          useCORS: true,
-          allowTaint: true,
-          backgroundColor: '#0d1117',
-          logging: false,
-          windowWidth: analyticsRef.current.scrollWidth,
-          windowHeight: analyticsRef.current.scrollHeight,
-        });
-
-        const imgData  = canvas.toDataURL('image/jpeg', 0.93);
-        const imgH     = (canvas.height * pageW) / canvas.width;
-
-        if (i > 0) pdf.addPage();
-
-        if (imgH <= pageH) {
-          pdf.addImage(imgData, 'JPEG', 0, 0, pageW, imgH);
-        } else {
-          // Scale down to fit page height
-          const scale = pageH / imgH;
-          pdf.addImage(imgData, 'JPEG', 0, 0, pageW * scale, pageH);
-        }
-      }
-
-      pdf.save(`${suiteName}_Run${runNum || selectedId}_Analytics.pdf`);
+      const response = await api.get(`/execution/runs/${selectedId}/export-pdf`, {
+        responseType: 'blob',
+      });
+      const url = URL.createObjectURL(new Blob([response.data], { type: 'application/pdf' }));
+      const a   = document.createElement('a');
+      a.href     = url;
+      a.download = `${suiteName}_Run${runNum || selectedId}_Analytics.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (e) {
       console.error('PDF export failed', e);
-      alert(`PDF export failed: ${e.message}`);
+      alert(`PDF export failed: ${e.response?.data?.error || e.message}`);
     } finally {
-      setActiveTab(savedTab);
       setExporting(false);
       setExportProgress('');
     }
@@ -983,11 +1089,24 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   );
 
   const selectedRun = runs.find(r=>String(r.id)===selectedId);
-  const runNum = selectedRun?.id;
+  // Extract the sequential number from result_dir basename (handles both Run_3 and SuiteName_Run3)
+  const getRunNum = r => {
+    const base = r?.result_dir?.split(/[/\\]/).pop() || '';
+    return (base.match(/Run_?(\d+)$/)||[])[1] || r?.id;
+  };
+  // Full execution label — the result_dir basename IS the canonical run name
+  const getRunLabel = r => r?.result_dir?.split(/[/\\]/).pop() || `Run_${r?.id}`;
+  const runNum = getRunNum(selectedRun);
 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
+      {syncingCi && (
+        <div style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 16px', marginBottom:12, borderRadius:8, background:'rgba(99,102,241,0.12)', border:'1px solid rgba(99,102,241,0.3)', fontSize:13, color:'#a5b4fc' }}>
+          <span className="spinner" style={{ borderTopColor:'#818cf8' }} />
+          Syncing CI pipeline results to Analytics… this page will update automatically.
+        </div>
+      )}
       {/* Run selector bar */}
       <div style={{ display:'flex', alignItems:'flex-end', gap:12, marginBottom:16, flexWrap:'wrap' }}>
         <div style={{ flex:1, minWidth:240 }}>
@@ -996,15 +1115,43 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           </label>
           {loading ? (
             <span style={{ fontSize:12, color:D.textSec }}><span className="spinner" /> Loading…</span>
-          ) : runs.length===0 ? (
-            <div style={{ fontSize:13, color:D.textSec }}>No JMeter runs found for this project.</div>
           ) : (
-            <CustomSelect value={selectedId} onChange={e=>{ setSelectedId(e.target.value); setActiveTab('summary'); }} style={{ width:'100%', maxWidth:520 }}>
-              <option value="">— Select a run —</option>
-              {runs.map(r=>{
-                return <option key={r.id} value={r.id}>{`Run ${r.id} — ${r.suite_name||'Unknown'} — ${r.status} — ${new Date(r.started_at).toLocaleString()}`}</option>;
-              })}
-            </CustomSelect>
+            <>
+              {runs.filter(r => !r.archived).length === 0 && !showArchived ? (
+                <div style={{ fontSize:13, color:D.textSec }}>No JMeter runs found for this project.</div>
+              ) : (
+                <CustomSelect value={selectedId} onChange={e=>{ setSelectedId(e.target.value); setActiveTab('summary'); }} style={{ width:'100%', maxWidth:520 }}>
+                  <option value="">— Select a run —</option>
+                  {runs.filter(r => !r.archived).map(r => (
+                    <option key={r.id} value={r.id}>{`${getRunLabel(r)} — ${new Date(r.started_at).toLocaleString()}`}</option>
+                  ))}
+                </CustomSelect>
+              )}
+              {/* Archived runs list */}
+              {showArchived && runs.filter(r => r.archived).length > 0 && (
+                <div style={{ marginTop:10, background:'rgba(107,114,128,0.08)', border:'1px solid rgba(107,114,128,0.2)', borderRadius:8, padding:'10px 14px' }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:D.textSec, textTransform:'uppercase', letterSpacing:'.5px', marginBottom:8 }}>Deleted Runs</div>
+                  {runs.filter(r => r.archived).map(r => (
+                    <div key={r.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0', borderBottom:'1px solid rgba(107,114,128,0.15)', gap:8 }}>
+                      <span style={{ fontSize:12, color:D.textSec }}>
+                        {getRunLabel(r)} — {new Date(r.started_at).toLocaleString()}
+                      </span>
+                      <button
+                        onClick={() => handleRestore(r.id)}
+                        disabled={restoring === r.id}
+                        style={{ display:'inline-flex', alignItems:'center', gap:4, padding:'4px 10px', borderRadius:5, border:'1px solid rgba(34,197,94,0.4)', background:'rgba(34,197,94,0.1)', color:'#22c55e', fontSize:11, fontWeight:600, cursor:'pointer', whiteSpace:'nowrap', flexShrink:0 }}
+                      >
+                        {restoring === r.id ? <span className="spinner" style={{ margin:0, width:10, height:10 }} /> : <i className="ti ti-refresh" />}
+                        Restore
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {showArchived && runs.filter(r => r.archived).length === 0 && (
+                <div style={{ fontSize:12, color:D.textTer, marginTop:6 }}>No deleted runs to recover.</div>
+              )}
+            </>
           )}
         </div>
         {data && (
@@ -1013,10 +1160,39 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
             {exporting ? (exportProgress || 'Exporting…') : 'Export PDF'}
           </button>
         )}
+        {selectedId && (
+          <button
+            className="btn-sm"
+            onClick={() => setDeleteConfirm(true)}
+            style={{ display:'inline-flex', alignItems:'center', gap:5, whiteSpace:'nowrap', background:'rgba(239,68,68,0.12)', border:'1px solid rgba(239,68,68,0.35)', color:'#ef4444', borderRadius:6, padding:'5px 12px', fontSize:12, fontWeight:600, cursor:'pointer' }}
+          >
+            <i className="ti ti-trash" /> Delete Report
+          </button>
+        )}
+        <button
+          className="btn-sm"
+          onClick={toggleArchived}
+          style={{ display:'inline-flex', alignItems:'center', gap:5, whiteSpace:'nowrap', background: showArchived ? 'rgba(245,158,11,0.15)' : 'transparent', border:`1px solid ${showArchived ? 'rgba(245,158,11,0.4)' : 'rgba(107,114,128,0.3)'}`, color: showArchived ? '#f59e0b' : D.textSec, borderRadius:6, padding:'5px 12px', fontSize:12, fontWeight:600, cursor:'pointer' }}
+        >
+          <i className="ti ti-archive" /> {showArchived ? 'Hide Deleted' : 'Deleted Runs'}
+        </button>
       </div>
 
-      {loadingData && <div className="empty"><span className="spinner" style={{ width:28, height:28 }} /><div style={{ marginTop:12, color:D.textSec, fontSize:13 }}>Parsing JTL results…</div></div>}
-      {error && <div style={{ padding:'12px 16px', background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.3)', borderRadius:8, color:'#ef4444', fontSize:13, marginBottom:16 }}>{error}</div>}
+      {loadingData && <div className="empty"><span className="spinner" style={{ width:28, height:28 }} /><div style={{ marginTop:12, color:D.textSec, fontSize:13 }}>Loading analytics…</div></div>}
+      {error && !loadingData && (
+        <div style={{ padding:'14px 16px', background:'rgba(239,68,68,0.08)', border:'1px solid rgba(239,68,68,0.25)', borderRadius:8, color:'#ef4444', fontSize:13, marginBottom:16, display:'flex', alignItems:'flex-start', gap:10 }}>
+          <i className="ti ti-alert-circle" style={{ fontSize:16, flexShrink:0, marginTop:1 }} />
+          <div>
+            <div style={{ fontWeight:600, marginBottom: errorMeta?.ci_run_id ? 6 : 0 }}>{error}</div>
+            {errorMeta?.ci_run_id && (
+              <div style={{ fontSize:12, color:'#f87171', marginTop:4 }}>
+                <i className="ti ti-refresh" style={{ marginRight:4 }} />
+                Go to <strong>CI Pipeline</strong> and sync this run's results to regenerate the report.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {!selectedId && !loadingData && (
         <div className="empty">
@@ -1056,18 +1232,73 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
 
           {/* Tab content */}
           <div>
-            {activeTab==='summary'     && <SummaryTab     data={data} runNum={runNum} />}
+            {activeTab==='summary'     && <SummaryTab     data={data} runNum={runNum} selectedRun={selectedRun} />}
             {activeTab==='dashboard'   && <DashboardTab   data={data} />}
             {activeTab==='transaction' && <TransactionTab data={data} />}
             {activeTab==='trend'       && <TrendTab       data={data} />}
             {activeTab==='resource'    && <ResourceTab    data={data} />}
             {activeTab==='errors'      && <ErrorsTab      data={data} />}
-            {activeTab==='logs'        && <LogsTab        data={data} />}
           </div>
 
           <footer style={{ marginTop:24, padding:'10px 0', borderTop:`1px solid ${D.border}`, fontSize:11, color:D.textTer, textAlign:'center' }}>
             Performance Studio — Analytics Report · {data.meta.suite_name} · Run {runNum}
           </footer>
+        </div>
+      )}
+
+      {/* ── Delete confirmation dialog ─────────────────────────────────────── */}
+      {deleteConfirm && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div style={{ background:'#1a2035', border:'1px solid #2a3558', borderRadius:12, padding:28, maxWidth:420, width:'90%', boxShadow:'0 20px 60px rgba(0,0,0,0.5)' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:16 }}>
+              <i className="ti ti-trash" style={{ fontSize:20, color:'#ef4444' }} />
+              <span style={{ fontSize:16, fontWeight:700, color:'#f0f4ff' }}>Delete Report</span>
+            </div>
+            <p style={{ fontSize:13, color:'#9ca3af', marginBottom:12, lineHeight:1.6 }}>
+              Choose how to delete <strong style={{ color:'#f0f4ff' }}>Run {runNum}</strong>:
+            </p>
+            <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:20 }}>
+              <div style={{ background:'rgba(34,197,94,0.06)', border:'1px solid rgba(34,197,94,0.2)', borderRadius:8, padding:'10px 14px' }}>
+                <div style={{ fontSize:13, fontWeight:600, color:'#22c55e', marginBottom:3 }}>
+                  <i className="ti ti-archive" style={{ marginRight:5 }} />Archive (Recoverable)
+                </div>
+                <div style={{ fontSize:12, color:'#6b7280', lineHeight:1.5 }}>
+                  Hides the report from the list. Disk files are kept. You can restore it anytime via the <strong style={{ color:'#9ca3af' }}>Deleted Runs</strong> button.
+                </div>
+              </div>
+              <div style={{ background:'rgba(239,68,68,0.06)', border:'1px solid rgba(239,68,68,0.2)', borderRadius:8, padding:'10px 14px' }}>
+                <div style={{ fontSize:13, fontWeight:600, color:'#ef4444', marginBottom:3 }}>
+                  <i className="ti ti-trash" style={{ marginRight:5 }} />Delete Permanently
+                </div>
+                <div style={{ fontSize:12, color:'#6b7280', lineHeight:1.5 }}>
+                  Removes the record AND deletes all local result files (JTL, HTML report). <strong style={{ color:'#f87171' }}>Cannot be undone.</strong>
+                </div>
+              </div>
+            </div>
+            <div style={{ display:'flex', gap:8, justifyContent:'flex-end', flexWrap:'wrap' }}>
+              <button
+                onClick={() => setDeleteConfirm(false)}
+                disabled={deleting}
+                style={{ padding:'7px 16px', borderRadius:6, border:'1px solid #2a3558', background:'transparent', color:'#9ca3af', fontSize:13, cursor:'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleDeleteRun(false)}
+                disabled={deleting}
+                style={{ padding:'7px 16px', borderRadius:6, border:'1px solid rgba(34,197,94,0.4)', background:'rgba(34,197,94,0.1)', color:'#22c55e', fontSize:13, fontWeight:600, cursor:'pointer' }}
+              >
+                {deleting ? <span className="spinner" style={{ margin:0 }} /> : <><i className="ti ti-archive" style={{ marginRight:4 }} />Archive</>}
+              </button>
+              <button
+                onClick={() => handleDeleteRun(true)}
+                disabled={deleting}
+                style={{ padding:'7px 16px', borderRadius:6, border:'none', background:'#ef4444', color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer' }}
+              >
+                {deleting ? <span className="spinner" style={{ margin:0 }} /> : <><i className="ti ti-trash" style={{ marginRight:4 }} />Delete Permanently</>}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

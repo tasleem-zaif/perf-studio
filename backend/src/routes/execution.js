@@ -17,6 +17,7 @@ const { generateAnalyticsPdf } = require('../utils/generateAnalyticsPdf');
 const { startAutoHeal, getHealStatus } = require('../utils/autoHealer');
 const { evaluateRules } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
+const { parseJtl } = require('../utils/parseJtl');
 
 const PERFSTUDIO_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.perfstudio');
 
@@ -104,13 +105,12 @@ function cleanStaleRuns(projectId) {
 
 function getNextRunNumber(projectId) {
   cleanStaleRuns(projectId);
-  // Use DB max(id) as the source of truth to avoid race conditions when
-  // multiple runs start simultaneously for the same project.
+  const { extractRunNumber } = require('../utils/buildRunName');
   const rows = db.prepare('SELECT result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
   let maxNum = 0;
   for (const r of rows) {
-    const m = r.result_dir?.match(/Run_(\d+)/);
-    if (m) maxNum = Math.max(maxNum, parseInt(m[1]));
+    const n = extractRunNumber(r.result_dir);
+    if (n > maxNum) maxNum = n;
   }
   return maxNum + 1;
 }
@@ -748,22 +748,27 @@ router.post('/run', auth, async (req, res) => {
 
   const projectFolderPath = project.folder_path || getProjectPath(project.name, project.id);
   const runNumber = getNextRunNumber(project_id);
+  const { buildRunDirName } = require('../utils/buildRunName');
+  const effectiveUsers    = vusers    || suite.vusers    || 1;
+  const effectiveLoops    = loops     || suite.loops     || 1;
+  const effectiveDuration = duration  || suite.duration  || 0;
+  const effectiveIterMode = iteration_mode || suite.iter_mode || 'duration';
+  const runDirName = buildRunDirName(suite.name, effectiveUsers, effectiveIterMode, effectiveLoops, effectiveDuration, runNumber);
 
-  // Results go into collection/env/results/Run_X/ — tracked per environment in git
+  // Results go into collection/env/results/{runDirName}/ — tracked per environment in git
   let resultDir;
   if (suite.collection_id && suite.env && projectFolderPath) {
     try {
       const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
       if (suiteCol) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        // getCollectionPath(path, colName, env) — 3 args only, no colId
         const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suite.env);
-        resultDir = path.join(envPath, 'results', `Run_${runNumber}`);
+        resultDir = path.join(envPath, 'results', runDirName);
       }
     } catch (_) {}
   }
   // Fallback to project-level results
-  if (!resultDir) resultDir = path.join(projectFolderPath, 'results', `Run_${runNumber}`);
+  if (!resultDir) resultDir = path.join(projectFolderPath, 'results', runDirName);
   fs.mkdirSync(resultDir, { recursive: true });
   log('info', `  Result dir : ${resultDir}`);
   log('info', `  Run #      : ${runNumber}`);
@@ -981,20 +986,25 @@ router.post('/run', auth, async (req, res) => {
     }
 
     // ── Mid-run rule monitoring setup ─────────────────────────────────────────
-    const { sendBreachAlertEmail } = require('../utils/emailUtils');
+    const { sendRuleViolationEmail: sendMidRunViolationEmail } = require('../utils/emailUtils');
     const alertedRuleIds = new Set();   // track which rule IDs already fired an alert
     const testStartMs    = Date.now();
     const project        = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
     const suiteName      = suite?.name || 'Test Run';
     const projectName    = project?.name || '';
 
-    // Metrics that can be meaningfully evaluated in real-time (mid-run).
-    // Response Time / P95 / P90 can swing during ramp-up and only stabilise at
-    // the end, so we intentionally exclude them from live monitoring.
+    // All rule metrics can be monitored in real-time against the partial JTL.
     const LIVE_MONITOR_METRICS = new Set([
       'error rate',
       'cpu usage',
       'memory usage',
+      'response time',
+      'avg response time',
+      'average response time',
+      'p90',
+      'p95',
+      'throughput',
+      'tps',
     ]);
 
     // Check rules against current partial JTL every second
@@ -1022,15 +1032,13 @@ router.post('/run', auth, async (req, res) => {
         log('warn', `  [Rules] ⚡ ${newViolations.length} rule breach(es) detected at ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s — sending alert…`);
         newViolations.forEach(v => log('warn', `          ${v.label} [${v.rule.severity}]`));
 
-        // Send breach alert email (non-blocking)
-        sendBreachAlertEmail(runId, req.userId, project_id, {
-          violations:    newViolations,
+        // Send rule violation alert email (non-blocking) — fires once per rule per run
+        sendMidRunViolationEmail(
+          runId, req.userId, project_id,
+          newViolations,
           suiteName,
-          projectName,
-          elapsedSec,
-          totalDuration: duration || 0,
-          runId,
-        }).catch(e => console.error('[Alerts] Breach email error:', e.message));
+          projectName
+        ).catch(e => console.error('[Alerts] Rule violation email error:', e.message));
 
       } catch (e) {
         console.error('[RuleMonitor] Error:', e.message);
@@ -1207,7 +1215,7 @@ router.post('/run', auth, async (req, res) => {
     const sendEmailForRun = async (targetRunId) => {
       console.log(`[Alerts] sendEmailForRun started for run #${targetRunId}`);
       try {
-        const { sendAlertEmail }             = require('../utils/emailUtils');
+        const { sendAlertEmail } = require('../utils/emailUtils');
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
 
         const runRow = db.prepare(`
@@ -1225,103 +1233,13 @@ router.post('/run', auth, async (req, res) => {
         }
         console.log('[Alerts] JTL found, building report data for email...');
 
-        const content = fs.readFileSync(jtlPath, 'utf8');
-        const lines   = content.trim().split('\n').filter(Boolean);
-        if (lines.length < 2) return;
-
-        const HNORM = { Latency:'latency', Connect:'connect', Bytes:'bytes', SentBytes:'sentBytes' };
-        const hdrs  = lines[0].split(',').map(h => { const c = h.trim().replace(/^"|"$/g,''); return HNORM[c]||c; });
-
-        const splitCsvLine = line => {
-          const cells = []; let cur = '', inQ = false;
-          for (const ch of line) {
-            if (ch === '"') inQ = !inQ;
-            else if (ch === ',' && !inQ) { cells.push(cur.trim()); cur = ''; }
-            else cur += ch;
-          }
-          cells.push(cur.trim()); return cells;
+        const runMeta = {
+          run_id: runRow.id, suite_name: runRow.suite_name || 'Test Plan',
+          engine: runRow.engine, status: runRow.status,
+          started_at: runRow.started_at, finished_at: runRow.finished_at,
         };
-        const parseRow = ln => { const p=splitCsvLine(ln),r={}; hdrs.forEach((h,i)=>{r[h]=(p[i]||'').replace(/^"|"$/g,'').trim();}); return r; };
-        const pctFn  = (arr,p) => { if(!arr.length)return null; const s=[...arr].sort((a,b)=>a-b); return s[Math.max(0,Math.ceil(p/100*s.length)-1)]; };
-        const safeMin = arr => { const v=arr.filter(n=>n>0); return v.length ? Math.min(...v) : null; };
-        const safeMax = arr => { const v=arr.filter(n=>n>0); return v.length ? Math.max(...v) : null; };
-
-        const allRows    = lines.slice(1).map(parseRow);
-        const allElapsed = allRows.map(r=>parseInt(r.elapsed)||0);
-        const allLat     = allRows.map(r=>parseInt(r.latency)||0);
-        const allConn    = allRows.map(r=>parseInt(r.connect)||0);
-        const allBytes   = allRows.map(r=>parseInt(r.bytes)||0);
-        const allSentB   = allRows.map(r=>parseInt(r.sentBytes)||0);
-        const totalReqs  = allRows.length;
-        const totalSucc  = allRows.filter(r=>r.success==='true').length;
-        const totalFail  = totalReqs - totalSucc;
-        const elSum      = allElapsed.reduce((a,b)=>a+b,0);
-        const tsList     = allRows.map(r=>parseInt(r.timeStamp)||0).filter(Boolean);
-        const minTs2     = tsList.length ? Math.min(...tsList) : 0;
-        const maxTsEnd   = tsList.length ? Math.max(...allRows.map((r,i)=>(parseInt(r.timeStamp)||0)+(allElapsed[i]||0))) : 0;
-        const durS2      = tsList.length ? (maxTsEnd - minTs2)/1000 : 1;
-
-        const byLabel = {};
-        allRows.forEach(r => {
-          const lbl = r.label||'Unknown';
-          if (!byLabel[lbl]) byLabel[lbl]={elapsed:[],success:0,failed:0,latency:[],connect:[],bytes:[],responseCodes:{},failMessages:{}};
-          const d = byLabel[lbl];
-          d.elapsed.push(parseInt(r.elapsed)||0); d.latency.push(parseInt(r.latency)||0);
-          d.connect.push(parseInt(r.connect)||0); d.bytes.push(parseInt(r.bytes)||0);
-          if (r.success==='true') d.success++;
-          else { d.failed++; const cd=r.responseCode||'unknown'; d.responseCodes[cd]=(d.responseCodes[cd]||0)+1; const mg=r.failureMessage||r.responseMessage||''; if(mg) d.failMessages[mg]=(d.failMessages[mg]||0)+1; }
-        });
-        const by_api = Object.entries(byLabel).map(([label,d])=>({
-          label, total:d.elapsed.length, success:d.success, failed:d.failed,
-          error_rate: parseFloat(((d.failed/d.elapsed.length)*100).toFixed(2)),
-          avg: parseFloat((d.elapsed.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(1)),
-          min: safeMin(d.elapsed), max: safeMax(d.elapsed),
-          p90: pctFn(d.elapsed,90), p95: pctFn(d.elapsed,95),
-          tps: parseFloat((d.elapsed.length/durS2).toFixed(3)),
-          avg_latency: parseFloat((d.latency.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(1)),
-          avg_connect: parseFloat((d.connect.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(1)),
-          avg_bytes:   parseFloat((d.bytes.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(0)),
-          response_codes: d.responseCodes, fail_messages: d.failMessages,
-        }));
-
-        const tlMap = {};
-        allRows.forEach((r,i) => {
-          const sec = Math.floor(((parseInt(r.timeStamp)||0) - minTs2)/1000);
-          if (!tlMap[sec]) tlMap[sec]={count:0,elapsed:[],latency:[],connect:[],bytes:0,sentBytes:0,threads:[],errors:0};
-          const t=tlMap[sec];
-          t.count++; t.elapsed.push(allElapsed[i]); t.latency.push(allLat[i]); t.connect.push(allConn[i]);
-          t.bytes+=allBytes[i]; t.sentBytes+=allSentB[i]; t.threads.push(parseInt(r.allThreads)||0);
-          if (r.success!=='true') t.errors++;
-        });
-        const timeline = Object.entries(tlMap).sort(([a],[b])=>+a-+b).map(([sec,d])=>({
-          second:+sec, tps:d.count,
-          avg_rt: parseFloat((d.elapsed.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(1)),
-          avg_latency: parseFloat((d.latency.reduce((a,b)=>a+b,0)/d.latency.length).toFixed(1)),
-          avg_connect: parseFloat((d.connect.reduce((a,b)=>a+b,0)/d.connect.length).toFixed(1)),
-          bytes_received:d.bytes, bytes_sent:d.sentBytes,
-          threads: d.threads.length ? Math.max(...d.threads) : 0, errors:d.errors,
-          error_rate: parseFloat(((d.errors/d.count)*100).toFixed(1)),
-        }));
-
-        const summary = {
-          total_requests:totalReqs, total_success:totalSucc, total_failed:totalFail,
-          error_rate: parseFloat(((totalFail/totalReqs)*100).toFixed(2)),
-          avg_response_time: parseFloat((elSum/(totalReqs||1)).toFixed(1)),
-          overall_tps: parseFloat((totalReqs/durS2).toFixed(3)),
-          p90: pctFn(allElapsed,90), p95: pctFn(allElapsed,95),
-          min_response_time: safeMin(allElapsed), max_response_time: safeMax(allElapsed),
-          avg_latency: parseFloat((allLat.reduce((a,b)=>a+b,0)/(totalReqs||1)).toFixed(1)),
-          avg_connect: parseFloat((allConn.reduce((a,b)=>a+b,0)/(totalReqs||1)).toFixed(1)),
-          total_bytes_received: allBytes.reduce((a,b)=>a+b,0),
-          total_bytes_sent: allSentB.reduce((a,b)=>a+b,0),
-        };
-
-        const errMap = {};
-        allRows.filter(r=>r.success!=='true').forEach(r => {
-          const k=`${r.label}||${r.responseCode||'N/A'}`;
-          if (!errMap[k]) errMap[k]={label:r.label||'Unknown',response_code:r.responseCode||'N/A',response_message:(r.responseMessage||'').slice(0,120),failure_message:(r.failureMessage||'').slice(0,200),count:0};
-          errMap[k].count++;
-        });
+        const parsed = parseJtl(jtlPath, runMeta);
+        if (!parsed) return;
 
         // Evaluate rules against this run's JTL so violations appear in the email
         let ruleViolationsForEmail = [];
@@ -1330,16 +1248,13 @@ router.post('/run', auth, async (req, res) => {
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
-        const reportData = {
-          meta: {
-            run_id: runRow.id, suite_name: runRow.suite_name || 'Test Plan',
-            engine: runRow.engine, status: runRow.status,
-            started_at: runRow.started_at, finished_at: runRow.finished_at,
-            duration_s: parseFloat(durS2.toFixed(1)),
-          },
-          summary, by_api, timeline, errors: Object.values(errMap), logs: [],
-          rule_violations: ruleViolationsForEmail,
-        };
+        const reportData = { ...parsed, rule_violations: ruleViolationsForEmail };
+
+        // Cache parsed data so Analytics page never needs to re-read the JTL
+        try {
+          db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
+            .run(JSON.stringify(parsed), targetRunId);
+        } catch (_) {}
 
         // Generate PDF — save to result_dir for permanent storage AND send via email
         let pdfPath = null;
@@ -1417,13 +1332,56 @@ router.get('/runs', auth, (req, res) => {
 
   cleanStaleRuns(project_id);
 
+  // Background: sync any completed CI runs that don't have an execution_runs record yet.
+  // Returns syncing_count so the frontend knows to poll again shortly.
+  let syncingCount = 0;
+  try {
+    // Only auto-sync runs completed within the last 7 days — older ones likely
+    // have expired artifacts and must not trigger email notifications retroactively.
+    const unsyncedCiRuns = db.prepare(`
+      SELECT * FROM ci_pipeline_runs
+      WHERE project_id = ? AND status = 'completed'
+        AND finished_at >= datetime('now', '-7 days')
+        AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
+    `).all(project_id);
+
+    syncingCount = unsyncedCiRuns.length;
+    if (syncingCount > 0) {
+      console.log(`[Auto-sync] Found ${syncingCount} unsynced CI run(s) for project ${project_id}`);
+      const http = require('http');
+      const authHeader = req.headers.authorization || '';
+      for (const ciRun of unsyncedCiRuns) {
+        const options = {
+          method: 'POST',
+          host: 'localhost',
+          port: 3001,
+          // suppress_email=true: auto-sync is retrospective; never spam old-run alerts
+          path: `/api/projects/${project_id}/ci/runs/${ciRun.id}/sync-results?suppress_email=true`,
+          headers: { Authorization: authHeader, 'Content-Type': 'application/json', 'Content-Length': 0 },
+        };
+        const syncReq = http.request(options, syncRes => {
+          let data = '';
+          syncRes.on('data', c => data += c);
+          syncRes.on('end', () => console.log(`[Auto-sync] CI run #${ciRun.id} → HTTP ${syncRes.statusCode}`));
+        });
+        syncReq.on('error', e => console.warn(`[Auto-sync] CI run #${ciRun.id} failed: ${e.message}`));
+        syncReq.end();
+      }
+    }
+  } catch (e) {
+    console.warn('[Auto-sync] Background check error:', e.message);
+  }
+
+  const includeArchived = req.query.include_archived === 'true';
   const runs = db.prepare(`
-    SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id
+    SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id,
+           ci.web_url as ci_web_url, ci.provider as ci_provider, ci.external_id as ci_external_id
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
-    WHERE r.project_id = ?
+    LEFT JOIN ci_pipeline_runs ci ON ci.id = r.ci_run_id
+    WHERE r.project_id = ? AND (r.archived = 0 OR r.archived IS NULL OR ? = 1)
     ORDER BY r.started_at DESC
-  `).all(project_id);
+  `).all(project_id, includeArchived ? 1 : 0);
 
   const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
@@ -1449,7 +1407,39 @@ router.get('/runs', auth, (req, res) => {
     }
     return { ...r, logs: JSON.parse(r.logs || '[]'), report_url, heal_status: r.heal_status, heal_run_id: r.heal_run_id };
   });
-  res.json({ runs: parsed });
+  res.json({ runs: parsed, syncing_count: syncingCount });
+});
+
+// ── Delete / archive a run ────────────────────────────────────────────────────
+// delete_files=true  → hard delete (wipe disk files + remove DB record, unrecoverable)
+// delete_files=false → soft delete (set archived=1, hide from list, fully recoverable)
+router.delete('/runs/:id', auth, (req, res) => {
+  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (run.status === 'running') return res.status(400).json({ error: 'Cannot delete a run that is currently in progress' });
+
+  if (req.query.delete_files === 'true') {
+    // Hard delete — wipe disk files then remove the record
+    if (run.result_dir && fs.existsSync(run.result_dir)) {
+      try { fs.rmSync(run.result_dir, { recursive: true, force: true }); } catch (_) {}
+    }
+    db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
+    res.json({ deleted: true, archived: false, id: run.id });
+  } else {
+    // Soft delete — archive only; disk files and DB record are preserved for recovery
+    db.prepare('UPDATE execution_runs SET archived=1 WHERE id=?').run(run.id);
+    res.json({ deleted: false, archived: true, id: run.id });
+  }
+});
+
+// ── Restore a soft-deleted (archived) run ────────────────────────────────────
+router.patch('/runs/:id/restore', auth, (req, res) => {
+  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  db.prepare('UPDATE execution_runs SET archived=0 WHERE id=?').run(run.id);
+  res.json({ restored: true, id: run.id });
 });
 
 router.get('/runs/:id/heal-status', auth, (req, res) => {
@@ -1472,200 +1462,53 @@ router.get('/runs/:id/report-data', auth, (req, res) => {
   if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   if (run.engine !== 'jmeter') return res.status(400).json({ error: 'Custom analytics only available for JMeter runs' });
 
-  const jtlPath = path.join(run.result_dir, 'results.jtl');
-  if (!fs.existsSync(jtlPath)) return res.status(404).json({ error: 'JTL results file not found for this run' });
-
-  const content = fs.readFileSync(jtlPath, 'utf8');
-  const lines = content.trim().split('\n').filter(Boolean);
-  if (lines.length < 2) return res.status(400).json({ error: 'JTL file contains no data rows' });
-
-  // JMeter may capitalize some column names (e.g. Latency, Connect) — normalize them
-  const HEADER_NORM = { 'Latency': 'latency', 'Connect': 'connect', 'Bytes': 'bytes', 'SentBytes': 'sentBytes' };
-  const headers = lines[0].split(',').map(h => {
-    const clean = h.trim().replace(/^"|"$/g, '');
-    return HEADER_NORM[clean] || clean;
-  });
-
-  function parseRow(line) {
-    const parts = line.split(',');
-    const row = {};
-    headers.forEach((h, i) => { row[h] = (parts[i] || '').replace(/^"|"$/g, '').trim(); });
-    return row;
-  }
-
-  function pct(arr, p) {
-    if (!arr.length) return 0;
-    const sorted = [...arr].sort((a, b) => a - b);
-    return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
-  }
-
-  const byLabel = {};
-  let minTs = Infinity, maxTs = -Infinity;
-
-  for (let i = 1; i < lines.length; i++) {
-    const row = parseRow(lines[i]);
-    const ts = parseInt(row.timeStamp) || 0;
-    const elapsed = parseInt(row.elapsed) || 0;
-    const success = row.success === 'true';
-    const label = row.label || 'Unknown';
-
-    if (ts < minTs) minTs = ts;
-    if (ts + elapsed > maxTs) maxTs = ts + elapsed;
-
-    if (!byLabel[label]) byLabel[label] = {
-      elapsed: [], timestamps: [], latency: [], connect: [],
-      bytes: [], sentBytes: [], success: 0, failed: 0,
-      responseCodes: {}, failMessages: {},
-    };
-    const d = byLabel[label];
-    d.elapsed.push(elapsed);
-    d.timestamps.push(ts);
-    d.latency.push(parseInt(row.latency) || 0);
-    d.connect.push(parseInt(row.connect) || 0);
-    d.bytes.push(parseInt(row.bytes) || 0);
-    d.sentBytes.push(parseInt(row.sentBytes) || 0);
-    if (success) {
-      d.success++;
-    } else {
-      d.failed++;
-      const code = row.responseCode || 'unknown';
-      const msg  = row.failureMessage || row.responseMessage || '';
-      d.responseCodes[code] = (d.responseCodes[code] || 0) + 1;
-      if (msg) d.failMessages[msg] = (d.failMessages[msg] || 0) + 1;
-    }
-  }
-
-  const totalDuration = minTs < maxTs ? (maxTs - minTs) / 1000 : 1;
-
-  const by_api = Object.entries(byLabel).map(([label, d]) => {
-    const total = d.elapsed.length;
-    const sum = d.elapsed.reduce((a, b) => a + b, 0);
-    const latSum = d.latency.reduce((a, b) => a + b, 0);
-    const connSum = d.connect.reduce((a, b) => a + b, 0);
-    const bytesSum = d.bytes.reduce((a, b) => a + b, 0);
-    return {
-      label,
-      total,
-      success: d.success,
-      failed: d.failed,
-      error_rate: parseFloat(((d.failed / total) * 100).toFixed(2)),
-      avg: parseFloat((sum / total).toFixed(1)),
-      min: d.elapsed.reduce((a, b) => Math.min(a, b), Infinity) || 0,
-      max: d.elapsed.reduce((a, b) => Math.max(a, b), 0),
-      median: pct(d.elapsed, 50),
-      p90: pct(d.elapsed, 90),
-      p95: pct(d.elapsed, 95),
-      tps: parseFloat((total / totalDuration).toFixed(3)),
-      avg_latency: parseFloat((latSum / total).toFixed(1)),
-      avg_connect: parseFloat((connSum / total).toFixed(1)),
-      avg_bytes: parseFloat((bytesSum / total).toFixed(0)),
-      response_codes: d.responseCodes,
-      fail_messages: d.failMessages,
-    };
-  });
-
-  const allRows = [];
-  for (let i = 1; i < lines.length; i++) allRows.push(parseRow(lines[i]));
-  const totalRequests = allRows.length;
-  const totalSuccess = allRows.filter(r => r.success === 'true').length;
-  const totalFailed = totalRequests - totalSuccess;
-  const allElapsed  = allRows.map(r => parseInt(r.elapsed)   || 0);
-  const allLatency  = allRows.map(r => parseInt(r.latency)   || 0);
-  const allConnect  = allRows.map(r => parseInt(r.connect)   || 0);
-  const allBytes    = allRows.map(r => parseInt(r.bytes)     || 0);
-  const allSentBytes= allRows.map(r => parseInt(r.sentBytes) || 0);
-  const elapsedSum  = allElapsed.reduce((a, b) => a + b, 0);
-
-  const summary = {
-    total_requests: totalRequests,
-    total_success: totalSuccess,
-    total_failed: totalFailed,
-    error_rate: parseFloat(((totalFailed / totalRequests) * 100).toFixed(2)),
-    avg_response_time: parseFloat((elapsedSum / (totalRequests || 1)).toFixed(1)),
-    overall_tps: parseFloat((totalRequests / totalDuration).toFixed(3)),
-    p90: pct(allElapsed, 90),
-    p95: pct(allElapsed, 95),
-    min_response_time: allElapsed.reduce((a, b) => Math.min(a, b), Infinity) || 0,
-    max_response_time: allElapsed.reduce((a, b) => Math.max(a, b), 0),
-    avg_latency: parseFloat((allLatency.reduce((a, b) => a + b, 0) / (totalRequests || 1)).toFixed(1)),
-    avg_connect: parseFloat((allConnect.reduce((a, b) => a + b, 0) / (totalRequests || 1)).toFixed(1)),
-    total_bytes_received: allBytes.reduce((a, b) => a + b, 0),
-    total_bytes_sent: allSentBytes.reduce((a, b) => a + b, 0),
-  };
-
-  // Timeline — group requests by second bucket
-  const timelineMap = {};
-  for (const row of allRows) {
-    const ts      = parseInt(row.timeStamp) || 0;
-    const elapsed = parseInt(row.elapsed)   || 0;
-    const latency = parseInt(row.latency)   || 0;
-    const connect = parseInt(row.connect)   || 0;
-    const bytes   = parseInt(row.bytes)     || 0;
-    const sentB   = parseInt(row.sentBytes) || 0;
-    const threads = parseInt(row.allThreads)|| 0;
-    const success = row.success === 'true';
-    const sec = Math.floor((ts - minTs) / 1000);
-    if (!timelineMap[sec]) timelineMap[sec] = { count: 0, elapsed: [], latency: [], connect: [], bytes: 0, sentBytes: 0, threads: [], errors: 0 };
-    const t = timelineMap[sec];
-    t.count++;
-    t.elapsed.push(elapsed);
-    t.latency.push(latency);
-    t.connect.push(connect);
-    t.bytes   += bytes;
-    t.sentBytes += sentB;
-    t.threads.push(threads);
-    if (!success) t.errors++;
-  }
-  const timeline = Object.entries(timelineMap)
-    .sort(([a], [b]) => parseInt(a) - parseInt(b))
-    .map(([sec, d]) => ({
-      second: parseInt(sec),
-      tps: d.count,
-      avg_rt: parseFloat((d.elapsed.reduce((a, b) => a + b, 0) / d.elapsed.length).toFixed(1)),
-      avg_latency: parseFloat((d.latency.reduce((a, b) => a + b, 0) / d.latency.length).toFixed(1)),
-      avg_connect: parseFloat((d.connect.reduce((a, b) => a + b, 0) / d.connect.length).toFixed(1)),
-      bytes_received: d.bytes,
-      bytes_sent: d.sentBytes,
-      threads: Math.max(...d.threads),
-      errors: d.errors,
-      error_rate: parseFloat(((d.errors / d.count) * 100).toFixed(1)),
-    }));
-
-  // Error analysis — aggregate across all APIs
-  const errorMap = {};
-  for (const row of allRows) {
-    if (row.success === 'true') continue;
-    const key = `${row.label}||${row.responseCode || 'N/A'}||${row.responseMessage || ''}`;
-    if (!errorMap[key]) errorMap[key] = {
-      label: row.label || 'Unknown',
-      response_code: row.responseCode || 'N/A',
-      response_message: (row.responseMessage || '').slice(0, 120),
-      failure_message: (row.failureMessage || '').slice(0, 200),
-      count: 0,
-    };
-    errorMap[key].count++;
-  }
-  const errors = Object.values(errorMap).sort((a, b) => b.count - a.count);
-
-  // Logs from stored run
   const storedLogs = JSON.parse(run.logs || '[]');
 
-  res.json({
-    meta: {
-      run_id: run.id,
-      suite_name: run.suite_name || 'Unknown',
-      engine: run.engine,
-      status: run.status,
-      started_at: run.started_at,
-      finished_at: run.finished_at,
-      duration_s: parseFloat(totalDuration.toFixed(1)),
-    },
-    summary,
-    by_api,
-    timeline,
-    errors,
-    logs: storedLogs,
-  });
+  // ── serve from DB cache if available ──────────────────────────────────────
+  if (run.report_data) {
+    try {
+      const cached = JSON.parse(run.report_data);
+      // Backfill timing fields from DB row — CI sync may have stored meta without them
+      if (cached.meta) {
+        if (!cached.meta.finished_at && run.finished_at) cached.meta.finished_at = run.finished_at;
+        if (!cached.meta.started_at  && run.started_at)  cached.meta.started_at  = run.started_at;
+        if (!(cached.meta.duration_s > 0) && run.finished_at && run.started_at) {
+          const ms = new Date(run.finished_at.replace(' ', 'T') + 'Z') - new Date(run.started_at.replace(' ', 'T') + 'Z');
+          if (ms > 0) cached.meta.duration_s = Math.round(ms / 1000);
+        }
+      }
+      return res.json({ ...cached, logs: storedLogs });
+    } catch (_) { /* corrupt cache — fall through to disk */ }
+  }
+
+  // ── fall back to disk, then cache the result ───────────────────────────────
+  const jtlPath = run.result_dir ? path.join(run.result_dir, 'results.jtl') : null;
+  if (!jtlPath || !fs.existsSync(jtlPath)) {
+    return res.status(404).json({
+      error: 'not_cached',
+      message: 'Report data is not available. Re-sync results from the CI pipeline to regenerate.',
+      ci_run_id: run.ci_run_id || null,
+    });
+  }
+
+  const runMeta = {
+    run_id:      run.id,
+    suite_name:  run.suite_name || 'Unknown',
+    engine:      run.engine,
+    status:      run.status,
+    started_at:  run.started_at,
+    finished_at: run.finished_at,
+  };
+  const parsed = parseJtl(jtlPath, runMeta);
+  if (!parsed) return res.status(400).json({ error: 'JTL file contains no data rows' });
+
+  // Backfill cache so next request is instant
+  try {
+    db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
+      .run(JSON.stringify(parsed), run.id);
+  } catch (_) {}
+
+  return res.json({ ...parsed, logs: storedLogs });
 });
 
 // ── Export analytics as a real server-side PDF ────────────────────────────────
@@ -1680,162 +1523,34 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
   if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   if (run.engine !== 'jmeter') return res.status(400).json({ error: 'PDF export only available for JMeter runs' });
 
-  const jtlPath = path.join(run.result_dir, 'results.jtl');
-  if (!fs.existsSync(jtlPath)) return res.status(404).json({ error: 'JTL results file not found' });
-
-  // ── parse JTL ──────────────────────────────────────────────────────────────
-  const content = fs.readFileSync(jtlPath, 'utf8');
-  const lines   = content.trim().split('\n').filter(Boolean);
-  if (lines.length < 2) return res.status(400).json({ error: 'JTL file contains no data rows' });
-
-  const HEADER_NORM = { 'Latency': 'latency', 'Connect': 'connect', 'Bytes': 'bytes', 'SentBytes': 'sentBytes' };
-  const headers = lines[0].split(',').map(h => {
-    const clean = h.trim().replace(/^"|"$/g, '');
-    return HEADER_NORM[clean] || clean;
-  });
-
-  function parseRow(line) {
-    const parts = line.split(',');
-    const row = {};
-    headers.forEach((h, i) => { row[h] = (parts[i] || '').replace(/^"|"$/g, '').trim(); });
-    return row;
+  // ── resolve report data (DB cache → disk fallback) ─────────────────────────
+  let reportData = null;
+  if (run.report_data) {
+    try { reportData = JSON.parse(run.report_data); } catch (_) {}
   }
-  function pct(arr, p) {
-    if (!arr.length) return 0;
-    const sorted = [...arr].sort((a, b) => a - b);
-    return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
-  }
-
-  const byLabel = {};
-  let minTs = Infinity, maxTs = -Infinity;
-  for (let i = 1; i < lines.length; i++) {
-    const row     = parseRow(lines[i]);
-    const ts      = parseInt(row.timeStamp) || 0;
-    const elapsed = parseInt(row.elapsed)   || 0;
-    const success = row.success === 'true';
-    const label   = row.label || 'Unknown';
-    if (ts < minTs) minTs = ts;
-    if (ts + elapsed > maxTs) maxTs = ts + elapsed;
-    if (!byLabel[label]) byLabel[label] = { elapsed: [], timestamps: [], latency: [], connect: [], bytes: [], sentBytes: [], success: 0, failed: 0, responseCodes: {}, failMessages: {} };
-    const d = byLabel[label];
-    d.elapsed.push(elapsed); d.timestamps.push(ts);
-    d.latency.push(parseInt(row.latency) || 0);
-    d.connect.push(parseInt(row.connect) || 0);
-    d.bytes.push(parseInt(row.bytes) || 0);
-    d.sentBytes.push(parseInt(row.sentBytes) || 0);
-    if (success) { d.success++; } else {
-      d.failed++;
-      const code = row.responseCode || 'unknown';
-      const msg  = row.failureMessage || row.responseMessage || '';
-      d.responseCodes[code] = (d.responseCodes[code] || 0) + 1;
-      if (msg) d.failMessages[msg] = (d.failMessages[msg] || 0) + 1;
+  if (!reportData) {
+    const jtlPath = run.result_dir ? path.join(run.result_dir, 'results.jtl') : null;
+    if (!jtlPath || !fs.existsSync(jtlPath)) {
+      return res.status(404).json({ error: 'JTL results file not found and no cached report data available' });
     }
-  }
-
-  const totalDuration = minTs < maxTs ? (maxTs - minTs) / 1000 : 1;
-  const by_api = Object.entries(byLabel).map(([label, d]) => {
-    const total    = d.elapsed.length;
-    const sum      = d.elapsed.reduce((a, b) => a + b, 0);
-    const latSum   = d.latency.reduce((a, b) => a + b, 0);
-    const connSum  = d.connect.reduce((a, b) => a + b, 0);
-    const bytesSum = d.bytes.reduce((a, b) => a + b, 0);
-    return {
-      label, total, success: d.success, failed: d.failed,
-      error_rate: parseFloat(((d.failed / total) * 100).toFixed(2)),
-      avg: parseFloat((sum / total).toFixed(1)),
-      min: d.elapsed.reduce((a, b) => Math.min(a, b), Infinity) || 0,
-      max: d.elapsed.reduce((a, b) => Math.max(a, b), 0),
-      median: pct(d.elapsed, 50), p90: pct(d.elapsed, 90), p95: pct(d.elapsed, 95),
-      tps: parseFloat((total / totalDuration).toFixed(3)),
-      avg_latency: parseFloat((latSum  / total).toFixed(1)),
-      avg_connect: parseFloat((connSum / total).toFixed(1)),
-      avg_bytes:   parseFloat((bytesSum / total).toFixed(0)),
-      response_codes: d.responseCodes, fail_messages: d.failMessages,
+    const runMeta = {
+      run_id: run.id, suite_name: run.suite_name || 'Unknown', engine: run.engine,
+      status: run.status, started_at: run.started_at, finished_at: run.finished_at,
     };
-  });
-
-  const allRows     = [];
-  for (let i = 1; i < lines.length; i++) allRows.push(parseRow(lines[i]));
-  const totalReqs   = allRows.length;
-  const totalSucc   = allRows.filter(r => r.success === 'true').length;
-  const totalFail   = totalReqs - totalSucc;
-  const allElapsed  = allRows.map(r => parseInt(r.elapsed)   || 0);
-  const allLatency  = allRows.map(r => parseInt(r.latency)   || 0);
-  const allConnect  = allRows.map(r => parseInt(r.connect)   || 0);
-  const allBytes    = allRows.map(r => parseInt(r.bytes)     || 0);
-  const allSentB    = allRows.map(r => parseInt(r.sentBytes) || 0);
-  const elapsedSum  = allElapsed.reduce((a, b) => a + b, 0);
-
-  const summary = {
-    total_requests: totalReqs, total_success: totalSucc, total_failed: totalFail,
-    error_rate: parseFloat(((totalFail / totalReqs) * 100).toFixed(2)),
-    avg_response_time: parseFloat((elapsedSum / (totalReqs || 1)).toFixed(1)),
-    overall_tps: parseFloat((totalReqs / totalDuration).toFixed(3)),
-    p90: pct(allElapsed, 90), p95: pct(allElapsed, 95),
-    min_response_time: allElapsed.reduce((a, b) => Math.min(a, b), Infinity) || 0,
-    max_response_time: allElapsed.reduce((a, b) => Math.max(a, b), 0),
-    avg_latency: parseFloat((allLatency.reduce((a, b) => a + b, 0) / (totalReqs || 1)).toFixed(1)),
-    avg_connect: parseFloat((allConnect.reduce((a, b) => a + b, 0) / (totalReqs || 1)).toFixed(1)),
-    total_bytes_received: allBytes.reduce((a, b) => a + b, 0),
-    total_bytes_sent:     allSentB.reduce((a, b) => a + b, 0),
-  };
-
-  const timelineMap = {};
-  for (const row of allRows) {
-    const ts  = parseInt(row.timeStamp) || 0;
-    const sec = Math.floor((ts - minTs) / 1000);
-    if (!timelineMap[sec]) timelineMap[sec] = { count: 0, elapsed: [], latency: [], connect: [], bytes: 0, sentBytes: 0, threads: [], errors: 0 };
-    const t = timelineMap[sec];
-    t.count++; t.elapsed.push(parseInt(row.elapsed)||0); t.latency.push(parseInt(row.latency)||0);
-    t.connect.push(parseInt(row.connect)||0); t.bytes += parseInt(row.bytes)||0;
-    t.sentBytes += parseInt(row.sentBytes)||0; t.threads.push(parseInt(row.allThreads)||0);
-    if (row.success !== 'true') t.errors++;
+    reportData = parseJtl(jtlPath, runMeta);
+    if (!reportData) return res.status(400).json({ error: 'JTL file contains no data rows' });
+    // Backfill cache
+    try { db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(reportData), run.id); } catch (_) {}
   }
-  const timeline = Object.entries(timelineMap).sort(([a],[b])=>parseInt(a)-parseInt(b)).map(([sec,d])=>({
-    second: parseInt(sec),
-    tps: d.count,
-    avg_rt: parseFloat((d.elapsed.reduce((a,b)=>a+b,0)/d.elapsed.length).toFixed(1)),
-    avg_latency: parseFloat((d.latency.reduce((a,b)=>a+b,0)/d.latency.length).toFixed(1)),
-    avg_connect: parseFloat((d.connect.reduce((a,b)=>a+b,0)/d.connect.length).toFixed(1)),
-    bytes_received: d.bytes, bytes_sent: d.sentBytes,
-    threads: Math.max(...d.threads), errors: d.errors,
-    error_rate: parseFloat(((d.errors/d.count)*100).toFixed(1)),
-  }));
 
-  const errorMap = {};
-  for (const row of allRows) {
-    if (row.success === 'true') continue;
-    const key = `${row.label}||${row.responseCode||'N/A'}||${row.responseMessage||''}`;
-    if (!errorMap[key]) errorMap[key] = { label: row.label||'Unknown', response_code: row.responseCode||'N/A', response_message: (row.responseMessage||'').slice(0,120), failure_message: (row.failureMessage||'').slice(0,200), count: 0 };
-    errorMap[key].count++;
-  }
-  const errors = Object.values(errorMap).sort((a,b)=>b.count-a.count);
-
-  const runNum = (run.result_dir.match(/Run_(\d+)/)||[])[1] || run.id;
-  const suiteName = (run.suite_name||'Analytics').replace(/[^a-zA-Z0-9_-]/g,'_');
-  const meta = {
-    run_id: run.id, suite_name: run.suite_name||'Unknown', engine: run.engine,
-    status: run.status, started_at: run.started_at, finished_at: run.finished_at,
-    duration_s: parseFloat(totalDuration.toFixed(1)),
-  };
-
+  const runNum    = (run.result_dir?.match(/Run_(\d+)/) || [])[1] || run.id;
+  const suiteName = (run.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_');
   const pdfFilename = `${suiteName}_Run${runNum}_Analytics.pdf`;
 
-  // Save PDF to results folder on disk
-  if (run.result_dir && fs.existsSync(run.result_dir)) {
-    try {
-      const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
-      const pdfPath = path.join(run.result_dir, pdfFilename);
-      await generateAnalyticsPdfToFile({ summary, by_api, timeline, errors, meta }, runNum, pdfPath);
-    } catch (e) {
-      console.error('[Execution] Failed to save analytics PDF to results:', e.message);
-    }
-  }
-
-  // Stream PDF to browser for download
+  // Stream PDF to browser
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${pdfFilename}"`);
-  await generateAnalyticsPdf({ summary, by_api, timeline, errors, meta }, runNum, res);
+  await generateAnalyticsPdf(reportData, runNum, res);
 });
 
 router.get('/runs/:id/download-report', auth, (req, res) => {

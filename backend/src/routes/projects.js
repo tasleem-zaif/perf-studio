@@ -5,7 +5,7 @@ const db     = require('../db');
 const auth   = require('../middleware/auth');
 const resetSequence = require('../utils/resetSequence');
 const { writeProjectSnapshot } = require('../utils/configWriter');
-const { ensureProjectFolders, deleteProjectFolder, backupAndDeleteProjectFolder } = require('../utils/projectFolders');
+const { ensureProjectFolders, deleteProjectFolder, backupAndDeleteProjectFolder, BACKUPS_ROOT } = require('../utils/projectFolders');
 
 const COLORS = ['#1a6bff','#00c896','#ef9f27','#e24b4a','#8b5cf6','#06b6d4'];
 const BKGS   = ['#e8f0ff','#e0faf3','#faeeda','#fcebeb','#ede9fe','#e0f2fe'];
@@ -95,7 +95,7 @@ router.put('/:id', (req, res) => {
   const project = caller.role === 'super_admin'
     ? db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
     : db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
-  if (!project) return res.status(404).json({ error: 'Not found' });
+  if (!project) return res.status(404).json({ error: 'Project not found or you do not have permission to edit it.' });
   const { name, description } = req.body;
   db.prepare('UPDATE projects SET name = ?, description = ? WHERE id = ?')
     .run(name || project.name, description ?? project.description, req.params.id);
@@ -120,7 +120,7 @@ router.delete('/:id', async (req, res) => {
     } else {
       project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
     }
-    if (!project) return res.status(404).json({ error: 'Not found' });
+    if (!project) return res.status(404).json({ error: 'Project not found or you do not have permission to delete it.' });
 
     // Capture git config BEFORE deleting from DB — CASCADE will delete it
     const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
@@ -149,8 +149,9 @@ router.delete('/:id', async (req, res) => {
 
             await git.addConfig('user.name', gitCfg.username || 'PerfStudio');
             await git.addConfig('user.email', gitCfg.email || 'noreply@perfstudio.com');
-            await git.checkout('main');
-            await git.pull('origin', 'main', { '--rebase': 'false' }).catch(() => {});
+            const baseBranch = gitCfg.base_branch || 'main';
+            await git.checkout(baseBranch);
+            await git.pull('origin', baseBranch, { '--rebase': 'false' }).catch(() => {});
 
             // Remove the project subfolder from git tracking
             const projectSubfolder = path.basename(project.folder_path);
@@ -168,7 +169,7 @@ router.delete('/:id', async (req, res) => {
               await git.add('.');
               await git.commit(`Remove project: ${project.name}`);
               await git.remote(['set-url', 'origin', remoteWithAuth]);
-              await git.push('origin', 'main');
+              await git.push('origin', baseBranch);
               console.log(`[Git] Project "${project.name}" removed from GitHub.`);
             }
 
@@ -194,16 +195,51 @@ router.delete('/:id', async (req, res) => {
     });
   } catch (e) {
     console.error('[Projects] Delete failed:', e.message);
-    if (!res.headersSent) res.status(500).json({ error: e.message });
+    if (!res.headersSent) res.status(500).json({ error: `Failed to delete project: ${e.message}. The project may have active runs or locked files.` });
   }
 });
 
 router.post('/:id/ensure-folders', (req, res) => {
   const project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
-  if (!project) return res.status(404).json({ error: 'Not found' });
+  if (!project) return res.status(404).json({ error: 'Project not found — please refresh the page and try again.' });
   const folderPath = ensureProjectFolders(project.name, project.id, project.uuid || project.environment);
   db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, req.params.id);
   res.json({ ok: true, folder_path: folderPath });
+});
+
+// ── GET /backups — list all project backup ZIPs (admin only) ─────────────────
+router.get('/backups', (req, res) => {
+  const caller = getCaller(req.userId);
+  if (!['org_admin', 'super_admin'].includes(caller?.role)) {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  try {
+    if (!fs.existsSync(BACKUPS_ROOT)) return res.json({ backups: [] });
+    const files = fs.readdirSync(BACKUPS_ROOT)
+      .filter(f => f.endsWith('.zip'))
+      .map(f => {
+        const stat = fs.statSync(path.join(BACKUPS_ROOT, f));
+        return { filename: f, size_bytes: stat.size, created_at: stat.mtime.toISOString() };
+      })
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    res.json({ backups: files, backups_dir: BACKUPS_ROOT });
+  } catch (e) {
+    res.status(500).json({ error: `Failed to list project backups: ${e.message}. The backups directory may be inaccessible.` });
+  }
+});
+
+// ── GET /backups/:filename — download a backup ZIP (admin only) ───────────────
+router.get('/backups/:filename', (req, res) => {
+  const caller = getCaller(req.userId);
+  if (!['org_admin', 'super_admin'].includes(caller?.role)) {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  // Prevent path traversal
+  const safe = path.basename(req.params.filename);
+  if (!safe.endsWith('.zip')) return res.status(400).json({ error: 'Invalid filename' });
+  const filePath = path.join(BACKUPS_ROOT, safe);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Backup not found' });
+  res.download(filePath, safe);
 });
 
 module.exports = router;

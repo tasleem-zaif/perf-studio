@@ -116,13 +116,13 @@ export default function PipelineConfig({ project, envs, user }) {
       toast(modal === 'add' ? 'Pipeline created' : 'Pipeline updated', 'success');
       setModal(null);
       load();
-    } catch (e) { toast(e.response?.data?.error || 'Save failed', 'error'); }
+    } catch (e) { toast(e.response?.data?.error || 'Failed to save pipeline — ensure the pipeline name is unique and all steps are valid.', 'error'); }
     finally { setSaving(false); }
   }
 
   async function deletePipeline(id) {
     if (!window.confirm('Delete this pipeline?')) return;
-    await api.delete(`/projects/${project.id}/pipelines/${id}`).catch(() => {});
+    await api.delete(`/projects/${project.id}/pipelines/${id}`).catch(e => toast(e.response?.data?.error || 'Failed to delete pipeline — please try again.', 'error'));
     toast('Pipeline deleted', 'success');
     load();
   }
@@ -162,7 +162,7 @@ export default function PipelineConfig({ project, envs, user }) {
       toast('CI/CD configuration saved', 'success');
       const { data } = await api.get(`/projects/${project.id}/ci/config`);
       if (data.config) setCiConfig(data.config);
-    } catch (e) { toast(e.response?.data?.error || 'Save failed', 'error'); }
+    } catch (e) { toast(e.response?.data?.error || 'Failed to save CI/CD configuration — check the provider token and repository name are correct.', 'error'); }
     finally { setCiSaving(false); }
   }
 
@@ -318,7 +318,12 @@ export default function PipelineConfig({ project, envs, user }) {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label">Repository <span style={{ color: '#94a3b8', fontWeight: 400 }}>(owner/repo)</span></label>
-                    <input style={ciInputStyle} value={ciForm.github_repo} onChange={e => setCiForm(f => ({ ...f, github_repo: e.target.value }))} placeholder="org/perf-studio" />
+                    <input style={ciInputStyle} value={ciForm.github_repo} onChange={e => setCiForm(f => ({ ...f, github_repo: e.target.value }))} placeholder="e.g. tasleemzaif85/Project-Demo" />
+                    {ciForm.github_repo && ciForm.github_repo.includes('@') && (
+                      <div style={{ fontSize: 11, color: 'var(--danger)', marginTop: 4 }}>
+                        This looks like an email address. Enter the GitHub repository in <strong>owner/repo</strong> format, e.g. <code>tasleemzaif85/Project-Demo</code>
+                      </div>
+                    )}
                   </div>
                   <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label">Personal Access Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(workflow scope)</span></label>
