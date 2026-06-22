@@ -88,24 +88,11 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: 'Your account request was rejected. Please contact your administrator.' });
   }
 
-  // Single-session enforcement
-  db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run(); // purge expired first
-  const existing = db.prepare('SELECT id, last_used_at FROM user_sessions WHERE user_id = ?').get(user.id);
-  if (existing) {
-    const lastUsed = existing.last_used_at ? new Date(existing.last_used_at + 'Z') : null;
-    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
-    const isActiveSession = lastUsed && lastUsed > thirtyMinutesAgo;
-
-    if (isActiveSession && !req.body.force) {
-      // A real active session exists in another browser — ask the user to confirm
-      return res.status(409).json({
-        error: 'You are already signed in from another location. Sign out there first, or click below to sign in here and end the other session.',
-        code: 'SESSION_ACTIVE',
-      });
-    }
-    // Orphaned/stale session (not used in 30+ min) or force override — clear it silently
-    db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
-  }
+  // Single-session enforcement — purge expired sessions, then silently replace any
+  // existing session for this user. The old JTI is deleted so any other device
+  // still holding that token immediately gets a 401 on their next request.
+  db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run();
+  db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
 
   const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
   const jti = crypto.randomUUID();
