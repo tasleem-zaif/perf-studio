@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import api from '../api';
 import CustomSelect from '../components/CustomSelect';
 import { useConfirm } from '../hooks/useConfirm';
@@ -853,7 +853,7 @@ function AIConfigPanel({ user }) {
   );
 }
 
-const BLANK_SMTP = { smtp_host: '', smtp_port: '587', smtp_secure: false, smtp_user: '', smtp_pass: '', from_name: 'Performance Studio', from_email: '' };
+const BLANK_SMTP = { smtp_host: '', smtp_port: '587', smtp_secure: false, smtp_user: '', smtp_pass: '', from_name: 'Peako', from_email: '' };
 
 /** Detect SMTP host/port from email domain */
 function detectSmtpFromEmail(email) {
@@ -898,7 +898,7 @@ function SMTPConfigPanel({ currentUser }) {
           ...prev, ...detected,
           smtp_user: currentUser.email,
           from_email: currentUser.email,
-          from_name: currentUser.name || 'Performance Studio',
+          from_name: currentUser.name || 'Peako',
         }));
         setAutoDetected('email');
       }
@@ -999,7 +999,7 @@ function SMTPConfigPanel({ currentUser }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
         <div className="form-group" style={{ marginBottom: 0 }}>
           <label className="form-label">From Name</label>
-          <input type="text" value={cfg.from_name} onChange={e => set('from_name', e.target.value)} placeholder="Performance Studio" />
+          <input type="text" value={cfg.from_name} onChange={e => set('from_name', e.target.value)} placeholder="Peako" />
         </div>
         <div className="form-group" style={{ marginBottom: 0 }}>
           <label className="form-label">From Email</label>

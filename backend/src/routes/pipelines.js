@@ -1,4 +1,4 @@
-const router = require('express').Router({ mergeParams: true });
+﻿const router = require('express').Router({ mergeParams: true });
 const db     = require('../db');
 const auth   = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
@@ -268,7 +268,7 @@ router.post('/:id/run', auth, async (req, res) => {
 
       const project  = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
       const userRow  = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(req.userId);
-      const orgName  = userRow?.org_name || userRow?.name || 'Performance Studio';
+      const orgName  = userRow?.org_name || userRow?.name || 'Peako';
       const finished = new Date().toLocaleString();
 
       // Build summary report data for the email template

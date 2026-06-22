@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import {
   Chart as ChartJS,
   CategoryScale, LinearScale, BarElement, LineElement,
@@ -1241,7 +1241,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           </div>
 
           <footer style={{ marginTop:24, padding:'10px 0', borderTop:`1px solid ${D.border}`, fontSize:11, color:D.textTer, textAlign:'center' }}>
-            Performance Studio — Analytics Report · {data.meta.suite_name} · Run {runNum}
+            Peako — Analytics Report · {data.meta.suite_name} · Run {runNum}
           </footer>
         </div>
       )}

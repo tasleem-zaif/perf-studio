@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+﻿import { useState, useEffect, useRef, useCallback } from 'react';
 import { projectDirName, collectionDirName } from '../utils/displayName';
 
 /* ── Icon / color config per feature key ──────────────────────────────── */
@@ -315,7 +315,7 @@ export default function Sidebar({
       <div className="sidebar-logo">
         <div className="sidebar-logo-icon">P</div>
         <div>
-          <div className="sidebar-logo-text">Performance Studio</div>
+          <div className="sidebar-logo-text">Peako</div>
           <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>
             AI-Powered Testing
           </div>

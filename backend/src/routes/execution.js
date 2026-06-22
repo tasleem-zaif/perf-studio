@@ -521,7 +521,7 @@ async function setJavaEnvVarsPermanently(platform, javaHome, sendLog) {
       path.join(process.env.HOME, '.profile'),
       path.join(process.env.HOME, '.bashrc'),
     ];
-    const exportLines = `\n# Java (set by Performance Studio)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
+    const exportLines = `\n# Java (set by Peako)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
     for (const pf of profileFiles) {
       try {
         const existing = fs.existsSync(pf) ? fs.readFileSync(pf, 'utf8') : '';
@@ -730,7 +730,7 @@ router.post('/run', auth, async (req, res) => {
 
   // ── Preparation summary ──────────────────────────────────────────────────
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  log('info', '  PERFORMANCE STUDIO  —  TEST EXECUTION ENGINE');
+  log('info', '  Peako  —  TEST EXECUTION ENGINE');
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   log('info', `  Engine     : ${engine.toUpperCase()} (Docker)`);
   log('info', `  Test Plan  : ${suite.name}`);

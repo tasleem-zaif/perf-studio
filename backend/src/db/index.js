@@ -469,7 +469,7 @@ try {
       smtp_secure INTEGER DEFAULT 0,
       smtp_user TEXT DEFAULT '',
       smtp_pass TEXT DEFAULT '',
-      from_name TEXT DEFAULT 'Performance Studio',
+      from_name TEXT DEFAULT 'Peako',
       from_email TEXT DEFAULT '',
       enabled INTEGER DEFAULT 0,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

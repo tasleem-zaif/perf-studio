@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import api from '../api';
 
 export default function ForgotPassword() {
@@ -27,7 +27,7 @@ export default function ForgotPassword() {
           <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
             alt="Quarks" style={{ height: 32, width: 'auto' }} />
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            Performance Studio
+            Peako
           </span>
         </div>
 

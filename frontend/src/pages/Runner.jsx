@@ -20,7 +20,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [healState, setHealState] = useState(null);
   const healPollRef = useRef(null);
   const [logs, setLogs] = useState([
-    { type: 'info', message: 'Performance Studio Execution Engine ready.' },
+    { type: 'info', message: 'Peako Execution Engine ready.' },
     { type: 'info', message: 'Select a project and test suite, then check Docker before running.' },
   ]);
   const [runs, setRuns] = useState([]);

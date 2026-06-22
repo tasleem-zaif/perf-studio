@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -74,7 +74,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 app.listen(PORT, () => {
-  console.log(`Performance Studio API running on http://localhost:${PORT}`);
+  console.log(`Peako API running on http://localhost:${PORT}`);
 
   // ── On startup: mark orphaned running runs as failed ─────────────────────
   // If the server was restarted mid-execution, runs stuck in 'running' state

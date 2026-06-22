@@ -53,7 +53,7 @@ function getInviteTransport(userId) {
 function buildInviteEmail(invite, acceptUrl, inviterName, orgName) {
   const roleLabel = invite.role === 'org_admin' ? 'Organization Admin' : 'Team Member';
   return {
-    subject: `You have been invited to Performance Studio — ${orgName || 'Performance Studio'}`,
+    subject: `You have been invited to Peako — ${orgName || 'Peako'}`,
     html: `<!DOCTYPE html>
 <html>
 <body style="font-family:Arial,sans-serif;background:#f4f6f9;margin:0;padding:32px;">
@@ -64,7 +64,7 @@ function buildInviteEmail(invite, acceptUrl, inviterName, orgName) {
     <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
          alt="Quarks" height="32"
          style="display:inline-block;height:32px;vertical-align:middle;margin-right:10px;filter:brightness(0) invert(1);" />
-    <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Performance Studio</span>
+    <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Peako</span>
   </div>
 
   <!-- Body -->
@@ -74,7 +74,7 @@ function buildInviteEmail(invite, acceptUrl, inviterName, orgName) {
     </h2>
     <p style="color:#b8c4d8;line-height:1.7;margin:0 0 6px;font-size:13px;">
       <strong style="color:#f0f3fa;">${inviterName}</strong> has invited you to join
-      <strong style="color:#f0f3fa;">${orgName || 'Performance Studio'}</strong> as a
+      <strong style="color:#f0f3fa;">${orgName || 'Peako'}</strong> as a
       <strong style="color:#22c55e;">${roleLabel}</strong>.
     </p>
     <p style="color:#b8c4d8;margin:0 0 20px;font-size:13px;line-height:1.6;">
@@ -108,13 +108,13 @@ function buildInviteEmail(invite, acceptUrl, inviterName, orgName) {
 
   <!-- Footer -->
   <div style="background:#0f172a;padding:10px 24px;border-top:1px solid #2e3a55;text-align:center;">
-    <p style="color:#4b5563;font-size:11px;margin:0;">Performance Studio — AI-Powered Performance Testing</p>
+    <p style="color:#4b5563;font-size:11px;margin:0;">Peako — AI-Powered Performance Testing</p>
   </div>
 
 </div>
 </body>
 </html>`,
-    text: `You have been invited!\n\n${inviterName} has invited you to join ${orgName || 'Performance Studio'} as ${roleLabel}.\n\nAccept your invitation here:\n${acceptUrl}\n\nThis link expires in 72 hours.\n\n— Performance Studio`,
+    text: `You have been invited!\n\n${inviterName} has invited you to join ${orgName || 'Peako'} as ${roleLabel}.\n\nAccept your invitation here:\n${acceptUrl}\n\nThis link expires in 72 hours.\n\n— Peako`,
   };
 }
 
@@ -172,7 +172,7 @@ router.post('/', auth, async (req, res) => {
   // Send email — uses inviter's SMTP or falls back to super admin's
   const { transport, cfg: smtpCfg } = getInviteTransport(req.userId);
   const org = orgId ? db.prepare('SELECT name FROM organizations WHERE id = ?').get(orgId) : null;
-  const email_ = buildInviteEmail({ role }, acceptUrl, inviter.name, org?.name || 'Performance Studio');
+  const email_ = buildInviteEmail({ role }, acceptUrl, inviter.name, org?.name || 'Peako');
   let emailSent = false;
 
   // Send invite email whenever SMTP is configured — don't require enabled=true
@@ -180,14 +180,14 @@ router.post('/', auth, async (req, res) => {
   if (transport) {
     try {
       await transport.sendMail({
-        from: `"${smtpCfg?.from_name || 'Performance Studio'}" <${smtpCfg?.from_email}>`,
+        from: `"${smtpCfg?.from_name || 'Peako'}" <${smtpCfg?.from_email}>`,
         replyTo: smtpCfg?.from_email,
         to: name ? `"${name}" <${email}>` : email,
         subject: email_.subject,
         html: email_.html,
         text: email_.text,
         headers: {
-          'X-Mailer':    'Performance Studio',
+          'X-Mailer':    'Peako',
           'X-Priority':  '1',
           'Importance':  'high',
           'Precedence':  'bulk',

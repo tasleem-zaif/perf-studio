@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 import EnvBar from '../components/EnvBar';
@@ -6,7 +6,7 @@ import EnvBar from '../components/EnvBar';
 const BLANK_CFG = {
   smtp_host: '', smtp_port: '587', smtp_secure: false,
   smtp_user: '', smtp_pass: '',
-  from_name: 'Performance Studio', from_email: '',
+  from_name: 'Peako', from_email: '',
   enabled: false,
 };
 
@@ -188,7 +188,7 @@ export default function Alerts({ project, collection, env, envs, onEnvChange }) 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
             <div className="form-group" style={{ marginBottom: 0 }}>
               <label className="form-label">From Name</label>
-              <input type="text" value={cfg.from_name} onChange={e => set('from_name', e.target.value)} placeholder="Performance Studio" />
+              <input type="text" value={cfg.from_name} onChange={e => set('from_name', e.target.value)} placeholder="Peako" />
             </div>
             <div className="form-group" style={{ marginBottom: 0 }}>
               <label className="form-label">From Email</label>

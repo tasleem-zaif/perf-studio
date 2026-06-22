@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import api from '../api';
 
 /* Same feature list as login page */
@@ -23,7 +23,7 @@ function LeftPanel() {
         />
         <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.15)' }} />
         <div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Performance Studio</div>
+          <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Peako</div>
           <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>by Quarks Technosoft</div>
         </div>
       </div>

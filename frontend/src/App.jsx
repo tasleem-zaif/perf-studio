@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import { projectDirName, collectionDirName, collectionPathLabel } from './utils/displayName';
 import AcceptInvite from './pages/AcceptInvite';
 import api from './api';
@@ -493,7 +493,7 @@ function AppInner() {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--color-body, #1e1f22)' }}>
       <div style={{ color: 'var(--color-text-primary, #bcbec4)', fontSize: '15px', display: 'flex', gap: '10px', alignItems: 'center' }}>
-        <span className="spinner" /> Loading Performance Studio...
+        <span className="spinner" /> Loading Peako...
       </div>
     </div>
   );
