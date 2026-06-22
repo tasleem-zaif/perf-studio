@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { projectDirName, collectionDirName, collectionPathLabel } from './utils/displayName';
 import AcceptInvite from './pages/AcceptInvite';
 import api from './api';

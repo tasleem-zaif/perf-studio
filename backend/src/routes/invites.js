@@ -1,4 +1,4 @@
-﻿/**
+/**
  * invites.js — Invite-based user onboarding
  *
  * Super Admin  → invites Org Admin   → email sent → Org Admin accepts → sets password

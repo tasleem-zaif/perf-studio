@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { projectDirName, collectionDirName } from '../utils/displayName';
 
 /* ── Icon / color config per feature key ──────────────────────────────── */

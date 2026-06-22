@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ciPipeline.js — GitLab & GitHub Actions CI/CD pipeline integration
  *
  * Routes (all under /api/projects/:projectId/ci):

@@ -1,4 +1,4 @@
-﻿# Performance Studio — Architecture & Flow Diagrams
+# Performance Studio — Architecture & Flow Diagrams
 
 All diagrams use [Mermaid](https://mermaid.js.org/) and render natively on GitHub.
 

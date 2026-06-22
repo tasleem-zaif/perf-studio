@@ -1,4 +1,4 @@
-﻿const jwt = require('jsonwebtoken');
+const jwt = require('jsonwebtoken');
 const db  = require('../db');
 const JWT_SECRET = process.env.JWT_SECRET || 'peako_secret_change_in_prod';
 

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ── Peako — Linux/macOS Setup & Docker Startup ───────────────────────────
 set -e
 

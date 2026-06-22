@@ -1,4 +1,4 @@
-﻿const { DatabaseSync } = require('node:sqlite');
+const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const { mkdirSync } = require('fs');
 const bcrypt = require('bcryptjs');

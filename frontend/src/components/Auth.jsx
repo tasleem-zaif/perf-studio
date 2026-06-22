@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import api from '../api';
 
 /* ── Feature highlights shown on the left branding panel ── */

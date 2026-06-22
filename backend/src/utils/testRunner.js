@@ -1,4 +1,4 @@
-﻿/**
+/**
  * testRunner.js — shared test suite execution utility
  *
  * Used by both the single-run execution route AND the pipeline runner.

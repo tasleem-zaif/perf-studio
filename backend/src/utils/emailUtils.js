@@ -1,4 +1,4 @@
-﻿/**
+/**
  * emailUtils.js — sends post-run alert emails with PDF analytics + JMeter HTML ZIP.
  */
 const nodemailer = require('nodemailer');

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * passwordReset.js — Self-service + admin password recovery
  *
  * POST /auth/forgot-password        — user requests reset email

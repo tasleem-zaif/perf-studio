@@ -1,4 +1,4 @@
-﻿# Peako — System Requirements
+# Peako — System Requirements
 
 ---
 

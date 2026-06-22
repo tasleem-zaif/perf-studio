@@ -1,4 +1,4 @@
-﻿/**
+/**
  * git.js — Project-level Git integration
  *
  * Org Admin  → main branch, can push/pull/merge PRs

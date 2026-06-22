@@ -1,4 +1,4 @@
-﻿/**
+/**
  * encryption.js — AES-256-CBC encrypt/decrypt using Node built-in crypto.
  *
  * The encryption key is derived from the JWT_SECRET env var (or a fallback).

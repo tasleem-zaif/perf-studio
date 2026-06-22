@@ -1,4 +1,4 @@
-﻿# 🚀 Performance Studio
+# 🚀 Performance Studio
 
 **AI-Powered Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, real-time analytics, Git integration, and team collaboration.
 

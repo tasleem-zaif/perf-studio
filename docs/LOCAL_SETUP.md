@@ -1,4 +1,4 @@
-﻿# Performance Studio — Local Setup Guide
+# Performance Studio — Local Setup Guide
 
 This guide walks you through running Performance Studio on your local machine. Two methods are covered: **Docker** (recommended, one command) and **Manual** (Node.js dev servers).
 
