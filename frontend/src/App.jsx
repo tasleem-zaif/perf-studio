@@ -133,27 +133,6 @@ function AppInner() {
   // Single Quarks Light theme — always; clear any stale dark theme from localStorage
   useEffect(() => { localStorage.setItem('ps_theme', 'quarks'); document.documentElement.setAttribute('data-theme', 'quarks'); }, []);
 
-  // On browser/tab close: send a logout beacon so the session is deleted immediately.
-  // sessionStorage.ps_refreshing is set here and checked on the next load to
-  // distinguish a page REFRESH (sessionStorage survives) from a browser CLOSE
-  // (sessionStorage is wiped). On refresh the mount effect calls /auth/restore-session
-  // to recreate the session without requiring the password.
-  useEffect(() => {
-    if (!user) return;
-    const handleUnload = () => {
-      sessionStorage.setItem('ps_refreshing', '1');
-      const token = localStorage.getItem('ps_token');
-      if (token) {
-        navigator.sendBeacon(
-          '/api/auth/logout',
-          new Blob([JSON.stringify({ token })], { type: 'application/json' })
-        );
-      }
-    };
-    window.addEventListener('beforeunload', handleUnload);
-    return () => window.removeEventListener('beforeunload', handleUnload);
-  }, [user]);
-
   // Heartbeat: fast kick-out when another browser force-logs in and deletes our session.
   // The 401 from the heartbeat triggers the api.js interceptor → clears token → reloads.
   // visibilitychange + focus fire an immediate beat so the user is kicked the instant
