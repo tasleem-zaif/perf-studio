@@ -88,10 +88,26 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: 'Your account request was rejected. Please contact your administrator.' });
   }
 
-  // Single-session enforcement — purge expired sessions, then silently replace any
-  // existing session for this user. The old JTI is deleted so any other device
-  // still holding that token immediately gets a 401 on their next request.
+  // Purge globally expired sessions first
   db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run();
+
+  // Single-session enforcement.
+  // Sessions are deleted immediately when the user logs out or when the browser/tab
+  // is closed (via sendBeacon). If a valid session still exists here the user is
+  // actively signed in somewhere else.
+  // Force=true (user clicked "Sign out other session") bypasses this check.
+  const activeSession = db.prepare(
+    "SELECT id FROM user_sessions WHERE user_id = ? AND expires_at > datetime('now')"
+  ).get(user.id);
+
+  if (activeSession && !req.body.force) {
+    return res.status(409).json({
+      error: 'You are already signed in from another location. Sign out that session to continue.',
+      code: 'SESSION_ACTIVE',
+    });
+  }
+
+  // Delete any existing sessions before creating the new one
   db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
 
   const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
@@ -103,18 +119,63 @@ router.post('/login', (req, res) => {
   res.json({ token, user: userPayload(user, org) });
 });
 
-// POST /auth/logout — accepts expired tokens so the frontend can clean up stale sessions
+// POST /auth/logout
+// Accepts token from Authorization header (normal logout) OR from JSON body
+// (sendBeacon on browser close — sendBeacon cannot set custom headers).
 router.post('/logout', (req, res) => {
+  let rawToken = null;
   const header = req.headers.authorization;
-  if (header && header.startsWith('Bearer ')) {
+  if (header?.startsWith('Bearer ')) {
+    rawToken = header.slice(7);
+  } else if (req.body?.token) {
+    rawToken = req.body.token;
+  }
+  if (rawToken) {
     try {
-      // ignoreExpiration: true lets expired JWTs clean up their own session row
-      const payload = jwt.verify(header.slice(7), JWT_SECRET, { ignoreExpiration: true });
-      if (payload.userId && payload.jti) {
-        db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(payload.userId, payload.jti);
+      const payload = jwt.verify(rawToken, JWT_SECRET, { ignoreExpiration: true });
+      if (payload.userId) {
+        db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(payload.userId);
       }
     } catch (_) {}
   }
+  res.json({ ok: true });
+});
+
+// POST /auth/restore-session
+// Called after a page REFRESH: beforeunload deleted the session via sendBeacon,
+// so on reload we recreate it from the still-valid JWT (no password needed).
+// Blocked if another browser already has an active session.
+router.post('/restore-session', (req, res) => {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET); // must be valid & unexpired
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.userId);
+    if (!user || user.status !== 'active') return res.status(401).json({ error: 'Unauthorized' });
+
+    db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run();
+
+    // Block if another device already owns an active session
+    const other = db.prepare(
+      "SELECT id FROM user_sessions WHERE user_id = ? AND expires_at > datetime('now')"
+    ).get(user.id);
+    if (other) return res.status(409).json({ error: 'Session active elsewhere', code: 'SESSION_ACTIVE' });
+
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    db.prepare('INSERT INTO user_sessions (user_id, jti, expires_at) VALUES (?, ?, ?)')
+      .run(user.id, payload.jti, expiresAt);
+
+    const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
+    res.json({ user: userPayload(user, org) });
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+});
+
+// POST /auth/heartbeat — called every 30s by the frontend to keep last_used_at fresh.
+// When the browser closes, heartbeats stop; after 90s the session is inactive and
+// another login is allowed without a SESSION_ACTIVE conflict.
+router.post('/heartbeat', auth, (req, res) => {
   res.json({ ok: true });
 });
 

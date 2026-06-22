@@ -132,6 +132,47 @@ function AppInner() {
   const [generateDataTrigger, setGenerateDataTrigger] = useState(0);
   // Single Quarks Light theme — always; clear any stale dark theme from localStorage
   useEffect(() => { localStorage.setItem('ps_theme', 'quarks'); document.documentElement.setAttribute('data-theme', 'quarks'); }, []);
+
+  // On browser/tab close: send a logout beacon so the session is deleted immediately.
+  // sessionStorage.ps_refreshing is set here and checked on the next load to
+  // distinguish a page REFRESH (sessionStorage survives) from a browser CLOSE
+  // (sessionStorage is wiped). On refresh the mount effect calls /auth/restore-session
+  // to recreate the session without requiring the password.
+  useEffect(() => {
+    if (!user) return;
+    const handleUnload = () => {
+      sessionStorage.setItem('ps_refreshing', '1');
+      const token = localStorage.getItem('ps_token');
+      if (token) {
+        navigator.sendBeacon(
+          '/api/auth/logout',
+          new Blob([JSON.stringify({ token })], { type: 'application/json' })
+        );
+      }
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
+  }, [user]);
+
+  // Heartbeat: fast kick-out when another browser force-logs in and deletes our session.
+  // The 401 from the heartbeat triggers the api.js interceptor → clears token → reloads.
+  // visibilitychange + focus fire an immediate beat so the user is kicked the instant
+  // they click back onto a browser whose session was replaced.
+  useEffect(() => {
+    if (!user) return;
+    const beat = () => api.post('/auth/heartbeat').catch(() => {});
+    const onVisible = () => { if (document.visibilityState === 'visible') beat(); };
+
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', beat);
+    const interval = setInterval(beat, 30_000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', beat);
+      clearInterval(interval);
+    };
+  }, [user]);
   const [theme, setTheme] = useState('quarks');
   // Track which pages have been mounted at least once so KeepAlive can preserve their state.
   const [everVisited, setEverVisited] = useState(() => new Set(['dashboard']));
@@ -174,19 +215,43 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
-    const token      = localStorage.getItem('ps_token');
-    const cachedUser = (() => { try { return JSON.parse(localStorage.getItem('ps_user')); } catch { return null; } })();
+    // Detect page REFRESH: beforeunload set this flag; sessionStorage survives refresh
+    // but is wiped on browser close, so absence means a fresh open after close.
+    const wasRefresh = sessionStorage.getItem('ps_refreshing') === '1';
+    sessionStorage.removeItem('ps_refreshing');
 
+    const token = localStorage.getItem('ps_token');
     if (!token) { setLoading(false); return; }
 
+    if (wasRefresh) {
+      // The beforeunload beacon deleted our session. Recreate it from the still-valid
+      // JWT so the user stays logged in without entering their password again.
+      fetch('/api/auth/restore-session', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      })
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(data => {
+          localStorage.setItem('ps_user', JSON.stringify(data.user));
+          setUser(data.user);
+          loadProjects(data.user.role);
+        })
+        .catch(() => {
+          localStorage.removeItem('ps_token');
+          localStorage.removeItem('ps_user');
+          setLoading(false);
+        });
+      return;
+    }
+
+    const cachedUser = (() => { try { return JSON.parse(localStorage.getItem('ps_user')); } catch { return null; } })();
+
     if (cachedUser) {
-      // User already verified this session — skip /auth/me entirely
       setUser(cachedUser);
       loadProjects(cachedUser.role);
       return;
     }
 
-    // First load this session — call /auth/me exactly once, then cache
     api.get('/auth/me').then(({ data }) => {
       localStorage.setItem('ps_user', JSON.stringify(data.user));
       setUser(data.user);
