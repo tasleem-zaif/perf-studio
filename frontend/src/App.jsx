@@ -215,8 +215,9 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
-    // Detect page REFRESH: beforeunload set this flag; sessionStorage survives refresh
-    // but is wiped on browser close, so absence means a fresh open after close.
+    // Detect page REFRESH vs fresh open:
+    // beforeunload sets ps_refreshing in sessionStorage which survives a refresh
+    // but is wiped when the browser/tab is closed.
     const wasRefresh = sessionStorage.getItem('ps_refreshing') === '1';
     sessionStorage.removeItem('ps_refreshing');
 
@@ -244,23 +245,28 @@ function AppInner() {
       return;
     }
 
-    const cachedUser = (() => { try { return JSON.parse(localStorage.getItem('ps_user')); } catch { return null; } })();
-
-    if (cachedUser) {
-      setUser(cachedUser);
-      loadProjects(cachedUser.role);
-      return;
-    }
-
-    api.get('/auth/me').then(({ data }) => {
-      localStorage.setItem('ps_user', JSON.stringify(data.user));
-      setUser(data.user);
-      loadProjects(data.user.role);
-    }).catch(() => {
-      localStorage.removeItem('ps_token');
-      localStorage.removeItem('ps_user');
-      setLoading(false);
-    });
+    // Fresh load (after browser close+reopen, or first visit with a stored token).
+    // Always verify with the server — never trust only the cached user, because the
+    // session may have been deleted (sendBeacon) while the browser was closed.
+    // Use native fetch so the 401 interceptor does not fire prematurely.
+    fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        localStorage.setItem('ps_user', JSON.stringify(data.user));
+        setUser(data.user);
+        loadProjects(data.user.role);
+      })
+      .catch(() => {
+        // Session is gone (browser was closed, or token expired) — clean up.
+        fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          keepalive: true,
+        }).catch(() => {});
+        localStorage.removeItem('ps_token');
+        localStorage.removeItem('ps_user');
+        setLoading(false);
+      });
   }, []);
 
   async function loadProjects(callerRole) {
