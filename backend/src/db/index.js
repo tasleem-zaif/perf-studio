@@ -4,9 +4,9 @@ const { mkdirSync } = require('fs');
 const bcrypt = require('bcryptjs');
 
 // DB_PATH env var allows Docker to persist the database in a mounted volume.
-// Default: backend/data/peako.db (local dev)
-// Docker:  /app/data/peako.db   (set via ENV DB_PATH in Dockerfile)
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'peako.db');
+// Default: backend/data/perf_studio.db (local dev)
+// Docker:  /app/data/perf_studio.db   (set via ENV DB_PATH in Dockerfile)
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'perf_studio.db');
 mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
