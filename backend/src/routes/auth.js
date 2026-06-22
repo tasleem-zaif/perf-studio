@@ -116,13 +116,18 @@ router.post('/login', (req, res) => {
   res.json({ token, user: userPayload(user, org) });
 });
 
-// POST /auth/logout
-router.post('/logout', auth, (req, res) => {
+// POST /auth/logout — accepts expired tokens so the frontend can clean up stale sessions
+router.post('/logout', (req, res) => {
   const header = req.headers.authorization;
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET);
-    db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(req.userId, payload.jti);
-  } catch (_) {}
+  if (header && header.startsWith('Bearer ')) {
+    try {
+      // ignoreExpiration: true lets expired JWTs clean up their own session row
+      const payload = jwt.verify(header.slice(7), JWT_SECRET, { ignoreExpiration: true });
+      if (payload.userId && payload.jti) {
+        db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(payload.userId, payload.jti);
+      }
+    } catch (_) {}
+  }
   res.json({ ok: true });
 });
 

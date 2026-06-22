@@ -1,4 +1,4 @@
-﻿import { useState } from 'react';
+﻿import { useState, useEffect } from 'react';
 import api from '../api';
 
 /* ── Feature highlights shown on the left branding panel ── */
@@ -31,6 +31,24 @@ export default function Auth({ onLogin }) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [sessionActive, setSessionActive] = useState(false);
+
+  // On mount: if a stale token exists in localStorage, clear its server session
+  // so the user doesn't see a false "already signed in" conflict on their next login.
+  useEffect(() => {
+    const staleToken = localStorage.getItem('ps_token');
+    if (!staleToken) return;
+    api.get('/auth/me')
+      .then(({ data }) => {
+        // Token is still valid — log the user straight in without touching the form
+        onLogin(data.user);
+      })
+      .catch(() => {
+        // Token is expired or invalid — call logout to delete the stale session row,
+        // then clear localStorage so the login form is clean.
+        api.post('/auth/logout').catch(() => {});
+        localStorage.removeItem('ps_token');
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function doLogin(force = false) {
     setError(''); setLoading(true); setSessionActive(false);
