@@ -326,7 +326,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
     api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => {
       setCiConfig(data.config);
-      if (data.config?.github_enabled && !data.config?.gitlab_enabled) setCiProvider('github');
+      if (data.config?.bitbucket_enabled && !data.config?.gitlab_enabled && !data.config?.github_enabled) setCiProvider('bitbucket');
+      else if (data.config?.github_enabled && !data.config?.gitlab_enabled) setCiProvider('github');
       else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
     }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
@@ -365,7 +366,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
       });
-      toast(`Pipeline triggered on ${ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'}`, 'success');
+      const providerLabel = ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines';
+      toast(`Pipeline triggered on ${providerLabel}`, 'success');
       setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, run_name: data.run_name, started_at: new Date().toISOString() }, ...prev]);
       // Start polling
       pollCiStatus(data.run_id);
@@ -647,16 +649,17 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 {/* Provider selector */}
                 <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
                   {[
-                    { id: 'gitlab',  icon: 'ti-brand-gitlab',  label: 'GitLab',         enabled: ciConfig?.gitlab_enabled },
-                    { id: 'github',  icon: 'ti-brand-github',  label: 'GitHub Actions', enabled: ciConfig?.github_enabled },
+                    { id: 'gitlab',     icon: 'ti-brand-gitlab',     label: 'GitLab',              enabled: ciConfig?.gitlab_enabled },
+                    { id: 'github',     icon: 'ti-brand-github',     label: 'GitHub Actions',      enabled: ciConfig?.github_enabled },
+                    { id: 'bitbucket',  icon: 'ti-brand-bitbucket',  label: 'Bitbucket Pipelines', enabled: ciConfig?.bitbucket_enabled },
                   ].filter(p => p.enabled).map(p => (
                     <button key={p.id} onClick={() => setCiProvider(p.id)}
                       style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 16px', border: `1.5px solid ${ciProvider === p.id ? 'var(--accent)' : '#e2e8f0'}`, borderRadius: 8, background: ciProvider === p.id ? '#f0fdf4' : '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13, fontWeight: ciProvider === p.id ? 700 : 500, color: ciProvider === p.id ? '#16a34a' : '#374151', transition: 'all .12s' }}>
                       <i className={`ti ${p.icon}`}/>{p.label}
                     </button>
                   ))}
-                  {!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && (
-                    <div style={{ fontSize: 12, color: '#94a3b8' }}>No providers enabled. Enable GitLab or GitHub in CI/CD settings.</div>
+                  {!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled && (
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>No providers enabled. Enable GitLab, GitHub, or Bitbucket in CI/CD settings.</div>
                   )}
                 </div>
 
@@ -742,10 +745,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
-                <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled)}>
+                <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
                   {ciTriggering
                     ? <><span className="spinner"/> Triggering…</>
-                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'} Pipeline</>}
+                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines'} Pipeline</>}
                 </button>
               </div>
 
@@ -766,7 +769,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                         <div key={r.id} style={{ borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
                           {/* Run row */}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
-                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
+                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : r.provider === 'bitbucket' ? 'ti-brand-bitbucket' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : r.provider === 'bitbucket' ? '#0052cc' : '#e24329', flexShrink: 0 }}/>
                             <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.exec_result_dir ? r.exec_result_dir.replace(/\\/g, '/').split('/').pop() : (r.run_name || r.script_name || '—')}</span>
                             <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
                             <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -831,7 +834,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
                                 {/* Trigger info */}
                                 <div style={{ color: '#8b949e', marginBottom: 6 }}>
-                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</span></div>
+                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : r.provider === 'bitbucket' ? 'Bitbucket Pipelines' : 'GitLab CI'}</span></div>
                                   {r.external_id && <div>Run ID: <span style={{ color: '#58a6ff' }}>#{r.external_id}</span>  {job?.runner_name ? `· Runner: ${job.runner_name}` : ''}</div>}
                                 </div>
 
@@ -878,7 +881,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 {(r.web_url || job?.html_url) && (
                                   <div style={{ marginTop: 6 }}>
                                     <a href={job?.html_url || r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
-                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
+                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : r.provider === 'bitbucket' ? 'Bitbucket' : 'GitLab'} ↗
                                     </a>
                                   </div>
                                 )}

@@ -437,6 +437,14 @@ db.exec(`CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
 // run_name: formatted execution name e.g. "APILoadTest_5Users_60sDuration"
 try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN run_name TEXT DEFAULT NULL"); } catch {}
 
+// ── Bitbucket Pipelines support ───────────────────────────────────────────────
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_enabled INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_workspace TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_username TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_app_password TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_repo_slug TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_ref TEXT DEFAULT 'main'"); } catch {}
+
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 

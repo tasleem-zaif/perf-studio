@@ -40,9 +40,10 @@ function decryptConfig(cfg) {
   if (!cfg) return null;
   return {
     ...cfg,
-    gitlab_token:         cfg.gitlab_token         ? decrypt(cfg.gitlab_token)         : '',
-    gitlab_trigger_token: cfg.gitlab_trigger_token ? decrypt(cfg.gitlab_trigger_token) : '',
-    github_token:         cfg.github_token         ? decrypt(cfg.github_token)         : '',
+    gitlab_token:          cfg.gitlab_token          ? decrypt(cfg.gitlab_token)          : '',
+    gitlab_trigger_token:  cfg.gitlab_trigger_token  ? decrypt(cfg.gitlab_trigger_token)  : '',
+    github_token:          cfg.github_token          ? decrypt(cfg.github_token)          : '',
+    bitbucket_app_password: cfg.bitbucket_app_password ? decrypt(cfg.bitbucket_app_password) : '',
   };
 }
 
@@ -144,12 +145,14 @@ router.get('/config', (req, res) => {
     config: {
       ...cfg,
       github_repo,
-      gitlab_token:             cfg.gitlab_token         ? '••••••••' : '',
-      gitlab_trigger_token:     cfg.gitlab_trigger_token ? '••••••••' : '',
-      github_token:             cfg.github_token         ? '••••••••' : '',
-      gitlab_token_set:         !!cfg.gitlab_token,
-      gitlab_trigger_token_set: !!cfg.gitlab_trigger_token,
-      github_token_set:         !!cfg.github_token,
+      gitlab_token:              cfg.gitlab_token          ? '••••••••' : '',
+      gitlab_trigger_token:      cfg.gitlab_trigger_token  ? '••••••••' : '',
+      github_token:              cfg.github_token          ? '••••••••' : '',
+      bitbucket_app_password:    cfg.bitbucket_app_password ? '••••••••' : '',
+      gitlab_token_set:          !!cfg.gitlab_token,
+      gitlab_trigger_token_set:  !!cfg.gitlab_trigger_token,
+      github_token_set:          !!cfg.github_token,
+      bitbucket_app_password_set: !!cfg.bitbucket_app_password,
     },
   });
 });
@@ -167,6 +170,7 @@ router.put('/config', (req, res) => {
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
     github_enabled, github_token, github_workflow_file, github_ref,
+    bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref,
   } = req.body;
 
   // Sanitize github_repo: strip full URLs, reject email addresses
@@ -178,15 +182,17 @@ router.put('/config', (req, res) => {
   const gitCfgDefault = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const defaultBranch = gitCfgDefault?.base_branch || 'main';
 
-  const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'         ? encrypt(gitlab_token)         : existing?.gitlab_token         || '';
-  const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••' ? encrypt(gitlab_trigger_token) : existing?.gitlab_trigger_token || '';
-  const encGithubToken        = github_token && github_token !== '••••••••'         ? encrypt(github_token)         : existing?.github_token         || '';
+  const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'                   ? encrypt(gitlab_token)                   : existing?.gitlab_token              || '';
+  const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••'   ? encrypt(gitlab_trigger_token)           : existing?.gitlab_trigger_token       || '';
+  const encGithubToken        = github_token && github_token !== '••••••••'                   ? encrypt(github_token)                   : existing?.github_token              || '';
+  const encBitbucketPassword  = bitbucket_app_password && bitbucket_app_password !== '••••••••' ? encrypt(bitbucket_app_password)       : existing?.bitbucket_app_password     || '';
 
   if (existing) {
     db.prepare(`UPDATE ci_pipeline_configs SET
       gitlab_enabled=?, gitlab_url=?, gitlab_project_id=?, gitlab_token=?,
       gitlab_trigger_token=?, gitlab_ref=?,
       github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?,
+      bitbucket_enabled=?, bitbucket_workspace=?, bitbucket_username=?, bitbucket_app_password=?, bitbucket_repo_slug=?, bitbucket_ref=?,
       updated_at=datetime('now')
       WHERE project_id=? AND user_id=?`
     ).run(
@@ -194,19 +200,24 @@ router.put('/config', (req, res) => {
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
       github_workflow_file || 'perf-test.yml', github_ref || defaultBranch,
+      bitbucket_enabled ? 1 : 0, bitbucket_workspace || '', bitbucket_username || '',
+      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch,
       req.params.projectId, req.userId
     );
   } else {
     db.prepare(`INSERT INTO ci_pipeline_configs
       (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
-       github_enabled, github_repo, github_token, github_workflow_file, github_ref)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+       github_enabled, github_repo, github_token, github_workflow_file, github_ref,
+       bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
       req.params.projectId, req.userId,
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
       encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
-      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch
+      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch,
+      bitbucket_enabled ? 1 : 0, bitbucket_workspace || '', bitbucket_username || '',
+      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch
     );
   }
 
@@ -240,7 +251,19 @@ router.post('/config/test', async (req, res) => {
       return res.status(400).json({ error: `GitHub returned ${r.status}: ${r.body?.message || 'Authentication failed'}` });
     }
 
-    res.status(400).json({ error: 'Unknown provider. Use gitlab or github.' });
+    if (provider === 'bitbucket') {
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+      if (!cfg.bitbucket_workspace)    return res.status(400).json({ error: 'Bitbucket workspace not set.' });
+      const auth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const r = await apiRequest('https://api.bitbucket.org/2.0/user', 'GET', null, {
+        Authorization: `Basic ${auth}`,
+        'User-Agent': 'PerfStudio',
+      });
+      if (r.status === 200) return res.json({ ok: true, message: `Connected as: ${r.body.account_id || r.body.username || r.body.display_name || 'Bitbucket user'}` });
+      return res.status(400).json({ error: `Bitbucket returned ${r.status}: ${r.body?.error?.message || r.body?.type || 'Authentication failed'}` });
+    }
+
+    res.status(400).json({ error: 'Unknown provider. Use gitlab, github, or bitbucket.' });
   } catch (e) {
     res.status(500).json({ error: `Connection failed: ${e.message}` });
   }
@@ -608,6 +631,92 @@ print("Patch complete")
     } catch (e) { errors.push(`${e.message}`); }
   }
 
+  // ── Generate bitbucket-pipelines.yml ────────────────────────────────────────
+  if (providers.includes('bitbucket')) {
+    const defaultScript = suites.length > 0
+      ? path.basename(suites[0].jmx_path || suites[0].js_path || 'test.jmx')
+      : 'test.jmx';
+
+    const scriptList = suites.map(s => {
+      const file = path.basename(s.jmx_path || s.js_path || '');
+      return `  # ${s.name} → ${file}`;
+    }).join('\n');
+
+    const bbYaml = `# ============================================================
+# PerfStudio — Bitbucket Pipelines Performance Test
+# Generated by PerfStudio on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
+#
+# REQUIRED SETUP (Bitbucket → Repository Settings → Repository Variables):
+#   BB_USERNAME     — your Bitbucket username  (mark as Secured)
+#   BB_APP_PASSWORD — Bitbucket App Password   (mark as Secured)
+#
+# Available test scripts:
+${scriptList || '  # (no generated scripts yet — generate from Test Plans first)'}
+# ============================================================
+
+image: docker:latest
+
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  custom:
+    perfstudio-test:
+      - variables:
+          - name: SCRIPT_NAME
+            default: "${defaultScript}"
+          - name: SCRIPT_PATH
+            default: ""
+          - name: JMETER_USERS
+            default: "10"
+          - name: JMETER_RAMPUP
+            default: "30"
+          - name: JMETER_LOOPS
+            default: "-1"
+          - name: JMETER_DURATION
+            default: "300"
+      - step:
+          name: Run JMeter Performance Test
+          size: 2x
+          services:
+            - docker
+          script:
+            - apk add --no-cache curl zip bash
+            - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
+            - echo "PerfStudio Pipeline Execution"
+            - echo "Script    | $SCRIPT_NAME"
+            - echo "VUsers    | $JMETER_USERS"
+            - echo "Ramp-up   | $JMETER_RAMPUP s"
+            - echo "Duration  | $JMETER_DURATION s"
+            - mkdir -p "$BITBUCKET_CLONE_DIR/html"
+            - |
+              docker run --rm \\
+                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                justb4/jmeter:latest \\
+                -Dlog4j2.formatMsgNoLookups=true \\
+                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                -Jusers="$JMETER_USERS" \\
+                -Jrampup="$JMETER_RAMPUP" \\
+                -Jloops="$JMETER_LOOPS" \\
+                -Jduration="$JMETER_DURATION" \\
+                -l "$BITBUCKET_CLONE_DIR/results.jtl" \\
+                -e -o "$BITBUCKET_CLONE_DIR/html"
+            - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null
+            - |
+              curl -s -f -X POST \\
+                "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \\
+                -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                -F "files=@perf-results-\${PIPELINE_ID}.zip"
+`;
+    try {
+      const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
+      fs.writeFileSync(dest, bbYaml, 'utf8');
+      created.push('bitbucket-pipelines.yml');
+    } catch (e) { errors.push(`bitbucket-pipelines.yml: ${e.message}`); }
+  }
+
   if (created.length === 0) return res.status(500).json({ error: errors.join('; ') || 'Nothing generated' });
 
   // Auto-commit and push to remote so the workflow is immediately available on GitHub.
@@ -693,11 +802,15 @@ router.post('/trigger', async (req, res) => {
   const isAdmin2    = ['org_admin', 'super_admin'].includes(callerRow2?.role);
   const gitCfgTrigger = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const baseBranch2 = gitCfgTrigger?.base_branch || 'main';
-  const targetRef   = cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
+  const targetRef   = provider === 'gitlab'
+    ? (cfg.gitlab_ref || baseBranch2)
+    : provider === 'bitbucket'
+    ? (cfg.bitbucket_ref || baseBranch2)
+    : (cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`));
 
   // ── Auto-push script file to the target branch before dispatching ──────────
-  // The CI runner checks out the branch from GitHub — the JMX file must exist
-  // there or the Patch JMX step will fail with FileNotFoundError.
+  // The CI runner checks out this branch — the JMX file must exist there or
+  // the Patch JMX step will fail with FileNotFoundError.
   try {
     const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder: resolveUF } = require('../utils/projectFolders');
     const projectRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
@@ -709,11 +822,26 @@ router.post('/trigger', async (req, res) => {
       const simpleGit2 = require('simple-git');
       const NO_PROMPT2 = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
-      // Use user's PAT to push to their branch
-      const rawTok  = userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
-      const authUrl = rawTok
-        ? gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawTok)}@`)
-        : gitCfg.remote_url;
+      // Build authenticated remote URL based on provider
+      let authUrl = gitCfg.remote_url;
+      if (provider === 'bitbucket') {
+        const bbUser = cfg.bitbucket_username || cfg.bitbucket_workspace;
+        const bbPass = cfg.bitbucket_app_password;
+        if (bbUser && bbPass) {
+          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(bbUser)}:${encodeURIComponent(bbPass)}@`);
+        }
+      } else if (provider === 'gitlab') {
+        const glTok = cfg.gitlab_token || userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
+        if (glTok) {
+          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1oauth2:${encodeURIComponent(glTok)}@`);
+        }
+      } else {
+        // GitHub (and any other provider): token-based auth
+        const rawTok = userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
+        if (rawTok) {
+          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawTok)}@`);
+        }
+      }
 
       const git2 = simpleGit2({ baseDir: wsRoot, env: { ...process.env, ...NO_PROMPT2 } });
       await git2.addConfig('user.name',  callerRow2?.name  || 'PerfStudio');
@@ -774,10 +902,7 @@ router.post('/trigger', async (req, res) => {
         await git2.commit(`ci: sync scripts for pipeline run [auto]`);
       }
       // Disable GCM account picker in local .git/config before every push
-      try {
-        await git2.addConfig('credential.helper', '', false, 'local');
-        await git2.addConfig('credential.https://github.com.helper', '', false, 'local');
-      } catch {}
+      try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
       // Push branch (set upstream if first time)
       await git2.push(['--set-upstream', 'origin', targetRef]);
     }
@@ -986,6 +1111,44 @@ router.post('/trigger', async (req, res) => {
       return res.status(400).json({ error: `GitHub returned ${r.status}: ${JSON.stringify(r.body)}` });
     }
 
+    // ── Bitbucket Pipelines trigger ────────────────────────────────────────────
+    if (provider === 'bitbucket') {
+      if (!cfg.bitbucket_workspace)    return res.status(400).json({ error: 'Bitbucket workspace not set.' });
+      if (!cfg.bitbucket_repo_slug)    return res.status(400).json({ error: 'Bitbucket repository slug not set.' });
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+
+      const bbAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
+
+      const bbBody = {
+        target: {
+          ref_type: 'branch',
+          type: 'pipeline_ref_target',
+          ref_name: bbRef,
+          selector: { type: 'custom', pattern: 'perfstudio-test' },
+        },
+        variables: Object.entries(variables).map(([key, value]) => ({ key: key.toUpperCase(), value: String(value), secured: false })),
+      };
+
+      const bbResp = await apiRequest(
+        `https://api.bitbucket.org/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/`,
+        'POST', bbBody, { Authorization: `Basic ${bbAuth}`, 'User-Agent': 'PerfStudio', Accept: 'application/json' }
+      );
+
+      if (bbResp.status === 201) {
+        const pipelineUuid = bbResp.body.uuid;
+        const bbRunInsert = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
+          .run(
+            req.params.projectId, 'bitbucket', pipelineUuid,
+            `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`,
+            'pending', script_name || '', ciRunDisplayName,
+            JSON.stringify(variables), req.userId
+          );
+        return res.json({ ok: true, run_id: bbRunInsert.lastInsertRowid, run_name: ciRunDisplayName, external_id: pipelineUuid, web_url: `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`, status: 'pending', message: 'Pipeline triggered on Bitbucket Pipelines' });
+      }
+      return res.status(400).json({ error: `Bitbucket returned ${bbResp.status}: ${bbResp.body?.error?.message || JSON.stringify(bbResp.body)}` });
+    }
+
     res.status(400).json({ error: `Unknown provider: ${provider}` });
   } catch (e) {
     res.status(500).json({ error: `Trigger failed: ${e.message}` });
@@ -1097,7 +1260,35 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         const urlObj = new URL(artifactUrl);
         const fileStream = fs.createWriteStream(tmpZip);
         https.request({ hostname: urlObj.hostname, port: urlObj.port || 443, path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false }, response => {
+          if (response.statusCode !== 200 && response.statusCode !== 206) {
+            fileStream.close();
+            return reject(new Error(`GitLab artifact download failed with HTTP ${response.statusCode}`));
+          }
           response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+        }).on('error', reject).end();
+      });
+    } else if (run.provider === 'bitbucket') {
+      if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password');
+      const bbAuth2 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const pipelineId2 = (run.external_id || '').replace(/[{}]/g, '');
+      await new Promise((resolve, reject) => {
+        const fileStream = fs.createWriteStream(tmpZip);
+        const options = { hostname: 'api.bitbucket.org', path: `/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/downloads/perf-results-${pipelineId2}.zip`, method: 'GET', headers: { Authorization: `Basic ${bbAuth2}`, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+        https.request(options, response => {
+          if (response.statusCode === 301 || response.statusCode === 302) {
+            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
+              if (r2.statusCode !== 200 && r2.statusCode !== 206) {
+                fileStream.close();
+                return reject(new Error(`Bitbucket artifact not found (HTTP ${r2.statusCode})`));
+              }
+              r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+            }).on('error', reject);
+          } else if (response.statusCode === 200 || response.statusCode === 206) {
+            response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+          } else {
+            fileStream.close();
+            reject(new Error(`Bitbucket artifact not found (HTTP ${response.statusCode})`));
+          }
         }).on('error', reject).end();
       });
     }
@@ -1243,6 +1434,24 @@ router.get('/runs/:runId/status', async (req, res) => {
         // GitHub: status=queued/in_progress/completed, conclusion=success/failure/cancelled
         status = r.body.status === 'completed' ? (r.body.conclusion || 'completed') : r.body.status;
         webUrl = r.body.html_url || webUrl;
+      }
+    }
+
+    if (run.provider === 'bitbucket') {
+      const bbAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const r = await apiRequest(
+        `https://api.bitbucket.org/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/${run.external_id}`,
+        'GET', null, { Authorization: `Basic ${bbAuth}`, 'User-Agent': 'PerfStudio' }
+      );
+      if (r.status === 200) {
+        const stName = r.body.state?.name;        // PENDING | IN_PROGRESS | COMPLETED | ERROR
+        const result = r.body.state?.result?.name; // SUCCESSFUL | FAILED | ERROR | STOPPED
+        if (stName === 'COMPLETED' || stName === 'ERROR') {
+          status = result === 'SUCCESSFUL' ? 'success' : result === 'STOPPED' ? 'cancelled' : 'failure';
+        } else {
+          status = stName === 'IN_PROGRESS' ? 'in_progress' : 'pending';
+        }
+        webUrl = `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${run.external_id}`;
       }
     }
 
@@ -1461,8 +1670,38 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         const fileStream = fs.createWriteStream(tmpZip);
         const options = { hostname: urlObj.hostname, port: urlObj.port || (isHttps ? 443 : 80), path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false };
         (isHttps ? https : http).request(options, response => {
+          if (response.statusCode !== 200 && response.statusCode !== 206) {
+            fileStream.close();
+            return reject(new Error(`GitLab artifact download failed with HTTP ${response.statusCode}. The pipeline may still be running or artifacts may have expired.`));
+          }
           response.pipe(fileStream);
           fileStream.on('finish', () => { fileStream.close(); resolve(); });
+        }).on('error', reject).end();
+      });
+    }
+
+    if (run.provider === 'bitbucket') {
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+      const bbAuth3 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const pipelineId3 = (run.external_id || '').replace(/[{}]/g, '');
+      await new Promise((resolve, reject) => {
+        const fileStream = fs.createWriteStream(tmpZip);
+        const options = { hostname: 'api.bitbucket.org', path: `/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/downloads/perf-results-${pipelineId3}.zip`, method: 'GET', headers: { Authorization: `Basic ${bbAuth3}`, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+        https.request(options, response => {
+          if (response.statusCode === 301 || response.statusCode === 302) {
+            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
+              if (r2.statusCode !== 200 && r2.statusCode !== 206) {
+                fileStream.close();
+                return reject(new Error(`Bitbucket artifact not found (HTTP ${r2.statusCode}). Ensure the pipeline uploaded perf-results-${pipelineId3}.zip to Bitbucket Downloads.`));
+              }
+              r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+            }).on('error', reject);
+          } else if (response.statusCode === 200 || response.statusCode === 206) {
+            response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+          } else {
+            fileStream.close();
+            reject(new Error(`Bitbucket artifact not found (HTTP ${response.statusCode}). Ensure the pipeline uploaded perf-results-${pipelineId3}.zip to Bitbucket Downloads.`));
+          }
         }).on('error', reject).end();
       });
     }

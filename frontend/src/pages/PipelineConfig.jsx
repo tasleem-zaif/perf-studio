@@ -10,6 +10,8 @@ const DEFAULT_CI = {
   gitlab_token: '', gitlab_ref: 'main',
   github_enabled: false, github_repo: '', github_token: '',
   github_workflow_file: 'perf-test.yml', github_ref: 'main',
+  bitbucket_enabled: false, bitbucket_workspace: '', bitbucket_username: '',
+  bitbucket_app_password: '', bitbucket_repo_slug: '', bitbucket_ref: 'main',
 };
 
 function StepRow({ step, index, total, onRemove, onMoveUp, onMoveDown }) {
@@ -84,6 +86,11 @@ export default function PipelineConfig({ project, envs, user }) {
               github_repo: data.config.github_repo || '',
               github_workflow_file: data.config.github_workflow_file || 'perf-test.yml',
               github_ref: data.config.github_ref || resolved,
+              bitbucket_enabled: !!data.config.bitbucket_enabled,
+              bitbucket_workspace: data.config.bitbucket_workspace || '',
+              bitbucket_username: data.config.bitbucket_username || '',
+              bitbucket_repo_slug: data.config.bitbucket_repo_slug || '',
+              bitbucket_ref: data.config.bitbucket_ref || resolved,
             }));
           } else {
             // No saved config yet — pre-fill refs with user's branch
@@ -197,7 +204,8 @@ export default function PipelineConfig({ project, envs, user }) {
       const providers = [];
       if (ciForm.gitlab_enabled) providers.push('gitlab');
       if (ciForm.github_enabled) providers.push('github');
-      if (!providers.length) providers.push('gitlab', 'github');
+      if (ciForm.bitbucket_enabled) providers.push('bitbucket');
+      if (!providers.length) providers.push('gitlab', 'github', 'bitbucket');
       const { data } = await api.post(`/projects/${project.id}/ci/generate-yaml`, { providers });
       toast(data.message || `Generated: ${data.created?.join(', ')}`, 'success');
     } catch (e) { toast(e.response?.data?.error || 'Generation failed', 'error'); }
@@ -224,7 +232,7 @@ export default function PipelineConfig({ project, envs, user }) {
           </div>
           <div style={{ marginBottom: 16, padding: '12px 16px', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, fontSize: 13, color: '#1d4ed8' }}>
             <i className="ti ti-info-circle" style={{ marginRight: 6 }}/>
-            Configure GitLab or GitHub to run JMeter tests on their infrastructure. After saving settings, generate the YAML file, commit + push it, then trigger from the <strong>Run Test</strong> page.
+            Configure GitLab, GitHub, or Bitbucket to run JMeter tests on their infrastructure. After saving settings, generate the YAML file, commit + push it, then trigger from the <strong>Run Test</strong> page.
           </div>
 
           {/* ── GitLab ─────────────────────────────────────────── */}
@@ -348,6 +356,67 @@ export default function PipelineConfig({ project, envs, user }) {
                     <span style={{ fontSize: 12, color: ciTestResult.github.ok ? '#16a34a' : '#dc2626', display: 'flex', alignItems: 'center', gap: 4 }}>
                       <i className={`ti ${ciTestResult.github.ok ? 'ti-circle-check' : 'ti-circle-x'}`}/>
                       {ciTestResult.github.message}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ── Bitbucket Pipelines ────────────────────────── */}
+          <div style={{ border: '1px solid #e2e8f0', borderRadius: 12, padding: '20px', marginBottom: 16, background: '#fff' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+              <div style={{ width: 36, height: 36, borderRadius: 9, background: '#e0f2fe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <i className="ti ti-brand-bitbucket" style={{ color: '#0052cc', fontSize: 18 }}/>
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, color: '#0f172a' }}>Bitbucket Pipelines</div>
+                <div style={{ fontSize: 12, color: '#64748b' }}>Trigger custom pipelines on Bitbucket Cloud</div>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 }}>
+                <input type="checkbox" checked={ciForm.bitbucket_enabled} onChange={e => setCiForm(f => ({ ...f, bitbucket_enabled: e.target.checked }))} style={{ width: 16, height: 16, accentColor: 'var(--accent)', cursor: 'pointer' }}/>
+                Enable
+              </label>
+            </div>
+
+            {ciForm.bitbucket_enabled && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Workspace</label>
+                    <input style={ciInputStyle} value={ciForm.bitbucket_workspace} onChange={e => setCiForm(f => ({ ...f, bitbucket_workspace: e.target.value }))} placeholder="your-workspace-slug" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Repository Slug</label>
+                    <input style={ciInputStyle} value={ciForm.bitbucket_repo_slug} onChange={e => setCiForm(f => ({ ...f, bitbucket_repo_slug: e.target.value }))} placeholder="your-repo-name" />
+                  </div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Username</label>
+                    <input style={ciInputStyle} value={ciForm.bitbucket_username} onChange={e => setCiForm(f => ({ ...f, bitbucket_username: e.target.value }))} placeholder="your-bitbucket-username" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">App Password <span style={{ color: '#94a3b8', fontWeight: 400 }}>(Pipelines read/write)</span></label>
+                    <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.bitbucket_app_password} onChange={e => setCiForm(f => ({ ...f, bitbucket_app_password: e.target.value }))} placeholder={ciConfig?.bitbucket_app_password_set ? '(saved — enter new to replace)' : 'ATBBxxxxxxxxxxxx'} />
+                  </div>
+                </div>
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label className="form-label">Branch / Ref</label>
+                  <input style={ciInputStyle} value={ciForm.bitbucket_ref} onChange={e => setCiForm(f => ({ ...f, bitbucket_ref: e.target.value }))} placeholder="main" />
+                </div>
+                <div style={{ padding: '10px 12px', background: '#eff6ff', borderRadius: 8, border: '1px solid #bfdbfe', fontSize: 12, color: '#1e40af' }}>
+                  <i className="ti ti-info-circle" style={{ marginRight: 6 }}/>
+                  Add <strong>BB_USERNAME</strong> and <strong>BB_APP_PASSWORD</strong> as secured <strong>Repository Variables</strong> in Bitbucket → Repository Settings → Repository Variables.
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('bitbucket')} disabled={ciTesting === 'bitbucket'}>
+                    {ciTesting === 'bitbucket' ? <><span className="spinner"/> Testing…</> : <><i className="ti ti-wifi"/> Test Connection</>}
+                  </button>
+                  {ciTestResult.bitbucket && (
+                    <span style={{ fontSize: 12, color: ciTestResult.bitbucket.ok ? '#16a34a' : '#dc2626', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <i className={`ti ${ciTestResult.bitbucket.ok ? 'ti-circle-check' : 'ti-circle-x'}`}/>
+                      {ciTestResult.bitbucket.message}
                     </span>
                   )}
                 </div>
