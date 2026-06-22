@@ -1,4 +1,4 @@
-/**
+﻿/**
  * testRunner.js — shared test suite execution utility
  *
  * Used by both the single-run execution route AND the pipeline runner.
@@ -21,13 +21,13 @@ const { patchJmxForParams }  = require('./patchJmx');
 const { evaluateRules }       = require('./ruleEvaluator');
 const { getUserProjectPath, getCollectionPath } = require('./projectFolders');
 
-const PERFSTUDIO_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.perfstudio');
+const Peako_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.Peako');
 
 // ── Binary detection (mirrors execution.js) ───────────────────────────────────
 
 function getJMeterBin() {
   const candidates = [
-    path.join(PERFSTUDIO_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(Peako_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -44,7 +44,7 @@ function getJMeterBin() {
 }
 
 function getK6Bin() {
-  const candidates = [path.join(PERFSTUDIO_DIR, 'k6', 'k6.exe')];
+  const candidates = [path.join(Peako_DIR, 'k6', 'k6.exe')];
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
   }

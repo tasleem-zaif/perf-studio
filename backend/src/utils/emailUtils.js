@@ -1,4 +1,4 @@
-/**
+﻿/**
  * emailUtils.js — sends post-run alert emails with PDF analytics + JMeter HTML ZIP.
  */
 const nodemailer = require('nodemailer');
@@ -326,7 +326,7 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
 
     const transport = createTransport(cfg);
     const suiteName = runData.meta?.suite_name || 'Test Plan';
-    const subject   = `[PerfStudio] ${suiteName} — Test Execution Report`;
+    const subject   = `[Peako] ${suiteName} — Test Execution Report`;
 
     for (const recipient of recipients) {
       const html = buildEmailBody(runData, orgName, recipient.name, reportDir);
@@ -503,7 +503,7 @@ async function sendBreachAlertEmail(runId, userId, projectId, params) {
     const orgName = userRow?.org_name || userRow?.name || 'Performance Studio';
 
     const transport = createTransport(cfg);
-    const subject = `🚨 [PerfStudio ALERT] Rule Breach — ${params.suiteName} (Run #${runId})`;
+    const subject = `🚨 [Peako ALERT] Rule Breach — ${params.suiteName} (Run #${runId})`;
 
     for (const recipient of recipients) {
       const html = buildBreachEmailBody(params, orgName, recipient.name);
@@ -654,7 +654,7 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
     const runNum = (runRow?.result_dir?.match(/Run_?(\d+)/i) || [])[1] || runId;
 
     const transport = createTransport(cfg);
-    const subject = `❌ [PerfStudio] Rule Violations — ${suiteName} (Run #${runNum})`;
+    const subject = `❌ [Peako] Rule Violations — ${suiteName} (Run #${runNum})`;
 
     for (const recipient of recipients) {
       const html = buildRuleViolationEmailBody(runId, suiteName, projectName, violations, orgName, recipient.name);

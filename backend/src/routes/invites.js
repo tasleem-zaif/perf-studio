@@ -1,4 +1,4 @@
-/**
+﻿/**
  * invites.js — Invite-based user onboarding
  *
  * Super Admin  → invites Org Admin   → email sent → Org Admin accepts → sets password
@@ -305,7 +305,7 @@ router.post('/accept/:token', (req, res) => {
 
   // Generate JWT for immediate login
   const jwt = require('jsonwebtoken');
-  const token = jwt.sign({ userId: userResult.lastInsertRowid }, process.env.JWT_SECRET || 'perf_studio_secret_change_in_prod', { expiresIn: '14d' });
+  const token = jwt.sign({ userId: userResult.lastInsertRowid }, process.env.JWT_SECRET || 'peako_secret_change_in_prod', { expiresIn: '14d' });
   const user  = db.prepare('SELECT id, email, name, role, org_id, status FROM users WHERE id = ?').get(userResult.lastInsertRowid);
 
   res.json({ ok: true, token, user });

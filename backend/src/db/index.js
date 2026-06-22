@@ -1,12 +1,12 @@
-const { DatabaseSync } = require('node:sqlite');
+﻿const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const { mkdirSync } = require('fs');
 const bcrypt = require('bcryptjs');
 
 // DB_PATH env var allows Docker to persist the database in a mounted volume.
-// Default: backend/data/perf_studio.db (local dev)
-// Docker:  /app/data/perf_studio.db   (set via ENV DB_PATH in Dockerfile)
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'perf_studio.db');
+// Default: backend/data/peako.db (local dev)
+// Docker:  /app/data/peako.db   (set via ENV DB_PATH in Dockerfile)
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'peako.db');
 mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
@@ -520,9 +520,9 @@ if (!superAdmin) {
   const hash = bcrypt.hashSync('Admin@123', 10);
   db.prepare(`
     INSERT INTO users (email, name, password_hash, role, status)
-    VALUES ('admin@perfstudio.com', 'Super Admin', ?, 'super_admin', 'active')
+    VALUES ('admin@Peako.com', 'Super Admin', ?, 'super_admin', 'active')
   `).run(hash);
-  console.log('Super admin seeded: admin@perfstudio.com / Admin@123');
+  console.log('Super admin seeded: admin@Peako.com / Admin@123');
 }
 
 module.exports = db;

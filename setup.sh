@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# ── PerfStudio — Linux/macOS Setup & Docker Startup ───────────────────────────
+﻿#!/usr/bin/env bash
+# ── Peako — Linux/macOS Setup & Docker Startup ───────────────────────────
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 
 echo ""
 echo "============================================="
-echo "  PerfStudio — Docker Startup"
+echo "  Peako — Docker Startup"
 echo "============================================="
 echo ""
 
@@ -91,12 +91,12 @@ done
 
 echo ""
 echo "============================================="
-echo "  PerfStudio is running!"
+echo "  Peako is running!"
 echo ""
 echo "  App : http://localhost:5173"
 echo "  API : http://localhost:3001/api/health"
 echo ""
-echo "  Default login: admin@perfstudio.com"
+echo "  Default login: admin@Peako.com"
 echo "  Default password: Admin@123"
 echo "  (Change this after first login)"
 echo "============================================="

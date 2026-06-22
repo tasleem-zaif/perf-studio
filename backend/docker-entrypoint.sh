@@ -1,5 +1,5 @@
-#!/bin/sh
-# ── PerfStudio Backend — Container Entrypoint ─────────────────────────────────
+﻿#!/bin/sh
+# ── Peako Backend — Container Entrypoint ─────────────────────────────────
 # Runs once at container start: ensures data directories exist, then starts app.
 # ──────────────────────────────────────────────────────────────────────────────
 

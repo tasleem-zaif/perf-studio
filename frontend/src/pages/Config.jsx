@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
@@ -182,8 +182,8 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
   const [enablingVirt, setEnablingVirt] = useState(false);
   const [virtMsg, setVirtMsg] = useState('');
   const [dockerLogs, setDockerLogs] = useState([]);
-  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/perfstudio:latest');
-  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/perfstudio:latest');
+  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/Peako:latest');
+  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/Peako:latest');
   const [pullingImage, setPullingImage] = useState(null); // 'jmeter' | 'k6' | null
 
   useEffect(() => {
@@ -501,7 +501,7 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
       {/* System Requirements removed — use Docker Engine section below */}
       {null && <CollapsibleSection title="" open={false} onToggle={() => {}}>
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Verifies all dependencies, permissions, and configuration needed to run PerfStudio and execute tests.
+          Verifies all dependencies, permissions, and configuration needed to run Peako and execute tests.
         </div>
 
         <button
@@ -711,7 +711,7 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
               type="text"
               value={jmeterDockerImage}
               onChange={e => setJmeterDockerImage(e.target.value)}
-              placeholder="tasleemzaif/perfstudio:latest"
+              placeholder="tasleemzaif/Peako:latest"
               style={{ flex: 1, minWidth: 0 }}
             />
             <button

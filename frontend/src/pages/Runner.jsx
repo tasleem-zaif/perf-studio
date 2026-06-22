@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, startTransition } from 'react';
+﻿import { useState, useEffect, useRef, startTransition } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
@@ -385,7 +385,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         if (!DONE.has(data.run?.status)) setTimeout(poll, 5000); // poll every 5s until done
         else {
           setCiPolling(null);
-          // Refresh full run list to pick up any runs triggered outside PerfStudio
+          // Refresh full run list to pick up any runs triggered outside Peako
           api.get(`/projects/${selectedProjectId}/ci/runs`)
             .then(({ data: d }) => setCiRuns(d.runs || []))
             .catch(() => {});

@@ -1,4 +1,4 @@
-const router = require('express').Router();
+﻿const router = require('express').Router();
 const path   = require('path');
 const fs     = require('fs');
 const db     = require('../db');
@@ -147,8 +147,8 @@ router.delete('/:id', async (req, res) => {
             if (token) { u.username = gitCfg.username || token; u.password = token; }
             const remoteWithAuth = u.toString();
 
-            await git.addConfig('user.name', gitCfg.username || 'PerfStudio');
-            await git.addConfig('user.email', gitCfg.email || 'noreply@perfstudio.com');
+            await git.addConfig('user.name', gitCfg.username || 'Peako');
+            await git.addConfig('user.email', gitCfg.email || 'noreply@Peako.com');
             const baseBranch = gitCfg.base_branch || 'main';
             await git.checkout(baseBranch);
             await git.pull('origin', baseBranch, { '--rebase': 'false' }).catch(() => {});

@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 const fs        = require('fs');
 const path      = require('path');
 const puppeteer = require('puppeteer');
@@ -552,7 +552,7 @@ async function renderPdf(data, runNum) {
       const el = pageEls[i];
       // Force page height to exactly 794px (A4 landscape) so screenshots are uniform
       await page.evaluate(e => { e.style.minHeight = '794px'; e.style.height = '794px'; e.style.overflow = 'hidden'; }, el);
-      const tmpPath = path.join(os.tmpdir(), `perfstudio_page_${process.pid}_${i}.jpg`);
+      const tmpPath = path.join(os.tmpdir(), `Peako_page_${process.pid}_${i}.jpg`);
       await el.screenshot({ type: 'jpeg', quality: 95, path: tmpPath });
       tmpFiles.push(tmpPath);
     }

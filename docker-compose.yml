@@ -1,7 +1,7 @@
-version: '3.9'
+﻿version: '3.9'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PerfStudio — All-in-one Docker Compose
+# Peako — All-in-one Docker Compose
 #
 # Single container: Node.js backend + React frontend + Java + JMeter + K6 + Git
 #
@@ -17,12 +17,12 @@ version: '3.9'
 
 services:
 
-  perfstudio:
-    image: ${PERFSTUDIO_IMAGE:-tasleemzaif/perfstudio:latest}
+  Peako:
+    image: ${Peako_IMAGE:-tasleemzaif/Peako:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: perfstudio
+    container_name: Peako
     ports:
       - "${PORT:-3001}:3001"
     env_file:
@@ -36,10 +36,10 @@ services:
       JMETER_HOME: /opt/jmeter
       K6_BIN: /usr/bin/k6
     volumes:
-      - perfstudio_data:/app/data         # SQLite database
-      - perfstudio_projects:/app/projects # project files, scripts, test data
-      - perfstudio_git:/app/git-workspaces
-      - perfstudio_backups:/app/backups
+      - Peako_data:/app/data         # SQLite database
+      - Peako_projects:/app/projects # project files, scripts, test data
+      - Peako_git:/app/git-workspaces
+      - Peako_backups:/app/backups
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]

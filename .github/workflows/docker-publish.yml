@@ -1,4 +1,4 @@
-name: Build & Publish Docker Images
+﻿name: Build & Publish Docker Images
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
     branches: [main]
 
 env:
-  BACKEND_IMAGE: tasleemzaif/perf-studio-backend
-  FRONTEND_IMAGE: tasleemzaif/perf-studio-frontend
+  BACKEND_IMAGE: tasleemzaif/peako-backend
+  FRONTEND_IMAGE: tasleemzaif/peako-frontend
 
 jobs:
   build-and-push:
