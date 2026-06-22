@@ -147,8 +147,8 @@ router.delete('/:id', async (req, res) => {
             if (token) { u.username = gitCfg.username || token; u.password = token; }
             const remoteWithAuth = u.toString();
 
-            await git.addConfig('user.name', gitCfg.username || 'Peako');
-            await git.addConfig('user.email', gitCfg.email || 'noreply@Peako.com');
+            await git.addConfig('user.name', gitCfg.username || 'PerfStudio');
+            await git.addConfig('user.email', gitCfg.email || 'noreply@perfstudio.com');
             const baseBranch = gitCfg.base_branch || 'main';
             await git.checkout(baseBranch);
             await git.pull('origin', baseBranch, { '--rebase': 'false' }).catch(() => {});

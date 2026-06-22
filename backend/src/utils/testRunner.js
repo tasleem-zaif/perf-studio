@@ -21,13 +21,13 @@ const { patchJmxForParams }  = require('./patchJmx');
 const { evaluateRules }       = require('./ruleEvaluator');
 const { getUserProjectPath, getCollectionPath } = require('./projectFolders');
 
-const Peako_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.Peako');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // ── Binary detection (mirrors execution.js) ───────────────────────────────────
 
 function getJMeterBin() {
   const candidates = [
-    path.join(Peako_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -44,7 +44,7 @@ function getJMeterBin() {
 }
 
 function getK6Bin() {
-  const candidates = [path.join(Peako_DIR, 'k6', 'k6.exe')];
+  const candidates = [path.join(PerfStudio_DIR, 'k6', 'k6.exe')];
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
   }

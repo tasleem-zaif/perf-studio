@@ -60,9 +60,9 @@ router.post('/forgot-password', async (req, res) => {
     const { transport, cfg } = result;
     try {
       await transport.sendMail({
-        from: `"Peako" <${cfg.from_email}>`,
+        from: `"PerfStudio" <${cfg.from_email}>`,
         to: email,
-        subject: 'Peako — Password Reset',
+        subject: 'PerfStudio — Password Reset',
         html: `<!DOCTYPE html>
 <html>
 <body style="font-family:Arial,sans-serif;background:#f4f6f9;margin:0;padding:32px;">
@@ -71,7 +71,7 @@ router.post('/forgot-password', async (req, res) => {
     <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
          alt="Quarks" height="32"
          style="height:32px;vertical-align:middle;margin-right:10px;filter:brightness(0) invert(1);" />
-    <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Peako</span>
+    <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">PerfStudio</span>
   </div>
   <div style="padding:28px;">
     <h2 style="color:#f59e0b;margin:0 0 14px;font-size:18px;">🔑 Password Reset Request</h2>
@@ -94,7 +94,7 @@ router.post('/forgot-password', async (req, res) => {
     </p>
   </div>
   <div style="background:#0f172a;padding:10px 24px;border-top:1px solid #2e3a55;text-align:center;">
-    <p style="color:#4b5563;font-size:11px;margin:0;">Peako — AI-Powered Performance Testing</p>
+    <p style="color:#4b5563;font-size:11px;margin:0;">PerfStudio — AI-Powered Performance Testing</p>
   </div>
 </div>
 </body>

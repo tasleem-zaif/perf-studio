@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const db = require('../db');
 const auth = require('../middleware/auth');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'peako_secret_change_in_prod';
+const JWT_SECRET = process.env.JWT_SECRET || 'perf_studio_secret_change_in_prod';
 const JWT_EXPIRES = '7d';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 

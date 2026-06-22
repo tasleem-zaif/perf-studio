@@ -19,7 +19,7 @@ const { evaluateRules } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
 const { parseJtl } = require('../utils/parseJtl');
 
-const Peako_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.Peako');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // Converts a container-internal path to the equivalent HOST-machine path for
 // Docker -v volume mount arguments. When the backend runs inside Docker Compose,
@@ -48,7 +48,7 @@ function getJMeterBin(customPath) {
 
   const candidates = [
     ...(customPath ? [resolveJmeterPath(customPath)] : []),
-    path.join(Peako_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -71,7 +71,7 @@ function getJMeterBin(customPath) {
 function getK6Bin(customPath) {
   const candidates = [
     ...(customPath ? [customPath] : []),
-    path.join(Peako_DIR, 'k6', 'k6.exe'),
+    path.join(PerfStudio_DIR, 'k6', 'k6.exe'),
   ];
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
@@ -521,7 +521,7 @@ async function setJavaEnvVarsPermanently(platform, javaHome, sendLog) {
       path.join(process.env.HOME, '.profile'),
       path.join(process.env.HOME, '.bashrc'),
     ];
-    const exportLines = `\n# Java (set by Peako)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
+    const exportLines = `\n# Java (set by PerfStudio)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
     for (const pf of profileFiles) {
       try {
         const existing = fs.existsSync(pf) ? fs.readFileSync(pf, 'utf8') : '';
@@ -730,7 +730,7 @@ router.post('/run', auth, async (req, res) => {
 
   // ── Preparation summary ──────────────────────────────────────────────────
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  log('info', '  Peako  —  TEST EXECUTION ENGINE');
+  log('info', '  PerfStudio  —  TEST EXECUTION ENGINE');
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   log('info', `  Engine     : ${engine.toUpperCase()} (Docker)`);
   log('info', `  Test Plan  : ${suite.name}`);
@@ -1264,7 +1264,7 @@ router.post('/run', auth, async (req, res) => {
           // Primary: save directly to result_dir so it persists
           const resultPdf = runRow.result_dir && fs.existsSync(runRow.result_dir)
             ? path.join(runRow.result_dir, `${suiteName}_Run${runNum}_Analytics.pdf`)
-            : path.join(os.tmpdir(), `Peako_run_${targetRunId}_${Date.now()}.pdf`);
+            : path.join(os.tmpdir(), `PerfStudio_run_${targetRunId}_${Date.now()}.pdf`);
           await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
           pdfPath = resultPdf;
           console.log('[Alerts] Analytics PDF saved:', pdfPath);

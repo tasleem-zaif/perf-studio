@@ -74,7 +74,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 app.listen(PORT, () => {
-  console.log(`Peako API running on http://localhost:${PORT}`);
+  console.log(`PerfStudio API running on http://localhost:${PORT}`);
 
   // ── On startup: mark orphaned running runs as failed ─────────────────────
   // If the server was restarted mid-execution, runs stuck in 'running' state

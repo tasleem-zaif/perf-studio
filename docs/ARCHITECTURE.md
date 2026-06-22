@@ -168,7 +168,7 @@ git-workspaces/
 | **Backend** | Node.js, Express 4, nodemon (dev) |
 | **Database** | SQLite via `node:sqlite` (built-in, no native deps) |
 | **AI Generation** | OpenAI GPT-4o (`openai` SDK) · Anthropic Claude (`@anthropic-ai/sdk`) |
-| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `peako-runner` Docker image (Java · Node.js pre-installed) |
+| **Test Engines** | Apache JMeter · Grafana K6 — both run inside the `PerfStudio-runner` Docker image (Java · Node.js pre-installed) |
 | **Git Integration** | `simple-git` (local ops) · `@octokit/rest` (GitHub API) · GitLab REST API |
 | **Email** | `nodemailer` (SMTP transport, TLS) |
 | **PDF Reports** | `puppeteer` (HTML → PDF) · `pdfkit` |

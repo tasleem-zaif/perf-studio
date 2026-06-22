@@ -9,7 +9,7 @@ const { evaluateRules } = require('./ruleEvaluator');
 const { patchJmxForParams } = require('./patchJmx');
 
 const MAX_ATTEMPTS   = 3;
-const Peako_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.Peako');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // Phase-1 quick-verify params — just enough to confirm the script fix is valid.
 // Runs in ~20 seconds regardless of original test duration.
@@ -33,7 +33,7 @@ function getJMeterBin(customPath) {
   };
   const candidates = [
     ...(customPath ? [resolve(customPath)] : []),
-    path.join(Peako_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -46,7 +46,7 @@ function getJMeterBin(customPath) {
 function getK6Bin(customPath) {
   const candidates = [
     ...(customPath ? [customPath] : []),
-    path.join(Peako_DIR, 'k6', 'k6.exe'),
+    path.join(PerfStudio_DIR, 'k6', 'k6.exe'),
   ];
   for (const p of candidates) if (p && fs.existsSync(p)) return p;
   try { execSync('k6 version 2>&1', { timeout: 5000 }); return 'k6'; } catch {}

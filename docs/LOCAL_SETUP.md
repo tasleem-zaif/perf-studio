@@ -41,8 +41,8 @@ docker --version  # only needed for Method A
 ## 2. Clone the Repository
 
 ```bash
-git clone https://bitbucket.org/qtsolv/peako.git
-cd peako
+git clone https://bitbucket.org/qtsolv/PerfStudio.git
+cd PerfStudio
 ```
 
 ---
@@ -65,7 +65,7 @@ Copy the two outputs — you will need them in the next step.
 
 ### Step 2 — Create the `.env` file
 
-Create a file named `.env` in the **project root** (`peako/.env`) with the content below. Replace the placeholder values with the keys you just generated.
+Create a file named `.env` in the **project root** (`PerfStudio/.env`) with the content below. Replace the placeholder values with the keys you just generated.
 
 ```env
 # ── Required ──────────────────────────────────────────────
@@ -84,8 +84,8 @@ BACKUPS_ROOT=../../backups
 
 # ── Docker paths (only needed for Method A) ───────────────
 # Set these to the absolute path of the project on your machine
-HOST_PROJECTS_ROOT=C:/Users/YourName/peako/projects
-HOST_BACKUPS_ROOT=C:/Users/YourName/peako/backups
+HOST_PROJECTS_ROOT=C:/Users/YourName/PerfStudio/projects
+HOST_BACKUPS_ROOT=C:/Users/YourName/PerfStudio/backups
 ```
 
 > **Important:** `HOST_PROJECTS_ROOT` and `HOST_BACKUPS_ROOT` must be absolute paths using forward slashes. Only needed for Method A (Docker).
@@ -124,7 +124,7 @@ This runs the backend and frontend as separate dev servers with hot-reload. Requ
 ### Terminal 1 — Backend
 
 ```bash
-cd peako/backend
+cd PerfStudio/backend
 npm install
 npm run dev
 ```
@@ -137,7 +137,7 @@ Performance Studio API running on http://localhost:3001
 ### Terminal 2 — Frontend
 
 ```bash
-cd peako/frontend
+cd PerfStudio/frontend
 npm install
 npm run dev
 ```
@@ -161,7 +161,7 @@ On first startup the database is created automatically and a Super Admin account
 | Field | Value |
 |---|---|
 | **URL** | http://localhost:5173 (Method B) or http://localhost:3001 (Method A) |
-| **Email** | `admin@Peako.com` |
+| **Email** | `admin@perfstudio.com` |
 | **Password** | `Admin@123` |
 
 > **Change the default password** immediately after first login via Profile → Change Password.
@@ -180,9 +180,9 @@ On first startup the database is created automatically and a Super Admin account
 The application creates the following folders automatically — do not delete them while the app is running.
 
 ```
-peako/
+PerfStudio/
 ├── data/
-│   └── peako.db          ← SQLite database (all app data)
+│   └── PerfStudio.db          ← SQLite database (all app data)
 ├── projects/                   ← Legacy admin project files
 ├── backups/                    ← Project ZIP backups (on delete)
 └── git-workspaces/
@@ -229,9 +229,9 @@ The `JWT_SECRET` in `.env` was likely changed after accounts were created. Run:
 ```bash
 # Delete the database and restart (all data will be lost)
 # Windows
-del data\peako.db
+del data\PerfStudio.db
 # Mac/Linux
-rm data/peako.db
+rm data/PerfStudio.db
 ```
 Then restart the server — the database and default admin account will be re-created.
 

@@ -198,7 +198,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
           <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
                alt="Quarks" height="36"
                style="display:inline-block;height:36px;vertical-align:middle;margin-right:12px;filter:brightness(0) invert(1);" />
-          <span style="color:#f0f3fa;font-size:17px;font-weight:700;vertical-align:middle;">Peako</span>
+          <span style="color:#f0f3fa;font-size:17px;font-weight:700;vertical-align:middle;">PerfStudio</span>
           <span style="color:#7a8eaa;font-size:12px;margin-left:10px;vertical-align:middle;">Test Execution Report</span>
         </td>
       </tr>
@@ -273,12 +273,12 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
   <!-- Sign-off -->
   <div style="padding:0 24px 22px;">
     <p style="color:#b8c4d8;font-size:13px;margin:0 0 4px;">Thanks,</p>
-    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'Peako Team'}</p>
+    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'PerfStudio Team'}</p>
   </div>
 
   <!-- Footer -->
   <div style="background:#0f172a;padding:12px 24px;text-align:center;border-top:1px solid #2e3a55;">
-    <p style="color:#4b5563;font-size:11px;margin:0;">Automated report from Peako &nbsp;·&nbsp; Do not reply</p>
+    <p style="color:#4b5563;font-size:11px;margin:0;">Automated report from PerfStudio &nbsp;·&nbsp; Do not reply</p>
   </div>
 
 </div>
@@ -307,7 +307,7 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
 
     // Get org name
     const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
-    const orgName = userRow?.org_name || userRow?.name || 'Peako';
+    const orgName = userRow?.org_name || userRow?.name || 'PerfStudio';
 
     // Build attachments
     const attachments = [];
@@ -326,13 +326,13 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
 
     const transport = createTransport(cfg);
     const suiteName = runData.meta?.suite_name || 'Test Plan';
-    const subject   = `[Peako] ${suiteName} — Test Execution Report`;
+    const subject   = `[PerfStudio] ${suiteName} — Test Execution Report`;
 
     for (const recipient of recipients) {
       const html = buildEmailBody(runData, orgName, recipient.name, reportDir);
       const s = runData.summary || {};
       const plainText = [
-        `Peako — Test Execution Report`,
+        `PerfStudio — Test Execution Report`,
         ``,
         `Hello ${recipient.name || 'Team'},`,
         ``,
@@ -352,7 +352,7 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
       ].join('\n');
 
       await transport.sendMail({
-        from:       `"${cfg.from_name || 'Peako'}" <${cfg.from_email}>`,
+        from:       `"${cfg.from_name || 'PerfStudio'}" <${cfg.from_email}>`,
         to:         recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
         replyTo:    cfg.from_email,
         subject,
@@ -360,7 +360,7 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
         html,
         attachments,
         headers: {
-          'X-Mailer':        'Peako',
+          'X-Mailer':        'PerfStudio',
           'X-Priority':      '3',
           'Importance':      'Normal',
           'Precedence':      'bulk',
@@ -430,7 +430,7 @@ function buildBreachEmailBody(params, orgName, recipientName) {
       <td style="vertical-align:middle;">
         <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
              alt="Quarks" height="32" style="height:32px;filter:brightness(0) invert(1);vertical-align:middle;margin-right:10px;"/>
-        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Peako</span>
+        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">PerfStudio</span>
         <span style="color:#fca5a5;font-size:12px;margin-left:8px;vertical-align:middle;">⚡ Live Rule Breach Alert</span>
       </td>
     </tr></table>
@@ -474,12 +474,12 @@ function buildBreachEmailBody(params, orgName, recipientName) {
   <!-- Sign-off -->
   <div style="padding:0 24px 22px;">
     <p style="color:#b8c4d8;font-size:13px;margin:0 0 4px;">Thanks,</p>
-    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'Peako Team'}</p>
+    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'PerfStudio Team'}</p>
   </div>
 
   <!-- Footer -->
   <div style="background:#0f172a;padding:12px 24px;text-align:center;border-top:1px solid #2e3a55;">
-    <p style="color:#4b5563;font-size:11px;margin:0;">Automated breach alert from Peako &nbsp;·&nbsp; Run ID: ${runId}</p>
+    <p style="color:#4b5563;font-size:11px;margin:0;">Automated breach alert from PerfStudio &nbsp;·&nbsp; Run ID: ${runId}</p>
   </div>
 
 </div>
@@ -500,15 +500,15 @@ async function sendBreachAlertEmail(runId, userId, projectId, params) {
     if (!recipients.length) return;
 
     const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
-    const orgName = userRow?.org_name || userRow?.name || 'Peako';
+    const orgName = userRow?.org_name || userRow?.name || 'PerfStudio';
 
     const transport = createTransport(cfg);
-    const subject = `🚨 [Peako ALERT] Rule Breach — ${params.suiteName} (Run #${runId})`;
+    const subject = `🚨 [PerfStudio ALERT] Rule Breach — ${params.suiteName} (Run #${runId})`;
 
     for (const recipient of recipients) {
       const html = buildBreachEmailBody(params, orgName, recipient.name);
       const plain = [
-        `Peako — Rule Breach Alert`,
+        `PerfStudio — Rule Breach Alert`,
         ``,
         `Hello ${recipient.name || 'Team'},`,
         ``,
@@ -524,13 +524,13 @@ async function sendBreachAlertEmail(runId, userId, projectId, params) {
       ].join('\n');
 
       await transport.sendMail({
-        from:    `"${cfg.from_name || 'Peako'}" <${cfg.from_email}>`,
+        from:    `"${cfg.from_name || 'PerfStudio'}" <${cfg.from_email}>`,
         to:      recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
         replyTo: cfg.from_email,
         subject,
         text:    plain,
         html,
-        headers: { 'X-Mailer': 'Peako', 'X-Priority': '1', 'Importance': 'High' },
+        headers: { 'X-Mailer': 'PerfStudio', 'X-Priority': '1', 'Importance': 'High' },
       });
     }
 
@@ -584,7 +584,7 @@ function buildRuleViolationEmailBody(runId, suiteName, projectName, violations, 
       <td style="vertical-align:middle;">
         <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
              alt="Quarks" height="32" style="height:32px;filter:brightness(0) invert(1);vertical-align:middle;margin-right:10px;"/>
-        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Peako</span>
+        <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">PerfStudio</span>
         <span style="color:#fca5a5;font-size:12px;margin-left:8px;vertical-align:middle;">Rule Violation Alert</span>
       </td>
     </tr></table>
@@ -621,12 +621,12 @@ function buildRuleViolationEmailBody(runId, suiteName, projectName, violations, 
   <!-- Sign-off -->
   <div style="padding:0 24px 22px;">
     <p style="color:#b8c4d8;font-size:13px;margin:0 0 4px;">Thanks,</p>
-    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'Peako Team'}</p>
+    <p style="color:#f0f3fa;font-size:14px;font-weight:600;margin:0;">${orgName || 'PerfStudio Team'}</p>
   </div>
 
   <!-- Footer -->
   <div style="background:#0f172a;padding:12px 24px;text-align:center;border-top:1px solid #2e3a55;">
-    <p style="color:#4b5563;font-size:11px;margin:0;">Post-run rule violation alert from Peako &nbsp;·&nbsp; Run ID: ${runId}</p>
+    <p style="color:#4b5563;font-size:11px;margin:0;">Post-run rule violation alert from PerfStudio &nbsp;·&nbsp; Run ID: ${runId}</p>
   </div>
 
 </div>
@@ -648,18 +648,18 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
     if (!recipients.length) return;
 
     const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
-    const orgName = userRow?.org_name || userRow?.name || 'Peako';
+    const orgName = userRow?.org_name || userRow?.name || 'PerfStudio';
 
     const runRow = db.prepare('SELECT result_dir FROM execution_runs WHERE id = ?').get(runId);
     const runNum = (runRow?.result_dir?.match(/Run_?(\d+)/i) || [])[1] || runId;
 
     const transport = createTransport(cfg);
-    const subject = `❌ [Peako] Rule Violations — ${suiteName} (Run #${runNum})`;
+    const subject = `❌ [PerfStudio] Rule Violations — ${suiteName} (Run #${runNum})`;
 
     for (const recipient of recipients) {
       const html = buildRuleViolationEmailBody(runId, suiteName, projectName, violations, orgName, recipient.name);
       const plain = [
-        `Peako — Rule Violation Alert`,
+        `PerfStudio — Rule Violation Alert`,
         ``,
         `Hello ${recipient.name || 'Team'},`,
         ``,
@@ -678,13 +678,13 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
       ].join('\n');
 
       await transport.sendMail({
-        from:    `"${cfg.from_name || 'Peako'}" <${cfg.from_email}>`,
+        from:    `"${cfg.from_name || 'PerfStudio'}" <${cfg.from_email}>`,
         to:      recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
         replyTo: cfg.from_email,
         subject,
         text:    plain,
         html,
-        headers: { 'X-Mailer': 'Peako', 'X-Priority': '2', 'Importance': 'High' },
+        headers: { 'X-Mailer': 'PerfStudio', 'X-Priority': '2', 'Importance': 'High' },
       });
     }
 

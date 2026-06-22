@@ -2,8 +2,8 @@
 
 **AI-Powered Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, real-time analytics, Git integration, and team collaboration.
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/tasleemzaif/peako-backend)](https://hub.docker.com/r/tasleemzaif/peako-backend)
-[![Build](https://github.com/tasleem-zaif/peako/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/tasleem-zaif/peako/actions)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tasleemzaif/PerfStudio-backend)](https://hub.docker.com/r/tasleemzaif/PerfStudio-backend)
+[![Build](https://github.com/tasleem-zaif/PerfStudio/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/tasleem-zaif/PerfStudio/actions)
 
 ---
 
@@ -11,8 +11,8 @@
 
 ```bash
 # 1. Download config files
-curl -O https://raw.githubusercontent.com/tasleem-zaif/peako/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/tasleem-zaif/peako/main/.env.example
+curl -O https://raw.githubusercontent.com/tasleem-zaif/PerfStudio/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/tasleem-zaif/PerfStudio/main/.env.example
 
 # 2. Configure environment
 cp .env.example .env
@@ -25,7 +25,7 @@ docker compose up -d
 open http://localhost:5173
 ```
 
-**Default Super Admin credentials:** `admin@Peako.com` / `Admin@123`
+**Default Super Admin credentials:** `admin@perfstudio.com` / `Admin@123`
 
 ---
 
@@ -91,8 +91,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full system diagrams.
 
 ```bash
 # Clone
-git clone https://github.com/tasleem-zaif/peako.git
-cd peako
+git clone https://github.com/tasleem-zaif/PerfStudio.git
+cd PerfStudio
 
 # Backend
 cd backend && npm install
@@ -109,8 +109,8 @@ npm run dev             # runs on :5173
 
 | Image | Docker Hub |
 |---|---|
-| Backend | `tasleemzaif/peako-backend:latest` |
-| Frontend | `tasleemzaif/peako-frontend:latest` |
+| Backend | `tasleemzaif/PerfStudio-backend:latest` |
+| Frontend | `tasleemzaif/PerfStudio-frontend:latest` |
 
 ```bash
 # Pull latest
@@ -138,7 +138,7 @@ docker compose pull && docker compose up -d
 ## 📁 Project Structure
 
 ```
-peako/
+PerfStudio/
 ├── backend/           Node.js Express API
 │   └── src/
 │       ├── routes/    auth, projects, collections, git, invites, ...

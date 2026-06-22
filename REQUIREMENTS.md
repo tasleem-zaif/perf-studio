@@ -1,4 +1,4 @@
-# Peako — System Requirements
+# PerfStudio — System Requirements
 
 ---
 

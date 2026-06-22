@@ -1,7 +1,7 @@
 'use strict';
 const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
-const db = new DatabaseSync(path.join(__dirname, 'data', 'peako.db'));
+const db = new DatabaseSync(path.join(__dirname, 'data', 'PerfStudio.db'));
 const run = db.prepare('SELECT id, started_at, finished_at, report_data FROM execution_runs WHERE ci_run_id IS NOT NULL ORDER BY id DESC LIMIT 1').get();
 console.log('ID:', run.id, '| started_at:', run.started_at, '| finished_at:', run.finished_at);
 if (run.report_data) {

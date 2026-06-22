@@ -469,7 +469,7 @@ try {
       smtp_secure INTEGER DEFAULT 0,
       smtp_user TEXT DEFAULT '',
       smtp_pass TEXT DEFAULT '',
-      from_name TEXT DEFAULT 'Peako',
+      from_name TEXT DEFAULT 'PerfStudio',
       from_email TEXT DEFAULT '',
       enabled INTEGER DEFAULT 0,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -520,9 +520,9 @@ if (!superAdmin) {
   const hash = bcrypt.hashSync('Admin@123', 10);
   db.prepare(`
     INSERT INTO users (email, name, password_hash, role, status)
-    VALUES ('admin@Peako.com', 'Super Admin', ?, 'super_admin', 'active')
+    VALUES ('admin@perfstudio.com', 'Super Admin', ?, 'super_admin', 'active')
   `).run(hash);
-  console.log('Super admin seeded: admin@Peako.com / Admin@123');
+  console.log('Super admin seeded: admin@perfstudio.com / Admin@123');
 }
 
 module.exports = db;

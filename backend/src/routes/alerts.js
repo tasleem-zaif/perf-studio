@@ -45,13 +45,13 @@ router.put('/config', (req, res) => {
       UPDATE alert_configs SET smtp_host=?, smtp_port=?, smtp_secure=?, smtp_user=?,
         smtp_pass=?, from_name=?, from_email=?, enabled=1 WHERE user_id=?
     `).run(smtp_host||'', Number(smtp_port)||587, smtp_secure?1:0, smtp_user||'',
-           finalPass, from_name||'Peako', from_email||'', req.userId);
+           finalPass, from_name||'PerfStudio', from_email||'', req.userId);
   } else {
     db.prepare(`
       INSERT INTO alert_configs (user_id, smtp_host, smtp_port, smtp_secure, smtp_user,
         smtp_pass, from_name, from_email, enabled) VALUES (?,?,?,?,?,?,?,?,1)
     `).run(req.userId, smtp_host||'', Number(smtp_port)||587, smtp_secure?1:0, smtp_user||'',
-           finalPass, from_name||'Peako', from_email||'');
+           finalPass, from_name||'PerfStudio', from_email||'');
   }
   res.json({ ok: true });
 });
@@ -97,30 +97,30 @@ router.post('/send-test', async (req, res) => {
     await transport.verify();
 
     const info = await transport.sendMail({
-      from:    `"${row.from_name||'Peako'}" <${row.from_email}>`,
+      from:    `"${row.from_name||'PerfStudio'}" <${row.from_email}>`,
       to,
       replyTo: row.from_email,
-      subject: `Peako — SMTP Configuration Verified`,
-      text: `Hello,\n\nYour Peako SMTP configuration is working correctly.\nSent from: ${row.from_email}\n\nThis is a test email. If you received this, email alerts will be delivered to your inbox after each test run.\n\nThanks,\nPeako`,
+      subject: `PerfStudio — SMTP Configuration Verified`,
+      text: `Hello,\n\nYour PerfStudio SMTP configuration is working correctly.\nSent from: ${row.from_email}\n\nThis is a test email. If you received this, email alerts will be delivered to your inbox after each test run.\n\nThanks,\nPerfStudio`,
       html: `<div style="font-family:Arial,sans-serif;max-width:520px;background:#1a2035;border-radius:12px;overflow:hidden;">
         <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);padding:18px 24px;">
           <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
                alt="Quarks" height="32"
                style="display:inline-block;height:32px;vertical-align:middle;margin-right:10px;filter:brightness(0) invert(1);" />
-          <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">Peako</span>
+          <span style="color:#f0f3fa;font-size:16px;font-weight:700;vertical-align:middle;">PerfStudio</span>
         </div>
         <div style="padding:24px;">
           <h2 style="color:#22c55e;margin:0 0 12px;font-size:16px;">✅ SMTP Configuration Working</h2>
-          <p style="color:#b8c4d8;margin:0 0 8px;font-size:13px;">Your Peako email alerts are configured correctly.</p>
+          <p style="color:#b8c4d8;margin:0 0 8px;font-size:13px;">Your PerfStudio email alerts are configured correctly.</p>
           <p style="color:#b8c4d8;margin:0 0 16px;font-size:13px;">Sent from: <strong style="color:#f0f3fa;">${row.from_email}</strong></p>
           <p style="color:#7a8eaa;font-size:12px;margin:0;">If you received this in your inbox, email alerts will be delivered after each test run.</p>
         </div>
         <div style="background:#0f172a;padding:10px 24px;border-top:1px solid #2e3a55;text-align:center;">
-          <p style="color:#4b5563;font-size:11px;margin:0;">Peako — Automated Test Reporting</p>
+          <p style="color:#4b5563;font-size:11px;margin:0;">PerfStudio — Automated Test Reporting</p>
         </div>
       </div>`,
       headers: {
-        'X-Mailer':       'Peako',
+        'X-Mailer':       'PerfStudio',
         'X-Priority':     '3',
         'Importance':     'Normal',
       },
