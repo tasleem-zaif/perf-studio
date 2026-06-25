@@ -948,7 +948,7 @@ pipelines:
         const hasStagedChanges = (statusOut.stdout || '').split('\n').some(l => l.match(/^[MADRCU]/));
 
         if (hasStagedChanges) {
-          gitRun(['commit', '-m', 'ci: add PerfStudio Performance Test workflow [auto]']);
+          gitRun(['commit', '-m', 'ci: add Peako Performance Test workflow [auto]']);
           gitRun(['push', '--set-upstream', remoteUrl, autoCommitBranch]);
           pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
         } else {
@@ -1126,7 +1126,8 @@ router.post('/trigger', async (req, res) => {
       const st2 = await git2.status();
       if (st2.staged.length > 0 || st2.not_added.length > 0) {
         await git2.add('.');
-        await git2.commit(`ci: sync scripts for pipeline run [auto]`);
+        const runLabel = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
+        await git2.commit(`Peako Performance Test: ${runLabel} [auto]`);
       }
       // Disable GCM account picker in local .git/config before every push
       try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
