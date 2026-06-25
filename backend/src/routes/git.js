@@ -66,13 +66,14 @@ const NO_PROMPT_ENV = {
   GIT_ASKPASS: 'echo',
   GIT_SSH_ASKPASS: 'echo',
   // Suppress Windows Git Credential Manager (GCM) GUI account-picker dialogs.
-  // GCM shows these even when a PAT is embedded in the URL unless we explicitly
-  // tell it to never open interactive windows.
   GCM_INTERACTIVE: 'never',
   GCM_NO_INTERACTIVE: '1',
+  // Ignore system-level gitconfig so the Windows GCM credential.helper entry
+  // (set in C:\Program Files\Git\etc\gitconfig) is never loaded.
+  GIT_CONFIG_NOSYSTEM: '1',
   // Override credential.helper to empty via git env config (Git 2.31+).
-  // This prevents GCM from intercepting HTTPS operations where the PAT is
-  // already present in the remote URL — so git uses the URL credentials directly.
+  // Combined with GIT_CONFIG_NOSYSTEM this ensures no credential helper runs
+  // and git uses the PAT already embedded in the remote URL directly.
   GIT_CONFIG_COUNT: '1',
   GIT_CONFIG_KEY_0: 'credential.helper',
   GIT_CONFIG_VALUE_0: '',
@@ -106,16 +107,24 @@ function gitExec(args, cwd, extraEnv = {}) {
 
 /**
  * Write credential.helper='' into the repo's local .git/config.
- * This overrides Windows Git Credential Manager (GCM) at every config level
- * (system → global → local) so git uses the PAT already embedded in the
- * remote URL without ever opening the GCM account-picker GUI.
- * Call this once after init and once at the start of every push flow.
+ * Pass the workspace root (gitRoot / gitDir) as the second argument so the
+ * config path is always reliable — never derived from private simple-git internals.
+ * Directly editing the file is necessary on Windows because `git config --local
+ * credential.helper ''` can be silently ignored by Git Credential Manager.
  */
-async function disableGcm(git) {
+async function disableGcm(git, workspaceRoot) {
   try {
     await git.addConfig('credential.helper', '', false, 'local');
-    // Also kill the GitHub-specific helper entry GCM sometimes writes
-    await git.addConfig('credential.https://github.com.helper', '', false, 'local');
+  } catch {}
+  try {
+    const cfgPath = path.join(workspaceRoot, '.git', 'config');
+    if (fs.existsSync(cfgPath)) {
+      let content = fs.readFileSync(cfgPath, 'utf8');
+      if (!content.includes('[credential]')) {
+        content += '\n[credential]\n\thelper = \n';
+        fs.writeFileSync(cfgPath, content, 'utf8');
+      }
+    }
   } catch {}
 }
 
@@ -604,7 +613,7 @@ router.post('/init', async (req, res) => {
     if (!isRepo) {
       await git.init();
     }
-    await disableGcm(git);
+    await disableGcm(git, gitRoot);
 
     // Enable long paths — required on Windows where default limit is 260 chars
     await git.addConfig('core.longpaths', 'true');
@@ -820,7 +829,7 @@ ${proj.name}/
         await git.add('.');
         await git.commit('Initialize: PerfStudio project structure (resolved merge)');
       }
-      await disableGcm(git);
+      await disableGcm(git, gitRoot);
       gitExec(['push', '--set-upstream', 'origin', baseBranch], gitRoot, sshEnv);
       pushed = true;
     }
@@ -985,7 +994,7 @@ router.post('/push', async (req, res) => {
     // Update remote URL
     await git.remote(['set-url', 'origin', remoteUrl]);
 
-    await disableGcm(git);
+    await disableGcm(git, gitDir);
     gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
 
     // Mark commits as pushed
@@ -1053,7 +1062,7 @@ router.post('/pull', async (req, res) => {
       }
 
       // Auto-push to create the remote branch so future pulls work seamlessly
-      await disableGcm(git);
+      await disableGcm(git, gitDir);
       gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
 
       // Protect feature branch: no force-push, no deletion (but no PR review required)
@@ -1226,7 +1235,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
     await git.merge([`origin/${pr.from_branch}`, '--no-ff', '--allow-unrelated-histories', '-m', `Merge PR: ${pr.title}`]);
 
     // Push merged base branch
-    await disableGcm(git);
+    await disableGcm(git, gitDir);
     gitExec(['push', 'origin', baseBranch], gitDir, mergeSshEnv);
 
     // ── Also merge on GitHub if PR has a remote URL ─────────────────────────
@@ -1417,7 +1426,7 @@ router.post('/branch', async (req, res) => {
     await git.checkoutLocalBranch(branchName);
 
     // Push branch to remote and apply protection
-    await disableGcm(git);
+    await disableGcm(git, gitRoot);
     gitExec(['push', '--set-upstream', 'origin', branchName], gitRoot, r.sshEnv || {});
     await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
 
