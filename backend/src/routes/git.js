@@ -808,19 +808,19 @@ ${proj.name}/
       } catch (_) { /* branch may not be protected yet — that's fine */ }
     }
 
-    // 2. Push — handle remote that was created with a README or other initial content.
-    //    Use gitExec for all network operations so GIT_SSH_COMMAND is reliably applied.
+    // 2. Push — use the full authenticated URL directly for all network ops.
+    //    Passing the URL (not the remote name 'origin') bypasses Windows Git
+    //    Credential Manager entirely — the same approach the test-connection uses
+    //    and the reason test-connection always succeeds while 'origin'-based push fails.
     //    Strategy:
     //      a) If remote already has the base branch: fetch + merge (--allow-unrelated-histories).
-    //         If the merge produces conflicts (e.g. both sides have README/.gitignore),
-    //         resolve by keeping our version, then regular push.
     //      b) If remote is empty: force-push to seed it.
     let pushed = false;
     let remoteRefs = '';
-    try { remoteRefs = gitExec(['ls-remote', '--heads', 'origin'], gitRoot, sshEnv); } catch {}
+    try { remoteRefs = gitExec(['ls-remote', '--heads', remoteWithAuth], gitRoot, sshEnv); } catch {}
     if (remoteRefs.includes(`refs/heads/${baseBranch}`)) {
       // Remote already has the base branch — must use merge path
-      gitExec(['fetch', 'origin', baseBranch], gitRoot, sshEnv);
+      gitExec(['fetch', remoteWithAuth, baseBranch], gitRoot, sshEnv);
       try {
         await git.merge(['FETCH_HEAD', '--allow-unrelated-histories', '--no-edit', '-m', 'Initialize: merge remote state']);
       } catch (_mergeErr) {
@@ -829,14 +829,13 @@ ${proj.name}/
         await git.add('.');
         await git.commit('Initialize: PerfStudio project structure (resolved merge)');
       }
-      await disableGcm(git, gitRoot);
-      gitExec(['push', '--set-upstream', 'origin', baseBranch], gitRoot, sshEnv);
+      gitExec(['push', '--set-upstream', remoteWithAuth, baseBranch], gitRoot, sshEnv);
       pushed = true;
     }
 
     if (!pushed) {
       // Remote is empty — seed it with a force-push
-      gitExec(['push', '--force', '--set-upstream', 'origin', baseBranch], gitRoot, sshEnv);
+      gitExec(['push', '--force', '--set-upstream', remoteWithAuth, baseBranch], gitRoot, sshEnv);
     }
 
     // 3. Apply branch protection after push
@@ -995,7 +994,7 @@ router.post('/push', async (req, res) => {
     await git.remote(['set-url', 'origin', remoteUrl]);
 
     await disableGcm(git, gitDir);
-    gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
+    gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
     // Mark commits as pushed
     db.prepare("UPDATE git_commits SET pushed=1 WHERE project_id=? AND branch=? AND pushed=0")
@@ -1032,7 +1031,7 @@ router.post('/pull', async (req, res) => {
     // Check if the user's branch exists on the remote
     let remoteBranches = [];
     try {
-      const lsRemote = gitExec(['ls-remote', '--heads', 'origin'], gitDir, sshEnv);
+      const lsRemote = gitExec(['ls-remote', '--heads', remoteUrl], gitDir, sshEnv);
       remoteBranches = lsRemote.split('\n')
         .map(l => l.replace(/.*refs\/heads\//, '').trim())
         .filter(Boolean);
@@ -1043,7 +1042,7 @@ router.post('/pull', async (req, res) => {
     if (branchExistsOnRemote) {
       // Branch exists on remote — pull directly from it
       await git.checkout(branch).catch(() => git.checkout(['-b', branch, `origin/${branch}`]));
-      gitExec(['pull', 'origin', branch, '--no-rebase'], gitDir, sshEnv);
+      gitExec(['pull', remoteUrl, branch, '--no-rebase'], gitDir, sshEnv);
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
     } else {
       // Branch doesn't exist on remote yet:
@@ -1051,7 +1050,7 @@ router.post('/pull', async (req, res) => {
       // 2. Create local branch from it (or sync if it already exists locally)
       // 3. Push the branch to remote immediately — so it exists for future pulls
       const baseBranch = getBaseBranch(cfg);
-      gitExec(['fetch', 'origin', baseBranch], gitDir, sshEnv);
+      gitExec(['fetch', remoteUrl, baseBranch], gitDir, sshEnv);
 
       const localBranches = await git.branchLocal();
       if (!localBranches.all.includes(branch)) {
@@ -1063,7 +1062,7 @@ router.post('/pull', async (req, res) => {
 
       // Auto-push to create the remote branch so future pulls work seamlessly
       await disableGcm(git, gitDir);
-      gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
+      gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
       // Protect feature branch: no force-push, no deletion (but no PR review required)
       await applyBranchProtection({ ...cfg, _featureBranch: true }, branch);
@@ -1224,19 +1223,19 @@ router.put('/prs/:prId/merge', async (req, res) => {
     await git.remote(['set-url', 'origin', mergeRemoteUrl]);
 
     // Fetch the feature branch
-    gitExec(['fetch', 'origin', pr.from_branch], gitDir, mergeSshEnv);
+    gitExec(['fetch', mergeRemoteUrl, pr.from_branch], gitDir, mergeSshEnv);
 
     const baseBranch = getBaseBranch(cfg);
     // Switch to base branch
     await git.checkout(baseBranch);
-    gitExec(['pull', 'origin', baseBranch, '--no-rebase'], gitDir, mergeSshEnv);
+    gitExec(['pull', mergeRemoteUrl, baseBranch, '--no-rebase'], gitDir, mergeSshEnv);
 
     // Merge feature branch
     await git.merge([`origin/${pr.from_branch}`, '--no-ff', '--allow-unrelated-histories', '-m', `Merge PR: ${pr.title}`]);
 
     // Push merged base branch
     await disableGcm(git, gitDir);
-    gitExec(['push', 'origin', baseBranch], gitDir, mergeSshEnv);
+    gitExec(['push', mergeRemoteUrl, baseBranch], gitDir, mergeSshEnv);
 
     // ── Also merge on GitHub if PR has a remote URL ─────────────────────────
     if (pr.remote_pr_url) {
@@ -1411,7 +1410,7 @@ router.post('/branch', async (req, res) => {
   let sshCleanup = () => {};
   try {
     const r = await ensureUserWorkspace(gitRoot, { ...cfg, project_id: req.params.projectId }, caller);
-    const { git } = r;
+    const { git, remoteWithAuth: branchRemoteUrl } = r;
     sshCleanup = r.sshCleanup || (() => {});
 
     const branchSummary = await git.branchLocal();
@@ -1421,13 +1420,13 @@ router.post('/branch', async (req, res) => {
     }
     const baseBranch = getBaseBranch(cfg);
     // Create from latest base branch
-    try { gitExec(['fetch', 'origin', baseBranch], gitRoot, r.sshEnv || {}); } catch {}
+    try { gitExec(['fetch', branchRemoteUrl, baseBranch], gitRoot, r.sshEnv || {}); } catch {}
     try { await git.checkout(baseBranch); } catch {}
     await git.checkoutLocalBranch(branchName);
 
     // Push branch to remote and apply protection
     await disableGcm(git, gitRoot);
-    gitExec(['push', '--set-upstream', 'origin', branchName], gitRoot, r.sshEnv || {});
+    gitExec(['push', '--set-upstream', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {});
     await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
 
     res.json({ message: `Branch "${branchName}" created from ${baseBranch} and pushed to remote.`, branch: branchName });
@@ -1718,7 +1717,7 @@ router.post('/sync', async (req, res) => {
     sshCleanup = r.sshCleanup || (() => {});
     const branch = r.identity?.branch_name || getBranchForUser(caller, cfg);
     const baseBranch = getBaseBranch(cfg);
-    gitExec(['fetch', 'origin', baseBranch], gitDir, r.sshEnv || {});
+    gitExec(['fetch', r.remoteWithAuth, baseBranch], gitDir, r.sshEnv || {});
     const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
       const branches = await r.git.branchLocal();
