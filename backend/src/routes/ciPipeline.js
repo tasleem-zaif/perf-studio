@@ -1037,10 +1037,13 @@ router.post('/trigger', async (req, res) => {
   try {
     const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder: resolveUF } = require('../utils/projectFolders');
     const projectRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const userFolder  = resolveUF(req.userId);
-    const wsRoot      = path.join(GIT_WORKSPACES_ROOT, cleanName(projectRow?.name || ''), userFolder);
-
     const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+    // Always use the project's initialized git_root (set by admin) for auto-push,
+    // not the triggering user's workspace — the user's workspace may lack .git.
+    const wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git')))
+      ? gitCfg.git_root
+      : path.join(GIT_WORKSPACES_ROOT, cleanName(projectRow?.name || ''), resolveUF(req.userId));
+
     if (gitCfg?.is_initialized && fs.existsSync(path.join(wsRoot, '.git'))) {
       const simpleGit2 = require('simple-git');
       const NO_PROMPT2 = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
