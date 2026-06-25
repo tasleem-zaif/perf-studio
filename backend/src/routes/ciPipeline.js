@@ -836,12 +836,16 @@ pipelines:
                 -Jduration="$JMETER_DURATION" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html"
-            - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null
+            - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null || true
             - |
-              curl -s -f -X POST \\
-                "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \\
-                -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                -F "files=@perf-results-\${PIPELINE_ID}.zip"
+              if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
+                curl -s -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \\
+                  -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                  -F "files=@perf-results-\${PIPELINE_ID}.zip" || echo "Upload to Bitbucket Downloads failed (non-fatal)"
+              else
+                echo "Skipping Bitbucket Downloads upload — BB_USERNAME / BB_APP_PASSWORD not set as repo variables"
+              fi
 `;
     try {
       const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
