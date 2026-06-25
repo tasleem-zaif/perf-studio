@@ -59,6 +59,19 @@ function decryptConfig(cfg) {
   };
 }
 
+/** Build correct Bitbucket Basic auth — ATATT tokens require email:token, not username:token */
+function bbBasicAuth(cfg, lookupUserId) {
+  const tok  = (cfg.bitbucket_app_password || '').trim();
+  const user = cfg.bitbucket_username || cfg.bitbucket_workspace || '';
+  // If it already looks like an email, use it directly
+  if (user.includes('@')) return `Basic ${Buffer.from(`${user}:${tok}`).toString('base64')}`;
+  // Not an email — look it up from the users table
+  const email = lookupUserId
+    ? (db.prepare('SELECT email FROM users WHERE id = ?').get(lookupUserId)?.email || user)
+    : user;
+  return `Basic ${Buffer.from(`${email}:${tok}`).toString('base64')}`;
+}
+
 /** Minimal JSON HTTP request using Node built-ins (no axios/node-fetch needed) */
 function apiRequest(urlStr, method, body, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -836,15 +849,35 @@ pipelines:
                 -Jduration="$JMETER_DURATION" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html" || true
-            - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null || true
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
-                curl -s -X POST \\
-                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \\
+                cd "$BITBUCKET_CLONE_DIR"
+                [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
+                curl -sf -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/refs/branches" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                  -F "files=@perf-results-\${PIPELINE_ID}.zip" || echo "Upload to Bitbucket Downloads failed (non-fatal)"
+                  -H "Content-Type: application/json" \\
+                  -d "{\\"name\\":\\"perf-results\\",\\"target\\":{\\"hash\\":\\"$BITBUCKET_COMMIT\\"}}" >/dev/null 2>&1 || true
+                if [ -f results.jtl ]; then
+                  curl -s -X POST \\
+                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                    -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
+                    -F "branch=perf-results" \\
+                    -F "ci-results/\${PIPELINE_ID}/results.jtl=@results.jtl" \\
+                    && echo "JTL committed to perf-results branch" || echo "JTL commit failed (non-fatal)"
+                fi
+                if [ -f html.zip ]; then
+                  curl -s -X POST \\
+                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                    -F "message=ci-results html: \${PIPELINE_ID} [auto]" \\
+                    -F "branch=perf-results" \\
+                    -F "ci-results/\${PIPELINE_ID}/html.zip=@html.zip" \\
+                    && echo "HTML report committed to perf-results branch" || echo "HTML commit failed (non-fatal)"
+                fi
               else
-                echo "Skipping Bitbucket Downloads upload — BB_USERNAME / BB_APP_PASSWORD not set as repo variables"
+                echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
 `;
     try {
@@ -1025,10 +1058,16 @@ router.post('/trigger', async (req, res) => {
   const isAdmin2    = ['org_admin', 'super_admin'].includes(callerRow2?.role);
   const gitCfgTrigger = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const baseBranch2 = gitCfgTrigger?.base_branch || 'main';
+  // For Bitbucket non-admin users, always use feature/<username> branch regardless of
+  // cfg.bitbucket_ref — that field defaults to 'main' from the admin config spread and
+  // would clobber the user's branch (which holds testData and personal config).
+  const bbUserBranch = isAdmin2
+    ? (cfg.bitbucket_ref || baseBranch2)
+    : `feature/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_/-]/g, '-')}`;
   const targetRef   = provider === 'gitlab'
     ? (cfg.gitlab_ref || baseBranch2)
     : provider === 'bitbucket'
-    ? (cfg.bitbucket_ref || baseBranch2)
+    ? bbUserBranch
     : (cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`));
 
   // ── Auto-push script file to the target branch before dispatching ──────────
@@ -1048,20 +1087,28 @@ router.post('/trigger', async (req, res) => {
       const simpleGit2 = require('simple-git');
       const NO_PROMPT2 = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
-      // Build authenticated remote URL based on provider
+      // Build authenticated remote URL based on provider.
+      // For Bitbucket: always use the ADMIN credentials for git push — the repo belongs
+      // to the admin account and only that token has repository:write scope.
+      // Using the triggering user's ATATT token with the admin's embedded username causes
+      // "Authentication failed" because ATATT tokens are account-specific.
       let authUrl = gitCfg.remote_url;
       if (provider === 'bitbucket') {
-        // Bitbucket personal API tokens (ATATT) use username:token — same as the
-        // App Passwords they replaced. Username comes from the stored remote URL
-        // (e.g. https://tasleema85@bitbucket.org/...) or the username field.
-        const bbPass = cfg.bitbucket_app_password;
+        const bbPass = adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password;
         if (bbPass) {
-          const embMatch2 = gitCfg.remote_url.match(/^https?:\/\/([^:@]+)@/);
-          const bbUser2 = gitCfg.username || (embMatch2 ? embMatch2[1] : null);
           const base2 = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, '$1');
-          authUrl = bbUser2
-            ? base2.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser2)}:${encodeURIComponent(bbPass)}@`)
-            : base2.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
+          // ATATT personal access tokens must use x-token-auth as the username for HTTPS git.
+          // App Passwords (ATBB) use username:password. Detect by prefix.
+          const isATATT = bbPass.trimStart().startsWith('ATATT');
+          if (isATATT) {
+            authUrl = base2.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
+          } else {
+            const embMatch2 = gitCfg.remote_url.match(/^https?:\/\/([^:@]+)@/);
+            const bbUser2 = adminCfg?.bitbucket_username || gitCfg.username || (embMatch2 ? embMatch2[1] : null);
+            authUrl = bbUser2
+              ? base2.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser2)}:${encodeURIComponent(bbPass)}@`)
+              : base2.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
+          }
         }
       } else if (provider === 'gitlab') {
         const glTok = cfg.gitlab_token || userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
@@ -1091,16 +1138,129 @@ router.post('/trigger', async (req, res) => {
       // Sync with remote BEFORE committing new files so the push is fast-forward.
       // Without this, if origin/main has new commits (workflow file updates, CI artifacts, etc.)
       // the push would be rejected as non-fast-forward and the JMX would never reach GitHub.
-      // Stash any uncommitted local changes (testData files, config edits) before syncing
-      // with remote so that reset --hard does not wipe them permanently.
+      // Stash ONLY tracked modifications (not untracked files like testData).
+      // git reset --hard does not touch untracked files, so testData survives naturally.
+      // Using --include-untracked caused testData to be stashed then lost on pop failure.
       let stashed = false;
-      try { const r = await git2.raw(['stash', '--include-untracked', '-m', 'peako-auto-stash']); stashed = !r.includes('No local changes'); } catch {}
+      try { const r = await git2.raw(['stash', '-m', 'peako-auto-stash']); stashed = !r.includes('No local changes'); } catch {}
       try { await git2.raw(['merge', '--ff-only', `origin/${targetRef}`]); } catch {
         // ff-only failed (diverged) — hard reset to remote and restore stash on top
         try { await git2.raw(['reset', '--hard', `origin/${targetRef}`]); } catch {}
       }
-      // Restore stashed files (testData etc.) after syncing
+      // Restore stashed tracked-file changes after syncing
       if (stashed) { try { await git2.raw(['stash', 'pop']); } catch {} }
+
+      // Always regenerate bitbucket-pipelines.yml from the canonical template so that
+      // git reset/merge never reverts to an outdated version lacking the explicit `jmeter` entrypoint.
+      if (provider === 'bitbucket') {
+        try {
+          const _gcRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
+            || db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
+          const _dockerImage = (JSON.parse(_gcRow?.config_json || '{}').jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
+          const _suites = db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
+          const _defScript = _suites.length ? path.basename(_suites[0].jmx_path || _suites[0].js_path || 'test.jmx') : 'test.jmx';
+          const _scriptList = _suites.map(s => {
+            const f = path.basename(s.jmx_path || s.js_path || '');
+            return `  # ${path.basename(s.jmx_path || s.js_path || f)} → ${f}`;
+          }).join('\n');
+          const _bbYaml = `# ============================================================
+# Peako — Bitbucket Pipelines Performance Test
+# Generated by Peako on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
+#
+# REQUIRED SETUP (Bitbucket → Repository Settings → Repository Variables):
+#   BB_USERNAME     — your Bitbucket username  (mark as Secured)
+#   BB_APP_PASSWORD — Bitbucket App Password / API Token (mark as Secured)
+#
+# Available test scripts:
+${_scriptList || '  # (no generated scripts yet — generate from Test Plans first)'}
+# ============================================================
+
+image: docker:latest
+
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  custom:
+    Peako-Performance-Test:
+      - variables:
+          - name: SCRIPT_NAME
+            default: "${_defScript}"
+          - name: SCRIPT_PATH
+            default: ""
+          - name: JMETER_USERS
+            default: "10"
+          - name: JMETER_RAMPUP
+            default: "30"
+          - name: JMETER_LOOPS
+            default: "-1"
+          - name: JMETER_DURATION
+            default: "300"
+      - step:
+          name: Run JMeter Performance Test
+          size: 2x
+          services:
+            - docker
+          script:
+            - apk add --no-cache curl zip bash
+            - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
+            - echo "Peako Performance Test"
+            - echo "Script    | $SCRIPT_NAME"
+            - echo "VUsers    | $JMETER_USERS"
+            - echo "Ramp-up   | $JMETER_RAMPUP s"
+            - echo "Duration  | $JMETER_DURATION s"
+            - |
+              docker run --rm \\
+                -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
+                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                ${_dockerImage} \\
+                jmeter \\
+                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                -Jusers="$JMETER_USERS" \\
+                -Jrampup="$JMETER_RAMPUP" \\
+                -Jloops="$JMETER_LOOPS" \\
+                -Jduration="$JMETER_DURATION" \\
+                -l "/workspace/results.jtl" \\
+                -e -o "/workspace/html" || true
+            - |
+              if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
+                cd "$BITBUCKET_CLONE_DIR"
+                [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
+                curl -sf -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/refs/branches" \\
+                  -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                  -H "Content-Type: application/json" \\
+                  -d "{\\"name\\":\\"perf-results\\",\\"target\\":{\\"hash\\":\\"$BITBUCKET_COMMIT\\"}}" >/dev/null 2>&1 || true
+                if [ -f results.jtl ]; then
+                  curl -s -X POST \\
+                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                    -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
+                    -F "branch=perf-results" \\
+                    -F "ci-results/\${PIPELINE_ID}/results.jtl=@results.jtl" \\
+                    && echo "JTL committed to perf-results branch" || echo "JTL commit failed (non-fatal)"
+                fi
+                if [ -f html.zip ]; then
+                  curl -s -X POST \\
+                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                    -F "message=ci-results html: \${PIPELINE_ID} [auto]" \\
+                    -F "branch=perf-results" \\
+                    -F "ci-results/\${PIPELINE_ID}/html.zip=@html.zip" \\
+                    && echo "HTML report committed to perf-results branch" || echo "HTML commit failed (non-fatal)"
+                fi
+              else
+                echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
+              fi
+`;
+          fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml, 'utf8');
+          console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template');
+        } catch (e) {
+          console.warn('[CI trigger] YAML regen failed:', e.message);
+        }
+      }
 
       // Copy the JMX/JS file into the workspace if it only exists in admin workspace.
       // Look up the absolute path from test_suites (jmx_path / js_path) — don't rely on
@@ -1145,11 +1305,89 @@ router.post('/trigger', async (req, res) => {
         users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
       }, null, 2), 'utf8');
       await git2.add('.');
-      await git2.commit(`Peako Performance Test: ${runLabel} [auto]`);
-      // Disable GCM account picker in local .git/config before every push
-      try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
-      // Push branch (set upstream if first time)
-      await git2.push(['--set-upstream', 'origin', targetRef]);
+      try { await git2.commit(`Peako Performance Test: ${runLabel} [auto]`); } catch (ce) {
+        if (!ce.message.includes('nothing to commit') && !ce.message.includes('nothing added')) throw ce;
+      }
+
+      if (provider === 'bitbucket') {
+        // ATATT tokens require Basic auth with the Atlassian account EMAIL (not Bitbucket username).
+        // Use Bitbucket Files API (REST) to commit files — same scope as pipeline trigger.
+        const _bbWs   = cfg.bitbucket_workspace;
+        const _bbSlug = cfg.bitbucket_repo_slug;
+        // Use admin token for write operations — admin's token has repository:write scope
+        const _adminTok = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
+        const _adminCfgForAuth = { ...cfg, bitbucket_app_password: _adminTok };
+        const _bbAuth = bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id || req.userId);
+        const _boundary = 'PeakoBoundary7x3f9z';
+        const _fileParts = [];
+
+        // Always include the pipeline YAML so the jmeter fix reaches Bitbucket
+        const _yamlDisk = path.join(wsRoot, 'bitbucket-pipelines.yml');
+        if (fs.existsSync(_yamlDisk)) {
+          _fileParts.push({ name: 'bitbucket-pipelines.yml', content: fs.readFileSync(_yamlDisk) });
+        }
+        // Always include the trigger file — its commit message becomes the pipeline display name
+        if (fs.existsSync(triggerFile)) {
+          _fileParts.push({ name: '.peako/last-run.json', content: fs.readFileSync(triggerFile) });
+        }
+        // Include JMX/JS script if present in workspace
+        if (script_name) {
+          const _sf2   = (script_name || '').replace(/\\/g, '/').split('/').pop();
+          const _dest2 = path.join(wsRoot, script_path ? script_path.replace(/\//g, path.sep) : _sf2);
+          if (fs.existsSync(_dest2)) {
+            _fileParts.push({ name: script_path || _sf2, content: fs.readFileSync(_dest2) });
+          }
+        }
+
+        // Build multipart body as a Buffer
+        const _chunks = [];
+        const _add = s => _chunks.push(Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8'));
+        _add(`--${_boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\nPeako Performance Test: ${runLabel} [auto]\r\n`);
+        _add(`--${_boundary}\r\nContent-Disposition: form-data; name="branch"\r\n\r\n${targetRef}\r\n`);
+        for (const fp of _fileParts) {
+          _add(`--${_boundary}\r\nContent-Disposition: form-data; name="${fp.name}"\r\n\r\n`);
+          _add(fp.content);
+          _add('\r\n');
+        }
+        _add(`--${_boundary}--\r\n`);
+        const _bodyBuf = Buffer.concat(_chunks);
+
+        await new Promise((resolve, reject) => {
+          const _opts = {
+            hostname: 'api.bitbucket.org',
+            port: 443,
+            path: `/2.0/repositories/${_bbWs}/${_bbSlug}/src`,
+            method: 'POST',
+            headers: {
+              Authorization: _bbAuth,
+              'Content-Type': `multipart/form-data; boundary=${_boundary}`,
+              'Content-Length': _bodyBuf.length,
+              'User-Agent': 'PerfStudio',
+            },
+            rejectUnauthorized: false,
+          };
+          const _req2 = https.request(_opts, _res2 => {
+            let _d = '';
+            _res2.on('data', c => _d += c);
+            _res2.on('end', () => {
+              if (_res2.statusCode === 201) {
+                console.log('[CI trigger] Bitbucket Files API committed YAML + JMX to branch', targetRef);
+                resolve();
+              } else {
+                console.warn('[CI trigger] Bitbucket Files API HTTP', _res2.statusCode, _d.slice(0, 400));
+                reject(new Error(`Bitbucket Files API returned ${_res2.statusCode}: ${_d.slice(0, 200)}`));
+              }
+            });
+          });
+          _req2.on('error', reject);
+          _req2.write(_bodyBuf);
+          _req2.end();
+        });
+      } else {
+        // GitHub / GitLab — standard git push
+        try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
+        await git2.push(['--set-upstream', 'origin', targetRef]);
+      }
     }
   } catch (syncErr) {
     console.warn('[CI trigger] Auto-push script failed:', syncErr.message);
@@ -1363,10 +1601,11 @@ router.post('/trigger', async (req, res) => {
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
       const bbToken = cfg.bitbucket_app_password.trim();
-      // ATATT personal API tokens require Basic auth with EMAIL:token (Atlassian account email, not Bitbucket username)
-      // App Passwords (ATBB) use Basic auth with Bitbucket username:token
-      const bbAuthHeader = `Basic ${Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${bbToken}`).toString('base64')}`;
-      const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
+      const bbAuthHeader = bbBasicAuth(cfg, req.userId);
+      // targetRef = feature/<username> for non-admin users (holds testData + JMX).
+      // The correct YAML (with Peako-Performance-Test + jmeter) is committed to this branch
+      // by the Files API auto-push above, so the pipeline trigger will find it.
+      const bbRef  = targetRef;
 
       const bbBody = {
         target: {
@@ -1378,8 +1617,8 @@ router.post('/trigger', async (req, res) => {
         variables: [
           ...Object.entries(variables).map(([key, value]) => ({ key: key.toUpperCase(), value: String(value), secured: false })),
           // Inject upload credentials so the YAML's curl can push results to Bitbucket Downloads
-          // without requiring BB_USERNAME / BB_APP_PASSWORD to be set as repo variables manually.
-          { key: 'BB_USERNAME', value: cfg.bitbucket_username || cfg.bitbucket_workspace || '', secured: false },
+          // BB_USERNAME must be the Atlassian account email for ATATT token auth in the pipeline curl
+          { key: 'BB_USERNAME', value: callerRow2?.email || cfg.bitbucket_username || cfg.bitbucket_workspace || '', secured: false },
           { key: 'BB_APP_PASSWORD', value: bbToken, secured: true },
         ],
       };
@@ -1479,7 +1718,6 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       resultDir = path.join(userProjPath, 'results', `CI_Run_${run.id}`);
     }
   }
-  fs.mkdirSync(resultDir, { recursive: true });
 
   const tmpZip = path.join(os.tmpdir(), `ci_auto_${run.id}_${Date.now()}.zip`);
 
@@ -1523,25 +1761,27 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       });
     } else if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password / API Token');
-      const bbAuth2 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const bbAuth2Header = bbBasicAuth(cfg, userId);
       const pipelineId2 = (run.external_id || '').replace(/[{}]/g, '');
+      const ws2   = cfg.bitbucket_workspace;
+      const slug2 = cfg.bitbucket_repo_slug;
+
+      // Download results.jtl directly from perf-results branch (Files API — works on free plan)
+      const jtlApiPath = `/2.0/repositories/${ws2}/${slug2}/src/perf-results/ci-results/${pipelineId2}/results.jtl`;
       await new Promise((resolve, reject) => {
-        const fileStream = fs.createWriteStream(tmpZip);
-        const options = { hostname: 'api.bitbucket.org', path: `/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/downloads/perf-results-${pipelineId2}.zip`, method: 'GET', headers: { Authorization: `Basic ${bbAuth2}`, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+        const fileStream = fs.createWriteStream(tmpZip); // reusing tmpZip path for the JTL
+        const options = { hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
         https.request(options, response => {
           if (response.statusCode === 301 || response.statusCode === 302) {
             https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
-              if (r2.statusCode !== 200 && r2.statusCode !== 206) {
-                fileStream.close();
-                return reject(new Error(`Bitbucket artifact not found (HTTP ${r2.statusCode})`));
-              }
+              if (r2.statusCode !== 200) { fileStream.close(); return reject(new Error(`JTL not found on perf-results branch (HTTP ${r2.statusCode}). Pipeline may not have completed yet.`)); }
               r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
             }).on('error', reject);
-          } else if (response.statusCode === 200 || response.statusCode === 206) {
+          } else if (response.statusCode === 200) {
             response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
           } else {
             fileStream.close();
-            reject(new Error(`Bitbucket artifact not found (HTTP ${response.statusCode})`));
+            reject(new Error(`JTL not found on perf-results branch (HTTP ${response.statusCode}). Ensure pipeline completed and BB_USERNAME/BB_APP_PASSWORD variables are set.`));
           }
         }).on('error', reject).end();
       });
@@ -1549,17 +1789,57 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) throw new Error('Empty zip');
 
-    const zip = new AdmZip(tmpZip);
-    zip.extractAllTo(resultDir, true);
-    fs.unlinkSync(tmpZip);
+    fs.mkdirSync(resultDir, { recursive: true });
 
-    // Normalise html → report folder
-    const ciHtmlDir = path.join(resultDir, 'html');
-    const localHtmlDir = path.join(resultDir, 'report');
-    if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) fs.renameSync(ciHtmlDir, localHtmlDir);
+    if (run.provider === 'bitbucket') {
+      // tmpZip holds the raw results.jtl — copy it directly
+      const jtlDest = path.join(resultDir, 'results.jtl');
+      fs.copyFileSync(tmpZip, jtlDest);
+      fs.unlinkSync(tmpZip);
+
+      // Download html.zip separately from perf-results branch (non-fatal if missing)
+      const _bbAuth3 = bbBasicAuth(cfg, userId);
+      const _pid3    = (run.external_id || '').replace(/[{}]/g, '');
+      const _ws3     = cfg.bitbucket_workspace;
+      const _slug3   = cfg.bitbucket_repo_slug;
+      const _htmlZipPath = `/2.0/repositories/${_ws3}/${_slug3}/src/perf-results/ci-results/${_pid3}/html.zip`;
+      const _tmpHtml = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
+      try {
+        await new Promise((resolve) => {
+          const fs2 = fs.createWriteStream(_tmpHtml);
+          const opts3 = { hostname: 'api.bitbucket.org', path: _htmlZipPath, method: 'GET', headers: { Authorization: _bbAuth3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+          https.request(opts3, res3 => {
+            const follow = (r) => {
+              if (r.statusCode === 200) { r.pipe(fs2); fs2.on('finish', () => { fs2.close(); resolve(); }); }
+              else { fs2.close(); resolve(); }
+            };
+            if (res3.statusCode === 301 || res3.statusCode === 302) {
+              https.get(res3.headers.location, { rejectUnauthorized: false }, follow).on('error', () => { fs2.close(); resolve(); });
+            } else { follow(res3); }
+          }).on('error', () => { fs2.close(); resolve(); }).end();
+        });
+        if (fs.existsSync(_tmpHtml) && fs.statSync(_tmpHtml).size > 0) {
+          const _reportDir = path.join(resultDir, 'report');
+          fs.mkdirSync(_reportDir, { recursive: true });
+          new AdmZip(_tmpHtml).extractAllTo(_reportDir, true);
+          fs.unlinkSync(_tmpHtml);
+        }
+      } catch (_e) {
+        console.warn('[CI sync] html.zip download failed (non-fatal):', _e.message);
+        try { if (fs.existsSync(_tmpHtml)) fs.unlinkSync(_tmpHtml); } catch {}
+      }
+    } else {
+      const zip = new AdmZip(tmpZip);
+      zip.extractAllTo(resultDir, true);
+      fs.unlinkSync(tmpZip);
+
+      // Normalise html → report folder
+      const ciHtmlDir = path.join(resultDir, 'html');
+      if (fs.existsSync(ciHtmlDir) && !fs.existsSync(path.join(resultDir, 'report'))) fs.renameSync(ciHtmlDir, path.join(resultDir, 'report'));
+    }
 
     const jtlPath    = path.join(resultDir, 'results.jtl');
-    const reportPath = path.join(localHtmlDir, 'index.html');
+    const reportPath = path.join(resultDir, 'report', 'index.html');
 
     // Resolve suite_id
     let suiteId = null;
@@ -1692,10 +1972,9 @@ router.get('/runs/:runId/status', async (req, res) => {
     }
 
     if (run.provider === 'bitbucket') {
-      const bbAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
       const r = await apiRequest(
         `https://api.bitbucket.org/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/${run.external_id}`,
-        'GET', null, { Authorization: `Basic ${bbAuth}`, 'User-Agent': 'PerfStudio' }
+        'GET', null, { Authorization: bbBasicAuth(cfg, req.userId), 'User-Agent': 'PerfStudio' }
       );
       if (r.status === 200) {
         const stName = r.body.state?.name;        // PENDING | IN_PROGRESS | COMPLETED | ERROR
