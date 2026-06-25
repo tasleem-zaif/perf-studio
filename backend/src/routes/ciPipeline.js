@@ -344,13 +344,38 @@ router.post('/config/test', async (req, res) => {
       }
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
       if (!cfg.bitbucket_workspace)    return res.status(400).json({ error: 'Bitbucket workspace not set.' });
-      const basicAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
-      const r = await apiRequest('https://api.bitbucket.org/2.0/user', 'GET', null, {
-        Authorization: `Basic ${basicAuth}`,
-        'User-Agent': 'PerfStudio',
-      });
-      if (r.status === 200) return res.json({ ok: true, message: `Connected as: ${r.body.account_id || r.body.username || r.body.display_name || 'Bitbucket user'}` });
-      return res.status(400).json({ error: `Bitbucket returned ${r.status}: ${r.body?.error?.message || r.body?.type || 'Authentication failed'}` });
+      if (!cfg.bitbucket_repo_slug)    return res.status(400).json({ error: 'Bitbucket repository slug not set.' });
+      {
+        // Personal API tokens (ATATT) are rejected by the Bitbucket REST API but
+        // work perfectly for git HTTPS. Test connectivity via git ls-remote instead
+        // of a REST API call so the same token that was used to init the repo works here.
+        const bbToken = cfg.bitbucket_app_password;
+        const bbUser  = cfg.bitbucket_username || cfg.bitbucket_workspace;
+        const repoBase = `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}.git`;
+        const authedUrl = bbToken.startsWith('ATATT')
+          ? repoBase.replace('https://', `https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@`)
+          : repoBase.replace('https://', `https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@`);
+        const NO_PROMPT = {
+          GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GCM_INTERACTIVE: 'never',
+          GCM_NO_INTERACTIVE: '1', GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '',
+        };
+        const lsResult = spawnSync('git', ['ls-remote', '--heads', authedUrl], {
+          env: { ...process.env, ...NO_PROMPT },
+          timeout: 15000, encoding: 'utf8', windowsHide: true,
+        });
+        if (lsResult.status === 0) {
+          return res.json({ ok: true, message: `Connected — ${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}` });
+        }
+        const errMsg = (lsResult.stderr || '').trim();
+        if (/Authentication failed|not.*access|could not read/i.test(errMsg)) {
+          return res.status(400).json({ error: 'Authentication failed. Check your username and API token.' });
+        }
+        if (/not found|does not exist/i.test(errMsg)) {
+          return res.status(400).json({ error: `Repository not found: ${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}` });
+        }
+        return res.status(400).json({ error: errMsg || 'Could not connect to Bitbucket repository.' });
+      }
     }
 
     res.status(400).json({ error: 'Unknown provider. Use gitlab, github, or bitbucket.' });
@@ -756,7 +781,7 @@ print("Patch complete")
 #
 # REQUIRED SETUP (Bitbucket → Repository Settings → Repository Variables):
 #   BB_USERNAME     — your Bitbucket username  (mark as Secured)
-#   BB_APP_PASSWORD — Bitbucket App Password   (mark as Secured)
+#   BB_APP_PASSWORD — Bitbucket App Password / API Token (mark as Secured)
 #
 # Available test scripts:
 ${scriptList || '  # (no generated scripts yet — generate from Test Plans first)'}
@@ -802,7 +827,7 @@ pipelines:
             - |
               docker run --rm \\
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
-                justb4/jmeter:latest \\
+                ${dockerImage} \\
                 -Dlog4j2.formatMsgNoLookups=true \\
                 -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
                 -Jusers="$JMETER_USERS" \\
@@ -833,7 +858,7 @@ pipelines:
   try {
     const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
     if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
-      const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1' };
+      const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
       // Detect SSH auth: any enabled provider using SSH key auth
       const providerInRequest = (providers[0] || 'github');
@@ -871,13 +896,24 @@ pipelines:
         sshEnv = { GIT_SSH_COMMAND: `ssh -i "${sshKeyFwd}" -o StrictHostKeyChecking=${strictCheck} -o UserKnownHostsFile="${sshKhFwd}" -o BatchMode=yes` };
         sshCleanup = () => { try { fs.unlinkSync(sshKeyPath); } catch {} try { fs.unlinkSync(sshKhPath); } catch {} };
       } else {
-        // Token-based HTTPS URL
+        // Token-based HTTPS URL — prefer user's personal token, fall back to project-level
         const { decrypt: dec } = require('../utils/encryption');
-        const rawToken = gitCfg.auth_token ? dec(gitCfg.auth_token) : '';
+        const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+          .get(req.userId, req.params.projectId);
+        const rawToken = (userIdentity?.auth_token ? dec(userIdentity.auth_token) : '')
+          || (gitCfg.auth_token ? dec(gitCfg.auth_token) : '');
         if (rawToken) {
           const isBb = /bitbucket\.org/i.test(gitCfg.remote_url);
-          const creds = isBb ? `x-token-auth:${encodeURIComponent(rawToken)}` : encodeURIComponent(rawToken);
-          remoteUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${creds}@`);
+          if (isBb) {
+            const embMatch = gitCfg.remote_url.match(/^https?:\/\/([^:@]+)@/);
+            const bbUser = gitCfg.username || (embMatch ? embMatch[1] : null);
+            const base = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, '$1');
+            remoteUrl = bbUser
+              ? base.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser)}:${encodeURIComponent(rawToken)}@`)
+              : base.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(rawToken)}@`);
+          } else {
+            remoteUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawToken)}@`);
+          }
         }
       }
 
@@ -912,7 +948,7 @@ pipelines:
 
         if (hasStagedChanges) {
           gitRun(['commit', '-m', 'ci: add PerfStudio Performance Test workflow [auto]']);
-          gitRun(['push', '--set-upstream', 'origin', autoCommitBranch]);
+          gitRun(['push', '--set-upstream', remoteUrl, autoCommitBranch]);
           pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
         } else {
           pushMessage = ` Files unchanged — already up to date on ${autoCommitBranch}.`;
@@ -988,10 +1024,17 @@ router.post('/trigger', async (req, res) => {
       // Build authenticated remote URL based on provider
       let authUrl = gitCfg.remote_url;
       if (provider === 'bitbucket') {
-        // API tokens require x-token-auth:{token} format; App Passwords also work with it.
+        // Bitbucket personal API tokens (ATATT) use username:token — same as the
+        // App Passwords they replaced. Username comes from the stored remote URL
+        // (e.g. https://tasleema85@bitbucket.org/...) or the username field.
         const bbPass = cfg.bitbucket_app_password;
         if (bbPass) {
-          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
+          const embMatch2 = gitCfg.remote_url.match(/^https?:\/\/([^:@]+)@/);
+          const bbUser2 = gitCfg.username || (embMatch2 ? embMatch2[1] : null);
+          const base2 = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, '$1');
+          authUrl = bbUser2
+            ? base2.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser2)}:${encodeURIComponent(bbPass)}@`)
+            : base2.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
         }
       } else if (provider === 'gitlab') {
         const glTok = cfg.gitlab_token || userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
@@ -1280,7 +1323,11 @@ router.post('/trigger', async (req, res) => {
       if (!cfg.bitbucket_repo_slug)    return res.status(400).json({ error: 'Bitbucket repository slug not set.' });
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
-      const bbAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const bbToken = cfg.bitbucket_app_password;
+      // ATATT = personal API token → use Bearer auth; otherwise Basic auth (App Password)
+      const bbAuthHeader = bbToken.startsWith('ATATT')
+        ? `Bearer ${bbToken}`
+        : `Basic ${Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${bbToken}`).toString('base64')}`;
       const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
 
       const bbBody = {
@@ -1295,7 +1342,7 @@ router.post('/trigger', async (req, res) => {
 
       const bbResp = await apiRequest(
         `https://api.bitbucket.org/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/`,
-        'POST', bbBody, { Authorization: `Basic ${bbAuth}`, 'User-Agent': 'PerfStudio', Accept: 'application/json' }
+        'POST', bbBody, { Authorization: bbAuthHeader, 'User-Agent': 'PerfStudio', Accept: 'application/json' }
       );
 
       if (bbResp.status === 201) {
