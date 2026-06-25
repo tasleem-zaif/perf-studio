@@ -842,7 +842,7 @@ pipelines:
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
                 ${dockerImage} \\
                 jmeter \\
-                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                -n -t "/workspace/$(basename "\${SCRIPT_PATH:-\$SCRIPT_NAME}")" \\
                 -JTHREADS="$JMETER_USERS" \\
                 -JRAMP_UP="$JMETER_RAMPUP" \\
                 -Jloops="$JMETER_LOOPS" \\
@@ -1219,7 +1219,7 @@ pipelines:
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
                 ${_dockerImage} \\
                 jmeter \\
-                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                -n -t "/workspace/$(basename "\${SCRIPT_PATH:-\$SCRIPT_NAME}")" \\
                 -JTHREADS="$JMETER_USERS" \\
                 -JRAMP_UP="$JMETER_RAMPUP" \\
                 -Jloops="$JMETER_LOOPS" \\
@@ -1899,6 +1899,23 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       engine: 'jmeter', started_at: run.started_at,
     }) : null;
 
+    // If JMeter produced 0 samples the pipeline ran but the test script didn't execute
+    // (missing JMX, wrong path, CSV load error, etc.). Don't send email or generate PDF.
+    const totalRequests = reportData?.summary?.total_requests || 0;
+    if (totalRequests === 0) {
+      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — skipping PDF/email. Check pipeline log for JMeter errors.`);
+      db.prepare(`
+        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
+        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+      `).run(
+        projectId, suiteId, resultDir,
+        JSON.stringify([{ type: 'error', message: 'JTL file contains no data rows — JMeter produced 0 samples. Check pipeline log.' }]),
+        run.started_at || new Date().toISOString(),
+        run.id
+      );
+      return;
+    }
+
     // Evaluate rule violations before PDF so the PDF shows correct PASSED/FAILED status
     let autoViolations = [];
     if (fs.existsSync(jtlPath)) {
@@ -2322,16 +2339,22 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           status: 'completed',
         });
         if (reportData) {
-          // Evaluate rules so PDF shows PASSED/FAILED correctly
-          try {
-            const { evaluateRules } = require('../utils/ruleEvaluator');
-            const rr = evaluateRules(req.params.projectId, jtlPath);
-            reportData.rule_violations = rr?.violations || [];
-          } catch (_) {}
+          // Don't generate PDF or send email for 0-sample runs
+          if ((reportData.summary?.total_requests || 0) === 0) {
+            console.warn('[CI Sync] JTL has 0 samples — skipping PDF/email.');
+            reportData = null;
+          } else {
+            // Evaluate rules so PDF shows PASSED/FAILED correctly
+            try {
+              const { evaluateRules } = require('../utils/ruleEvaluator');
+              const rr = evaluateRules(req.params.projectId, jtlPath);
+              reportData.rule_violations = rr?.violations || [];
+            } catch (_) {}
 
-          await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-          pdfPath = tmpPdf;
-          console.log('[CI Sync] Analytics PDF generated:', pdfPath);
+            await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
+            pdfPath = tmpPdf;
+            console.log('[CI Sync] Analytics PDF generated:', pdfPath);
+          }
         }
       } catch (e) {
         console.error('[CI Sync] PDF generation failed:', e.message, e.stack?.split('\n')[1] || '');
@@ -2370,7 +2393,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     // ── Send email alert for CI run ───────────────────────────────────────────
     const newRunId = execRunRow.lastInsertRowid;
-    const suppressEmail = req.query.suppress_email === 'true';
+    const suppressEmail = req.query.suppress_email === 'true' || (reportData?.summary?.total_requests || 0) === 0;
     if (!suppressEmail) setImmediate(async () => {
       try {
         const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
