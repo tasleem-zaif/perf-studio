@@ -823,7 +823,6 @@ pipelines:
             - echo "VUsers    | $JMETER_USERS"
             - echo "Ramp-up   | $JMETER_RAMPUP s"
             - echo "Duration  | $JMETER_DURATION s"
-            - mkdir -p "$BITBUCKET_CLONE_DIR/html"
             - |
               docker run --rm \\
                 -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
@@ -835,8 +834,8 @@ pipelines:
                 -Jrampup="$JMETER_RAMPUP" \\
                 -Jloops="$JMETER_LOOPS" \\
                 -Jduration="$JMETER_DURATION" \\
-                -l "$BITBUCKET_CLONE_DIR/results.jtl" \\
-                -e -o "$BITBUCKET_CLONE_DIR/html"
+                -l "/workspace/results.jtl" \\
+                -e -o "/workspace/html"
             - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null
             - |
               curl -s -f -X POST \\
