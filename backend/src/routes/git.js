@@ -1437,6 +1437,17 @@ router.post('/branch', async (req, res) => {
     const branchSummary = await git.branchLocal();
     if (branchSummary.all.includes(branchName)) {
       await git.checkout(branchName);
+      // Branch exists locally — check if it's on the remote too; push if not
+      await disableGcm(git, gitRoot);
+      const lsResult = spawnSync('git', ['ls-remote', '--heads', branchRemoteUrl, branchName], {
+        env: { ...process.env, ...NO_PROMPT_ENV }, cwd: gitRoot, timeout: 15000, encoding: 'utf8', windowsHide: true,
+      });
+      const existsOnRemote = lsResult.status === 0 && lsResult.stdout.includes(branchName);
+      if (!existsOnRemote) {
+        gitExec(['push', '--set-upstream', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {});
+        await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
+        return res.json({ message: `Branch "${branchName}" pushed to remote.`, branch: branchName });
+      }
       return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
     }
     const baseBranch = getBaseBranch(cfg);
