@@ -1324,10 +1324,15 @@ router.post('/trigger', async (req, res) => {
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
       const bbToken = cfg.bitbucket_app_password;
-      // ATATT = personal API token → use Bearer auth; otherwise Basic auth (App Password)
-      const bbAuthHeader = bbToken.startsWith('ATATT')
-        ? `Bearer ${bbToken}`
-        : `Basic ${Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${bbToken}`).toString('base64')}`;
+      // Bitbucket pipeline trigger endpoint only accepts App Passwords (ATBB), NOT personal API tokens (ATATT)
+      if (bbToken.startsWith('ATATT')) {
+        return res.status(400).json({
+          error: 'Bitbucket pipeline triggering requires an App Password, not a personal API token (ATATT). ' +
+            'Go to Bitbucket → Personal settings → App passwords → Create app password with "Pipelines: Read & Write" and "Repositories: Read" scopes. ' +
+            'Enter that App Password in CI Pipeline → Bitbucket → App Password field.',
+        });
+      }
+      const bbAuthHeader = `Basic ${Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${bbToken}`).toString('base64')}`;
       const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
 
       const bbBody = {

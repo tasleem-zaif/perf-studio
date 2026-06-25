@@ -480,8 +480,12 @@ export default function PipelineConfig({ project, envs, user }) {
                       <input style={ciInputStyle} value={ciForm.bitbucket_username} onChange={e => setCiForm(f => ({ ...f, bitbucket_username: e.target.value }))} placeholder="your-bitbucket-username" />
                     </div>
                     <div className="form-group" style={{ margin: 0 }}>
-                      <label className="form-label">App Password / API Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(Pipelines read/write)</span></label>
-                      <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.bitbucket_app_password} onChange={e => setCiForm(f => ({ ...f, bitbucket_app_password: e.target.value }))} placeholder={ciConfig?.bitbucket_app_password_set ? '(saved — enter new to replace)' : 'ATBBxxxx or API Token'} />
+                      <label className="form-label">App Password <span style={{ color: '#dc2626', fontWeight: 600 }}>*</span> <span style={{ color: '#94a3b8', fontWeight: 400 }}>(NOT an API token)</span></label>
+                      <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.bitbucket_app_password} onChange={e => setCiForm(f => ({ ...f, bitbucket_app_password: e.target.value }))} placeholder={ciConfig?.bitbucket_app_password_set ? '(saved — enter new to replace)' : 'ATBB…'} />
+                      <div style={{ fontSize: 11, color: '#b45309', marginTop: 3 }}>
+                        Must be an <strong>App Password</strong> (starts with ATBB) — personal API tokens (ATATT) cannot trigger pipelines.
+                        Create one at Bitbucket → Personal settings → App passwords → scopes: <strong>Pipelines Read+Write, Repositories Read</strong>.
+                      </div>
                     </div>
                   </div>
                 ) : (
