@@ -835,7 +835,7 @@ pipelines:
                 -Jloops="$JMETER_LOOPS" \\
                 -Jduration="$JMETER_DURATION" \\
                 -l "/workspace/results.jtl" \\
-                -e -o "/workspace/html"
+                -e -o "/workspace/html" || true
             - cd "$BITBUCKET_CLONE_DIR" && zip -r "perf-results-\${PIPELINE_ID}.zip" results.jtl html/ 2>/dev/null || true
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
@@ -1091,8 +1091,16 @@ router.post('/trigger', async (req, res) => {
       // Sync with remote BEFORE committing new files so the push is fast-forward.
       // Without this, if origin/main has new commits (workflow file updates, CI artifacts, etc.)
       // the push would be rejected as non-fast-forward and the JMX would never reach GitHub.
-      try { await git2.raw(['merge', '--ff-only', `origin/${targetRef}`]); } catch {}
-      try { await git2.raw(['reset', '--hard', `origin/${targetRef}`]); } catch {}
+      // Stash any uncommitted local changes (testData files, config edits) before syncing
+      // with remote so that reset --hard does not wipe them permanently.
+      let stashed = false;
+      try { const r = await git2.raw(['stash', '--include-untracked', '-m', 'peako-auto-stash']); stashed = !r.includes('No local changes'); } catch {}
+      try { await git2.raw(['merge', '--ff-only', `origin/${targetRef}`]); } catch {
+        // ff-only failed (diverged) — hard reset to remote and restore stash on top
+        try { await git2.raw(['reset', '--hard', `origin/${targetRef}`]); } catch {}
+      }
+      // Restore stashed files (testData etc.) after syncing
+      if (stashed) { try { await git2.raw(['stash', 'pop']); } catch {} }
 
       // Copy the JMX/JS file into the workspace if it only exists in admin workspace.
       // Look up the absolute path from test_suites (jmx_path / js_path) — don't rely on
@@ -1367,7 +1375,13 @@ router.post('/trigger', async (req, res) => {
           ref_name: bbRef,
           selector: { type: 'custom', pattern: 'Peako-Performance-Test' },
         },
-        variables: Object.entries(variables).map(([key, value]) => ({ key: key.toUpperCase(), value: String(value), secured: false })),
+        variables: [
+          ...Object.entries(variables).map(([key, value]) => ({ key: key.toUpperCase(), value: String(value), secured: false })),
+          // Inject upload credentials so the YAML's curl can push results to Bitbucket Downloads
+          // without requiring BB_USERNAME / BB_APP_PASSWORD to be set as repo variables manually.
+          { key: 'BB_USERNAME', value: cfg.bitbucket_username || cfg.bitbucket_workspace || '', secured: false },
+          { key: 'BB_APP_PASSWORD', value: bbToken, secured: true },
+        ],
       };
 
       const bbResp = await apiRequest(
