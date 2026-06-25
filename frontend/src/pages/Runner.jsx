@@ -868,7 +868,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 ) : (
                                   <div style={{ color: '#484f58', marginBottom: 8 }}>
                                     {['running','in_progress','queued','pending'].includes(r.status)
-                                      ? '⟳ Fetching live steps from GitHub…'
+                                      ? `⟳ Fetching live steps from ${r.provider === 'gitlab' ? 'GitLab' : r.provider === 'bitbucket' ? 'Bitbucket' : 'GitHub'}…`
                                       : 'No step details available'}
                                   </div>
                                 )}
