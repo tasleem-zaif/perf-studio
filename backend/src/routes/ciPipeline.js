@@ -843,10 +843,12 @@ pipelines:
                 ${dockerImage} \\
                 jmeter \\
                 -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
-                -Jusers="$JMETER_USERS" \\
-                -Jrampup="$JMETER_RAMPUP" \\
+                -JTHREADS="$JMETER_USERS" \\
+                -JRAMP_UP="$JMETER_RAMPUP" \\
                 -Jloops="$JMETER_LOOPS" \\
-                -Jduration="$JMETER_DURATION" \\
+                -JDURATION="$JMETER_DURATION" \\
+                -JCSV_PATH_1="/workspace/testData" \\
+                -JCSV_PATH_2="/workspace/testData" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html" || true
             - |
@@ -1218,10 +1220,12 @@ pipelines:
                 ${_dockerImage} \\
                 jmeter \\
                 -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
-                -Jusers="$JMETER_USERS" \\
-                -Jrampup="$JMETER_RAMPUP" \\
+                -JTHREADS="$JMETER_USERS" \\
+                -JRAMP_UP="$JMETER_RAMPUP" \\
                 -Jloops="$JMETER_LOOPS" \\
-                -Jduration="$JMETER_DURATION" \\
+                -JDURATION="$JMETER_DURATION" \\
+                -JCSV_PATH_1="/workspace/testData" \\
+                -JCSV_PATH_2="/workspace/testData" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html" || true
             - |
@@ -1314,10 +1318,15 @@ pipelines:
         // Use Bitbucket Files API (REST) to commit files — same scope as pipeline trigger.
         const _bbWs   = cfg.bitbucket_workspace;
         const _bbSlug = cfg.bitbucket_repo_slug;
-        // Use admin token for write operations — admin's token has repository:write scope
+        // Use admin token for write operations — admin's token has repository:write scope.
+        // IMPORTANT: pair admin token with admin's username/email, NOT the triggering user's email.
         const _adminTok = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
-        const _adminCfgForAuth = { ...cfg, bitbucket_app_password: _adminTok };
-        const _bbAuth = bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id || req.userId);
+        const _adminCfgForAuth = {
+          ...cfg,
+          bitbucket_app_password: _adminTok,
+          bitbucket_username: adminCfg?.bitbucket_username || adminRawCfg?.bitbucket_username || cfg.bitbucket_username || '',
+        };
+        const _bbAuth = bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id);
         const _boundary = 'PeakoBoundary7x3f9z';
         const _fileParts = [];
 
@@ -1337,6 +1346,42 @@ pipelines:
           if (fs.existsSync(_dest2)) {
             _fileParts.push({ name: script_path || _sf2, content: fs.readFileSync(_dest2) });
           }
+        }
+
+        // Include testData CSV files so pipeline can read them at /workspace/testData/
+        // Search recursively within wsRoot for any 'testData' directory containing CSV files
+        const _findTestDataDir = (dir, depth) => {
+          if (depth > 6) return null;
+          try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+              if (e.isDirectory() && e.name === 'testData') {
+                const full = path.join(dir, e.name);
+                const files = fs.readdirSync(full);
+                if (files.some(f => f.endsWith('.csv'))) return full;
+              }
+            }
+            for (const e of entries) {
+              if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'results' && e.name !== 'node_modules') {
+                const found = _findTestDataDir(path.join(dir, e.name), depth + 1);
+                if (found) return found;
+              }
+            }
+          } catch {}
+          return null;
+        };
+        const _testDataDir = _findTestDataDir(wsRoot, 0);
+        if (_testDataDir) {
+          try {
+            fs.readdirSync(_testDataDir).forEach(f => {
+              if (!f.startsWith('.') && (f.endsWith('.csv') || f.endsWith('.txt') || f.endsWith('.json'))) {
+                _fileParts.push({ name: `testData/${f}`, content: fs.readFileSync(path.join(_testDataDir, f)) });
+              }
+            });
+            console.log('[CI trigger] testData files pushed from:', _testDataDir);
+          } catch {}
+        } else {
+          console.warn('[CI trigger] No testData directory with CSV files found in', wsRoot);
         }
 
         // Build multipart body as a Buffer
