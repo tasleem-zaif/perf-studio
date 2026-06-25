@@ -1119,14 +1119,18 @@ router.post('/trigger', async (req, res) => {
         }
       }
 
-      // Stage everything new and push
+      // Always write a trigger-info file so every pipeline run gets a clean commit
+      // with the test name as the message — this is what Bitbucket shows as the pipeline title.
+      const runLabel = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
+      const triggerFile = path.join(wsRoot, '.peako', 'last-run.json');
+      fs.mkdirSync(path.dirname(triggerFile), { recursive: true });
+      fs.writeFileSync(triggerFile, JSON.stringify({
+        triggered_at: new Date().toISOString(),
+        script: script_name || '',
+        users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
+      }, null, 2), 'utf8');
       await git2.add('.');
-      const st2 = await git2.status();
-      if (st2.staged.length > 0 || st2.not_added.length > 0) {
-        await git2.add('.');
-        const runLabel = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
-        await git2.commit(`Peako Performance Test: ${runLabel} [auto]`);
-      }
+      await git2.commit(`Peako Performance Test: ${runLabel} [auto]`);
       // Disable GCM account picker in local .git/config before every push
       try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
       // Push branch (set upstream if first time)
