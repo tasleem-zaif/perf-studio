@@ -829,6 +829,7 @@ pipelines:
                 -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
                 ${dockerImage} \\
+                jmeter \\
                 -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
                 -Jusers="$JMETER_USERS" \\
                 -Jrampup="$JMETER_RAMPUP" \\
