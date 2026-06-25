@@ -1102,15 +1102,14 @@ router.post('/trigger', async (req, res) => {
         if (!srcAbs || !fs.existsSync(srcAbs)) {
           const { GIT_WORKSPACES_ROOT: _wsRoot2, cleanName: _cn2 } = require('../utils/projectFolders');
           const pName   = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId)?.name || '';
-          const pFolder = path.join(_wsRoot2, _cn2(pName));
-          try {
-            const allDirs = fs.readdirSync(pFolder, { withFileTypes: true })
-              .filter(d => d.isDirectory()).map(d => path.join(pFolder, d.name));
-            for (const d of allDirs) {
-              const candidate = path.join(d, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
-              if (fs.existsSync(candidate)) { srcAbs = candidate; break; }
-            }
-          } catch {}
+          // Search dirs: project-named subfolder AND root-level workspace dirs (covers legacy paths)
+          const searchBases = [];
+          try { searchBases.push(...fs.readdirSync(path.join(_wsRoot2, _cn2(pName)), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(_wsRoot2, _cn2(pName), d.name))); } catch {}
+          try { searchBases.push(...fs.readdirSync(_wsRoot2, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(_wsRoot2, d.name))); } catch {}
+          for (const base of searchBases) {
+            const candidate = path.join(base, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
+            if (fs.existsSync(candidate)) { srcAbs = candidate; break; }
+          }
         }
 
         const destAbs = path.join(wsRoot, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
