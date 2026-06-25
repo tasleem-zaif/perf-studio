@@ -118,7 +118,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── Identity ──────────────────────────────────────────────────────────────
   const [identity,       setIdentity]       = useState(null);
-  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '', auth_method: 'pat', ssh_key: '' });
+  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '', auth_method: 'pat', ssh_key: '', git_username: '' });
   const [savingId,       setSavingId]       = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [autoIniting,    setAutoIniting]    = useState(false);
@@ -192,7 +192,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       }
       const id = idRes.data.identity;
       setIdentity(id);
-      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '', auth_method: id.auth_method||'pat', ssh_key: '' }));
+      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '', auth_method: id.auth_method||'pat', ssh_key: '', git_username: id.git_username||'' }));
       setPrs(prsRes.data.prs || []);
 
       // Phase 2: load git workspace data in background (runs git commands — slower)
@@ -302,7 +302,8 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       toast('Git identity saved', 'success');
       loadAll();
       // Auto-init branch if all fields are set and repo is initialized
-      if (initialized && idForm.branch_name && idForm.author_name && idForm.author_email && (idForm.auth_token || identity?.auth_token)) {
+      const bbUsernameOk = cfg?.provider !== 'bitbucket' || idForm.auth_method === 'ssh' || !!(idForm.git_username || identity?.git_username);
+      if (initialized && idForm.branch_name && idForm.author_name && idForm.author_email && (idForm.auth_token || identity?.auth_token) && bbUsernameOk) {
         setAutoIniting(true);
         addLog(`Setting up branch "${idForm.branch_name}"…`);
         try {
@@ -793,6 +794,19 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                   ))}
                 </div>
               </Field>
+
+              {cfg?.provider === 'bitbucket' && idForm.auth_method !== 'ssh' && (
+                <Field label="Bitbucket Username" required hint="Your Bitbucket account username (e.g. tasleema85) — required to authenticate with your API token.">
+                  <input
+                    type="text"
+                    value={idForm.git_username}
+                    onChange={e => setIdForm(f => ({ ...f, git_username: e.target.value }))}
+                    placeholder="your-bitbucket-username"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Field>
+              )}
 
               {idForm.auth_method === 'ssh' ? (
                 <Field label="SSH Private Key" required hint={`Paste your private key (-----BEGIN ... PRIVATE KEY-----). The public key must be added to your ${cfg?.provider === 'bitbucket' ? 'Bitbucket' : cfg?.provider === 'gitlab' ? 'GitLab' : 'GitHub'} account.`}>

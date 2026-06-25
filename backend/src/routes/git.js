@@ -211,9 +211,11 @@ function getAuth(cfg, userId, projectId) {
   const projectToken  = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
   const personalToken = identity?.auth_token ? decrypt(identity.auth_token).trim() : '';
   const effectiveToken = personalToken || projectToken;
+  // Use user's own git_username (required for Bitbucket ATATT tokens) falling back to project-level username
+  const effectiveUsername = identity?.git_username || cfg.username || '';
   return {
     isSSH: false,
-    remoteUrl: buildRemoteWithAuth(cfg.remote_url, cfg.username, effectiveToken),
+    remoteUrl: buildRemoteWithAuth(cfg.remote_url, effectiveUsername, effectiveToken),
     sshEnv: {},
     cleanup: () => {},
   };
@@ -292,8 +294,10 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   } else {
     const token         = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
     const personalToken = identity?.auth_token ? decrypt(identity.auth_token).trim() : '';
+    // Use user's own git_username (required for Bitbucket ATATT tokens) falling back to project-level username
+    const effectiveUsername = identity?.git_username || cfg.username || '';
     // buildRemoteWithAuth already converts SSH URLs → HTTPS when a token is provided
-    remoteForOps = buildRemoteWithAuth(cfg.remote_url, cfg.username, personalToken || token);
+    remoteForOps = buildRemoteWithAuth(cfg.remote_url, effectiveUsername, personalToken || token);
   }
 
   if (!fs.existsSync(path.join(gitRoot, '.git'))) {
@@ -390,11 +394,25 @@ function buildRemoteWithAuth(url, username, token) {
     if (sshMatch) {
       httpsUrl = `https://${sshMatch[1]}/${sshMatch[2]}.git`;
     }
+    // Extract username embedded in URL (e.g. https://tasleema85@bitbucket.org/...)
+    // before stripping — used for Bitbucket personal API token auth.
+    const embeddedUserMatch = httpsUrl.match(/^https?:\/\/([^:@]+)@/);
+    const embeddedUser = embeddedUserMatch ? embeddedUserMatch[1] : null;
     // Strip any existing credentials
     const clean = httpsUrl.replace(/^(https?:\/\/)[^@]+@/, '$1');
-    // Bitbucket requires x-token-auth:{token} for API tokens (also works for
-    // App Passwords). GitHub/GitLab accept bare token-only format.
+
     if (/bitbucket\.org/i.test(clean)) {
+      // Bitbucket personal API tokens (ATATT prefix) use username:token — same
+      // as the deprecated App Passwords they replaced. The username comes from
+      // the HTTPS clone URL (shown as https://USERNAME@bitbucket.org/...).
+      // Workspace/repo HTTP access tokens use x-token-auth:token instead.
+      // Prefer: 1) explicit username arg, 2) username embedded in stored URL,
+      //         3) x-token-auth fallback (for HTTP access tokens).
+      const bbUser = username || embeddedUser;
+      if (bbUser) {
+        return clean.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser)}:${encodeURIComponent(token)}@`);
+      }
+      // No username available — fall back to x-token-auth (HTTP access tokens)
       return clean.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(token)}@`);
     }
     return clean.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(token)}@`);
@@ -1338,6 +1356,7 @@ router.get('/identity', (req, res) => {
       auth_token:   identity?.auth_token   ? '••••••••' : '',
       auth_method:  identity?.auth_method  || 'pat',
       ssh_key_set:  !!(identity?.ssh_key),
+      git_username: identity?.git_username || '',
     }
   });
 });
@@ -1346,7 +1365,7 @@ router.get('/identity', (req, res) => {
 router.put('/identity', (req, res) => {
   const proj = getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const { branch_name, author_name, author_email, auth_token, auth_method, ssh_key } = req.body;
+  const { branch_name, author_name, author_email, auth_token, auth_method, ssh_key, git_username } = req.body;
   const existing = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
 
@@ -1361,12 +1380,14 @@ router.put('/identity', (req, res) => {
     ? encrypt(ssh_key)
     : (existing?.ssh_key || '');
 
+  const finalUsername = (git_username !== undefined) ? (git_username || '') : (existing?.git_username || '');
+
   if (existing) {
-    db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=?,auth_method=?,ssh_key=? WHERE user_id=? AND project_id=?')
-      .run(branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, req.userId, req.params.projectId);
+    db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=?,auth_method=?,ssh_key=?,git_username=? WHERE user_id=? AND project_id=?')
+      .run(branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, finalUsername, req.userId, req.params.projectId);
   } else {
-    db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token,auth_method,ssh_key) VALUES (?,?,?,?,?,?,?,?)')
-      .run(req.userId, req.params.projectId, branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey);
+    db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token,auth_method,ssh_key,git_username) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(req.userId, req.params.projectId, branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, finalUsername);
   }
   res.json({ ok: true });
 });
