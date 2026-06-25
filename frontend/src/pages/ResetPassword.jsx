@@ -26,12 +26,15 @@ export default function ResetPassword({ token }) {
       <div className="auth-card" style={{ width: 400, maxWidth: '90vw' }}>
 
         {/* Logo */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 28 }}>
-          <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-            alt="Quarks" style={{ height: 32, width: 'auto' }} />
-          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            Peako
-          </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 }}>
+          <img src="/favicon.svg" alt="Peako" style={{ height: 44, width: 'auto' }} />
+          <div>
+            <div style={{ lineHeight: 1.3 }}>
+              <span style={{ fontSize: 18, fontWeight: 800, color: 'var(--color-text-primary)' }}>Peako</span>
+              <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--color-text-secondary)', marginLeft: 4 }}>- Next Gen Performance Testing</span>
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)', marginTop: 2 }}>by Quarks Technosoft</div>
+          </div>
         </div>
 
         {done ? (

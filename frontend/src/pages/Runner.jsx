@@ -321,9 +321,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
   const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
   const ciStepsPollerRef = useRef(null);
+  const [runTab, setRunTab] = useState('ci-pipeline'); // 'single' | 'ci-pipeline' — declared here so useEffect below can reference it
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
+    // Re-fetch every time the CI Pipeline tab becomes active so freshly-saved configs are picked up
+    if (runTab !== 'ci-pipeline') return;
     api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => {
       setCiConfig(data.config);
       if (data.config?.bitbucket_enabled && !data.config?.gitlab_enabled && !data.config?.github_enabled) setCiProvider('bitbucket');
@@ -331,7 +334,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
     }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
-  }, [selectedProjectId]);
+  }, [selectedProjectId, runTab]);
 
   // Poll live steps when a terminal is expanded
   useEffect(() => {
@@ -396,7 +399,6 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   }
 
   // ── Pipeline runner state ─────────────────────────────────────────────────
-  const [runTab,           setRunTab]           = useState('ci-pipeline'); // 'single' | 'ci-pipeline'
   const [pipelines,        setPipelines]        = useState([]);
   const [selectedPipeline, setSelectedPipeline] = useState('');
   const [pipelineRunning,  setPipelineRunning]  = useState(false);
@@ -748,7 +750,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
                   {ciTriggering
                     ? <><span className="spinner"/> Triggering…</>
-                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines'} Pipeline</>}
+                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket'} Pipeline</>}
                 </button>
               </div>
 

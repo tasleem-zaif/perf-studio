@@ -1695,6 +1695,17 @@ router.post('/jmeter/pull-image', auth, (req, res) => {
   function sendLog(type, msg) { res.write('data: ' + JSON.stringify({ type, message: msg }) + '\n\n'); }
   function sendDone(result) { res.write('data: ' + JSON.stringify({ done: true, ...result }) + '\n\n'); res.end(); }
 
+  // Check Docker daemon is running before attempting pull
+  try {
+    execSync('docker info', { timeout: 6000, stdio: 'pipe' });
+  } catch (_) {
+    sendLog('warn', 'Docker Desktop is not running on this machine.');
+    sendLog('info', 'Local pull is only needed if you want to run tests directly on this machine.');
+    sendLog('info', 'Cloud CI (GitHub Actions, GitLab CI, Bitbucket Pipelines) pulls the image automatically on the CI runner — no local Docker required.');
+    sendDone({ ok: false, error: 'Docker daemon not running' });
+    return;
+  }
+
   sendLog('info', `Pulling Docker image: ${image}`);
   sendLog('info', 'This may take a few minutes on first pull...');
 

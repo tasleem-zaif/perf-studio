@@ -967,8 +967,28 @@ pipelines:
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
 router.post('/trigger', async (req, res) => {
   if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
-  if (!cfg) return res.status(400).json({ error: 'CI configuration not saved yet.' });
+  // Workspace/repo/ref are project-level settings — always from the admin's config.
+  // Auth credentials (token, username/email) come from the triggering user's own config,
+  // falling back to the admin's config if the user hasn't set their own.
+  const adminRawCfg = db.prepare(`
+    SELECT cpc.* FROM ci_pipeline_configs cpc
+    JOIN users u ON u.id = cpc.user_id
+    WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
+    ORDER BY cpc.updated_at DESC LIMIT 1
+  `).get(req.params.projectId);
+  const userRawCfg  = getConfig(req.params.projectId, req.userId);
+  const adminCfg    = decryptConfig(adminRawCfg);
+  const userCfg     = decryptConfig(userRawCfg);
+  if (!adminCfg && !userCfg) return res.status(400).json({ error: 'CI configuration not saved yet.' });
+  // Merge: project-level settings from admin, auth credentials from user (or admin as fallback)
+  const cfg = {
+    ...(adminCfg || userCfg),
+    bitbucket_username:    userCfg?.bitbucket_username    || adminCfg?.bitbucket_username    || '',
+    bitbucket_app_password: userCfg?.bitbucket_app_password || adminCfg?.bitbucket_app_password || '',
+    github_token:          userCfg?.github_token          || adminCfg?.github_token          || '',
+    gitlab_token:          userCfg?.gitlab_token          || adminCfg?.gitlab_token          || '',
+    gitlab_trigger_token:  userCfg?.gitlab_trigger_token  || adminCfg?.gitlab_trigger_token  || '',
+  };
 
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
@@ -1323,15 +1343,9 @@ router.post('/trigger', async (req, res) => {
       if (!cfg.bitbucket_repo_slug)    return res.status(400).json({ error: 'Bitbucket repository slug not set.' });
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
-      const bbToken = cfg.bitbucket_app_password;
-      // Bitbucket pipeline trigger endpoint only accepts App Passwords (ATBB), NOT personal API tokens (ATATT)
-      if (bbToken.startsWith('ATATT')) {
-        return res.status(400).json({
-          error: 'Bitbucket pipeline triggering requires an App Password, not a personal API token (ATATT). ' +
-            'Go to Bitbucket → Personal settings → App passwords → Create app password with "Pipelines: Read & Write" and "Repositories: Read" scopes. ' +
-            'Enter that App Password in CI Pipeline → Bitbucket → App Password field.',
-        });
-      }
+      const bbToken = cfg.bitbucket_app_password.trim();
+      // ATATT personal API tokens require Basic auth with EMAIL:token (Atlassian account email, not Bitbucket username)
+      // App Passwords (ATBB) use Basic auth with Bitbucket username:token
       const bbAuthHeader = `Basic ${Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${bbToken}`).toString('base64')}`;
       const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
 

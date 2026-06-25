@@ -107,7 +107,7 @@ function KeepAlive({ active, everVisited, children }) {
 }
 
 export default function App() {
-  return <ToastProvider><AppInner /></ToastProvider>;
+  return <ErrorBoundary><ToastProvider><AppInner /></ToastProvider></ErrorBoundary>;
 }
 
 function AppInner() {

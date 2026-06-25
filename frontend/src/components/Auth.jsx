@@ -32,21 +32,30 @@ export default function Auth({ onLogin }) {
   const [loading, setLoading] = useState(false);
   const [sessionActive, setSessionActive] = useState(false);
 
-  // On mount: if a stale token exists in localStorage, clear its server session
-  // so the user doesn't see a false "already signed in" conflict on their next login.
+  // On mount: if a stale token exists in localStorage, verify it.
+  // Use native fetch (not api.js) so the 401 response interceptor doesn't fire and
+  // clear ps_token before we can use it to delete the orphaned server session.
   useEffect(() => {
     const staleToken = localStorage.getItem('ps_token');
     if (!staleToken) return;
-    api.get('/auth/me')
-      .then(({ data }) => {
-        // Token is still valid — log the user straight in without touching the form
+    fetch('/api/auth/me', { headers: { Authorization: `Bearer ${staleToken}` } })
+      .then(res => {
+        if (!res.ok) throw new Error();
+        return res.json();
+      })
+      .then(data => {
         onLogin(data.user);
       })
       .catch(() => {
-        // Token is expired or invalid — call logout to delete the stale session row,
-        // then clear localStorage so the login form is clean.
-        api.post('/auth/logout').catch(() => {});
+        // Token is invalid — delete the orphaned session on the server using the
+        // captured token, then clean localStorage so the login form is unblocked.
+        fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${staleToken}` },
+          keepalive: true,
+        }).catch(() => {});
         localStorage.removeItem('ps_token');
+        localStorage.removeItem('ps_user');
       });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -75,23 +84,21 @@ export default function Auth({ onLogin }) {
         {/* ── LEFT — Branding & Features ── */}
         <div className="auth-left">
           {/* Logo */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 }}>
-            <img
-              src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-              alt="Quarks"
-              style={{ height: 36, width: 'auto' }}
-            />
-            <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.15)' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 28 }}>
+            <img src="/favicon.svg" alt="Peako" style={{ height: 52, width: 'auto' }} />
             <div>
-              <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Peako</div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>by Quarks Technosoft</div>
+              <div style={{ lineHeight: 1.3 }}>
+                <span style={{ fontSize: 26, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Peako</span>
+                <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.65)', marginLeft: 4 }}>- Next Gen Performance Testing</span>
+              </div>
+              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>by Quarks Technosoft</div>
             </div>
           </div>
 
           {/* Headline */}
           <div style={{ marginBottom: 8 }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: '#fff', lineHeight: 1.25, letterSpacing: '-0.3px' }}>
-              AI-Powered<br />
+              Next Gen<br />
               <span style={{ color: '#22c55e' }}>Performance Testing</span><br />
               Platform
             </div>

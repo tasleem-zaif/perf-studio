@@ -630,7 +630,7 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         badge={dockerStatus === 'ok' ? 'Running' : dockerStatus === 'installed' ? 'Installed' : dockerStatus === 'missing' ? 'Missing' : undefined}
       >
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Checks whether Docker is installed and running on your local machine. Required for pulling the CI pipeline image locally.
+          Checks whether Docker is installed and running on your local machine. <strong>Only required for local test execution.</strong> Cloud CI (GitHub Actions, GitLab CI, Bitbucket Pipelines) runs Docker automatically on the CI runner — you do not need Docker locally if you are using cloud CI.
         </div>
 
         {/* Status display */}
@@ -705,6 +705,11 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
           </div>
           <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
             Custom Docker image used in GitHub Actions / GitLab CI pipelines. Contains JMeter, K6, Java and Node.js.
+            The image name here is also embedded in generated CI YAML files — update it before generating YAML if you use a custom image.
+            <span style={{ display: 'block', marginTop: '4px', color: 'var(--color-text-tertiary)' }}>
+              <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
+              Pull is only needed if you want to run tests locally. Cloud CI pulls automatically on the runner.
+            </span>
           </div>
           <div style={{ display: 'flex', gap: '6px', maxWidth: 520, marginBottom: '12px' }}>
             <input
@@ -717,9 +722,9 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
             <button
               className="btn-primary btn-sm"
               onClick={() => pullImage('jmeter')}
-              disabled={!!pullingImage || !jmeterDockerImage.trim()}
+              disabled={!!pullingImage || !jmeterDockerImage.trim() || (dockerStatus !== null && dockerStatus !== 'ok')}
               style={{ whiteSpace: 'nowrap' }}
-              title="docker pull"
+              title={dockerStatus && dockerStatus !== 'ok' ? 'Start Docker Desktop first to pull locally' : 'docker pull'}
             >
               {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
             </button>
@@ -727,10 +732,12 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
           <button className="btn-secondary btn-sm" onClick={saveDockerImages}>
             <i className="ti ti-device-floppy" /> Save Image
           </button>
-          <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-            <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-            Pull caches the image locally. This is also the image referenced in generated CI YAML files.
-          </div>
+          {dockerStatus && dockerStatus !== 'ok' && (
+            <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--warn)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <i className="ti ti-alert-triangle" />
+              Docker Desktop is not running — Pull is disabled. Start Docker above to cache the image locally, or use cloud CI which pulls automatically.
+            </div>
+          )}
         </div>
       </CollapsibleSection>
 

@@ -445,6 +445,12 @@ try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_app_password
 try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_repo_slug TEXT DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_ref TEXT DEFAULT 'main'"); } catch {}
 
+// ── SSH key for CI pipelines ──────────────────────────────────────────────────
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN ssh_private_key TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN gitlab_auth_method TEXT DEFAULT 'pat'"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN github_auth_method TEXT DEFAULT 'pat'"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_configs ADD COLUMN bitbucket_auth_method TEXT DEFAULT 'pat'"); } catch {}
+
 // Add folder_path to collections
 try { db.exec("ALTER TABLE collections ADD COLUMN folder_path TEXT DEFAULT ''"); } catch {}
 
