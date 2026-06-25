@@ -7,12 +7,34 @@ const DEFAULT_FORM = { name: '', description: '', steps: [], stop_on_failure: tr
 
 const DEFAULT_CI = {
   gitlab_enabled: false, gitlab_url: 'https://gitlab.com', gitlab_project_id: '',
-  gitlab_token: '', gitlab_ref: 'main',
-  github_enabled: false, github_repo: '', github_token: '',
-  github_workflow_file: 'perf-test.yml', github_ref: 'main',
+  gitlab_auth_method: 'pat', gitlab_token: '', gitlab_ref: 'main',
+  github_enabled: false, github_repo: '', github_auth_method: 'pat',
+  github_token: '', github_workflow_file: 'perf-test.yml', github_ref: 'main',
   bitbucket_enabled: false, bitbucket_workspace: '', bitbucket_username: '',
-  bitbucket_app_password: '', bitbucket_repo_slug: '', bitbucket_ref: 'main',
+  bitbucket_auth_method: 'pat', bitbucket_app_password: '', bitbucket_repo_slug: '', bitbucket_ref: 'main',
+  ssh_private_key: '',
 };
+
+function AuthToggle({ value, onChange }) {
+  return (
+    <div style={{ display: 'flex', gap: 0, borderRadius: 6, overflow: 'hidden', border: '1px solid var(--color-border-secondary)', width: 'fit-content' }}>
+      {['pat', 'ssh'].map(method => (
+        <button
+          key={method}
+          onClick={() => onChange(method)}
+          style={{
+            padding: '4px 14px', fontSize: 12, fontWeight: 600, border: 'none', cursor: 'pointer',
+            background: value === method ? 'var(--accent)' : 'var(--input-bg)',
+            color: value === method ? '#fff' : 'var(--color-text-secondary)',
+            transition: 'background 0.15s',
+          }}
+        >
+          {method === 'pat' ? 'Token / PAT' : 'SSH Key'}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function StepRow({ step, index, total, onRemove, onMoveUp, onMoveDown }) {
   return (
@@ -35,6 +57,7 @@ function StepRow({ step, index, total, onRemove, onMoveUp, onMoveDown }) {
 export default function PipelineConfig({ project, envs, user }) {
   const { toast } = useToast();
   const isProjectOwner = project && user && String(project.user_id) === String(user.id);
+  const isAdmin = user?.role === 'org_admin' || user?.role === 'super_admin';
   // Local Pipelines tab removed — only CI/CD Integration remains
   const [pipelines, setPipelines]   = useState([]);
   const [suites,    setSuites]      = useState([]);
@@ -46,57 +69,62 @@ export default function PipelineConfig({ project, envs, user }) {
 
   // CI/CD config state
   const [ciForm,       setCiForm]       = useState(DEFAULT_CI);
-  const [ciSaving,     setCiSaving]     = useState(false);
-  const [ciTesting,    setCiTesting]    = useState(null); // 'gitlab'|'github'
+  const [ciSaving,     setCiSaving]     = useState(null); // provider string | null
+  const [ciTesting,    setCiTesting]    = useState(null); // 'gitlab'|'github'|'bitbucket'
   const [ciTestResult, setCiTestResult] = useState({});
   const [ciCreatingToken, setCiCreatingToken] = useState(false);
-  const [ciGenerating, setCiGenerating] = useState(false);
+  const [ciGenerating, setCiGenerating] = useState(null); // provider string | null
   const [ciConfig,     setCiConfig]     = useState(null); // loaded from DB
   const [userBranch,   setUserBranch]   = useState('main');
 
   useEffect(() => {
     if (!project?.id) return;
     load();
-    api.get(`/projects/${project.id}/test-suites`).then(r => setSuites(r.data.suites || [])).catch(() => {});
 
-    // Load git identity to get the user's actual branch name
     const isRegularUser = user?.role === 'user';
-    const branchPromise = isRegularUser
-      ? api.get(`/projects/${project.id}/git/identity`).then(r => r.data.identity?.branch_name || '').catch(() => '')
-      : Promise.resolve('main');
+    const fallbackBranch = isRegularUser && user?.name
+      ? `users/${user.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-')}`
+      : 'main';
 
-    branchPromise.then(branch => {
-      // Fallback: derive from user name (same logic as getBranchForUser in backend)
-      const resolved = branch || (isRegularUser && user?.name
-        ? `users/${user.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-')}`
-        : 'main');
+    // Fire all three requests in parallel — don't wait for identity before loading ci/config
+    Promise.all([
+      api.get(`/projects/${project.id}/test-suites`).catch(() => ({ data: { suites: [] } })),
+      isRegularUser
+        ? api.get(`/projects/${project.id}/git/identity`).catch(() => ({ data: {} }))
+        : Promise.resolve({ data: {} }),
+      api.get(`/projects/${project.id}/ci/config`).catch(() => ({ data: {} })),
+    ]).then(([suitesRes, identityRes, ciRes]) => {
+      setSuites(suitesRes.data.suites || []);
+
+      const resolved = identityRes.data.identity?.branch_name || fallbackBranch;
       setUserBranch(resolved);
 
-      api.get(`/projects/${project.id}/ci/config`)
-        .then(({ data }) => {
-          if (data.config) {
-            setCiConfig(data.config);
-            setCiForm(f => ({
-              ...f,
-              gitlab_enabled: !!data.config.gitlab_enabled,
-              gitlab_url: data.config.gitlab_url || 'https://gitlab.com',
-              gitlab_project_id: data.config.gitlab_project_id || '',
-              gitlab_ref: data.config.gitlab_ref || resolved,
-              github_enabled: !!data.config.github_enabled,
-              github_repo: data.config.github_repo || '',
-              github_workflow_file: data.config.github_workflow_file || 'perf-test.yml',
-              github_ref: data.config.github_ref || resolved,
-              bitbucket_enabled: !!data.config.bitbucket_enabled,
-              bitbucket_workspace: data.config.bitbucket_workspace || '',
-              bitbucket_username: data.config.bitbucket_username || '',
-              bitbucket_repo_slug: data.config.bitbucket_repo_slug || '',
-              bitbucket_ref: data.config.bitbucket_ref || resolved,
-            }));
-          } else {
-            // No saved config yet — pre-fill refs with user's branch
-            setCiForm(f => ({ ...f, gitlab_ref: resolved, github_ref: resolved }));
-          }
-        }).catch(() => {});
+      const cfg = ciRes.data.config;
+      if (cfg) {
+        setCiConfig(cfg);
+        setCiForm(f => ({
+          ...f,
+          gitlab_enabled: !!cfg.gitlab_enabled,
+          gitlab_url: cfg.gitlab_url || 'https://gitlab.com',
+          gitlab_project_id: cfg.gitlab_project_id || '',
+          gitlab_ref: cfg.gitlab_ref || resolved,
+          github_enabled: !!cfg.github_enabled,
+          github_repo: cfg.github_repo || '',
+          github_workflow_file: cfg.github_workflow_file || 'perf-test.yml',
+          github_ref: cfg.github_ref || resolved,
+          gitlab_auth_method: cfg.gitlab_auth_method || 'pat',
+          bitbucket_enabled: !!cfg.bitbucket_enabled,
+          bitbucket_workspace: cfg.bitbucket_workspace || '',
+          bitbucket_username: cfg.bitbucket_username || '',
+          bitbucket_repo_slug: cfg.bitbucket_repo_slug || '',
+          bitbucket_ref: cfg.bitbucket_ref || resolved,
+          bitbucket_auth_method: cfg.bitbucket_auth_method || 'pat',
+          github_auth_method: cfg.github_auth_method || 'pat',
+          ssh_private_key: '',
+        }));
+      } else {
+        setCiForm(f => ({ ...f, gitlab_ref: resolved, github_ref: resolved }));
+      }
     });
   }, [project?.id]);
 
@@ -162,15 +190,17 @@ export default function PipelineConfig({ project, envs, user }) {
   const availableSuites = suites.filter(s => !form.steps.find(st => st.suite_id === s.id));
 
   // ── CI/CD helpers ─────────────────────────────────────────────────────────
-  async function saveCiConfig() {
-    setCiSaving(true);
+  async function saveCiConfig(provider) {
+    setCiSaving(provider);
     try {
       await api.put(`/projects/${project.id}/ci/config`, ciForm);
       toast('CI/CD configuration saved', 'success');
       const { data } = await api.get(`/projects/${project.id}/ci/config`);
       if (data.config) setCiConfig(data.config);
+      // Clear sensitive fields from form — they're now stored; placeholder will show "saved" state
+      setCiForm(f => ({ ...f, ssh_private_key: '' }));
     } catch (e) { toast(e.response?.data?.error || 'Failed to save CI/CD configuration — check the provider token and repository name are correct.', 'error'); }
-    finally { setCiSaving(false); }
+    finally { setCiSaving(null); }
   }
 
   async function testCiConnection(provider) {
@@ -197,19 +227,14 @@ export default function PipelineConfig({ project, envs, user }) {
     finally { setCiCreatingToken(false); }
   }
 
-  async function generateYaml() {
-    setCiGenerating(true);
+  async function generateYaml(provider) {
+    setCiGenerating(provider);
     try {
       await api.put(`/projects/${project.id}/ci/config`, ciForm);
-      const providers = [];
-      if (ciForm.gitlab_enabled) providers.push('gitlab');
-      if (ciForm.github_enabled) providers.push('github');
-      if (ciForm.bitbucket_enabled) providers.push('bitbucket');
-      if (!providers.length) providers.push('gitlab', 'github', 'bitbucket');
-      const { data } = await api.post(`/projects/${project.id}/ci/generate-yaml`, { providers });
+      const { data } = await api.post(`/projects/${project.id}/ci/generate-yaml`, { providers: [provider] });
       toast(data.message || `Generated: ${data.created?.join(', ')}`, 'success');
     } catch (e) { toast(e.response?.data?.error || 'Generation failed', 'error'); }
-    finally { setCiGenerating(false); }
+    finally { setCiGenerating(null); }
   }
 
   function StatusBadge({ status }) {
@@ -263,16 +288,36 @@ export default function PipelineConfig({ project, envs, user }) {
                     <input style={ciInputStyle} value={ciForm.gitlab_project_id} onChange={e => setCiForm(f => ({ ...f, gitlab_project_id: e.target.value }))} placeholder="123456 or org/repo" />
                   </div>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Personal Access Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(api scope)</span></label>
-                    <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.gitlab_token} onChange={e => setCiForm(f => ({ ...f, gitlab_token: e.target.value }))} placeholder={ciConfig?.gitlab_token_set ? '(saved — enter new to replace)' : 'glpat-xxxxxxxxxxxx'} />
-                  </div>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Branch / Ref</label>
-                    <input style={ciInputStyle} value={ciForm.gitlab_ref} onChange={e => setCiForm(f => ({ ...f, gitlab_ref: e.target.value }))} placeholder="main" />
-                  </div>
+
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label className="form-label">Authentication Method</label>
+                  <AuthToggle value={ciForm.gitlab_auth_method} onChange={v => setCiForm(f => ({ ...f, gitlab_auth_method: v }))} />
                 </div>
+
+                {ciForm.gitlab_auth_method === 'pat' ? (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Personal Access Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(api scope)</span></label>
+                      <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.gitlab_token} onChange={e => setCiForm(f => ({ ...f, gitlab_token: e.target.value }))} placeholder={ciConfig?.gitlab_token_set ? '(saved — enter new to replace)' : 'glpat-xxxxxxxxxxxx'} />
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Branch / Ref</label>
+                      <input style={ciInputStyle} value={ciForm.gitlab_ref} onChange={e => setCiForm(f => ({ ...f, gitlab_ref: e.target.value }))} placeholder="main" />
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">SSH Private Key</label>
+                      <textarea style={{ ...ciInputStyle, fontFamily: 'monospace', fontSize: 11, minHeight: 90, resize: 'vertical' }} value={ciForm.ssh_private_key} onChange={e => setCiForm(f => ({ ...f, ssh_private_key: e.target.value }))} placeholder={ciConfig?.ssh_private_key_set ? '(saved — paste new key to replace)' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'} autoComplete="off" spellCheck={false} />
+                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>Add <strong>SSH_PRIVATE_KEY</strong> as a masked variable in GitLab → Settings → CI/CD → Variables</div>
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Branch / Ref</label>
+                      <input style={ciInputStyle} value={ciForm.gitlab_ref} onChange={e => setCiForm(f => ({ ...f, gitlab_ref: e.target.value }))} placeholder="main" />
+                    </div>
+                  </div>
+                )}
 
                 {/* Trigger token */}
                 <div style={{ padding: '12px 14px', background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0' }}>
@@ -289,11 +334,16 @@ export default function PipelineConfig({ project, envs, user }) {
                   </div>
                 </div>
 
-                {/* Test + result */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('gitlab')} disabled={ciTesting === 'gitlab'}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('gitlab')} disabled={!!ciTesting}>
                     {ciTesting === 'gitlab' ? <><span className="spinner"/> Testing…</> : <><i className="ti ti-wifi"/> Test Connection</>}
                   </button>
+                  <button className="btn-primary btn-sm" onClick={() => saveCiConfig('gitlab')} disabled={!!ciSaving}>
+                    {ciSaving === 'gitlab' ? <><span className="spinner"/> Saving…</> : <><i className="ti ti-device-floppy"/> Save Settings</>}
+                  </button>
+                  {isAdmin && <button className="btn-secondary btn-sm" onClick={() => generateYaml('gitlab')} disabled={!!ciGenerating} title="Generates .gitlab-ci.yml in your workspace">
+                    {ciGenerating === 'gitlab' ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML</>}
+                  </button>}
                   {ciTestResult.gitlab && (
                     <span style={{ fontSize: 12, color: ciTestResult.gitlab.ok ? '#16a34a' : '#dc2626', display: 'flex', alignItems: 'center', gap: 4 }}>
                       <i className={`ti ${ciTestResult.gitlab.ok ? 'ti-circle-check' : 'ti-circle-x'}`}/>
@@ -334,24 +384,50 @@ export default function PipelineConfig({ project, envs, user }) {
                     )}
                   </div>
                   <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Personal Access Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(workflow scope)</span></label>
-                    <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.github_token} onChange={e => setCiForm(f => ({ ...f, github_token: e.target.value }))} placeholder={ciConfig?.github_token_set ? '(saved — enter new to replace)' : 'ghp_xxxxxxxxxxxx'} />
-                  </div>
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label">Workflow file</label>
                     <input style={ciInputStyle} value={ciForm.github_workflow_file} onChange={e => setCiForm(f => ({ ...f, github_workflow_file: e.target.value }))} placeholder="perf-test.yml" />
                   </div>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Branch / Ref</label>
-                    <input style={ciInputStyle} value={ciForm.github_ref} onChange={e => setCiForm(f => ({ ...f, github_ref: e.target.value }))} placeholder="main" />
-                  </div>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('github')} disabled={ciTesting === 'github'}>
+
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label className="form-label">Authentication Method</label>
+                  <AuthToggle value={ciForm.github_auth_method} onChange={v => setCiForm(f => ({ ...f, github_auth_method: v }))} />
+                </div>
+
+                {ciForm.github_auth_method === 'pat' ? (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Personal Access Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(workflow scope)</span></label>
+                      <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.github_token} onChange={e => setCiForm(f => ({ ...f, github_token: e.target.value }))} placeholder={ciConfig?.github_token_set ? '(saved — enter new to replace)' : 'ghp_xxxxxxxxxxxx'} />
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Branch / Ref</label>
+                      <input style={ciInputStyle} value={ciForm.github_ref} onChange={e => setCiForm(f => ({ ...f, github_ref: e.target.value }))} placeholder="main" />
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">SSH Private Key</label>
+                      <textarea style={{ ...ciInputStyle, fontFamily: 'monospace', fontSize: 11, minHeight: 90, resize: 'vertical' }} value={ciForm.ssh_private_key} onChange={e => setCiForm(f => ({ ...f, ssh_private_key: e.target.value }))} placeholder={ciConfig?.ssh_private_key_set ? '(saved — paste new key to replace)' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'} autoComplete="off" spellCheck={false} />
+                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>Used to push workflow files from Peako to your repository. Not stored in GitHub Actions.</div>
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Branch / Ref</label>
+                      <input style={ciInputStyle} value={ciForm.github_ref} onChange={e => setCiForm(f => ({ ...f, github_ref: e.target.value }))} placeholder="main" />
+                    </div>
+                  </div>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('github')} disabled={!!ciTesting}>
                     {ciTesting === 'github' ? <><span className="spinner"/> Testing…</> : <><i className="ti ti-wifi"/> Test Connection</>}
                   </button>
+                  <button className="btn-primary btn-sm" onClick={() => saveCiConfig('github')} disabled={!!ciSaving}>
+                    {ciSaving === 'github' ? <><span className="spinner"/> Saving…</> : <><i className="ti ti-device-floppy"/> Save Settings</>}
+                  </button>
+                  {isAdmin && <button className="btn-secondary btn-sm" onClick={() => generateYaml('github')} disabled={!!ciGenerating} title="Generates .github/workflows/perf-test.yml in your workspace">
+                    {ciGenerating === 'github' ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML</>}
+                  </button>}
                   {ciTestResult.github && (
                     <span style={{ fontSize: 12, color: ciTestResult.github.ok ? '#16a34a' : '#dc2626', display: 'flex', alignItems: 'center', gap: 4 }}>
                       <i className={`ti ${ciTestResult.github.ok ? 'ti-circle-check' : 'ti-circle-x'}`}/>
@@ -391,28 +467,56 @@ export default function PipelineConfig({ project, envs, user }) {
                     <input style={ciInputStyle} value={ciForm.bitbucket_repo_slug} onChange={e => setCiForm(f => ({ ...f, bitbucket_repo_slug: e.target.value }))} placeholder="your-repo-name" />
                   </div>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">Username</label>
-                    <input style={ciInputStyle} value={ciForm.bitbucket_username} onChange={e => setCiForm(f => ({ ...f, bitbucket_username: e.target.value }))} placeholder="your-bitbucket-username" />
-                  </div>
-                  <div className="form-group" style={{ margin: 0 }}>
-                    <label className="form-label">App Password <span style={{ color: '#94a3b8', fontWeight: 400 }}>(Pipelines read/write)</span></label>
-                    <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.bitbucket_app_password} onChange={e => setCiForm(f => ({ ...f, bitbucket_app_password: e.target.value }))} placeholder={ciConfig?.bitbucket_app_password_set ? '(saved — enter new to replace)' : 'ATBBxxxxxxxxxxxx'} />
-                  </div>
+
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label className="form-label">Authentication Method</label>
+                  <AuthToggle value={ciForm.bitbucket_auth_method} onChange={v => setCiForm(f => ({ ...f, bitbucket_auth_method: v }))} />
                 </div>
+
+                {ciForm.bitbucket_auth_method === 'pat' ? (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Username</label>
+                      <input style={ciInputStyle} value={ciForm.bitbucket_username} onChange={e => setCiForm(f => ({ ...f, bitbucket_username: e.target.value }))} placeholder="your-bitbucket-username" />
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">App Password / API Token <span style={{ color: '#94a3b8', fontWeight: 400 }}>(Pipelines read/write)</span></label>
+                      <input style={ciInputStyle} type="password" autoComplete="off" value={ciForm.bitbucket_app_password} onChange={e => setCiForm(f => ({ ...f, bitbucket_app_password: e.target.value }))} placeholder={ciConfig?.bitbucket_app_password_set ? '(saved — enter new to replace)' : 'ATBBxxxx or API Token'} />
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">SSH Private Key</label>
+                      <textarea style={{ ...ciInputStyle, fontFamily: 'monospace', fontSize: 11, minHeight: 90, resize: 'vertical' }} value={ciForm.ssh_private_key} onChange={e => setCiForm(f => ({ ...f, ssh_private_key: e.target.value }))} placeholder={ciConfig?.ssh_private_key_set ? '(saved — paste new key to replace)' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'} autoComplete="off" spellCheck={false} />
+                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>Add <strong>SSH_PRIVATE_KEY</strong> as a secured variable in Bitbucket → Repository Settings → Repository Variables</div>
+                    </div>
+                    <div className="form-group" style={{ margin: 0 }}>
+                      <label className="form-label">Username</label>
+                      <input style={ciInputStyle} value={ciForm.bitbucket_username} onChange={e => setCiForm(f => ({ ...f, bitbucket_username: e.target.value }))} placeholder="your-bitbucket-username" />
+                    </div>
+                  </div>
+                )}
                 <div className="form-group" style={{ margin: 0 }}>
                   <label className="form-label">Branch / Ref</label>
                   <input style={ciInputStyle} value={ciForm.bitbucket_ref} onChange={e => setCiForm(f => ({ ...f, bitbucket_ref: e.target.value }))} placeholder="main" />
                 </div>
+                {ciForm.bitbucket_auth_method === 'pat' && (
                 <div style={{ padding: '10px 12px', background: '#eff6ff', borderRadius: 8, border: '1px solid #bfdbfe', fontSize: 12, color: '#1e40af' }}>
                   <i className="ti ti-info-circle" style={{ marginRight: 6 }}/>
                   Add <strong>BB_USERNAME</strong> and <strong>BB_APP_PASSWORD</strong> as secured <strong>Repository Variables</strong> in Bitbucket → Repository Settings → Repository Variables.
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('bitbucket')} disabled={ciTesting === 'bitbucket'}>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn-secondary btn-sm" onClick={() => testCiConnection('bitbucket')} disabled={!!ciTesting}>
                     {ciTesting === 'bitbucket' ? <><span className="spinner"/> Testing…</> : <><i className="ti ti-wifi"/> Test Connection</>}
                   </button>
+                  <button className="btn-primary btn-sm" onClick={() => saveCiConfig('bitbucket')} disabled={!!ciSaving}>
+                    {ciSaving === 'bitbucket' ? <><span className="spinner"/> Saving…</> : <><i className="ti ti-device-floppy"/> Save Settings</>}
+                  </button>
+                  {isAdmin && <button className="btn-secondary btn-sm" onClick={() => generateYaml('bitbucket')} disabled={!!ciGenerating} title="Generates bitbucket-pipelines.yml in your workspace">
+                    {ciGenerating === 'bitbucket' ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML</>}
+                  </button>}
                   {ciTestResult.bitbucket && (
                     <span style={{ fontSize: 12, color: ciTestResult.bitbucket.ok ? '#16a34a' : '#dc2626', display: 'flex', alignItems: 'center', gap: 4 }}>
                       <i className={`ti ${ciTestResult.bitbucket.ok ? 'ti-circle-check' : 'ti-circle-x'}`}/>
@@ -424,25 +528,6 @@ export default function PipelineConfig({ project, envs, user }) {
             )}
           </div>
 
-          {/* ── Actions ───────────────────────────────────────── */}
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button className="btn-primary" onClick={saveCiConfig} disabled={ciSaving}>
-              {ciSaving ? <><span className="spinner"/> Saving…</> : <><i className="ti ti-device-floppy"/> Save My Settings</>}
-            </button>
-            <button className="btn-secondary" onClick={generateYaml} disabled={ciGenerating} title="Generates .gitlab-ci.yml and/or .github/workflows/perf-test.yml in your workspace">
-              {ciGenerating ? <><span className="spinner"/> Generating…</> : <><i className="ti ti-file-code"/> Generate &amp; Commit YAML Files</>}
-            </button>
-          </div>
-          <div style={{ marginTop: 10, padding: '10px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, fontSize: 12, color: '#92400e' }}>
-            <i className="ti ti-alert-triangle" style={{ marginRight: 6 }}/>
-            <strong>Important:</strong> Pushing <code>.github/workflows/</code> files requires the <strong>"workflow" scope</strong> on your GitHub Personal Access Token.
-            {user?.role === 'user'
-              ? <> YAML is generated into <strong>your workspace</strong> — commit and push it to <strong>{userBranch}</strong> from Configuration → Git.</>
-              : <> YAML is generated into the <strong>admin workspace</strong> — commit and push it to <strong>main</strong> from Configuration → Git.</>
-            }
-            <br/><br/>
-            To add workflow scope: GitHub → Settings → Developer Settings → Personal Access Tokens → edit token → tick <strong>workflow</strong> → Save → update your PAT in Git Identity.
-          </div>
         </div>
     </div>
   );

@@ -31,6 +31,7 @@ const db            = require('../db');
 const auth          = require('../middleware/auth');
 const ownsProject   = require('../utils/ownsProject');
 const { encrypt, decrypt } = require('../utils/encryption');
+const { execSync, spawnSync } = require('child_process');
 
 router.use(auth);
 
@@ -84,6 +85,25 @@ function gitInstance(projectPath, extraEnv = {}) {
   });
 }
 
+// Run git directly via spawnSync — used for all network operations (push/pull/fetch/ls-remote)
+// because simple-git's env option does not reliably pass GIT_SSH_COMMAND on all platforms.
+function gitExec(args, cwd, extraEnv = {}) {
+  const result = spawnSync('git', args, {
+    cwd,
+    env: { ...process.env, ...NO_PROMPT_ENV, ...extraEnv },
+    timeout: 30000,
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (result.status !== 0) {
+    const msg = (result.stderr || result.stdout || `git ${args[0]} failed`).trim();
+    const err = new Error(msg);
+    err.gitStderr = result.stderr;
+    throw err;
+  }
+  return (result.stdout || '').trim();
+}
+
 /**
  * Write credential.helper='' into the repo's local .git/config.
  * This overrides Windows Git Credential Manager (GCM) at every config level
@@ -99,36 +119,88 @@ async function disableGcm(git) {
   } catch {}
 }
 
-// Write SSH private key to a temp file and return GIT_SSH_COMMAND env + cleanup fn
-function createSshEnv(privateKey) {
+// Extract the hostname from any git remote URL format
+function extractSshHostname(remoteUrl) {
+  if (!remoteUrl) return null;
+  // SSH format: git@github.com:user/repo.git
+  const sshMatch = remoteUrl.match(/^[^@]+@([^:]+):/);
+  if (sshMatch) return sshMatch[1];
+  // HTTPS format: https://github.com/user/repo.git
+  try { return new URL(remoteUrl).hostname; } catch {}
+  return null;
+}
+
+// Write SSH private key to a temp file and return GIT_SSH_COMMAND env + cleanup fn.
+// Pre-populates a temp known_hosts via ssh-keyscan so host key verification passes
+// on every OS (Windows, Linux, macOS, Docker) without relying on system known_hosts.
+function createSshEnv(privateKey, remoteUrl = null) {
   if (!privateKey?.trim()) return { env: {}, cleanup: () => {} };
-  const tmpPath = path.join(os.tmpdir(), `ps_ssh_${randomBytes(8).toString('hex')}`);
-  fs.writeFileSync(tmpPath, privateKey.trim() + '\n', { mode: 0o600 });
+  const id = randomBytes(8).toString('hex');
+  const tmpPath = path.join(os.tmpdir(), `ps_ssh_${id}`);
+  const knownHostsPath = path.join(os.tmpdir(), `ps_kh_${id}`);
+
+  // Normalize line endings — keys pasted on Windows may have \r\n which SSH rejects
+  const normalizedKey = privateKey.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  fs.writeFileSync(tmpPath, normalizedKey + '\n', { mode: 0o600 });
+
+  // Scan the target host's public key and write it into a temp known_hosts file.
+  // Use spawnSync (not execSync) so we capture stdout even when the exit code is
+  // non-zero — ssh-keyscan exits non-zero when some key types are unavailable but
+  // still writes the keys it did find to stdout.
+  let knownHostsContent = '';
+  const hostname = extractSshHostname(remoteUrl);
+  if (hostname) {
+    try {
+      const result = spawnSync(
+        'ssh-keyscan',
+        ['-H', '-t', 'ed25519,rsa,ecdsa', hostname],
+        { timeout: 10000, windowsHide: true, encoding: 'utf8' }
+      );
+      const raw = (result.stdout || '').trim();
+      if (raw) {
+        // Normalize line endings — on Windows ssh-keyscan may output \r\n
+        knownHostsContent = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n') + '\n';
+      }
+    } catch { /* network issue — fall back to StrictHostKeyChecking=no */ }
+  }
+  fs.writeFileSync(knownHostsPath, knownHostsContent, { mode: 0o600 });
+
   // Use forward slashes — required for ssh on Windows with Git for Windows
   const sshPath = tmpPath.replace(/\\/g, '/');
-  const env = { GIT_SSH_COMMAND: `ssh -i "${sshPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` };
-  const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };
+  const khPath  = knownHostsPath.replace(/\\/g, '/');
+  // If keyscan produced entries use strict checking; otherwise skip host key check
+  const strictCheck = knownHostsContent.trim() ? 'yes' : 'no';
+  const sshCmd = `ssh -i "${sshPath}" -o StrictHostKeyChecking=${strictCheck} -o UserKnownHostsFile="${khPath}" -o BatchMode=yes`;
+  console.log('[SSH] keyscan lines:', knownHostsContent.trim().split('\n').length, '| strictCheck:', strictCheck);
+  console.log('[SSH] GIT_SSH_COMMAND:', sshCmd);
+  const env = { GIT_SSH_COMMAND: sshCmd };
+  const cleanup = () => {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    try { fs.unlinkSync(knownHostsPath); } catch {}
+  };
   return { env, cleanup };
 }
 
-// Resolve effective auth (SSH or PAT) for a user on a project
+// Resolve effective auth (SSH or PAT) for a user on a project.
+// Each user's auth_method is their own independent choice — never inherit from project cfg.
 function getAuth(cfg, userId, projectId) {
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(userId, projectId);
-  const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
+  const authMethod = identity?.auth_method || 'pat';
 
   if (authMethod === 'ssh') {
-    const rawKey = identity?.ssh_key ? decrypt(identity.ssh_key) : '';
+    const rawKey = identity?.ssh_key ? decrypt(identity.ssh_key).trim() : '';
+    const sshRemote = toSshUrl(cfg.remote_url);
     if (rawKey) {
-      const { env, cleanup } = createSshEnv(rawKey);
-      return { isSSH: true, remoteUrl: cfg.remote_url, sshEnv: env, cleanup };
+      const { env, cleanup } = createSshEnv(rawKey, sshRemote);
+      return { isSSH: true, remoteUrl: sshRemote, sshEnv: env, cleanup };
     }
-    return { isSSH: true, remoteUrl: cfg.remote_url, sshEnv: {}, cleanup: () => {} };
+    return { isSSH: true, remoteUrl: sshRemote, sshEnv: {}, cleanup: () => {} };
   }
 
-  // PAT mode
+  // PAT mode — buildRemoteWithAuth converts SSH URLs → HTTPS automatically
   const projectToken  = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
-  const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : '';
+  const personalToken = identity?.auth_token ? decrypt(identity.auth_token).trim() : '';
   const effectiveToken = personalToken || projectToken;
   return {
     isSSH: false,
@@ -178,37 +250,54 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(user.id, cfg.project_id);
 
-  const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
+  // Each user's auth_method is their own choice — never inherit from the project cfg.
+  // Default to 'pat' when the user hasn't saved a Git Identity yet.
+  const authMethod = identity?.auth_method || 'pat';
   const isSSHMode  = authMethod === 'ssh';
 
   let remoteForOps, sshEnv = {}, sshCleanup = () => {};
 
   if (isSSHMode) {
-    const rawKey = identity?.ssh_key ? decrypt(identity.ssh_key) : '';
+    // Convert HTTPS remote URL → SSH format if needed
+    // (admin may have stored HTTPS but this user prefers SSH)
+    const sshRemote = toSshUrl(cfg.remote_url);
+
+    // Try user's own SSH key first; fall back to the admin's key for initial clone
+    let rawKey = identity?.ssh_key ? decrypt(identity.ssh_key).trim() : '';
+    if (!rawKey && cfg.project_id) {
+      const adminIdentity = db.prepare(
+        `SELECT ugc.ssh_key FROM user_git_configs ugc
+         JOIN users u ON u.id = ugc.user_id
+         WHERE ugc.project_id = ? AND u.role IN ('org_admin','super_admin')
+         AND ugc.ssh_key IS NOT NULL AND ugc.ssh_key != ''
+         ORDER BY ugc.id LIMIT 1`
+      ).get(cfg.project_id);
+      if (adminIdentity?.ssh_key) rawKey = decrypt(adminIdentity.ssh_key).trim();
+    }
     if (rawKey) {
-      const r = createSshEnv(rawKey);
+      const r = createSshEnv(rawKey, sshRemote);
       sshEnv    = r.env;
       sshCleanup = r.cleanup;
     }
-    remoteForOps = cfg.remote_url;
+    remoteForOps = sshRemote;
   } else {
     const token         = cfg.auth_token      ? decrypt(cfg.auth_token)      : '';
-    const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : token;
+    const personalToken = identity?.auth_token ? decrypt(identity.auth_token).trim() : '';
+    // buildRemoteWithAuth already converts SSH URLs → HTTPS when a token is provided
     remoteForOps = buildRemoteWithAuth(cfg.remote_url, cfg.username, personalToken || token);
   }
 
   if (!fs.existsSync(path.join(gitRoot, '.git'))) {
     const dirExists = fs.existsSync(gitRoot);
     const isEmpty   = !dirExists || fs.readdirSync(gitRoot).length === 0;
-    const cloneGit  = simpleGit({ env: { ...process.env, ...NO_PROMPT_ENV, ...sshEnv } });
 
     if (isEmpty) {
       fs.mkdirSync(gitRoot, { recursive: true });
-      await cloneGit.clone(remoteForOps, gitRoot);
+      gitExec(['clone', remoteForOps, gitRoot], os.tmpdir(), sshEnv);
     } else {
       const tmpDir = gitRoot + '_clone_tmp';
       if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
-      await cloneGit.clone(remoteForOps, tmpDir);
+      gitExec(['clone', remoteForOps, tmpDir], os.tmpdir(), sshEnv);
       fs.renameSync(path.join(tmpDir, '.git'), path.join(gitRoot, '.git'));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -265,18 +354,40 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
     }
   } catch (_) { /* non-fatal — workspace still usable */ }
 
-  return { git, remoteWithAuth: remoteForOps, authorName, authorEmail, identity, sshCleanup };
+  return { git, remoteWithAuth: remoteForOps, sshEnv, authorName, authorEmail, identity, sshCleanup };
+}
+
+// Convert HTTPS remote URL to SSH format, leave SSH URLs unchanged.
+// https://github.com/owner/repo.git  →  git@github.com:owner/repo.git
+function toSshUrl(url) {
+  if (!url) return url;
+  if (url.startsWith('git@')) return url; // already SSH
+  try {
+    const httpsMatch = url.match(/^https?:\/\/(?:[^@]+@)?([^/]+)\/(.+?)(?:\.git)?$/);
+    if (httpsMatch) return `git@${httpsMatch[1]}:${httpsMatch[2]}.git`;
+  } catch {}
+  return url;
 }
 
 function buildRemoteWithAuth(url, username, token) {
-  // Inject PAT into HTTPS URL for GitHub authentication.
-  // Most reliable format: https://TOKEN@github.com/owner/repo.git
-  // This works for both classic PATs (ghp_...) and fine-grained tokens (github_pat_...)
+  // Inject PAT into HTTPS URL for GitHub/GitLab/Bitbucket authentication.
+  // If the stored remote_url is SSH format (git@host:owner/repo.git), convert it
+  // to HTTPS first — a PAT cannot authenticate over SSH protocol.
   if (!token) return url;
   try {
-    // Strip any existing credentials first
-    const clean = url.replace(/^(https?:\/\/)[^@]+@/, '$1');
-    // Inject token — use token as username, empty password
+    let httpsUrl = url;
+    // Convert SSH → HTTPS: git@github.com:owner/repo.git → https://github.com/owner/repo.git
+    const sshMatch = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+    if (sshMatch) {
+      httpsUrl = `https://${sshMatch[1]}/${sshMatch[2]}.git`;
+    }
+    // Strip any existing credentials
+    const clean = httpsUrl.replace(/^(https?:\/\/)[^@]+@/, '$1');
+    // Bitbucket requires x-token-auth:{token} for API tokens (also works for
+    // App Passwords). GitHub/GitLab accept bare token-only format.
+    if (/bitbucket\.org/i.test(clean)) {
+      return clean.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(token)}@`);
+    }
     return clean.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(token)}@`);
   } catch {
     return url;
@@ -689,16 +800,18 @@ ${proj.name}/
     }
 
     // 2. Push — handle remote that was created with a README or other initial content.
+    //    Use gitExec for all network operations so GIT_SSH_COMMAND is reliably applied.
     //    Strategy:
     //      a) If remote already has the base branch: fetch + merge (--allow-unrelated-histories).
     //         If the merge produces conflicts (e.g. both sides have README/.gitignore),
     //         resolve by keeping our version, then regular push.
     //      b) If remote is empty: force-push to seed it.
     let pushed = false;
-    const remoteRefs = await git.raw(['ls-remote', '--heads', 'origin']).catch(() => '');
+    let remoteRefs = '';
+    try { remoteRefs = gitExec(['ls-remote', '--heads', 'origin'], gitRoot, sshEnv); } catch {}
     if (remoteRefs.includes(`refs/heads/${baseBranch}`)) {
       // Remote already has the base branch — must use merge path
-      await git.fetch(['origin', baseBranch]);
+      gitExec(['fetch', 'origin', baseBranch], gitRoot, sshEnv);
       try {
         await git.merge(['FETCH_HEAD', '--allow-unrelated-histories', '--no-edit', '-m', 'Initialize: merge remote state']);
       } catch (_mergeErr) {
@@ -708,13 +821,13 @@ ${proj.name}/
         await git.commit('Initialize: PerfStudio project structure (resolved merge)');
       }
       await disableGcm(git);
-      await git.push(['--set-upstream', 'origin', baseBranch]);
+      gitExec(['push', '--set-upstream', 'origin', baseBranch], gitRoot, sshEnv);
       pushed = true;
     }
 
     if (!pushed) {
       // Remote is empty — seed it with a force-push
-      await git.raw(['push', '--force', '--set-upstream', 'origin', baseBranch]);
+      gitExec(['push', '--force', '--set-upstream', 'origin', baseBranch], gitRoot, sshEnv);
     }
 
     // 3. Apply branch protection after push
@@ -753,35 +866,25 @@ router.get('/status', async (req, res) => {
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
-    const status = await git.status();
-    const branch = status.current;
 
-    // Get line-level additions/deletions for tracked changed files
+    // Run status + numstat in parallel — previously sequential, adding ~1-2s
+    const [status, numstatOut] = await Promise.all([
+      git.status(),
+      git.raw(['diff', 'HEAD', '--numstat']).catch(() => ''),
+    ]);
+
     let totalAdded = 0, totalDeleted = 0;
-    try {
-      // --numstat gives: <added>\t<deleted>\t<file> for each changed tracked file
-      const numstatTracked = await git.raw(['diff', 'HEAD', '--numstat']);
-      for (const line of numstatTracked.trim().split('\n').filter(Boolean)) {
-        const [a, d] = line.split('\t');
-        if (!isNaN(parseInt(a))) totalAdded   += parseInt(a);
-        if (!isNaN(parseInt(d))) totalDeleted += parseInt(d);
-      }
-    } catch {}
-
-    // Count lines in untracked files as additions (they are entirely new)
-    for (const uf of status.not_added) {
-      try {
-        const absPath = path.join(gitDir, uf);
-        if (fs.existsSync(absPath)) {
-          const content = fs.readFileSync(absPath, 'utf8');
-          totalAdded += content.split('\n').length;
-        }
-      } catch {}
+    for (const line of numstatOut.trim().split('\n').filter(Boolean)) {
+      const [a, d] = line.split('\t');
+      if (!isNaN(parseInt(a))) totalAdded   += parseInt(a);
+      if (!isNaN(parseInt(d))) totalDeleted += parseInt(d);
     }
+    // Count untracked files as additions (file count, not line count — avoids reading every file)
+    totalAdded += status.not_added.length;
 
     res.json({
       initialized: true,
-      branch,
+      branch: status.current,
       modified: status.modified,
       not_added: status.not_added,
       deleted: status.deleted,
@@ -883,7 +986,7 @@ router.post('/push', async (req, res) => {
     await git.remote(['set-url', 'origin', remoteUrl]);
 
     await disableGcm(git);
-    await git.push(['--set-upstream', 'origin', branch]);
+    gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
 
     // Mark commits as pushed
     db.prepare("UPDATE git_commits SET pushed=1 WHERE project_id=? AND branch=? AND pushed=0")
@@ -920,7 +1023,7 @@ router.post('/pull', async (req, res) => {
     // Check if the user's branch exists on the remote
     let remoteBranches = [];
     try {
-      const lsRemote = await git.listRemote(['--heads', 'origin']);
+      const lsRemote = gitExec(['ls-remote', '--heads', 'origin'], gitDir, sshEnv);
       remoteBranches = lsRemote.split('\n')
         .map(l => l.replace(/.*refs\/heads\//, '').trim())
         .filter(Boolean);
@@ -931,7 +1034,7 @@ router.post('/pull', async (req, res) => {
     if (branchExistsOnRemote) {
       // Branch exists on remote — pull directly from it
       await git.checkout(branch).catch(() => git.checkout(['-b', branch, `origin/${branch}`]));
-      await git.pull('origin', branch, { '--rebase': 'false' });
+      gitExec(['pull', 'origin', branch, '--no-rebase'], gitDir, sshEnv);
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
     } else {
       // Branch doesn't exist on remote yet:
@@ -939,7 +1042,7 @@ router.post('/pull', async (req, res) => {
       // 2. Create local branch from it (or sync if it already exists locally)
       // 3. Push the branch to remote immediately — so it exists for future pulls
       const baseBranch = getBaseBranch(cfg);
-      await git.fetch('origin', baseBranch);
+      gitExec(['fetch', 'origin', baseBranch], gitDir, sshEnv);
 
       const localBranches = await git.branchLocal();
       if (!localBranches.all.includes(branch)) {
@@ -951,7 +1054,7 @@ router.post('/pull', async (req, res) => {
 
       // Auto-push to create the remote branch so future pulls work seamlessly
       await disableGcm(git);
-      await git.push(['--set-upstream', 'origin', branch]);
+      gitExec(['push', '--set-upstream', 'origin', branch], gitDir, sshEnv);
 
       // Protect feature branch: no force-push, no deletion (but no PR review required)
       await applyBranchProtection({ ...cfg, _featureBranch: true }, branch);
@@ -1112,19 +1215,19 @@ router.put('/prs/:prId/merge', async (req, res) => {
     await git.remote(['set-url', 'origin', mergeRemoteUrl]);
 
     // Fetch the feature branch
-    await git.fetch('origin', pr.from_branch);
+    gitExec(['fetch', 'origin', pr.from_branch], gitDir, mergeSshEnv);
 
     const baseBranch = getBaseBranch(cfg);
     // Switch to base branch
     await git.checkout(baseBranch);
-    await git.pull('origin', baseBranch, { '--rebase': 'false' });
+    gitExec(['pull', 'origin', baseBranch, '--no-rebase'], gitDir, mergeSshEnv);
 
     // Merge feature branch
     await git.merge([`origin/${pr.from_branch}`, '--no-ff', '--allow-unrelated-histories', '-m', `Merge PR: ${pr.title}`]);
 
     // Push merged base branch
     await disableGcm(git);
-    await git.push('origin', baseBranch);
+    gitExec(['push', 'origin', baseBranch], gitDir, mergeSshEnv);
 
     // ── Also merge on GitHub if PR has a remote URL ─────────────────────────
     if (pr.remote_pr_url) {
@@ -1275,20 +1378,21 @@ router.post('/branch', async (req, res) => {
   const branchName = (req.body.branch_name || '').trim() || identity?.branch_name;
   if (!branchName) return res.status(400).json({ error: 'Enter a branch name in Git Identity first.' });
 
-  // For regular users, require a personal PAT/SSH key so the push is attributed to their account
+  // For regular users, require a personal PAT/SSH key so the push is attributed to their account.
+  // Each user's auth_method is their own choice — never fall back to the project/admin method.
   const isAdmin = caller.role === 'org_admin' || caller.role === 'super_admin';
   if (!isAdmin) {
-    const authMethod = identity?.auth_method || cfg?.auth_method || 'pat';
-    const hasPersonalToken = identity?.auth_token && identity.auth_token.trim();
-    const hasPersonalSshKey = identity?.ssh_key && identity.ssh_key.trim();
+    const authMethod = identity?.auth_method || 'pat';
+    const hasPersonalToken  = !!(identity?.auth_token  && decrypt(identity.auth_token).trim());
+    const hasPersonalSshKey = !!(identity?.ssh_key     && decrypt(identity.ssh_key).trim());
     if (authMethod === 'ssh' && !hasPersonalSshKey) {
       return res.status(400).json({
-        error: 'Please save your SSH key in Git Identity before creating a branch.',
+        error: 'Please save your SSH private key in Git Identity before creating a branch.',
       });
     }
     if (authMethod !== 'ssh' && !hasPersonalToken) {
       return res.status(400).json({
-        error: 'Please save your Personal Access Token in Git Identity before creating a branch. Without it, the branch would be pushed under the org admin\'s GitHub account.',
+        error: 'Please save your Personal Access Token in Git Identity before creating a branch.',
       });
     }
   }
@@ -1308,13 +1412,13 @@ router.post('/branch', async (req, res) => {
     }
     const baseBranch = getBaseBranch(cfg);
     // Create from latest base branch
-    try { await git.fetch('origin', baseBranch); } catch {}
+    try { gitExec(['fetch', 'origin', baseBranch], gitRoot, r.sshEnv || {}); } catch {}
     try { await git.checkout(baseBranch); } catch {}
     await git.checkoutLocalBranch(branchName);
 
     // Push branch to remote and apply protection
     await disableGcm(git);
-    await git.push(['--set-upstream', 'origin', branchName]);
+    gitExec(['push', '--set-upstream', 'origin', branchName], gitRoot, r.sshEnv || {});
     await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
 
     res.json({ message: `Branch "${branchName}" created from ${baseBranch} and pushed to remote.`, branch: branchName });
@@ -1535,8 +1639,8 @@ router.post('/fetch', async (req, res) => {
     const gitDir = getUserWorkspace(proj, caller);
     const r = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
     sshCleanup = r.sshCleanup || (() => {});
-    const result = await r.git.fetch(r.remoteWithAuth);
-    res.json({ ok: true, message: 'Fetched latest from remote successfully.', output: result });
+    gitExec(['fetch', '--all'], gitDir, r.sshEnv || {});
+    res.json({ ok: true, message: 'Fetched latest from remote successfully.' });
   } catch (e) {
     res.status(500).json({ error: `Fetch failed: ${e.message}. Verify your access token and network connectivity.` });
   } finally {
@@ -1558,8 +1662,22 @@ router.post('/test', async (req, res) => {
       if (!sshEnv.GIT_SSH_COMMAND) {
         return res.status(400).json({ error: 'No SSH key configured. Add your private key in Git Identity first.' });
       }
-      const git = simpleGit({ env: { ...process.env, ...sshEnv } });
-      await git.listRemote(['--heads', remoteUrl]);
+      // Use spawnSync directly — bypasses any simple-git env-passing quirks
+      const mergedEnv = { ...process.env, ...NO_PROMPT_ENV, ...sshEnv };
+      console.log('[SSH Test] Running: git ls-remote --heads', remoteUrl);
+      const result = spawnSync('git', ['ls-remote', '--heads', remoteUrl], {
+        env: mergedEnv,
+        timeout: 15000,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      console.log('[SSH Test] exit code:', result.status);
+      console.log('[SSH Test] stdout:', result.stdout?.slice(0, 200));
+      console.log('[SSH Test] stderr:', result.stderr?.slice(0, 500));
+      if (result.status !== 0) {
+        const errMsg = result.stderr || result.stdout || 'Unknown SSH error';
+        return res.status(400).json({ ok: false, error: 'Connection failed: ' + errMsg.trim() });
+      }
       res.json({ ok: true, message: 'SSH connection successful! Repository is accessible.', token_preview: 'SSH key' });
     } else {
       const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
@@ -1591,7 +1709,7 @@ router.post('/sync', async (req, res) => {
     sshCleanup = r.sshCleanup || (() => {});
     const branch = r.identity?.branch_name || getBranchForUser(caller, cfg);
     const baseBranch = getBaseBranch(cfg);
-    await r.git.fetch(r.remoteWithAuth, baseBranch);
+    gitExec(['fetch', 'origin', baseBranch], gitDir, r.sshEnv || {});
     const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
       const branches = await r.git.branchLocal();

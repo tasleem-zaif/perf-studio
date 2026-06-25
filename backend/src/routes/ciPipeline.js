@@ -21,6 +21,9 @@ const https   = require('https');
 const http    = require('http');
 const path    = require('path');
 const fs      = require('fs');
+const os      = require('os');
+const { randomBytes } = require('crypto');
+const { spawnSync } = require('child_process');
 
 router.use(auth);
 
@@ -31,8 +34,16 @@ function getConfig(projectId, userId) {
   if (userId) {
     const own = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId);
     if (own) return own;
+    // Fall back to the project admin's config so regular users inherit SSH keys/tokens set up at admin level
+    const adminCfg = db.prepare(`
+      SELECT cpc.* FROM ci_pipeline_configs cpc
+      JOIN users u ON u.id = cpc.user_id
+      WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
+      ORDER BY cpc.updated_at DESC LIMIT 1
+    `).get(projectId);
+    if (adminCfg) return adminCfg;
   }
-  // Legacy shared config (user_id IS NULL) — used as read-only template if the user hasn't saved their own yet
+  // Legacy shared config (user_id IS NULL)
   return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId) || null;
 }
 
@@ -40,10 +51,11 @@ function decryptConfig(cfg) {
   if (!cfg) return null;
   return {
     ...cfg,
-    gitlab_token:          cfg.gitlab_token          ? decrypt(cfg.gitlab_token)          : '',
-    gitlab_trigger_token:  cfg.gitlab_trigger_token  ? decrypt(cfg.gitlab_trigger_token)  : '',
-    github_token:          cfg.github_token          ? decrypt(cfg.github_token)          : '',
+    gitlab_token:           cfg.gitlab_token           ? decrypt(cfg.gitlab_token)           : '',
+    gitlab_trigger_token:   cfg.gitlab_trigger_token   ? decrypt(cfg.gitlab_trigger_token)   : '',
+    github_token:           cfg.github_token           ? decrypt(cfg.github_token)           : '',
     bitbucket_app_password: cfg.bitbucket_app_password ? decrypt(cfg.bitbucket_app_password) : '',
+    ssh_private_key:        cfg.ssh_private_key        ? decrypt(cfg.ssh_private_key)        : '',
   };
 }
 
@@ -145,14 +157,16 @@ router.get('/config', (req, res) => {
     config: {
       ...cfg,
       github_repo,
-      gitlab_token:              cfg.gitlab_token          ? '••••••••' : '',
-      gitlab_trigger_token:      cfg.gitlab_trigger_token  ? '••••••••' : '',
-      github_token:              cfg.github_token          ? '••••••••' : '',
+      gitlab_token:              cfg.gitlab_token           ? '••••••••' : '',
+      gitlab_trigger_token:      cfg.gitlab_trigger_token   ? '••••••••' : '',
+      github_token:              cfg.github_token           ? '••••••••' : '',
       bitbucket_app_password:    cfg.bitbucket_app_password ? '••••••••' : '',
+      ssh_private_key:           cfg.ssh_private_key        ? '••••••••' : '',
       gitlab_token_set:          !!cfg.gitlab_token,
       gitlab_trigger_token_set:  !!cfg.gitlab_trigger_token,
       github_token_set:          !!cfg.github_token,
       bitbucket_app_password_set: !!cfg.bitbucket_app_password,
+      ssh_private_key_set:       !!cfg.ssh_private_key,
     },
   });
 });
@@ -169,8 +183,11 @@ router.put('/config', (req, res) => {
   // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
-    github_enabled, github_token, github_workflow_file, github_ref,
+    gitlab_auth_method,
+    github_enabled, github_token, github_workflow_file, github_ref, github_auth_method,
     bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref,
+    bitbucket_auth_method,
+    ssh_private_key,
   } = req.body;
 
   // Sanitize github_repo: strip full URLs, reject email addresses
@@ -182,47 +199,104 @@ router.put('/config', (req, res) => {
   const gitCfgDefault = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const defaultBranch = gitCfgDefault?.base_branch || 'main';
 
-  const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'                   ? encrypt(gitlab_token)                   : existing?.gitlab_token              || '';
-  const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••'   ? encrypt(gitlab_trigger_token)           : existing?.gitlab_trigger_token       || '';
-  const encGithubToken        = github_token && github_token !== '••••••••'                   ? encrypt(github_token)                   : existing?.github_token              || '';
-  const encBitbucketPassword  = bitbucket_app_password && bitbucket_app_password !== '••••••••' ? encrypt(bitbucket_app_password)       : existing?.bitbucket_app_password     || '';
+  const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'                     ? encrypt(gitlab_token)           : existing?.gitlab_token              || '';
+  const encGitlabTriggerToken = gitlab_trigger_token && gitlab_trigger_token !== '••••••••'     ? encrypt(gitlab_trigger_token)   : existing?.gitlab_trigger_token       || '';
+  const encGithubToken        = github_token && github_token !== '••••••••'                     ? encrypt(github_token)           : existing?.github_token              || '';
+  const encBitbucketPassword  = bitbucket_app_password && bitbucket_app_password !== '••••••••' ? encrypt(bitbucket_app_password) : existing?.bitbucket_app_password     || '';
+  const normalizedSshKey      = ssh_private_key && ssh_private_key !== '••••••••'
+    ? ssh_private_key.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    : null;
+  const encSshKey             = normalizedSshKey ? encrypt(normalizedSshKey) : (existing?.ssh_private_key || '');
 
   if (existing) {
     db.prepare(`UPDATE ci_pipeline_configs SET
       gitlab_enabled=?, gitlab_url=?, gitlab_project_id=?, gitlab_token=?,
-      gitlab_trigger_token=?, gitlab_ref=?,
-      github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?,
-      bitbucket_enabled=?, bitbucket_workspace=?, bitbucket_username=?, bitbucket_app_password=?, bitbucket_repo_slug=?, bitbucket_ref=?,
-      updated_at=datetime('now')
+      gitlab_trigger_token=?, gitlab_ref=?, gitlab_auth_method=?,
+      github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?, github_auth_method=?,
+      bitbucket_enabled=?, bitbucket_workspace=?, bitbucket_username=?, bitbucket_app_password=?, bitbucket_repo_slug=?, bitbucket_ref=?, bitbucket_auth_method=?,
+      ssh_private_key=?, updated_at=datetime('now')
       WHERE project_id=? AND user_id=?`
     ).run(
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
-      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
+      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch, gitlab_auth_method || 'pat',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
-      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch,
+      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch, github_auth_method || 'pat',
       bitbucket_enabled ? 1 : 0, bitbucket_workspace || '', bitbucket_username || '',
-      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch,
+      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch, bitbucket_auth_method || 'pat',
+      encSshKey,
       req.params.projectId, req.userId
     );
   } else {
     db.prepare(`INSERT INTO ci_pipeline_configs
-      (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
-       github_enabled, github_repo, github_token, github_workflow_file, github_ref,
-       bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref, gitlab_auth_method,
+       github_enabled, github_repo, github_token, github_workflow_file, github_ref, github_auth_method,
+       bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref, bitbucket_auth_method,
+       ssh_private_key)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
       req.params.projectId, req.userId,
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
-      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch,
+      encGitlabToken, encGitlabTriggerToken, gitlab_ref || defaultBranch, gitlab_auth_method || 'pat',
       github_enabled ? 1 : 0, github_repo || '', encGithubToken,
-      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch,
+      github_workflow_file || 'perf-test.yml', github_ref || defaultBranch, github_auth_method || 'pat',
       bitbucket_enabled ? 1 : 0, bitbucket_workspace || '', bitbucket_username || '',
-      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch
+      encBitbucketPassword, bitbucket_repo_slug || '', bitbucket_ref || defaultBranch, bitbucket_auth_method || 'pat',
+      encSshKey
     );
   }
 
   res.json({ ok: true });
 });
+
+// ── SSH test helper ───────────────────────────────────────────────────────────
+function testSshConnection(privateKey, host) {
+  const id = randomBytes(8).toString('hex');
+  const keyPath = path.join(os.tmpdir(), `ps_ci_ssh_${id}`);
+  const khPath  = path.join(os.tmpdir(), `ps_ci_kh_${id}`);
+  try {
+    const normalizedKey = privateKey.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    fs.writeFileSync(keyPath, normalizedKey + '\n', { mode: 0o600 });
+
+    // Windows: strip inherited ACLs and grant only the current user — SSH rejects world-readable keys
+    if (os.platform() === 'win32') {
+      const username = process.env.USERNAME || process.env.USER || 'User';
+      spawnSync('icacls', [keyPath, '/inheritance:r', '/grant:r', `${username}:F`], { windowsHide: true });
+    }
+
+    // Pre-populate known_hosts so StrictHostKeyChecking=yes works
+    const scan = spawnSync('ssh-keyscan', ['-H', '-t', 'ed25519,rsa,ecdsa', host], {
+      timeout: 10000, windowsHide: true, encoding: 'utf8',
+    });
+    const khContent = (scan.stdout || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+    fs.writeFileSync(khPath, khContent ? khContent + '\n' : '', { mode: 0o600 });
+
+    const strictCheck = khContent ? 'yes' : 'no';
+    const sshArgs = [
+      '-T', `git@${host}`,
+      '-i', keyPath.replace(/\\/g, '/'),
+      '-o', `StrictHostKeyChecking=${strictCheck}`,
+      '-o', `UserKnownHostsFile=${khPath.replace(/\\/g, '/')}`,
+      '-o', 'BatchMode=yes',
+      '-o', 'ConnectTimeout=10',
+    ];
+
+    const result = spawnSync('ssh', sshArgs, {
+      timeout: 15000, windowsHide: true, encoding: 'utf8',
+    });
+
+    // SSH -T exits non-zero but prints success message to stderr
+    const output = (result.stderr || '') + (result.stdout || '');
+    if (/successfully authenticated|welcome to gitlab|logged in as/i.test(output)) {
+      const match = output.match(/Hi ([^!]+)!|welcome to gitlab.*?([a-z0-9_.-]+)/i);
+      const user = match ? (match[1] || match[2]) : 'unknown';
+      return { ok: true, message: `SSH authenticated as: ${user.trim()}` };
+    }
+    return { ok: false, message: output.trim() || `SSH exit code ${result.status}` };
+  } finally {
+    try { fs.unlinkSync(keyPath); } catch {}
+    try { fs.unlinkSync(khPath); } catch {}
+  }
+}
 
 // ── POST /config/test — test connection ───────────────────────────────────────
 router.post('/config/test', async (req, res) => {
@@ -233,6 +307,12 @@ router.post('/config/test', async (req, res) => {
 
   try {
     if (provider === 'gitlab') {
+      if (cfg.gitlab_auth_method === 'ssh') {
+        if (!cfg.ssh_private_key) return res.status(400).json({ error: 'SSH private key not set. Save it in Settings first.' });
+        const gitlabHost = (() => { try { return new URL(cfg.gitlab_url || 'https://gitlab.com').hostname; } catch { return 'gitlab.com'; } })();
+        const r = testSshConnection(cfg.ssh_private_key, gitlabHost);
+        return r.ok ? res.json(r) : res.status(400).json({ error: r.message });
+      }
       if (!cfg.gitlab_token) return res.status(400).json({ error: 'GitLab access token not set.' });
       const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
       const r = await apiRequest(`${gitlabUrl}/api/v4/user`, 'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token });
@@ -241,6 +321,11 @@ router.post('/config/test', async (req, res) => {
     }
 
     if (provider === 'github') {
+      if (cfg.github_auth_method === 'ssh') {
+        if (!cfg.ssh_private_key) return res.status(400).json({ error: 'SSH private key not set. Save it in Settings first.' });
+        const r = testSshConnection(cfg.ssh_private_key, 'github.com');
+        return r.ok ? res.json(r) : res.status(400).json({ error: r.message });
+      }
       if (!cfg.github_token) return res.status(400).json({ error: 'GitHub token not set.' });
       const r = await apiRequest('https://api.github.com/user', 'GET', null, {
         Authorization: `token ${cfg.github_token}`,
@@ -252,11 +337,16 @@ router.post('/config/test', async (req, res) => {
     }
 
     if (provider === 'bitbucket') {
-      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+      if (cfg.bitbucket_auth_method === 'ssh') {
+        if (!cfg.ssh_private_key) return res.status(400).json({ error: 'SSH private key not set. Save it in Settings first.' });
+        const r = testSshConnection(cfg.ssh_private_key, 'bitbucket.org');
+        return r.ok ? res.json(r) : res.status(400).json({ error: r.message });
+      }
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
       if (!cfg.bitbucket_workspace)    return res.status(400).json({ error: 'Bitbucket workspace not set.' });
-      const auth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
+      const basicAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
       const r = await apiRequest('https://api.bitbucket.org/2.0/user', 'GET', null, {
-        Authorization: `Basic ${auth}`,
+        Authorization: `Basic ${basicAuth}`,
         'User-Agent': 'PerfStudio',
       });
       if (r.status === 200) return res.json({ ok: true, message: `Connected as: ${r.body.account_id || r.body.username || r.body.display_name || 'Bitbucket user'}` });
@@ -309,6 +399,14 @@ router.post('/generate-yaml', async (req, res) => {
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
+  // Docker image — read from user's global config, fall back to admin's config, then default
+  const globalCfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const globalCfgAdmin = !globalCfgRow
+    ? db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get()
+    : null;
+  const globalCfg = JSON.parse((globalCfgRow || globalCfgAdmin)?.config_json || '{}');
+  const dockerImage = (globalCfg.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim().toLowerCase();
+
   // Use per-project workspace (new structure: git-workspaces/<ProjectName>/admin/)
   const callerRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
@@ -342,12 +440,22 @@ router.post('/generate-yaml', async (req, res) => {
       return `  # ${s.name} → ${relPath}`;
     }).join('\n');
 
+    const gitlabHasSsh = !!cfg?.ssh_private_key;
+    const gitlabSshVars = gitlabHasSsh ? `\n  # SSH key — add SSH_PRIVATE_KEY as a masked CI/CD variable in GitLab → Settings → CI/CD → Variables` : '';
+    const gitlabSshSetup = gitlabHasSsh ? `
+    - which ssh-agent || apt-get install -y openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan github.com gitlab.com bitbucket.org >> ~/.ssh/known_hosts 2>/dev/null` : '';
+
     const gitlabYaml = `# ============================================================
 # PerfStudio — GitLab CI/CD Performance Test Pipeline
 # Generated by PerfStudio on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
 #
 # Available test scripts:
 ${scriptList || '  # (no generated scripts yet — generate from Test Plans first)'}
+#${gitlabHasSsh ? '\n# SSH: Add SSH_PRIVATE_KEY as a masked variable in GitLab → Settings → CI/CD → Variables' : ''}
 # ============================================================
 
 workflow:
@@ -365,14 +473,14 @@ variables:
   JMETER_USERS: "10"
   JMETER_RAMPUP: "30"
   JMETER_LOOPS: "1"
-  JMETER_DURATION: "300"
+  JMETER_DURATION: "300"${gitlabSshVars}
 
 stages:
   - test
 
 run_jmeter:
   stage: test
-  before_script:
+  before_script:${gitlabSshSetup}
     - echo "PerfStudio Pipeline Execution"
     - echo "Script   : \${SCRIPT_NAME}"
     - echo "VUsers   : \${JMETER_USERS}"
@@ -490,23 +598,23 @@ jobs:
           echo "=== Enabled elements ==="
           grep "enabled=" "\$SCRIPT" | head -10
 
-      - name: Cache PerfStudio Docker image
+      - name: Cache CI Docker image
         uses: actions/cache@v4
         with:
           path: /tmp/docker-cache
-          key: docker-PerfStudio-\${{ runner.os }}
-          restore-keys: docker-PerfStudio-
+          key: docker-perf-\${{ runner.os }}
+          restore-keys: docker-perf-
 
       - name: Load cached image or pull
         run: |
-          if [ -f /tmp/docker-cache/PerfStudio.tar ]; then
-            echo "Loading PerfStudio image from cache..."
-            docker load -i /tmp/docker-cache/PerfStudio.tar
+          if [ -f /tmp/docker-cache/perf-image.tar ]; then
+            echo "Loading cached image..."
+            docker load -i /tmp/docker-cache/perf-image.tar
           else
-            echo "Pulling PerfStudio image (first run on this runner)..."
-            docker pull tasleemzaif/PerfStudio:latest
+            echo "Pulling ${dockerImage} (first run on this runner)..."
+            docker pull ${dockerImage}
             mkdir -p /tmp/docker-cache
-            docker save tasleemzaif/PerfStudio:latest -o /tmp/docker-cache/PerfStudio.tar
+            docker save ${dockerImage} -o /tmp/docker-cache/perf-image.tar
           fi
 
       - name: Verify patch and CSV files
@@ -530,7 +638,7 @@ jobs:
           docker run --rm \\
             -v "\${{ github.workspace }}":/workspace \\
             -v "\${{ github.workspace }}/reports":/output \\
-            tasleemzaif/PerfStudio:latest \\
+            ${dockerImage} \\
             jmeter \\
             -n -t "/workspace/\$SCRIPT" \\
             -j /output/jmeter.log \\
@@ -725,37 +833,92 @@ pipelines:
   try {
     const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
     if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
-      const simpleGit = require('simple-git');
-      const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
+      const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1' };
 
-      // Build authenticated remote URL
-      const { decrypt: dec } = require('../utils/encryption');
-      const rawToken  = gitCfg.auth_token ? dec(gitCfg.auth_token) : '';
-      const remoteUrl = rawToken
-        ? gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawToken)}@`)
-        : gitCfg.remote_url;
+      // Detect SSH auth: any enabled provider using SSH key auth
+      const providerInRequest = (providers[0] || 'github');
+      const authMethodKey = `${providerInRequest}_auth_method`;
+      const useSsh = cfg?.[authMethodKey] === 'ssh' && !!cfg?.ssh_private_key;
 
-      const git = simpleGit({ baseDir: gitRoot, env: { ...process.env, ...NO_PROMPT } });
+      // Build SSH env or token-based remote URL
+      let sshEnv = {};
+      let sshCleanup = () => {};
+      let remoteUrl = gitCfg.remote_url;
 
-      // Configure identity
-      await git.addConfig('user.name',  callerRow.name  || 'PerfStudio');
-      await git.addConfig('user.email', callerRow.email || 'noreply@perfstudio.com');
-
-      // Checkout base branch (workflow must be on default branch for workflow_dispatch to work)
-      const autoCommitBranch = gitCfg?.base_branch || baseBranch;
-      try { await git.checkout(autoCommitBranch); } catch {}
-      await git.remote(['set-url', 'origin', remoteUrl]);
-
-      // Stage and commit only the generated CI files
-      await git.add(created.map(f => path.join(gitRoot, f)));
-      const status = await git.status();
-      if (status.staged.length > 0) {
-        await git.commit('ci: add PerfStudio Performance Test workflow [auto]');
-        try { await git.addConfig('credential.helper', '', false, 'local'); await git.addConfig('credential.https://github.com.helper', '', false, 'local'); } catch {}
-        await git.push(['--set-upstream', 'origin', autoCommitBranch]);
-        pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
+      if (useSsh) {
+        // Write temp key and set GIT_SSH_COMMAND (same approach as git.js gitExec)
+        const sshId = randomBytes(8).toString('hex');
+        const sshKeyPath = path.join(os.tmpdir(), `ps_ci_push_${sshId}`);
+        const sshKhPath  = path.join(os.tmpdir(), `ps_ci_kh_push_${sshId}`);
+        const normalizedKey = cfg.ssh_private_key.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        fs.writeFileSync(sshKeyPath, normalizedKey + '\n', { mode: 0o600 });
+        if (os.platform() === 'win32') {
+          const username = process.env.USERNAME || process.env.USER || 'User';
+          spawnSync('icacls', [sshKeyPath, '/inheritance:r', '/grant:r', `${username}:F`], { windowsHide: true });
+        }
+        // Scan known_hosts
+        const extractHost = url => { const m = url.match(/(?:git@|ssh:\/\/[^@]+@?)([^:/]+)/); return m?.[1] || null; };
+        const sshHost = extractHost(gitCfg.remote_url);
+        let khContent = '';
+        if (sshHost) {
+          const scan = spawnSync('ssh-keyscan', ['-H', '-t', 'ed25519,rsa,ecdsa', sshHost], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
+          khContent = (scan.stdout || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+        }
+        fs.writeFileSync(sshKhPath, khContent ? khContent + '\n' : '', { mode: 0o600 });
+        const strictCheck = khContent ? 'yes' : 'no';
+        const sshKeyFwd = sshKeyPath.replace(/\\/g, '/');
+        const sshKhFwd  = sshKhPath.replace(/\\/g, '/');
+        sshEnv = { GIT_SSH_COMMAND: `ssh -i "${sshKeyFwd}" -o StrictHostKeyChecking=${strictCheck} -o UserKnownHostsFile="${sshKhFwd}" -o BatchMode=yes` };
+        sshCleanup = () => { try { fs.unlinkSync(sshKeyPath); } catch {} try { fs.unlinkSync(sshKhPath); } catch {} };
       } else {
-        pushMessage = ` Files unchanged — already up to date on ${autoCommitBranch}.`;
+        // Token-based HTTPS URL
+        const { decrypt: dec } = require('../utils/encryption');
+        const rawToken = gitCfg.auth_token ? dec(gitCfg.auth_token) : '';
+        if (rawToken) {
+          const isBb = /bitbucket\.org/i.test(gitCfg.remote_url);
+          const creds = isBb ? `x-token-auth:${encodeURIComponent(rawToken)}` : encodeURIComponent(rawToken);
+          remoteUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${creds}@`);
+        }
+      }
+
+      // Helper: run git via spawnSync so env vars (GIT_SSH_COMMAND) are reliably forwarded
+      const gitRun = (args) => {
+        const r = spawnSync('git', args, {
+          cwd: gitRoot,
+          env: { ...process.env, ...NO_PROMPT, ...sshEnv },
+          timeout: 30000, encoding: 'utf8', windowsHide: true,
+        });
+        if (r.status !== 0) throw new Error((r.stderr || r.stdout || `git ${args[0]} failed`).trim());
+        return (r.stdout || '').trim();
+      };
+
+      try {
+        const autoCommitBranch = gitCfg?.base_branch || baseBranch;
+
+        // Configure identity
+        gitRun(['config', 'user.name',  callerRow.name  || 'PerfStudio']);
+        gitRun(['config', 'user.email', callerRow.email || 'noreply@perfstudio.com']);
+        gitRun(['remote', 'set-url', 'origin', remoteUrl]);
+        try { gitRun(['checkout', autoCommitBranch]); } catch {}
+
+        // Stage only the generated CI files
+        gitRun(['add', ...created.map(f => path.join(gitRoot, f))]);
+
+        // Check if anything staged
+        const statusOut = spawnSync('git', ['status', '--porcelain'], {
+          cwd: gitRoot, env: { ...process.env, ...NO_PROMPT }, timeout: 10000, encoding: 'utf8', windowsHide: true,
+        });
+        const hasStagedChanges = (statusOut.stdout || '').split('\n').some(l => l.match(/^[MADRCU]/));
+
+        if (hasStagedChanges) {
+          gitRun(['commit', '-m', 'ci: add PerfStudio Performance Test workflow [auto]']);
+          gitRun(['push', '--set-upstream', 'origin', autoCommitBranch]);
+          pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
+        } else {
+          pushMessage = ` Files unchanged — already up to date on ${autoCommitBranch}.`;
+        }
+      } finally {
+        sshCleanup();
       }
     }
   } catch (pushErr) {
@@ -825,10 +988,10 @@ router.post('/trigger', async (req, res) => {
       // Build authenticated remote URL based on provider
       let authUrl = gitCfg.remote_url;
       if (provider === 'bitbucket') {
-        const bbUser = cfg.bitbucket_username || cfg.bitbucket_workspace;
+        // API tokens require x-token-auth:{token} format; App Passwords also work with it.
         const bbPass = cfg.bitbucket_app_password;
-        if (bbUser && bbPass) {
-          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(bbUser)}:${encodeURIComponent(bbPass)}@`);
+        if (bbPass) {
+          authUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1x-token-auth:${encodeURIComponent(bbPass)}@`);
         }
       } else if (provider === 'gitlab') {
         const glTok = cfg.gitlab_token || userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
@@ -1115,7 +1278,7 @@ router.post('/trigger', async (req, res) => {
     if (provider === 'bitbucket') {
       if (!cfg.bitbucket_workspace)    return res.status(400).json({ error: 'Bitbucket workspace not set.' });
       if (!cfg.bitbucket_repo_slug)    return res.status(400).json({ error: 'Bitbucket repository slug not set.' });
-      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
       const bbAuth = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
       const bbRef  = variables.branch || cfg.bitbucket_ref || baseBranch2;
@@ -1268,7 +1431,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         }).on('error', reject).end();
       });
     } else if (run.provider === 'bitbucket') {
-      if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password');
+      if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password / API Token');
       const bbAuth2 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
       const pipelineId2 = (run.external_id || '').replace(/[{}]/g, '');
       await new Promise((resolve, reject) => {
@@ -1681,7 +1844,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     }
 
     if (run.provider === 'bitbucket') {
-      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password not set.' });
+      if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
       const bbAuth3 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
       const pipelineId3 = (run.external_id || '').replace(/[{}]/g, '');
       await new Promise((resolve, reject) => {
