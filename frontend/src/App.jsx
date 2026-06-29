@@ -142,9 +142,10 @@ function AppInner() {
     const beat = () => api.post('/auth/heartbeat').catch(() => {});
     const onVisible = () => { if (document.visibilityState === 'visible') beat(); };
 
+    beat(); // immediate check — catches a replaced session the moment the tab is active
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', beat);
-    const interval = setInterval(beat, 30_000);
+    const interval = setInterval(beat, 1_000); // 1 s — old session is dead within 1 s
 
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
@@ -194,40 +195,13 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
-    // Detect page REFRESH vs fresh open:
-    // beforeunload sets ps_refreshing in sessionStorage which survives a refresh
-    // but is wiped when the browser/tab is closed.
-    const wasRefresh = sessionStorage.getItem('ps_refreshing') === '1';
-    sessionStorage.removeItem('ps_refreshing');
-
     const token = localStorage.getItem('ps_token');
     if (!token) { setLoading(false); return; }
 
-    if (wasRefresh) {
-      // The beforeunload beacon deleted our session. Recreate it from the still-valid
-      // JWT so the user stays logged in without entering their password again.
-      fetch('/api/auth/restore-session', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      })
-        .then(r => r.ok ? r.json() : Promise.reject())
-        .then(data => {
-          localStorage.setItem('ps_user', JSON.stringify(data.user));
-          setUser(data.user);
-          loadProjects(data.user.role);
-        })
-        .catch(() => {
-          localStorage.removeItem('ps_token');
-          localStorage.removeItem('ps_user');
-          setLoading(false);
-        });
-      return;
-    }
-
-    // Fresh load (after browser close+reopen, or first visit with a stored token).
-    // Always verify with the server — never trust only the cached user, because the
-    // session may have been deleted (sendBeacon) while the browser was closed.
-    // Use native fetch so the 401 interceptor does not fire prematurely.
+    // Verify stored token with the server on every load (refresh, reopen, first visit).
+    // Sessions survive browser close and refresh — they expire only on explicit logout
+    // or after 30 minutes of inactivity. Use native fetch so the 401 interceptor does
+    // not fire prematurely and clear the token before we can react here.
     fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(data => {
@@ -236,12 +210,6 @@ function AppInner() {
         loadProjects(data.user.role);
       })
       .catch(() => {
-        // Session is gone (browser was closed, or token expired) — clean up.
-        fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-          keepalive: true,
-        }).catch(() => {});
         localStorage.removeItem('ps_token');
         localStorage.removeItem('ps_user');
         setLoading(false);
@@ -472,9 +440,11 @@ function AppInner() {
     });
   }
 
-  function logout() {
-    // Revoke server-side session so the old token is immediately invalid
-    api.post('/auth/logout').catch(() => {});
+  async function logout() {
+    // Await the server-side session deletion before clearing local state.
+    // Fire-and-forget caused a race: the login form appeared before the DELETE
+    // completed, so an immediate re-login would still find an "active" session.
+    await api.post('/auth/logout').catch(() => {});
     localStorage.removeItem('ps_token');
     localStorage.removeItem('ps_user');
     setUser(null); setProjects([]); setActiveProject(null);

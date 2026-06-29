@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import api from '../api';
 
 /* ── Feature highlights shown on the left branding panel ── */
@@ -31,33 +31,6 @@ export default function Auth({ onLogin }) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [sessionActive, setSessionActive] = useState(false);
-
-  // On mount: if a stale token exists in localStorage, verify it.
-  // Use native fetch (not api.js) so the 401 response interceptor doesn't fire and
-  // clear ps_token before we can use it to delete the orphaned server session.
-  useEffect(() => {
-    const staleToken = localStorage.getItem('ps_token');
-    if (!staleToken) return;
-    fetch('/api/auth/me', { headers: { Authorization: `Bearer ${staleToken}` } })
-      .then(res => {
-        if (!res.ok) throw new Error();
-        return res.json();
-      })
-      .then(data => {
-        onLogin(data.user);
-      })
-      .catch(() => {
-        // Token is invalid — delete the orphaned session on the server using the
-        // captured token, then clean localStorage so the login form is unblocked.
-        fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${staleToken}` },
-          keepalive: true,
-        }).catch(() => {});
-        localStorage.removeItem('ps_token');
-        localStorage.removeItem('ps_user');
-      });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function doLogin(force = false) {
     setError(''); setLoading(true); setSessionActive(false);
@@ -178,7 +151,7 @@ export default function Auth({ onLogin }) {
                       justifyContent: 'center', gap: 6,
                     }}>
                     {loading ? <span className="spinner" /> : <i className="ti ti-logout" />}
-                    Sign out other session &amp; sign in here
+                    Logout from other devices and Sign In
                   </button>
                 )}
               </div>

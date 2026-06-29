@@ -142,6 +142,31 @@ function buildCanonicalRepoPaths(projectId, scriptName) {
   };
 }
 
+// Resolves a Bitbucket branch name to its latest commit hash.
+// Branch names with '/' (e.g. feature/quarks-user) cannot be used directly in
+// the /src/{node}/{path} URL because servers decode %2F → / before routing,
+// turning "feature%2Fquarks-user" into branch "feature" (404).
+// Using the commit hash avoids any path-separator ambiguity.
+async function resolveBranchToCommit(ws, slug, branch, authHeader) {
+  return new Promise((resolve, reject) => {
+    const q = `name="${branch}"`;
+    const apiPath = `/2.0/repositories/${ws}/${slug}/refs/branches?q=${encodeURIComponent(q)}&pagelen=1`;
+    const opts = { hostname: 'api.bitbucket.org', path: apiPath, method: 'GET', headers: { Authorization: authHeader, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+    https.request(opts, r => {
+      let data = '';
+      r.on('data', chunk => { data += chunk; });
+      r.on('end', () => {
+        try {
+          const body = JSON.parse(data);
+          const hash = body.values?.[0]?.target?.hash;
+          if (hash) resolve(hash);
+          else reject(new Error(`Branch "${branch}" not found in repository`));
+        } catch (e) { reject(e); }
+      });
+    }).on('error', reject).end();
+  });
+}
+
 function decryptConfig(cfg) {
   if (!cfg) return null;
   return {
@@ -2078,7 +2103,12 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const _jtlBranch   = _ciVars2.bb_branch || 'perf-results';
       const _runFolder2  = _ciVars2.bb_build_number ? `Run${_ciVars2.bb_build_number}` : pipelineId2;
       const _jtlBasePath = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
-      const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${encodeURIComponent(_jtlBranch)}/${_jtlBasePath}/results.jtl`;
+      // Branches with '/' (e.g. feature/quarks-user) cannot be %2F-encoded in the path —
+      // servers decode it before routing, so resolve the branch to a commit hash instead.
+      const _jtlBranchNode = _jtlBranch.includes('/')
+        ? await resolveBranchToCommit(ws2, slug2, _jtlBranch, bbAuth2Header)
+        : encodeURIComponent(_jtlBranch);
+      const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${_jtlBranchNode}/${_jtlBasePath}/results.jtl`;
 
       let jtlMissing = false;
       try {
@@ -2162,7 +2192,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const _ws3     = cfg.bitbucket_workspace;
       const _slug3   = cfg.bitbucket_repo_slug;
       const _jtlBasePath2 = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
-      const _htmlZipPath  = `/2.0/repositories/${_ws3}/${_slug3}/src/${encodeURIComponent(_jtlBranch)}/${_jtlBasePath2}/html.zip`;
+      const _htmlZipPath  = `/2.0/repositories/${_ws3}/${_slug3}/src/${_jtlBranchNode}/${_jtlBasePath2}/html.zip`;
       const _tmpHtml = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
       try {
         await new Promise((resolve) => {
@@ -2670,8 +2700,14 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const ws3        = cfg.bitbucket_workspace;
       const slug3      = cfg.bitbucket_repo_slug;
 
-      // Fetch results.jtl directly from the repo branch
-      const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${encodeURIComponent(branch3)}/${base3}/results.jtl`;
+      // Fetch results.jtl directly from the repo branch.
+      // Branches with '/' must be resolved to a commit hash — %2F in a URL path gets
+      // decoded by the server before routing, turning "feature%2Fquarks-user" into
+      // branch "feature" (non-existent) → 404.
+      const branchNode3 = branch3.includes('/')
+        ? await resolveBranchToCommit(ws3, slug3, branch3, bbAuthHdr3)
+        : encodeURIComponent(branch3);
+      const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/results.jtl`;
       const tmpJtl3 = path.join(os.tmpdir(), `ci_jtl_${run.id}_${Date.now()}.jtl`);
       await new Promise((resolve, reject) => {
         const fs3 = fs.createWriteStream(tmpJtl3);
@@ -2690,7 +2726,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       fs.unlinkSync(tmpJtl3);
 
       // Fetch html.zip from the repo branch (non-fatal if missing)
-      const htmlZipPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${encodeURIComponent(branch3)}/${base3}/html.zip`;
+      const htmlZipPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/html.zip`;
       const tmpHtml3 = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
       try {
         await new Promise((resolve) => {
