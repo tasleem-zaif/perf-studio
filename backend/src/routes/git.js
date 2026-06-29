@@ -1012,6 +1012,22 @@ router.post('/push', async (req, res) => {
     await git.remote(['set-url', 'origin', remoteUrl]);
 
     await disableGcm(git, gitDir);
+
+    // Sync with remote before pushing so we don't get "fetch first" rejection
+    // when the remote branch has new commits (e.g. another user pushed, or CI added a commit).
+    try {
+      gitExec(['fetch', remoteUrl, `${branch}:refs/remotes/origin/${branch}`], gitDir, sshEnv);
+      // Fast-forward if possible; if diverged, rebase local commits on top of remote
+      try {
+        gitExec(['rebase', `refs/remotes/origin/${branch}`], gitDir, sshEnv);
+      } catch (_) {
+        // Rebase failed (e.g. no common history yet) — try ff-only merge
+        try { gitExec(['merge', '--ff-only', `refs/remotes/origin/${branch}`], gitDir, sshEnv); } catch (_) {}
+      }
+    } catch (_) {
+      // fetch failed (branch doesn't exist on remote yet) — first push, proceed normally
+    }
+
     gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
     // Mark commits as pushed

@@ -520,6 +520,29 @@ try {
   `);
 } catch (_) {}
 
+// ── CI Auto Heal ──────────────────────────────────────────────────────────────
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN heal_status TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN heal_ci_run_id INTEGER DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN is_heal_run INTEGER DEFAULT 0"); } catch {}
+// Auto-heal config saved at trigger time so autoSyncCiRun can start it automatically
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN auto_heal INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN auto_heal_mode TEXT DEFAULT 'auto'"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN auto_heal_instruction TEXT DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE ci_pipeline_runs ADD COLUMN heal_summary TEXT DEFAULT NULL"); } catch {}
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS ci_auto_heal_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ci_run_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    diagnosis TEXT,
+    fix_applied TEXT,
+    fix_type TEXT,
+    new_ci_run_id INTEGER,
+    result TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+} catch {}
+
 // Seed super admin if not present
 const superAdmin = db.prepare("SELECT id FROM users WHERE role = 'super_admin'").get();
 if (!superAdmin) {

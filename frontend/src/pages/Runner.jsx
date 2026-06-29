@@ -237,6 +237,26 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     }, 2000);
   }
 
+  function startCiHealPolling(runId) {
+    if (ciHealPollRef.current[runId]) clearInterval(ciHealPollRef.current[runId]);
+    setCiHealStates(prev => ({ ...prev, [runId]: { status: 'pending', logs: [] } }));
+    ciHealPollRef.current[runId] = setInterval(async () => {
+      try {
+        const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${runId}/heal-status`);
+        setCiHealStates(prev => ({ ...prev, [runId]: data }));
+        const done = ['healed', 'failed', 'exhausted', 'infra_error'].includes(data.status);
+        if (done) {
+          clearInterval(ciHealPollRef.current[runId]);
+          delete ciHealPollRef.current[runId];
+          api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data: d }) => setCiRuns(d.runs || [])).catch(() => {});
+        }
+      } catch {
+        clearInterval(ciHealPollRef.current[runId]);
+        delete ciHealPollRef.current[runId];
+      }
+    }, 3000);
+  }
+
   async function runTest() {
     if (!selectedSuiteId) return toast('Select a test suite first', 'warn');
     if (!selectedProjectId) return toast('Select a project first', 'warn');
@@ -321,6 +341,22 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
   const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
   const ciStepsPollerRef = useRef(null);
+  // CI Auto Heal state
+  const [ciAutoHeal,    setCiAutoHeal]    = useState(true);  // toggle on trigger form
+  const [ciHealStates,  setCiHealStates]  = useState({});    // runId → { status, logs, heal_ci_run_id }
+  const [ciManualHeal,  setCiManualHeal]  = useState({});    // runId → { showing, text, loading }
+  const ciHealPollRef = useRef({});
+
+  // Auto-poll heal status for any run with an active heal in progress when history loads
+  useEffect(() => {
+    const ACTIVE = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'];
+    ciRuns.forEach(r => {
+      if (r.heal_status && ACTIVE.includes(r.heal_status) && !ciHealPollRef.current[r.id]) {
+        startCiHealPolling(r.id);
+      }
+    });
+  }, [ciRuns]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const [runTab, setRunTab] = useState('ci-pipeline'); // 'single' | 'ci-pipeline' — declared here so useEffect below can reference it
 
   useEffect(() => {
@@ -368,6 +404,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         // Pass only the active param; set the other to -1 so JMeter ignores it
         jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
+        auto_heal: ciAutoHeal ? 1 : 0,
       });
       const providerLabel = ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines';
       toast(`Pipeline triggered on ${providerLabel}`, 'success');
@@ -747,11 +784,38 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
-                <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
-                  {ciTriggering
-                    ? <><span className="spinner"/> Triggering…</>
-                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket'} Pipeline</>}
-                </button>
+                {/* ── Auto Heal toggle ── */}
+                <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4,
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                    <i className="ti ti-heart-rate-monitor" style={{ color: 'var(--accent)', fontSize: 16 }}/>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>Auto Heal</div>
+                      <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 1 }}>
+                        {ciAutoHeal
+                          ? 'AI will fix and re-run automatically if the pipeline fails'
+                          : 'Heal button appears in run history to fix manually'}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', userSelect: 'none' }}
+                    onClick={() => setCiAutoHeal(v => !v)}>
+                    <span style={{ fontSize: 12, color: ciAutoHeal ? 'var(--accent)' : 'var(--color-text-tertiary)', fontWeight: 600 }}>
+                      {ciAutoHeal ? 'ON' : 'OFF'}
+                    </span>
+                    <div style={{ width: 38, height: 21, borderRadius: 11, background: ciAutoHeal ? 'var(--accent)' : 'var(--color-border-secondary)', position: 'relative', transition: 'background .2s' }}>
+                      <div style={{ position: 'absolute', top: 3, left: ciAutoHeal ? 19 : 3, width: 15, height: 15, borderRadius: '50%', background: '#fff', transition: 'left .2s', boxShadow: '0 1px 3px rgba(0,0,0,.4)' }}/>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 14 }}>
+                  <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
+                    {ciTriggering
+                      ? <><span className="spinner"/> Triggering…</>
+                      : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket'} Pipeline</>}
+                  </button>
+                </div>
               </div>
 
               {/* Run history */}
@@ -810,7 +874,115 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
                               </a>
                             )}
+                            {/* Heal button — shown when run failed and no heal is currently active */}
+                            {['failed','failure'].includes(r.status) && !r.is_heal_run &&
+                              !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
+                              <button className="btn-secondary btn-sm"
+                                style={{ padding: '2px 8px', fontSize: 11, color: '#dc2626', borderColor: '#fca5a5' }}
+                                onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: true, text: '', loading: false } }))}>
+                                <i className="ti ti-heart-rate-monitor" style={{ fontSize: 11 }}/>
+                                {['failed','exhausted'].includes(ciHealStates[r.id]?.status) ? ' Heal Again' : ' Heal'}
+                              </button>
+                            )}
                           </div>
+
+                          {/* Manual Heal inline form */}
+                          {ciManualHeal[r.id]?.showing && !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
+                            <div style={{ padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#fafafa' }}>
+                              <div style={{ fontSize: 11, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                                Describe what to fix — AI will apply it and re-run the pipeline
+                              </div>
+                              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                <textarea
+                                  value={ciManualHeal[r.id]?.text || ''}
+                                  onChange={e => setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], text: e.target.value } }))}
+                                  placeholder="e.g. The login endpoint changed to /api/v2/auth — update all request paths accordingly"
+                                  rows={2}
+                                  style={{ flex: 1, fontSize: 12, padding: '7px 10px', borderRadius: 6,
+                                    border: '1px solid var(--color-border)', background: 'var(--color-background)',
+                                    color: 'var(--color-text)', fontFamily: 'inherit', resize: 'vertical',
+                                    boxSizing: 'border-box', outline: 'none', minHeight: 60 }}
+                                />
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                  <button className="btn-primary btn-sm"
+                                    disabled={!ciManualHeal[r.id]?.text?.trim() || ciManualHeal[r.id]?.loading}
+                                    style={{ padding: '6px 14px', fontSize: 11, whiteSpace: 'nowrap' }}
+                                    onClick={async () => {
+                                      const instruction = ciManualHeal[r.id]?.text?.trim();
+                                      if (!instruction) return;
+                                      setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], loading: true } }));
+                                      try {
+                                        await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/heal`, { instruction });
+                                        setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: false, text: '', loading: false } }));
+                                        startCiHealPolling(r.id);
+                                      } catch (e) {
+                                        toast(e.response?.data?.error || 'Failed to start heal', 'error');
+                                        setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], loading: false } }));
+                                      }
+                                    }}>
+                                    {ciManualHeal[r.id]?.loading ? <><span className="spinner"/> Healing…</> : <><i className="ti ti-heart-rate-monitor"/> Heal</>}
+                                  </button>
+                                  <button className="btn-secondary btn-sm"
+                                    style={{ padding: '4px 14px', fontSize: 11 }}
+                                    onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: false, text: '', loading: false } }))}>
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* CI Heal Status Panel */}
+                          {(ciHealStates[r.id]?.status || r.heal_status) && (() => {
+                            const hs = ciHealStates[r.id] || { status: r.heal_status, heal_ci_run_id: r.heal_ci_run_id, heal_summary: r.heal_summary, logs: [] };
+                            const isActive = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(hs.status);
+                            const accentColor = hs.status === 'healed' ? '#16a34a' : hs.status === 'infra_error' ? '#f59e0b' : isActive ? 'var(--accent)' : '#dc2626';
+                            return (
+                              <div style={{ padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#f0f9ff', borderLeft: `3px solid ${accentColor}` }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: hs.logs?.length ? 10 : 0 }}>
+                                  <i className={`ti ${hs.status === 'healed' ? 'ti-circle-check' : ['failed','exhausted'].includes(hs.status) ? 'ti-circle-x' : 'ti-loader'}`}
+                                    style={{ fontSize: 15, color: accentColor, animation: isActive ? 'spin 1s linear infinite' : 'none' }}/>
+                                  <div style={{ fontSize: 12, fontWeight: 600, color: '#0f172a' }}>
+                                    Auto Heal —{' '}
+                                    {hs.status === 'pending'        && 'Queued…'}
+                                    {hs.status === 'diagnosing'     && 'AI diagnosing failure…'}
+                                    {hs.status === 'applying_fix'   && 'Applying fix to script…'}
+                                    {hs.status === 'rerunning'      && 'Re-running quick verify on Bitbucket…'}
+                                    {hs.status === 'rerunning_full' && 'Quick verify passed — running full test…'}
+                                    {hs.status === 'healed'         && 'Issue fixed and CI test passed!'}
+                                    {hs.status === 'failed'         && 'Could not fix automatically'}
+                                    {hs.status === 'exhausted'      && `Reached ${3} attempts without success`}
+                                    {hs.status === 'infra_error'    && 'Server/infrastructure failure — script changes cannot fix this'}
+                                  </div>
+                                  {hs.heal_ci_run_id && (
+                                    <span style={{ fontSize: 10, color: '#64748b', marginLeft: 'auto' }}>Heal run #{hs.heal_ci_run_id}</span>
+                                  )}
+                                </div>
+                                {hs.logs?.length > 0 && (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                    {hs.logs.map((l, i) => (
+                                      <div key={i} style={{ background: '#fff', borderRadius: 6, padding: '8px 10px', fontSize: 11, border: '1px solid #e2e8f0' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                                          <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: l.result === 'healed' ? '#16a34a' : ['failed','no_fix','still_failing'].includes(l.result) ? '#dc2626' : '#64748b', color: '#fff' }}>
+                                            Attempt {i + 1}
+                                          </span>
+                                          <span style={{ fontSize: 10, color: '#64748b' }}>{l.fix_type === 'script_rewrite' ? 'Script rewrite' : l.fix_type === 'no_fix' ? 'No fix found' : l.fix_type || ''}</span>
+                                        </div>
+                                        {l.diagnosis && <div style={{ marginBottom: 2 }}><span style={{ color: '#b45309', fontWeight: 600 }}>Issue: </span>{l.diagnosis}</div>}
+                                        {l.fix_applied && <div><span style={{ color: '#16a34a', fontWeight: 600 }}>Fix: </span>{l.fix_applied}</div>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                                {hs.status === 'exhausted' && hs.heal_summary && (
+                                  <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', borderRadius: 6, border: '1px solid #fed7aa', fontSize: 11 }}>
+                                    <div style={{ fontWeight: 700, color: '#c2410c', marginBottom: 5 }}>Exhaustion Summary</div>
+                                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: '#374151', lineHeight: 1.5 }}>{hs.heal_summary}</pre>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
 
                           {/* Expandable terminal */}
                           {isExpanded && (() => {
@@ -1262,7 +1434,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                   'var(--color-border-secondary)',
                       color: '#fff',
                     }}>
-                      Attempt {l.attempt}
+                      Attempt {i + 1}
                     </span>
                     <span style={{ fontSize: '10px', color: 'var(--color-text-tertiary)' }}>
                       {l.fix_type === 'script_rewrite' ? 'Script rewrite' : l.fix_type === 'no_fix' ? 'No fix found' : l.fix_type}
@@ -1282,6 +1454,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
               ))}
+            </div>
+          )}
+          {healState?.status === 'exhausted' && healState?.heal_summary && (
+            <div style={{ marginTop: '10px', padding: '10px 12px', background: 'var(--color-background-secondary)', borderRadius: '6px', border: '1px solid var(--warn)', fontSize: '12px' }}>
+              <div style={{ fontWeight: 700, color: 'var(--warn)', marginBottom: '6px' }}>Exhaustion Summary</div>
+              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: 'var(--color-text-primary)', lineHeight: 1.55 }}>{healState.heal_summary}</pre>
             </div>
           )}
         </div>

@@ -25,6 +25,66 @@ const os      = require('os');
 const { randomBytes } = require('crypto');
 const { spawnSync } = require('child_process');
 
+// ── Shared patcher script content ─────────────────────────────────────────────
+// Written to .PerfStudio/patch_jmx.py in every Bitbucket workspace before push.
+// Uses double-quoted raw strings to avoid character-class escaping issues in re.
+const BB_PATCHER_PY = `# PerfStudio JMX parameter patcher
+# Usage: python3 patch_jmx.py <script> <users> <rampup> <loops> <duration>
+import re, sys
+
+script, users, rampup, loops, duration = sys.argv[1:6]
+use_duration = duration != "-1" and int(duration) > 0
+
+with open(script, "r", encoding="utf-8") as f:
+    content = f.read()
+
+def sp(xml, name, val):
+    pat = r'(<(?:string|int|long|bool)Prop\\s+name="' + re.escape(name) + r'">)[^<]*'
+    new, n = re.subn(pat, r'\\g<1>' + str(val), xml)
+    print(("  SET " if n else "  WARN ") + name + "=" + str(val))
+    return new
+
+# Fix absolute local Windows paths -> CI /workspace/ paths
+# Handles two-level structure: git-workspaces/<project>/<user>/
+path_pattern = r"[A-Za-z]:[/\\\\][^'\\"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\][^/\\\\]+[/\\\\]"
+fixed_content, path_fixes = re.subn(path_pattern, "/workspace/", content)
+if path_fixes:
+    fixed_content = fixed_content.replace("\\\\", "/")
+    content = fixed_content
+    print("  FIXED " + str(path_fixes) + " absolute path(s) -> /workspace/")
+else:
+    path_pattern_old = r"[A-Za-z]:[/\\\\][^'\\"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]"
+    fixed_content, path_fixes = re.subn(path_pattern_old, "/workspace/", content)
+    if path_fixes:
+        fixed_content = fixed_content.replace("\\\\", "/")
+        content = fixed_content
+        print("  FIXED " + str(path_fixes) + " absolute path(s) (old structure) -> /workspace/")
+    else:
+        print("  No absolute paths to fix")
+
+content = sp(content, "ThreadGroup.num_threads", users)
+content = sp(content, "ThreadGroup.ramp_time", rampup)
+
+if use_duration:
+    print("  Mode: Duration " + duration + "s")
+    content = sp(content, "ThreadGroup.scheduler", "true")
+    content = sp(content, "ThreadGroup.duration", duration)
+    content = sp(content, "LoopController.loops", "-1")
+    if 'name="ThreadGroup.duration"' not in content:
+        content = content.replace("</ThreadGroup>",
+            '<stringProp name="ThreadGroup.duration">' + duration + '</stringProp>\\n'
+            '<boolProp name="ThreadGroup.scheduler">true</boolProp>\\n</ThreadGroup>')
+        print("  INJECTED duration+scheduler")
+else:
+    print("  Mode: Loops " + loops)
+    content = sp(content, "ThreadGroup.scheduler", "false")
+    content = sp(content, "LoopController.loops", loops)
+
+with open(script, "w") as f:
+    f.write(content)
+print("Patch complete")
+`;
+
 router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -45,6 +105,41 @@ function getConfig(projectId, userId) {
   }
   // Legacy shared config (user_id IS NULL)
   return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId) || null;
+}
+
+/**
+ * Build the canonical repo paths for a script following the defined folder structure:
+ *   Project_Name/Collection_Name/Env/script/file.jmx
+ *   Project_Name/Collection_Name/Env/testData
+ *   Project_Name/Collection_Name/Env/results
+ */
+function buildCanonicalRepoPaths(projectId, scriptName) {
+  const clean = s => (s || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'Default';
+  const scriptFile = (scriptName || '').replace(/\\/g, '/').split('/').pop() || scriptName || '';
+  const project    = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
+  const suite      = scriptFile
+    ? db.prepare(`
+        SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
+        FROM test_suites ts
+        LEFT JOIN collections c ON c.id = ts.collection_id
+        WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
+        LIMIT 1
+      `).get(projectId, `%${scriptFile}`, `%${scriptFile}`)
+    : null;
+
+  const projectDir    = clean(project?.name);
+  const collectionDir = clean(suite?.col_name);
+  const envDir        = clean(suite?.env) || 'QA';
+
+  return {
+    projectDir,
+    collectionDir,
+    envDir,
+    scriptRepoPath:  `${projectDir}/${collectionDir}/${envDir}/script/${scriptFile}`,
+    testDataPath:    `${projectDir}/${collectionDir}/${envDir}/testData`,
+    resultsPath:     `${projectDir}/${collectionDir}/${envDir}/results`,
+    jmxDiskPath:     suite?.jmx_path || suite?.js_path || '',
+  };
 }
 
 function decryptConfig(cfg) {
@@ -100,6 +195,32 @@ function apiRequest(urlStr, method, body, headers = {}) {
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+// ── Helper: fetch Bitbucket pipeline step logs as a single text string ────────
+async function fetchBbPipelineLogs(authHeader, ws, slug, pipelineUuid) {
+  try {
+    const encodedUuid = encodeURIComponent(pipelineUuid);
+    const stepsR = await apiRequest(
+      `https://api.bitbucket.org/2.0/repositories/${ws}/${slug}/pipelines/${encodedUuid}/steps/`,
+      'GET', null, { Authorization: authHeader, 'User-Agent': 'PerfStudio' }
+    );
+    if (stepsR.status !== 200 || !Array.isArray(stepsR.body?.values)) return '';
+    const parts = [];
+    for (const step of stepsR.body.values) {
+      const stepUuid = encodeURIComponent(step.uuid || '');
+      if (!stepUuid) continue;
+      const logR = await apiRequest(
+        `https://api.bitbucket.org/2.0/repositories/${ws}/${slug}/pipelines/${encodedUuid}/steps/${stepUuid}/log`,
+        'GET', null, { Authorization: authHeader, 'User-Agent': 'PerfStudio', Accept: 'text/plain' }
+      );
+      if (logR.status === 200) {
+        const body = typeof logR.body === 'string' ? logR.body : JSON.stringify(logR.body);
+        parts.push(`=== Step: ${step.name || step.uuid} ===\n${body.slice(0, 8000)}`);
+      }
+    }
+    return parts.join('\n\n').slice(0, 15000);
+  } catch (_) { return ''; }
 }
 
 // ── Helper: parse "owner/repo" from any GitHub remote URL ────────────────────
@@ -815,6 +936,10 @@ pipelines:
             default: "${defaultScript}"
           - name: SCRIPT_PATH
             default: ""
+          - name: RESULTS_PATH
+            default: ""
+          - name: TESTDATA_PATH
+            default: "testData"
           - name: JMETER_USERS
             default: "10"
           - name: JMETER_RAMPUP
@@ -829,63 +954,79 @@ pipelines:
           services:
             - docker
           script:
-            - apk add --no-cache curl zip bash
+            - apk add --no-cache curl zip bash python3
             - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
             - echo "Peako Performance Test"
-            - echo "Script    | $SCRIPT_NAME"
+            - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
             - echo "VUsers    | $JMETER_USERS"
             - echo "Ramp-up   | $JMETER_RAMPUP s"
             - echo "Duration  | $JMETER_DURATION s"
+            - |
+              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+              echo "=== Patching JMX parameters and fixing paths ==="
+              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+              echo "=== JMX state after patch ==="
+              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
             - |
               docker run --rm \\
                 -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
                 ${dockerImage} \\
                 jmeter \\
-                -n -t "/workspace/$(basename "\${SCRIPT_PATH:-\$SCRIPT_NAME}")" \\
-                -JTHREADS="$JMETER_USERS" \\
-                -JRAMP_UP="$JMETER_RAMPUP" \\
-                -Jloops="$JMETER_LOOPS" \\
-                -JDURATION="$JMETER_DURATION" \\
-                -JCSV_PATH_1="/workspace/testData" \\
-                -JCSV_PATH_2="/workspace/testData" \\
+                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html" || true
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
                 cd "$BITBUCKET_CLONE_DIR"
                 [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
-                curl -sf -X POST \\
-                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/refs/branches" \\
+                DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
+                # Always upload results.jtl — create header stub if JMeter crashed without output
+                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                curl -s -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                  -H "Content-Type: application/json" \\
-                  -d "{\\"name\\":\\"perf-results\\",\\"target\\":{\\"hash\\":\\"$BITBUCKET_COMMIT\\"}}" >/dev/null 2>&1 || true
-                if [ -f results.jtl ]; then
-                  curl -s -X POST \\
-                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
-                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                    -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
-                    -F "branch=perf-results" \\
-                    -F "ci-results/\${PIPELINE_ID}/results.jtl=@results.jtl" \\
-                    && echo "JTL committed to perf-results branch" || echo "JTL commit failed (non-fatal)"
-                fi
+                  -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
+                  -F "branch=$BITBUCKET_BRANCH" \\
+                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
+                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
                 if [ -f html.zip ]; then
                   curl -s -X POST \\
                     "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                     -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
                     -F "message=ci-results html: \${PIPELINE_ID} [auto]" \\
-                    -F "branch=perf-results" \\
-                    -F "ci-results/\${PIPELINE_ID}/html.zip=@html.zip" \\
-                    && echo "HTML report committed to perf-results branch" || echo "HTML commit failed (non-fatal)"
+                    -F "branch=$BITBUCKET_BRANCH" \\
+                    -F "\${DEST_BASE}/html.zip=@html.zip" \\
+                    && echo "HTML report committed to $BITBUCKET_BRANCH" || echo "HTML commit failed (non-fatal)"
                 fi
               else
                 echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
+            - |
+              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+              if [ ! -f "$JTL" ]; then
+                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                exit 1
+              fi
+              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+              echo "JMeter sample count: $TOTAL"
+              if [ "$TOTAL" -le 0 ]; then
+                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                exit 1
+              fi
+              echo "Validation passed: $TOTAL requests executed."
 `;
     try {
       const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
-      fs.writeFileSync(dest, bbYaml, 'utf8');
+      fs.writeFileSync(dest, bbYaml.replace(/\r\n/g, '\n'), 'utf8');
       created.push('bitbucket-pipelines.yml');
+
+      // Write the Python patcher alongside the YAML
+      const bbPatcherDir = path.join(gitRoot, '.PerfStudio');
+      fs.mkdirSync(bbPatcherDir, { recursive: true });
+      fs.writeFileSync(path.join(bbPatcherDir, 'patch_jmx.py'), BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+      created.push('.PerfStudio/patch_jmx.py');
     } catch (e) { errors.push(`bitbucket-pipelines.yml: ${e.message}`); }
   }
 
@@ -1000,6 +1141,71 @@ pipelines:
     errors.push(`Auto-push failed: ${pushErr.message} — go to Configuration → Git and push manually.`);
   }
 
+  // ── Bitbucket API fallback: commit YAML directly via Files API ────────────────
+  // Used when the admin workspace has no local .git (never cloned), or when the
+  // git push above was skipped. The Files API needs no local repo at all.
+  if (providers.includes('bitbucket') && !pushMessage.includes('pushed') && cfg?.bitbucket_workspace && cfg?.bitbucket_repo_slug && cfg?.bitbucket_app_password) {
+    try {
+      const _bbAuth   = bbBasicAuth(cfg, req.userId);
+      const _bbWs     = cfg.bitbucket_workspace;
+      const _bbSlug   = cfg.bitbucket_repo_slug;
+      const gitCfgBb  = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+      const _bbBranch = gitCfgBb?.base_branch || baseBranch || 'main';
+      const _boundary = `bbpush${randomBytes(8).toString('hex')}`;
+
+      const yamlDest    = path.join(gitRoot, 'bitbucket-pipelines.yml');
+      const yamlContent = fs.existsSync(yamlDest) ? fs.readFileSync(yamlDest) : Buffer.from(bbYaml || '', 'utf8');
+      const patcherDest  = path.join(gitRoot, '.PerfStudio', 'patch_jmx.py');
+      const patcherContent = fs.existsSync(patcherDest) ? fs.readFileSync(patcherDest) : null;
+
+      const _chunks = [];
+      const _add = s => _chunks.push(Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8'));
+      _add(`--${_boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\nci: update Peako Performance Test YAML [auto]\r\n`);
+      _add(`--${_boundary}\r\nContent-Disposition: form-data; name="branch"\r\n\r\n${_bbBranch}\r\n`);
+      _add(`--${_boundary}\r\nContent-Disposition: form-data; name="bitbucket-pipelines.yml"\r\n\r\n`);
+      _add(yamlContent);
+      _add('\r\n');
+      if (patcherContent) {
+        _add(`--${_boundary}\r\nContent-Disposition: form-data; name=".PerfStudio/patch_jmx.py"\r\n\r\n`);
+        _add(patcherContent);
+        _add('\r\n');
+      }
+      _add(`--${_boundary}--\r\n`);
+      const _bodyBuf = Buffer.concat(_chunks);
+
+      await new Promise((resolve, reject) => {
+        const _opts = {
+          hostname: 'api.bitbucket.org', port: 443,
+          path: `/2.0/repositories/${_bbWs}/${_bbSlug}/src`,
+          method: 'POST',
+          headers: {
+            Authorization: _bbAuth,
+            'Content-Type': `multipart/form-data; boundary=${_boundary}`,
+            'Content-Length': _bodyBuf.length,
+            'User-Agent': 'PerfStudio',
+          },
+          rejectUnauthorized: false,
+        };
+        const _r = https.request(_opts, _res => {
+          let _d = ''; _res.on('data', c => _d += c);
+          _res.on('end', () => {
+            if (_res.statusCode === 201) resolve();
+            else reject(new Error(`Bitbucket API ${_res.statusCode}: ${_d.slice(0, 200)}`));
+          });
+        });
+        _r.on('error', reject);
+        _r.write(_bodyBuf);
+        _r.end();
+      });
+
+      pushMessage = ` Pushed bitbucket-pipelines.yml to ${_bbBranch} via Bitbucket API.`;
+      console.log(`[generate-yaml] bitbucket-pipelines.yml committed to ${_bbBranch} via API`);
+    } catch (bbApiErr) {
+      errors.push(`Bitbucket API push failed: ${bbApiErr.message}`);
+      console.error('[generate-yaml] Bitbucket API push error:', bbApiErr.message);
+    }
+  }
+
   res.json({ ok: true, created, errors, message: `Generated: ${created.join(', ')}.${pushMessage}` });
 });
 
@@ -1029,7 +1235,8 @@ router.post('/trigger', async (req, res) => {
     gitlab_trigger_token:  userCfg?.gitlab_trigger_token  || adminCfg?.gitlab_trigger_token  || '',
   };
 
-  const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration } = req.body;
+  const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration,
+          auto_heal = 0, auto_heal_mode = 'auto', auto_heal_instruction = '' } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
   // Build human-readable run_name: {SuiteName}_{N}Users_{D}sDuration (no Run# yet — added on sync)
@@ -1053,7 +1260,24 @@ router.post('/trigger', async (req, res) => {
   const effectiveGithubToken = cfg.github_token || userToken || getTokenFromGitRemote(req.params.projectId);
   const effectiveGitlabToken = cfg.gitlab_token || cfg.gitlab_trigger_token || userToken;
 
-  const variables = { script_name, script_path: script_path || '', jmeter_users: String(jmeter_users || 10), jmeter_rampup: String(jmeter_rampup || 30), jmeter_loops: String(jmeter_loops || 1), jmeter_duration: String(jmeter_duration || 300) };
+  // Resolve script name from DB when not provided by the caller (frontend omits it on some flows)
+  let resolvedScriptName = script_name;
+  if (!resolvedScriptName) {
+    const suiteRow = db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? LIMIT 1').get(req.params.projectId);
+    const suiteFile = suiteRow?.jmx_path || suiteRow?.js_path || '';
+    resolvedScriptName = suiteFile.replace(/\\/g, '/').split('/').pop() || '';
+  }
+  const canonicalPaths = buildCanonicalRepoPaths(req.params.projectId, resolvedScriptName || script_name);
+  const variables = {
+    script_name: resolvedScriptName || script_name,
+    script_path:   canonicalPaths.scriptRepoPath,
+    results_path:  canonicalPaths.resultsPath,
+    testdata_path: canonicalPaths.testDataPath,
+    jmeter_users:    String(jmeter_users    || 10),
+    jmeter_rampup:   String(jmeter_rampup   || 30),
+    jmeter_loops:    String(jmeter_loops    || 1),
+    jmeter_duration: String(jmeter_duration || 300),
+  };
 
   // ── Compute targetRef here so it is in scope for both auto-push and dispatch ─
   const callerRow2  = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -1071,6 +1295,9 @@ router.post('/trigger', async (req, res) => {
     : provider === 'bitbucket'
     ? bbUserBranch
     : (cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`));
+
+  // Store bb_branch so autoSyncCiRun can fetch results from the right branch
+  variables.bb_branch = targetRef;
 
   // ── Auto-push script file to the target branch before dispatching ──────────
   // The CI runner checks out this branch — the JMX file must exist there or
@@ -1192,6 +1419,10 @@ pipelines:
             default: "${_defScript}"
           - name: SCRIPT_PATH
             default: ""
+          - name: RESULTS_PATH
+            default: ""
+          - name: TESTDATA_PATH
+            default: "testData"
           - name: JMETER_USERS
             default: "10"
           - name: JMETER_RAMPUP
@@ -1206,61 +1437,79 @@ pipelines:
           services:
             - docker
           script:
-            - apk add --no-cache curl zip bash
+            - apk add --no-cache curl zip bash python3
             - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
             - echo "Peako Performance Test"
-            - echo "Script    | $SCRIPT_NAME"
+            - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
             - echo "VUsers    | $JMETER_USERS"
             - echo "Ramp-up   | $JMETER_RAMPUP s"
             - echo "Duration  | $JMETER_DURATION s"
+            - |
+              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+              echo "=== Patching JMX parameters and fixing paths ==="
+              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+              echo "=== JMX state after patch ==="
+              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
             - |
               docker run --rm \\
                 -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
                 -v "$BITBUCKET_CLONE_DIR:/workspace" \\
                 ${_dockerImage} \\
                 jmeter \\
-                -n -t "/workspace/$(basename "\${SCRIPT_PATH:-\$SCRIPT_NAME}")" \\
-                -JTHREADS="$JMETER_USERS" \\
-                -JRAMP_UP="$JMETER_RAMPUP" \\
-                -Jloops="$JMETER_LOOPS" \\
-                -JDURATION="$JMETER_DURATION" \\
-                -JCSV_PATH_1="/workspace/testData" \\
-                -JCSV_PATH_2="/workspace/testData" \\
+                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
                 -l "/workspace/results.jtl" \\
                 -e -o "/workspace/html" || true
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
                 cd "$BITBUCKET_CLONE_DIR"
                 [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
-                curl -sf -X POST \\
-                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/refs/branches" \\
+                DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
+                # Always upload results.jtl — create header stub if JMeter crashed without output
+                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                curl -s -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                  -H "Content-Type: application/json" \\
-                  -d "{\\"name\\":\\"perf-results\\",\\"target\\":{\\"hash\\":\\"$BITBUCKET_COMMIT\\"}}" >/dev/null 2>&1 || true
-                if [ -f results.jtl ]; then
-                  curl -s -X POST \\
-                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
-                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
-                    -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
-                    -F "branch=perf-results" \\
-                    -F "ci-results/\${PIPELINE_ID}/results.jtl=@results.jtl" \\
-                    && echo "JTL committed to perf-results branch" || echo "JTL commit failed (non-fatal)"
-                fi
+                  -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
+                  -F "branch=$BITBUCKET_BRANCH" \\
+                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
+                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
                 if [ -f html.zip ]; then
                   curl -s -X POST \\
                     "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                     -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
                     -F "message=ci-results html: \${PIPELINE_ID} [auto]" \\
-                    -F "branch=perf-results" \\
-                    -F "ci-results/\${PIPELINE_ID}/html.zip=@html.zip" \\
-                    && echo "HTML report committed to perf-results branch" || echo "HTML commit failed (non-fatal)"
+                    -F "branch=$BITBUCKET_BRANCH" \\
+                    -F "\${DEST_BASE}/html.zip=@html.zip" \\
+                    && echo "HTML report committed to $BITBUCKET_BRANCH" || echo "HTML commit failed (non-fatal)"
                 fi
               else
                 echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
+            - |
+              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+              if [ ! -f "$JTL" ]; then
+                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                exit 1
+              fi
+              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+              echo "JMeter sample count: $TOTAL"
+              if [ "$TOTAL" -le 0 ]; then
+                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                exit 1
+              fi
+              echo "Validation passed: $TOTAL requests executed."
 `;
-          fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml, 'utf8');
+          fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
           console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template');
+          // Ensure .PerfStudio/patch_jmx.py is present (may already be there from git checkout)
+          const _patcherDir = path.join(wsRoot, '.PerfStudio');
+          const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
+          if (!fs.existsSync(_patcherPath)) {
+            fs.mkdirSync(_patcherDir, { recursive: true });
+            fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+            console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
+          }
         } catch (e) {
           console.warn('[CI trigger] YAML regen failed:', e.message);
         }
@@ -1291,10 +1540,11 @@ pipelines:
           }
         }
 
-        const destAbs = path.join(wsRoot, script_path ? script_path.replace(/\//g, path.sep) : scriptFile);
-        if (srcAbs && fs.existsSync(srcAbs) && !fs.existsSync(destAbs)) {
-          fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-          fs.copyFileSync(srcAbs, destAbs);
+        // Place JMX at canonical path inside workspace
+        const canonicalDest = path.join(wsRoot, canonicalPaths.scriptRepoPath.replace(/\//g, path.sep));
+        if (srcAbs && fs.existsSync(srcAbs)) {
+          fs.mkdirSync(path.dirname(canonicalDest), { recursive: true });
+          if (!fs.existsSync(canonicalDest)) fs.copyFileSync(srcAbs, canonicalDest);
         }
       }
 
@@ -1339,13 +1589,20 @@ pipelines:
         if (fs.existsSync(triggerFile)) {
           _fileParts.push({ name: '.peako/last-run.json', content: fs.readFileSync(triggerFile) });
         }
-        // Include JMX/JS script if present in workspace
+        // Include JMX at canonical repo path
         if (script_name) {
-          const _sf2   = (script_name || '').replace(/\\/g, '/').split('/').pop();
-          const _dest2 = path.join(wsRoot, script_path ? script_path.replace(/\//g, path.sep) : _sf2);
-          if (fs.existsSync(_dest2)) {
-            _fileParts.push({ name: script_path || _sf2, content: fs.readFileSync(_dest2) });
+          const _canonDest = path.join(wsRoot, canonicalPaths.scriptRepoPath.replace(/\//g, path.sep));
+          if (fs.existsSync(_canonDest)) {
+            _fileParts.push({ name: canonicalPaths.scriptRepoPath, content: fs.readFileSync(_canonDest) });
           }
+        }
+
+        // Include patcher so the pipeline step can run python3 .PerfStudio/patch_jmx.py
+        const _patcherFilePath = path.join(wsRoot, '.PerfStudio', 'patch_jmx.py');
+        if (fs.existsSync(_patcherFilePath)) {
+          _fileParts.push({ name: '.PerfStudio/patch_jmx.py', content: fs.readFileSync(_patcherFilePath) });
+        } else {
+          _fileParts.push({ name: '.PerfStudio/patch_jmx.py', content: Buffer.from(BB_PATCHER_PY, 'utf8') });
         }
 
         // Include testData CSV files so pipeline can read them at /workspace/testData/
@@ -1375,7 +1632,7 @@ pipelines:
           try {
             fs.readdirSync(_testDataDir).forEach(f => {
               if (!f.startsWith('.') && (f.endsWith('.csv') || f.endsWith('.txt') || f.endsWith('.json'))) {
-                _fileParts.push({ name: `testData/${f}`, content: fs.readFileSync(path.join(_testDataDir, f)) });
+                _fileParts.push({ name: `${canonicalPaths.testDataPath}/${f}`, content: fs.readFileSync(path.join(_testDataDir, f)) });
               }
             });
             console.log('[CI trigger] testData files pushed from:', _testDataDir);
@@ -1483,8 +1740,8 @@ pipelines:
       });
 
       if (r.status === 201) {
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
-          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId);
+        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId, auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction);
         return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
       }
       return res.status(400).json({ error: `GitLab returned ${r.status}: ${JSON.stringify(r.body)}` });
@@ -1626,13 +1883,14 @@ pipelines:
           if (recentRun) { latestRun = recentRun; break; }
         }
 
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
+        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'github',
             latestRun ? String(latestRun.id) : null,
             latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`,
             latestRun?.status || 'queued',
-            script_name, ciRunDisplayName, JSON.stringify(variables), req.userId
+            script_name, ciRunDisplayName, JSON.stringify(variables), req.userId,
+            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction
           );
         return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions' });
       }
@@ -1674,13 +1932,16 @@ pipelines:
       );
 
       if (bbResp.status === 201) {
-        const pipelineUuid = bbResp.body.uuid;
-        const bbRunInsert = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by) VALUES (?,?,?,?,?,?,?,?,?)')
+        const pipelineUuid   = bbResp.body.uuid;
+        const bbBuildNumber  = bbResp.body.build_number || null;
+        const variablesWithBuild = { ...variables, ...(bbBuildNumber ? { bb_build_number: bbBuildNumber } : {}) };
+        const bbRunInsert = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'bitbucket', pipelineUuid,
             `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`,
             'pending', script_name || '', ciRunDisplayName,
-            JSON.stringify(variables), req.userId
+            JSON.stringify(variablesWithBuild), req.userId,
+            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction
           );
         return res.json({ ok: true, run_id: bbRunInsert.lastInsertRowid, run_name: ciRunDisplayName, external_id: pipelineUuid, web_url: `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`, status: 'pending', message: 'Pipeline triggered on Bitbucket Pipelines' });
       }
@@ -1747,7 +2008,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
       try { require('fs').mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
       let nums = [];
-      try { nums = require('fs').readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      try { nums = require('fs').readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
       const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
       const runDirName = buildRunDirName(suiteName || scriptFile.replace(/\.jmx$/, ''), ciUsers, 'duration', ciLoops, ciDur, nextRun);
       resultDir = path.join(envPath, 'results', runDirName);
@@ -1755,7 +2016,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   }
   if (!resultDir) {
     try {
-      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
       const scriptBase = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
       resultDir = path.join(userProjPath, 'results', buildRunDirName(suiteName || scriptBase, ciUsers, 'duration', ciLoops, ciDur, next));
@@ -1811,25 +2072,78 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const ws2   = cfg.bitbucket_workspace;
       const slug2 = cfg.bitbucket_repo_slug;
 
-      // Download results.jtl directly from perf-results branch (Files API — works on free plan)
-      const jtlApiPath = `/2.0/repositories/${ws2}/${slug2}/src/perf-results/ci-results/${pipelineId2}/results.jtl`;
-      await new Promise((resolve, reject) => {
-        const fileStream = fs.createWriteStream(tmpZip); // reusing tmpZip path for the JTL
-        const options = { hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-        https.request(options, response => {
-          if (response.statusCode === 301 || response.statusCode === 302) {
-            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
-              if (r2.statusCode !== 200) { fileStream.close(); return reject(new Error(`JTL not found on perf-results branch (HTTP ${r2.statusCode}). Pipeline may not have completed yet.`)); }
-              r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-            }).on('error', reject);
-          } else if (response.statusCode === 200) {
-            response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-          } else {
-            fileStream.close();
-            reject(new Error(`JTL not found on perf-results branch (HTTP ${response.statusCode}). Ensure pipeline completed and BB_USERNAME/BB_APP_PASSWORD variables are set.`));
-          }
-        }).on('error', reject).end();
-      });
+      // Download results.jtl from the canonical path: branch/results_path/Run{N}/results.jtl
+      // bb_build_number stored at trigger time; fall back to UUID for old runs, then legacy path
+      const _ciVars2     = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+      const _jtlBranch   = _ciVars2.bb_branch || 'perf-results';
+      const _runFolder2  = _ciVars2.bb_build_number ? `Run${_ciVars2.bb_build_number}` : pipelineId2;
+      const _jtlBasePath = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
+      const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${encodeURIComponent(_jtlBranch)}/${_jtlBasePath}/results.jtl`;
+
+      let jtlMissing = false;
+      try {
+        await new Promise((resolve, reject) => {
+          const fileStream = fs.createWriteStream(tmpZip); // reusing tmpZip path for the JTL
+          const options = { hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+          https.request(options, response => {
+            if (response.statusCode === 301 || response.statusCode === 302) {
+              https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
+                if (r2.statusCode !== 200) { fileStream.close(); return reject(new Error(`JTL not found on perf-results branch (HTTP ${r2.statusCode})`)); }
+                r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+              }).on('error', reject);
+            } else if (response.statusCode === 200) {
+              response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
+            } else {
+              fileStream.close();
+              reject(new Error(`JTL not found on perf-results branch (HTTP ${response.statusCode})`));
+            }
+          }).on('error', reject).end();
+        });
+        if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) jtlMissing = true;
+      } catch (jtlErr) {
+        console.warn(`[Auto-sync] Bitbucket JTL unavailable for CI run #${run.id}: ${jtlErr.message}`);
+        jtlMissing = true;
+      }
+
+      if (jtlMissing) {
+        // Pipeline failed before uploading results — fetch pipeline logs for AI context, create execRun, trigger heal
+        let bbPipeLogs = '';
+        try { bbPipeLogs = await fetchBbPipelineLogs(bbAuth2Header, ws2, slug2, run.external_id || pipelineId2); } catch (_) {}
+
+        fs.mkdirSync(resultDir, { recursive: true });
+        const noJtlLogs = [{ type: 'error', message: 'JMeter results not uploaded — pipeline failed before JMeter could produce output.' }];
+        if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
+
+        db.prepare(`
+          INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
+          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id);
+
+        const healUserId = run.triggered_by || userId;
+        if (run.auto_heal && !run.is_heal_run) {
+          setImmediate(() => {
+            try {
+              startAutoHealCI(healUserId, run.id, projectId, {
+                mode: run.auto_heal_mode || 'auto',
+                customInstruction: run.auto_heal_instruction || null,
+              });
+            } catch (e) { console.error('[Auto-sync] Failed to start CI auto heal (no JTL):', e.message); }
+          });
+        }
+        setImmediate(async () => {
+          try {
+            const { sendAlertEmail } = require('../utils/emailUtils');
+            await sendAlertEmail(null, healUserId, projectId, {
+              meta: { suite_name: run.run_name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+              summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
+              by_api: [], timeline: [],
+              errors: [{ type: 'Pipeline Error', message: 'Pipeline failed before JMeter produced results. Check pipeline logs.' }],
+              rule_violations: [],
+            }, null, null);
+          } catch (_) {}
+        });
+        return;
+      }
     }
 
     if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) throw new Error('Empty zip');
@@ -1847,7 +2161,8 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const _pid3    = (run.external_id || '').replace(/[{}]/g, '');
       const _ws3     = cfg.bitbucket_workspace;
       const _slug3   = cfg.bitbucket_repo_slug;
-      const _htmlZipPath = `/2.0/repositories/${_ws3}/${_slug3}/src/perf-results/ci-results/${_pid3}/html.zip`;
+      const _jtlBasePath2 = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
+      const _htmlZipPath  = `/2.0/repositories/${_ws3}/${_slug3}/src/${encodeURIComponent(_jtlBranch)}/${_jtlBasePath2}/html.zip`;
       const _tmpHtml = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
       try {
         await new Promise((resolve) => {
@@ -1899,20 +2214,62 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       engine: 'jmeter', started_at: run.started_at,
     }) : null;
 
-    // If JMeter produced 0 samples the pipeline ran but the test script didn't execute
-    // (missing JMX, wrong path, CSV load error, etc.). Don't send email or generate PDF.
     const totalRequests = reportData?.summary?.total_requests || 0;
     if (totalRequests === 0) {
-      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — skipping PDF/email. Check pipeline log for JMeter errors.`);
-      db.prepare(`
+      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — marking run as failed`);
+      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+
+      // Fetch pipeline logs for AI context (helps diagnose why JMeter produced 0 requests)
+      let zeroBbLogs = '';
+      if (run.provider === 'bitbucket' && cfg.bitbucket_app_password) {
+        try {
+          zeroBbLogs = await fetchBbPipelineLogs(
+            bbBasicAuth(cfg, userId), cfg.bitbucket_workspace, cfg.bitbucket_repo_slug,
+            run.external_id || ''
+          );
+        } catch (_) {}
+      }
+
+      const zeroLogs = [{ type: 'error', message: 'JTL file contains no data rows — JMeter produced 0 samples. The test plan may be malformed or all thread groups are disabled.' }];
+      if (zeroBbLogs) zeroLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
+
+      const zeroInsert = db.prepare(`
         INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
         VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
-      `).run(
-        projectId, suiteId, resultDir,
-        JSON.stringify([{ type: 'error', message: 'JTL file contains no data rows — JMeter produced 0 samples. Check pipeline log.' }]),
-        run.started_at || new Date().toISOString(),
-        run.id
-      );
+      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id);
+      const zeroRunId = zeroInsert.lastInsertRowid;
+
+      const healUserId0 = run.triggered_by || userId;
+      if (run.auto_heal && !run.is_heal_run) {
+        setImmediate(() => {
+          try {
+            startAutoHealCI(healUserId0, run.id, projectId, {
+              mode: run.auto_heal_mode || 'auto',
+              customInstruction: run.auto_heal_instruction || null,
+            });
+          } catch (e) {
+            console.error('[Auto-sync] Failed to start CI auto heal (0-sample):', e.message);
+          }
+        });
+      }
+      setImmediate(async () => {
+        try {
+          const { sendAlertEmail } = require('../utils/emailUtils');
+          const suiteName0 = suiteId
+            ? (db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId)?.name || run.script_name || 'CI Run')
+            : (run.script_name || 'CI Run');
+          await sendAlertEmail(zeroRunId, healUserId0, projectId, {
+            meta: { suite_name: suiteName0, engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+            summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
+            by_api: [], timeline: [],
+            errors: [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }],
+            rule_violations: [],
+          }, null, null);
+          console.log(`[Auto-sync] Failure email sent for 0-sample CI run #${run.id}`);
+        } catch (e) {
+          console.error('[Auto-sync] Failure email failed (0-sample):', e.message);
+        }
+      });
       return;
     }
 
@@ -1980,6 +2337,29 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     const newRunId = execInsert.lastInsertRowid;
 
     console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
+
+    // Auto-heal: if the run was triggered with auto_heal=1 and the results show failures, start heal
+    if (run.auto_heal && !run.is_heal_run) {
+      const totalReqs = reportData?.summary?.total_requests || 0;
+      const hasViolations = (reportData?.rule_violations || []).length > 0;
+      const hasFailed = totalReqs === 0 || hasViolations ||
+        (reportData?.summary?.error_rate != null && reportData.summary.error_rate > 0);
+
+      if (hasFailed) {
+        console.log(`[Auto-sync] CI run #${run.id} auto_heal enabled — starting CI heal (mode: ${run.auto_heal_mode})`);
+        const healUserId2 = run.triggered_by || userId;
+        setImmediate(() => {
+          try {
+            startAutoHealCI(healUserId2, run.id, projectId, {
+              mode: run.auto_heal_mode || 'auto',
+              customInstruction: run.auto_heal_instruction || null,
+            });
+          } catch (e) {
+            console.error('[Auto-sync] Failed to start CI auto heal:', e.message);
+          }
+        });
+      }
+    }
 
     // Send final report email (with PDF) after run is fully processed
     setImmediate(async () => {
@@ -2066,9 +2446,11 @@ router.get('/runs/:runId/status', async (req, res) => {
     db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=datetime('now')" : '') + ' WHERE id=?')
       .run(mappedStatus, webUrl, run.id);
 
-    // Auto-sync: first time this run reaches "completed", download artifacts and
-    // create an execution_runs record so it appears in Analytics automatically.
-    if (mappedStatus === 'completed' && run.status !== 'completed') {
+    // Auto-sync: whenever this run is in a finished state and has no execution_runs record yet,
+    // attempt to download artifacts and create the record. Retry on every poll until it succeeds —
+    // the first auto-sync attempt may have failed silently (e.g. JTL not yet on perf-results branch).
+    const wasFinished = ['completed','failed','cancelled','skipped'].includes(run.status);
+    if (['completed','failed'].includes(mappedStatus)) {
       const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
       if (!alreadySynced) {
         const runSnapshot = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
@@ -2076,8 +2458,9 @@ router.get('/runs/:runId/status', async (req, res) => {
       }
     }
 
-    // Send email alert for failed / cancelled runs (completed runs get email via autoSyncCiRun)
-    const wasFinished = ['completed','failed','cancelled','skipped'].includes(run.status);
+    // Send email alert for failed / cancelled runs.
+    // For 'failed' with results: auto-sync also fires and sends a more detailed email.
+    // For 'failed' without results (infra crash): this is the only notification.
     if (!wasFinished && ['failed','cancelled'].includes(mappedStatus)) {
       setImmediate(async () => {
         try {
@@ -2166,7 +2549,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
       try { fs.mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
       let nums = [];
-      try { nums = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      try { nums = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
       const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
       const syncScriptBase = scriptFile.replace(/\.jmx$/, '');
       resultDir = path.join(envPath, 'results', buildRunDirName(syncSuiteName || syncScriptBase, ciUsers2, 'duration', ciLoops2, ciDur2, nextRun));
@@ -2176,7 +2559,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   // Fallback to project-level results
   if (!resultDir) {
     try {
-      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
       const fb = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
       resultDir = path.join(userProjPath, 'results', buildRunDirName(syncSuiteName || fb, ciUsers2, 'duration', ciLoops2, ciDur2, next));
@@ -2189,6 +2572,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
   // ── Download artifact zip ─────────────────────────────────────────────────
   const tmpZip = path.join(os.tmpdir(), `ci_artifact_${run.id}_${Date.now()}.zip`);
+  let bbHandledDirect = false; // Bitbucket: files placed directly, skip generic zip extraction
 
   try {
     if (run.provider === 'github') {
@@ -2277,47 +2661,83 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
-      const bbAuth3 = Buffer.from(`${cfg.bitbucket_username || cfg.bitbucket_workspace}:${cfg.bitbucket_app_password}`).toString('base64');
-      const pipelineId3 = (run.external_id || '').replace(/[{}]/g, '');
+      const bbAuthHdr3 = bbBasicAuth(cfg, req.userId);
+      const pid3       = (run.external_id || '').replace(/[{}]/g, '');
+      const ciVars3    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+      const branch3      = ciVars3.bb_branch || 'perf-results';
+      const runFolder3   = ciVars3.bb_build_number ? `Run${ciVars3.bb_build_number}` : pid3;
+      const base3        = ciVars3.results_path ? `${ciVars3.results_path}/${runFolder3}` : `ci-results/${runFolder3}`;
+      const ws3        = cfg.bitbucket_workspace;
+      const slug3      = cfg.bitbucket_repo_slug;
+
+      // Fetch results.jtl directly from the repo branch
+      const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${encodeURIComponent(branch3)}/${base3}/results.jtl`;
+      const tmpJtl3 = path.join(os.tmpdir(), `ci_jtl_${run.id}_${Date.now()}.jtl`);
       await new Promise((resolve, reject) => {
-        const fileStream = fs.createWriteStream(tmpZip);
-        const options = { hostname: 'api.bitbucket.org', path: `/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/downloads/perf-results-${pipelineId3}.zip`, method: 'GET', headers: { Authorization: `Basic ${bbAuth3}`, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-        https.request(options, response => {
-          if (response.statusCode === 301 || response.statusCode === 302) {
-            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
-              if (r2.statusCode !== 200 && r2.statusCode !== 206) {
-                fileStream.close();
-                return reject(new Error(`Bitbucket artifact not found (HTTP ${r2.statusCode}). Ensure the pipeline uploaded perf-results-${pipelineId3}.zip to Bitbucket Downloads.`));
-              }
-              r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-            }).on('error', reject);
-          } else if (response.statusCode === 200 || response.statusCode === 206) {
-            response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-          } else {
-            fileStream.close();
-            reject(new Error(`Bitbucket artifact not found (HTTP ${response.statusCode}). Ensure the pipeline uploaded perf-results-${pipelineId3}.zip to Bitbucket Downloads.`));
-          }
+        const fs3 = fs.createWriteStream(tmpJtl3);
+        const opts3 = { hostname: 'api.bitbucket.org', path: jtlApiPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+        https.request(opts3, r => {
+          const follow = (r2) => {
+            if (r2.statusCode === 200 || r2.statusCode === 206) { r2.pipe(fs3); fs3.on('finish', () => { fs3.close(); resolve(); }); }
+            else { fs3.close(); reject(new Error(`results.jtl not found on branch "${branch3}" at ${base3} (HTTP ${r2.statusCode}). Ensure the pipeline completed and committed results.`)); }
+          };
+          if (r.statusCode === 301 || r.statusCode === 302) {
+            https.get(r.headers.location, { rejectUnauthorized: false }, follow).on('error', reject);
+          } else { follow(r); }
         }).on('error', reject).end();
       });
+      fs.copyFileSync(tmpJtl3, path.join(resultDir, 'results.jtl'));
+      fs.unlinkSync(tmpJtl3);
+
+      // Fetch html.zip from the repo branch (non-fatal if missing)
+      const htmlZipPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${encodeURIComponent(branch3)}/${base3}/html.zip`;
+      const tmpHtml3 = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
+      try {
+        await new Promise((resolve) => {
+          const fsh = fs.createWriteStream(tmpHtml3);
+          const opth = { hostname: 'api.bitbucket.org', path: htmlZipPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
+          https.request(opth, r => {
+            const follow = (r2) => {
+              if (r2.statusCode === 200) { r2.pipe(fsh); fsh.on('finish', () => { fsh.close(); resolve(); }); }
+              else { fsh.close(); resolve(); }
+            };
+            if (r.statusCode === 301 || r.statusCode === 302) {
+              https.get(r.headers.location, { rejectUnauthorized: false }, follow).on('error', () => { fsh.close(); resolve(); });
+            } else { follow(r); }
+          }).on('error', () => { fsh.close(); resolve(); }).end();
+        });
+        if (fs.existsSync(tmpHtml3) && fs.statSync(tmpHtml3).size > 0) {
+          const reportDir3 = path.join(resultDir, 'report');
+          fs.mkdirSync(reportDir3, { recursive: true });
+          new AdmZip(tmpHtml3).extractAllTo(reportDir3, true);
+          fs.unlinkSync(tmpHtml3);
+        }
+      } catch (_e) {
+        console.warn('[CI sync] html.zip download failed (non-fatal):', _e.message);
+        try { if (fs.existsSync(tmpHtml3)) fs.unlinkSync(tmpHtml3); } catch {}
+      }
+
+      bbHandledDirect = true;
     }
 
-    // ── Extract zip to resultDir ─────────────────────────────────────────────
-    if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) {
-      return res.status(500).json({ error: 'Downloaded artifact is empty or missing.' });
+    // ── Extract zip to resultDir (GitHub / GitLab — Bitbucket writes files directly) ──
+    if (!bbHandledDirect) {
+      if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) {
+        return res.status(500).json({ error: 'Downloaded artifact is empty or missing.' });
+      }
+      const zip = new AdmZip(tmpZip);
+      zip.extractAllTo(resultDir, true);
+      fs.unlinkSync(tmpZip);
+
+      // Normalise html → report folder
+      const ciHtmlDir = path.join(resultDir, 'html');
+      const localHtmlDir = path.join(resultDir, 'report');
+      if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) {
+        fs.renameSync(ciHtmlDir, localHtmlDir);
+      }
     }
 
-    const zip = new AdmZip(tmpZip);
-    zip.extractAllTo(resultDir, true);
-    fs.unlinkSync(tmpZip);
-
-    // ── Normalise folder names to match local run structure ───────────────────
-    // CI YAML writes HTML to reports/html/ — local runs use resultDir/report/
-    const ciHtmlDir    = path.join(resultDir, 'html');
-    const localHtmlDir = path.join(resultDir, 'report');
-    if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) {
-      fs.renameSync(ciHtmlDir, localHtmlDir);
-    }
-    const reportPath = path.join(localHtmlDir, 'index.html');
+    const reportPath = path.join(resultDir, 'report', 'index.html');
     const jtlPath    = path.join(resultDir, 'results.jtl');
 
     // ── Generate analytics PDF from JTL ──────────────────────────────────────
@@ -2564,6 +2984,511 @@ router.get('/runs/:runId/steps', async (req, res) => {
   } catch (e) {
     res.json({ steps: [], status: run.status, error: e.message });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CI AUTO HEAL
+// ══════════════════════════════════════════════════════════════════════════════
+
+const HEAL_CI_MAX_ATTEMPTS = 3;
+const HEAL_CI_VUSERS       = 3;
+const HEAL_CI_DURATION     = 20;
+const HEAL_CI_RAMPUP       = 2;
+
+function generateHealSummary(ciRunId) {
+  const logs = db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(ciRunId);
+  if (!logs.length) return 'Auto-heal exhausted — no attempt logs found.';
+  const lines = [`Auto-heal exhausted after ${logs.length} attempt(s). The script could not be automatically fixed.\n`];
+  for (const log of logs) {
+    lines.push(`Attempt ${log.attempt}:`);
+    if (log.diagnosis)   lines.push(`  Issue:       ${log.diagnosis}`);
+    if (log.fix_applied) lines.push(`  Fix applied: ${log.fix_applied}`);
+    lines.push(`  Result:      ${log.result || 'unknown'}`);
+    lines.push('');
+  }
+  const last = logs[logs.length - 1];
+  if (last?.diagnosis) {
+    lines.push(`Remaining issue: ${last.diagnosis}`);
+    lines.push('\nRecommendation: Review the script manually. Check that Bitbucket YAML variables (jmeter_users, jmeter_rampup, jmeter_duration) are injected, all ThreadGroup elements have enabled="true", and the target host is reachable from the CI runner.');
+  }
+  return lines.join('\n');
+}
+
+function setCiHealStatus(ciRunId, status) {
+  if (status === 'exhausted') {
+    const summary = generateHealSummary(ciRunId);
+    db.prepare('UPDATE ci_pipeline_runs SET heal_status=?, heal_summary=? WHERE id=?').run(status, summary, ciRunId);
+  } else {
+    db.prepare('UPDATE ci_pipeline_runs SET heal_status=? WHERE id=?').run(status, ciRunId);
+  }
+}
+
+function logCiHealAttempt(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId = null) {
+  return db.prepare(
+    'INSERT INTO ci_auto_heal_logs (ci_run_id, attempt, diagnosis, fix_applied, fix_type, new_ci_run_id) VALUES (?,?,?,?,?,?)'
+  ).run(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId).lastInsertRowid;
+}
+
+async function pollBitbucketUntilDone(ws, slug, pipelineUuid, authHeader, maxWaitMs = 35 * 60 * 1000) {
+  const POLL_MS = 15_000;
+  const uuid    = pipelineUuid.replace(/[{}]/g, '');
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, POLL_MS));
+    try {
+      const resp = await apiRequest(
+        `https://api.bitbucket.org/2.0/repositories/${ws}/${slug}/pipelines/${uuid}`,
+        'GET', null, { Authorization: authHeader, 'User-Agent': 'PerfStudio' }
+      );
+      const pipeState = resp.body?.state?.name;
+      if (pipeState === 'COMPLETED') {
+        const result = resp.body?.state?.result?.name || 'FAILED';
+        return { done: true, success: result === 'SUCCESSFUL', result };
+      }
+    } catch (e) {
+      console.warn('[CI Heal] poll error:', e.message);
+    }
+  }
+  return { done: false, success: false, result: 'TIMEOUT' };
+}
+
+// Push fixed JMX to Bitbucket Files API and trigger the pipeline.
+// overrideVars replaces matching keys from the original run's variables.
+async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, overrideVars = {}) {
+  const adminRawCfg = db.prepare(`
+    SELECT cpc.* FROM ci_pipeline_configs cpc
+    JOIN users u ON u.id = cpc.user_id
+    WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
+    ORDER BY cpc.updated_at DESC LIMIT 1
+  `).get(projectId);
+  const userRawCfg = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
+  const adminCfg = decryptConfig(adminRawCfg);
+  const userCfg  = decryptConfig(userRawCfg);
+  const cfg = {
+    ...(adminCfg || userCfg),
+    bitbucket_username:     userCfg?.bitbucket_username     || adminCfg?.bitbucket_username     || '',
+    bitbucket_app_password: userCfg?.bitbucket_app_password || adminCfg?.bitbucket_app_password || '',
+  };
+  const bbWs   = cfg.bitbucket_workspace;
+  const bbSlug = cfg.bitbucket_repo_slug;
+  if (!bbWs || !bbSlug || !cfg.bitbucket_app_password) throw new Error('Bitbucket CI config incomplete');
+
+  const callerRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
+  const gitCfg    = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
+  const baseBranch = gitCfg?.base_branch || 'main';
+  const bbBranch = isAdmin
+    ? (cfg.bitbucket_ref || baseBranch)
+    : `feature/${(callerRow?.name || '').toLowerCase().replace(/[^a-z0-9_/-]/g, '-')}`;
+
+  const origVars = (() => { try { return JSON.parse(originalCiRun.variables || '{}'); } catch { return {}; } })();
+  const mergedVars = { ...origVars, ...overrideVars };
+
+  const adminTok = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
+  const adminForAuth = { ...cfg, bitbucket_app_password: adminTok, bitbucket_username: adminCfg?.bitbucket_username || cfg.bitbucket_username || '' };
+  const authHeader = bbBasicAuth(adminForAuth, adminRawCfg?.user_id);
+
+  // Locate the fixed JMX on disk and build canonical repo paths
+  const scriptName   = originalCiRun.script_name || '';
+  const scriptFile   = scriptName.replace(/\\/g, '/').split('/').pop() || scriptName || 'test';
+  const healCanonical = buildCanonicalRepoPaths(projectId, scriptName);
+  const jmxDiskPath  = healCanonical.jmxDiskPath;
+
+  // Build multipart file push
+  const boundary = 'PeakoHealBoundary9z';
+  const fileParts = [];
+
+  // Include pipeline YAML if available
+  const wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git'))) ? gitCfg.git_root : null;
+  if (wsRoot) {
+    const yamlPath = path.join(wsRoot, 'bitbucket-pipelines.yml');
+    if (fs.existsSync(yamlPath)) fileParts.push({ name: 'bitbucket-pipelines.yml', content: fs.readFileSync(yamlPath) });
+  }
+
+  // Include fixed JMX at canonical repo path
+  if (jmxDiskPath && fs.existsSync(jmxDiskPath)) {
+    fileParts.push({ name: healCanonical.scriptRepoPath, content: fs.readFileSync(jmxDiskPath) });
+  }
+
+  // Trigger marker so Bitbucket shows a meaningful pipeline title
+  const triggerMeta = JSON.stringify({ triggered_at: new Date().toISOString(), script: scriptName, heal: true }, null, 2);
+  fileParts.push({ name: '.peako/last-run.json', content: Buffer.from(triggerMeta) });
+
+  const chunks = [];
+  const addBuf = s => chunks.push(Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8'));
+  addBuf(`--${boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\nPeako Auto Heal: ${scriptFile || 'test'} [heal]\r\n`);
+  addBuf(`--${boundary}\r\nContent-Disposition: form-data; name="branch"\r\n\r\n${bbBranch}\r\n`);
+  for (const fp of fileParts) {
+    addBuf(`--${boundary}\r\nContent-Disposition: form-data; name="${fp.name}"\r\n\r\n`);
+    addBuf(fp.content);
+    addBuf('\r\n');
+  }
+  addBuf(`--${boundary}--\r\n`);
+  const bodyBuf = Buffer.concat(chunks);
+
+  await new Promise((resolve, reject) => {
+    const opts = {
+      hostname: 'api.bitbucket.org', port: 443,
+      path: `/2.0/repositories/${bbWs}/${bbSlug}/src`,
+      method: 'POST',
+      headers: { Authorization: authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': bodyBuf.length, 'User-Agent': 'PerfStudio' },
+      rejectUnauthorized: false,
+    };
+    const req2 = https.request(opts, res2 => {
+      let d = '';
+      res2.on('data', c => d += c);
+      res2.on('end', () => {
+        if (res2.statusCode === 201) resolve();
+        else reject(new Error(`Files API ${res2.statusCode}: ${d.slice(0, 200)}`));
+      });
+    });
+    req2.on('error', reject);
+    req2.write(bodyBuf);
+    req2.end();
+  });
+
+  // Trigger pipeline
+  const bbBody = {
+    target: {
+      ref_type: 'branch', type: 'pipeline_ref_target', ref_name: bbBranch,
+      selector: { type: 'custom', pattern: 'Peako-Performance-Test' },
+    },
+    variables: [
+      ...Object.entries(mergedVars).map(([k, v]) => ({ key: k.toUpperCase(), value: String(v), secured: false })),
+      { key: 'SCRIPT_PATH',    value: healCanonical.scriptRepoPath,  secured: false },
+      { key: 'RESULTS_PATH',   value: healCanonical.resultsPath,     secured: false },
+      { key: 'TESTDATA_PATH',  value: healCanonical.testDataPath,    secured: false },
+      { key: 'BB_USERNAME',    value: callerRow?.email || cfg.bitbucket_username || '', secured: false },
+      { key: 'BB_APP_PASSWORD', value: adminTok, secured: true },
+    ],
+  };
+  const bbResp = await apiRequest(
+    `https://api.bitbucket.org/2.0/repositories/${bbWs}/${bbSlug}/pipelines/`,
+    'POST', bbBody,
+    { Authorization: authHeader, 'User-Agent': 'PerfStudio', Accept: 'application/json' }
+  );
+  if (bbResp.status !== 201) throw new Error(`Bitbucket ${bbResp.status}: ${bbResp.body?.error?.message || JSON.stringify(bbResp.body)}`);
+
+  const pipelineUuid      = bbResp.body.uuid;
+  const pipelineBuildNum  = bbResp.body.build_number || null;
+
+  // Store the CORRECT bb_build_number for this new pipeline (not inherited from parent run)
+  const healVars = {
+    ...mergedVars,
+    script_path:  healCanonical.scriptRepoPath,
+    results_path: healCanonical.resultsPath,
+    testdata_path: healCanonical.testDataPath,
+    bb_branch:    bbBranch,
+    ...(pipelineBuildNum ? { bb_build_number: pipelineBuildNum } : {}),
+  };
+
+  const healRunInsert = db.prepare(
+    'INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, is_heal_run) VALUES (?,?,?,?,?,?,?,?,?,?)'
+  ).run(
+    projectId, 'bitbucket', pipelineUuid,
+    `https://bitbucket.org/${bbWs}/${bbSlug}/pipelines/results/${pipelineUuid}`,
+    'pending', scriptName,
+    `Heal_${scriptFile?.replace(/\.jmx$/, '') || 'run'}`,
+    JSON.stringify(healVars), userId, 1
+  );
+  console.log(`[CI Heal] Triggered heal pipeline ${pipelineUuid} (build #${pipelineBuildNum}), new ci_run #${healRunInsert.lastInsertRowid}`);
+  return { ciRunId: healRunInsert.lastInsertRowid, pipelineUuid, authHeader, bbWs, bbSlug };
+}
+
+async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sessionStart) {
+  const { buildContext, diagnoseWithAi, classifyErrors } = require('../utils/autoHealer');
+  // sessionStart is the first attemptNum of this session; limit retries per session not globally
+  if (sessionStart === undefined) sessionStart = attemptNum;
+  if (attemptNum > sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
+    setCiHealStatus(ciRunId, 'exhausted');
+    return;
+  }
+
+  setCiHealStatus(ciRunId, 'diagnosing');
+
+  const ciRun  = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+  const execRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(ciRunId);
+  if (!execRun || !execRun.result_dir) {
+    console.warn(`[CI Heal] No execution_run for CI run #${ciRunId}`);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  const scriptFile = (ciRun?.script_name || '').replace(/\\/g, '/').split('/').pop();
+  const suite = scriptFile
+    ? db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+        .get(projectId, `%${scriptFile}`, `%${scriptFile}`)
+    : null;
+  if (!suite) {
+    console.warn(`[CI Heal] No test suite for script "${ciRun?.script_name}"`);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  let ctx;
+  try { ctx = await buildContext(execRun, suite); }
+  catch (e) { console.error('[CI Heal] buildContext error:', e.message); setCiHealStatus(ciRunId, 'failed'); return; }
+
+  if (!ctx.hasErrors) { setCiHealStatus(ciRunId, null); return; }
+
+  if (ctx.errorClass.isInfra) {
+    const lid = logCiHealAttempt(ciRunId, attemptNum, `Infrastructure/server failure: ${ctx.errorClass.summary}`, '', 'no_fix');
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('infra_error', lid);
+    setCiHealStatus(ciRunId, 'infra_error');
+    return;
+  }
+
+  let aiResp;
+  try {
+    aiResp = await diagnoseWithAi(userId, execRun, suite, ctx, attemptNum, options.customInstruction || null);
+  } catch (e) {
+    const lid = logCiHealAttempt(ciRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  const lid = logCiHealAttempt(ciRunId, attemptNum, aiResp.issue || 'Unknown issue', aiResp.fix || '', aiResp.fix_type || 'no_fix');
+
+  if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('no_fix', lid);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  // Apply fix to the local JMX file
+  setCiHealStatus(ciRunId, 'applying_fix');
+  const jmxPath = suite.jmx_path || suite.js_path;
+  try {
+    if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
+    if (jmxPath) fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
+  } catch (e) {
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  // ── Phase 1: Quick verify (3 VUsers × 20s) ────────────────────────────────
+  setCiHealStatus(ciRunId, 'rerunning');
+  let quickResult;
+  try {
+    quickResult = await pushJmxAndTriggerBitbucket(userId, projectId, ciRun, {
+      jmeter_users:    String(HEAL_CI_VUSERS),
+      jmeter_rampup:   String(HEAL_CI_RAMPUP),
+      jmeter_duration: String(HEAL_CI_DURATION),
+      jmeter_loops:    '-1',
+    });
+  } catch (e) {
+    console.error('[CI Heal] Phase 1 trigger error:', e.message);
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
+
+  const quickCiRunId = quickResult.ciRunId;
+  db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(quickCiRunId, ciRunId);
+  db.prepare('UPDATE ci_auto_heal_logs SET new_ci_run_id=? WHERE id=?').run(quickCiRunId, lid);
+
+  const quickPoll = await pollBitbucketUntilDone(
+    quickResult.bbWs, quickResult.bbSlug, quickResult.pipelineUuid,
+    quickResult.authHeader, 5 * 60 * 1000
+  );
+  db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
+    quickPoll.done ? (quickPoll.success ? 'completed' : 'failed') : 'failed', quickCiRunId
+  );
+
+  if (quickPoll.done) {
+    try {
+      const quickCiRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+      const quickCfg   = decryptConfig(getConfig(projectId, userId));
+      await autoSyncCiRun(quickCiRow, quickCfg, projectId, userId);
+    } catch (e) { console.warn('[CI Heal] quick sync error:', e.message); }
+  }
+
+  // Guarantee execution_runs exists for quickCiRunId so the next attempt can read context.
+  // If autoSyncCiRun failed (JTL missing, wrong path, etc.) create a minimal fallback record.
+  const quickExecCheck = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(quickCiRunId);
+  if (!quickExecCheck) {
+    const fallbackDir = path.join(os.tmpdir(), `ci_heal_nojtl_${quickCiRunId}`);
+    try { fs.mkdirSync(fallbackDir, { recursive: true }); } catch (_) {}
+    const quickCiRunRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+    const quickScriptFile2 = (quickCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
+    const quickSuite2 = quickScriptFile2
+      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
+      : null;
+    db.prepare(`
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, datetime('now'), datetime('now'), ?)
+    `).run(
+      projectId, quickSuite2?.id || null, fallbackDir,
+      JSON.stringify([{ type: 'error', message: `Heal pipeline run ${quickCiRunId} failed — results not uploaded. Re-attempting fix.` }]),
+      quickCiRunId
+    );
+    console.log(`[CI Heal] Created fallback execRun for heal run #${quickCiRunId}`);
+  }
+
+  const quickExecRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(quickCiRunId);
+  const quickTotal   = (() => { try { return JSON.parse(quickExecRun?.report_data || 'null')?.summary?.total_requests || 0; } catch { return 0; } })();
+  const quickPassed  = quickPoll.success && quickExecRun?.status === 'completed' && quickTotal > 0;
+
+  if (!quickPassed) {
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
+    if (attemptNum < sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
+      await healCycleCI(userId, quickCiRunId, projectId, options, attemptNum + 1, sessionStart);
+      const latest = db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+      if (latest?.heal_status) setCiHealStatus(ciRunId, latest.heal_status);
+    } else {
+      setCiHealStatus(ciRunId, 'exhausted');
+    }
+    return;
+  }
+
+  // ── Phase 2: Full run with original params ────────────────────────────────
+  setCiHealStatus(ciRunId, 'rerunning_full');
+  const origVarsForFull = (() => { try { return JSON.parse(ciRun.variables || '{}'); } catch { return {}; } })();
+  let fullResult;
+  try {
+    fullResult = await pushJmxAndTriggerBitbucket(userId, projectId, ciRun, origVarsForFull);
+  } catch (e) {
+    // Quick passed — still count as healed
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
+    setCiHealStatus(ciRunId, 'healed');
+    return;
+  }
+
+  const fullCiRunId = fullResult.ciRunId;
+  db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(fullCiRunId, ciRunId);
+
+  const origDurationS = parseInt(origVarsForFull.jmeter_duration || '300', 10);
+  const fullMaxWaitMs = Math.max(20 * 60 * 1000, origDurationS * 3 * 1000 + 5 * 60 * 1000);
+  const fullPoll = await pollBitbucketUntilDone(
+    fullResult.bbWs, fullResult.bbSlug, fullResult.pipelineUuid,
+    fullResult.authHeader, fullMaxWaitMs
+  );
+  db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
+    fullPoll.done ? (fullPoll.success ? 'completed' : 'failed') : 'failed', fullCiRunId
+  );
+
+  if (fullPoll.done) {
+    try {
+      const fullCiRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+      const fullCfg   = decryptConfig(getConfig(projectId, userId));
+      await autoSyncCiRun(fullCiRow, fullCfg, projectId, userId);
+    } catch (e) { console.warn('[CI Heal] full sync error:', e.message); }
+  }
+
+  // Guarantee execution_runs for fullCiRunId before any retry
+  const fullExecCheck = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(fullCiRunId);
+  if (!fullExecCheck) {
+    const fallbackDir2 = path.join(os.tmpdir(), `ci_heal_nojtl_${fullCiRunId}`);
+    try { fs.mkdirSync(fallbackDir2, { recursive: true }); } catch (_) {}
+    const fullCiRunRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+    const fullScriptFile2 = (fullCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
+    const fullSuite2 = fullScriptFile2
+      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
+      : null;
+    db.prepare(`
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, datetime('now'), datetime('now'), ?)
+    `).run(
+      projectId, fullSuite2?.id || null, fallbackDir2,
+      JSON.stringify([{ type: 'error', message: `Full heal pipeline run ${fullCiRunId} failed — results not uploaded.` }]),
+      fullCiRunId
+    );
+  }
+
+  const fullExecRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(fullCiRunId);
+  const fullTotal   = (() => { try { return JSON.parse(fullExecRun?.report_data || 'null')?.summary?.total_requests || 0; } catch { return 0; } })();
+  const fullPassed  = fullPoll.success && fullExecRun?.status === 'completed' && fullTotal > 0;
+
+  if (fullPassed) {
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
+    setCiHealStatus(ciRunId, 'healed');
+  } else {
+    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
+    if (attemptNum < sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
+      await healCycleCI(userId, fullCiRunId, projectId, options, attemptNum + 1, sessionStart);
+      const latest = db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+      if (latest?.heal_status) setCiHealStatus(ciRunId, latest.heal_status);
+    } else {
+      setCiHealStatus(ciRunId, 'exhausted');
+    }
+  }
+}
+
+function startAutoHealCI(userId, ciRunId, projectId, options = {}) {
+  const ciRun = db.prepare('SELECT id FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+  if (!ciRun) { console.warn(`[CI Heal] CI run ${ciRunId} not found`); return; }
+  setCiHealStatus(ciRunId, 'pending');
+  // Continue attempt numbering across sessions so logs show Attempt 1, 2, 3… globally
+  const prevAttempts = db.prepare('SELECT COUNT(*) AS cnt FROM ci_auto_heal_logs WHERE ci_run_id = ?').get(ciRunId)?.cnt || 0;
+  const startAttempt = prevAttempts + 1;
+  setImmediate(async () => {
+    try {
+      await healCycleCI(userId, ciRunId, projectId, options, startAttempt);
+    } catch (e) {
+      console.error('[CI Heal] Unexpected error:', e.message);
+      setCiHealStatus(ciRunId, 'failed');
+    }
+  });
+}
+
+// ── POST /runs/:runId/heal ─────────────────────────────────────────────────────
+router.post('/runs/:runId/heal', async (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+
+  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
+    .get(req.params.runId, req.params.projectId);
+  if (!run) return res.status(404).json({ error: 'CI run not found' });
+
+  let execRun = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  if (!execRun) {
+    // No synced results — create a minimal execution_runs record so healCycleCI can proceed.
+    // The AI healer reads the JMX file directly from the test suite; an empty result_dir is fine.
+    const scriptFile = (run.script_name || '').replace(/\\/g, '/').split('/').pop();
+    const suiteRow = scriptFile
+      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+          .get(run.project_id, `%${scriptFile}`, `%${scriptFile}`)
+      : null;
+    const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
+    fs.mkdirSync(resultDir, { recursive: true });
+    db.prepare(`
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
+      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+    `).run(
+      run.project_id, suiteRow?.id || null, resultDir,
+      JSON.stringify([{ type: 'error', message: `CI pipeline run failed on ${run.provider}. No results were uploaded. Heal triggered manually.` }]),
+      run.started_at || new Date().toISOString(),
+      run.id
+    );
+    execRun = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  }
+  if (!execRun) return res.status(400).json({ error: 'Run not synced yet — sync results first, then start heal.' });
+
+  const { instruction = '' } = req.body;
+
+  const alreadyRunning = ['pending', 'diagnosing', 'applying_fix', 'rerunning', 'rerunning_full'].includes(run.heal_status);
+  if (alreadyRunning) return res.status(400).json({ error: 'Heal already in progress for this run.' });
+
+  const customInstruction = instruction.trim() || null;
+  startAutoHealCI(req.userId, run.id, req.params.projectId, {
+    mode: customInstruction ? 'custom' : 'auto',
+    customInstruction,
+  });
+
+  res.json({ ok: true, message: 'CI auto heal started' });
+});
+
+// ── GET /runs/:runId/heal-status ──────────────────────────────────────────────
+router.get('/runs/:runId/heal-status', (req, res) => {
+  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+
+  const run = db.prepare('SELECT heal_status, heal_ci_run_id, heal_summary FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
+    .get(req.params.runId, req.params.projectId);
+  if (!run) return res.status(404).json({ error: 'CI run not found' });
+
+  const logs = db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(req.params.runId);
+  res.json({ status: run.heal_status, heal_ci_run_id: run.heal_ci_run_id, logs, heal_summary: run.heal_summary || null });
 });
 
 module.exports = router;

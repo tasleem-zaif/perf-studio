@@ -515,8 +515,27 @@ async function buildContext(run, suite) {
   };
 }
 
+// Escape bare control characters (0x00–0x1F) that appear inside JSON string
+// literals — the AI sometimes embeds multi-line JMX/XML without escaping newlines.
+function sanitizeJsonControlChars(s) {
+  const ESC = { '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f' };
+  let inString = false, escaped = false, out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escaped)             { out += c; escaped = false; continue; }
+    if (c === '\\' && inString) { out += c; escaped = true;  continue; }
+    if (c === '"')           { inString = !inString; out += c; continue; }
+    if (inString && c.charCodeAt(0) < 0x20) {
+      out += ESC[c] || `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 // ── AI diagnosis with category-specific guidance ──────────────────────────────
-async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
+async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruction = null) {
   const isJmeter    = run.engine === 'jmeter';
   const engineLabel = isJmeter ? 'JMeter 5.6' : 'k6 v0.50';
   const allCount    = ctx.allLabels.length;
@@ -524,16 +543,34 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
   const jtl         = ctx.jtl;
 
   // ── Detect active failure categories ────────────────────────────────────────
+  const zeroSamples = ctx.allLabels.length === 0;
   const cats = [];
-  if (jtl.dnsErrors.length)         cats.push('DNS_HOST_FAILURE');
-  if (jtl.correlationErrors.length) cats.push('CORRELATION_PARAMETERIZATION');
-  if (jtl.assertionErrors.length)   cats.push('ASSERTION_FAILURE');
-  if (jtl.variableErrors.length || ctx.missingVars.length) cats.push('VARIABLE_REFERENCE');
-  if (jtl.requestErrors.length)     cats.push('REQUEST_MALFUNCTION');
-  if (!cats.length)                 cats.push('UNKNOWN');
+  if (zeroSamples)                                          cats.push('ZERO_SAMPLES');
+  if (!zeroSamples && jtl.dnsErrors.length)                cats.push('DNS_HOST_FAILURE');
+  if (!zeroSamples && jtl.correlationErrors.length)        cats.push('CORRELATION_PARAMETERIZATION');
+  if (!zeroSamples && jtl.assertionErrors.length)          cats.push('ASSERTION_FAILURE');
+  if (!zeroSamples && (jtl.variableErrors.length || ctx.missingVars.length)) cats.push('VARIABLE_REFERENCE');
+  if (!zeroSamples && jtl.requestErrors.length)            cats.push('REQUEST_MALFUNCTION');
+  if (!cats.length)                                         cats.push('UNKNOWN');
 
   // ── Category-specific fix instructions ──────────────────────────────────────
   const catGuidance = [];
+  if (cats.includes('ZERO_SAMPLES')) {
+    catGuidance.push(
+      `ZERO SAMPLES — JMeter produced NO requests at all. This means either JMeter didn't start properly or the test plan is structurally broken.\n` +
+      `Common root causes (check the pipeline logs and script carefully):\n` +
+      `  1. ThreadGroup has enabled="false" — ALL thread groups must have enabled="true"\n` +
+      `  2. Thread count or duration is 0 — jmeter_users / jmeter_rampup / jmeter_duration variables may not be substituted\n` +
+      `  3. ${isJmeter ? 'HTTPSamplerProxy' : 'http.get/post'} elements disabled — check enabled attributes\n` +
+      `  4. Variable reference ${isJmeter ? '${jmeter_users}, ${jmeter_rampup}, ${jmeter_duration}' : 'VU/duration overrides'} missing from test plan\n` +
+      `  5. XML/JMX is malformed — TestPlan or ThreadGroup element broken\n` +
+      `→ REGENERATE the complete script. Ensure:\n` +
+      `  • All ThreadGroup elements: enabled="true", num_threads="\${jmeter_users}", ramp_time="\${jmeter_rampup}", duration="\${jmeter_duration}"\n` +
+      `  • TestPlan scheduler enabled where duration is used\n` +
+      `  • Every ${isJmeter ? 'HTTPSamplerProxy' : 'request'} element: enabled="true"\n` +
+      `  • User Defined Variables element defines defaults for any variable used that may not be passed at runtime`
+    );
+  }
   if (cats.includes('DNS_HOST_FAILURE')) {
     const dnsLines = Object.entries(ctx.endpointStatus)
       .map(([h, r]) => `  ${h}: ${r.ok ? 'RESOLVES → ' + r.addresses.join(',') : 'UNREACHABLE — ' + r.error}`).join('\n');
@@ -604,6 +641,12 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     .join('\n') || '  (not checked)';
 
   // ── System prompt ────────────────────────────────────────────────────────────
+  const samplerRule = zeroSamples
+    ? `1. REGENERATE the complete ${engineLabel} script from scratch — fix ALL structural issues so JMeter actually executes requests.\n` +
+      `   The regenerated script must have all thread groups enabled and all variable references correct.\n`
+    : `1. The fixed script MUST contain ALL ${allCount || 'original'} ${samplerTag} elements — zero may be removed.\n` +
+      `2. Only modify elements directly responsible for FAILING requests. Preserve PASSING requests byte-for-byte.\n`;
+
   const systemPrompt =
     `You are an expert ${engineLabel} performance test auto-healer with deep knowledge of:\n` +
     `  • HTTP request construction (methods, headers, body formats, URL encoding)\n` +
@@ -613,18 +656,17 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     `  • CSV DataSet configuration and parameterization\n` +
     `  • JMeter timers (Constant Timer, Gaussian, Uniform) and connection settings\n\n` +
     `## ABSOLUTE RULES — never break these:\n` +
-    `1. The fixed script MUST contain ALL ${allCount || 'original'} ${samplerTag} elements — zero may be removed.\n` +
-    `2. Only modify elements directly responsible for FAILING requests. Preserve PASSING requests byte-for-byte.\n` +
-    `3. Maintain original sampler ORDER — reorder only if a dependency requires it (e.g. extractor before consumer).\n` +
-    `4. When adding extractors, place them as post-processors on the RESPONSE that contains the value.\n` +
-    `5. Fix the root cause — do not mask failures by removing assertions or catching all errors.\n` +
-    `6. Output ONLY a single valid JSON object — no markdown fences, no explanation outside JSON.\n\n` +
+    samplerRule +
+    (zeroSamples ? '' : `3. Maintain original sampler ORDER — reorder only if a dependency requires it (e.g. extractor before consumer).\n`) +
+    (zeroSamples ? '' : `4. When adding extractors, place them as post-processors on the RESPONSE that contains the value.\n`) +
+    `${zeroSamples ? '2' : '5'}. Fix the root cause — do not mask failures by removing assertions or catching all errors.\n` +
+    `${zeroSamples ? '3' : '6'}. Output ONLY a single valid JSON object — no markdown fences, no explanation outside JSON.\n\n` +
     `JSON schema (all fields required):\n` +
     `{\n` +
-    `  "issue":        "root cause in 1-3 sentences — be specific (e.g. login response token not extracted)",\n` +
-    `  "fix":          "exactly what was changed and why — reference sampler names and element types",\n` +
+    `  "issue":        "root cause in 1-3 sentences — be specific (e.g. all thread groups were disabled)",\n` +
+    `  "fix":          "exactly what was changed and why — reference element names and types",\n` +
     `  "fix_type":     "script_rewrite" | "no_fix",\n` +
-    `  "fixed_script": "complete corrected script — every original sampler present"\n` +
+    `  "fixed_script": "${zeroSamples ? 'complete regenerated script with all thread groups enabled and variable references fixed' : 'complete corrected script — every original sampler present'}"\n` +
     `}`;
 
   // ── User prompt ───────────────────────────────────────────────────────────────
@@ -665,7 +707,11 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     ctx.scriptContent || '(script file not found)',
   ].join('\n');
 
-  const raw = await callAi(userId, systemPrompt, userPrompt, 'heal');
+  const customPrefix = customInstruction
+    ? `=== USER INSTRUCTION (APPLY THIS FIX — HIGHEST PRIORITY) ===\n${customInstruction}\n\nThe above instruction MUST be implemented in the fixed_script. Also address any other issues found below.\n\n`
+    : '';
+
+  const raw = await callAi(userId, systemPrompt, customPrefix + userPrompt, 'heal');
 
   // Extract JSON — handle both plain and markdown-fenced responses
   const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
@@ -676,7 +722,16 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
 
   let parsed;
   try { parsed = JSON.parse(jsonStr.trim()); }
-  catch (e) { return { fix_type: 'no_fix', issue: `JSON parse error: ${e.message}`, fix: '', fixed_script: '' }; }
+  catch {
+    // AI sometimes embeds the JMX with bare newlines/tabs inside a JSON string value.
+    // Sanitize control characters that are inside string literals and retry.
+    try {
+      const sanitized = sanitizeJsonControlChars(jsonStr.trim());
+      parsed = JSON.parse(sanitized);
+    } catch (e2) {
+      return { fix_type: 'no_fix', issue: `JSON parse error: ${e2.message}`, fix: '', fixed_script: '' };
+    }
+  }
 
   // Guard: reject if AI dropped any sampler label
   if (parsed.fix_type === 'script_rewrite' && parsed.fixed_script && ctx.allLabels.length > 0) {
@@ -899,4 +954,4 @@ function getHealStatus(runId) {
   return { status: run.heal_status, heal_run_id: run.heal_run_id, logs };
 }
 
-module.exports = { startAutoHeal, getHealStatus };
+module.exports = { startAutoHeal, getHealStatus, buildContext, diagnoseWithAi, classifyErrors };
