@@ -91,22 +91,6 @@ router.post('/login', (req, res) => {
   // Purge globally expired sessions first
   db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run();
 
-  // Single-session enforcement.
-  // Sessions are deleted immediately when the user logs out or when the browser/tab
-  // is closed (via sendBeacon). If a valid session still exists here the user is
-  // actively signed in somewhere else.
-  // Force=true (user clicked "Sign out other session") bypasses this check.
-  const activeSession = db.prepare(
-    "SELECT id FROM user_sessions WHERE user_id = ? AND expires_at > datetime('now')"
-  ).get(user.id);
-
-  if (activeSession && !req.body.force) {
-    return res.status(409).json({
-      error: 'You are already signed in from another location. Sign out that session to continue.',
-      code: 'SESSION_ACTIVE',
-    });
-  }
-
   // Delete any existing sessions before creating the new one
   db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
 
