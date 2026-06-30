@@ -5,7 +5,7 @@ pipeline {
         ENVIRONMENT      = 'QA'
         BRANCH_OR_TAG    = 'develop'
         DEPLOY_USER      = 'peako'
-        AGENT_LABEL      = 'Automation_AI_Platform_QA_Agent'
+        AGENT_LABEL      = 'peako'
         CUSTOM_WORKSPACE = '/var/www/html/perf-studio'
     }
 
