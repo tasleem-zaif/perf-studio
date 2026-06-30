@@ -51,7 +51,7 @@ def deployToServer() {
             git checkout $GIT_COMMIT && \\
             cd backend && npm install --omit=dev && cd .. && \\
             cd frontend && npm install && npm run build && cd .. && \\
-            cd backend && pm2 restart perfstudio-backend --update-env || pm2 start src/index.js --name perfstudio-backend && \\
+            cd backend && pm2 restart perfstudio-backend --update-env  && \\
             pm2 save
         '
     """
