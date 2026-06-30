@@ -147,24 +147,69 @@ function buildCanonicalRepoPaths(projectId, scriptName) {
 // the /src/{node}/{path} URL because servers decode %2F → / before routing,
 // turning "feature%2Fquarks-user" into branch "feature" (404).
 // Using the commit hash avoids any path-separator ambiguity.
-async function resolveBranchToCommit(ws, slug, branch, authHeader) {
-  return new Promise((resolve, reject) => {
-    const q = `name="${branch}"`;
-    const apiPath = `/2.0/repositories/${ws}/${slug}/refs/branches?q=${encodeURIComponent(q)}&pagelen=1`;
-    const opts = { hostname: 'api.bitbucket.org', path: apiPath, method: 'GET', headers: { Authorization: authHeader, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-    https.request(opts, r => {
-      let data = '';
-      r.on('data', chunk => { data += chunk; });
-      r.on('end', () => {
-        try {
-          const body = JSON.parse(data);
-          const hash = body.values?.[0]?.target?.hash;
-          if (hash) resolve(hash);
-          else reject(new Error(`Branch "${branch}" not found in repository`));
-        } catch (e) { reject(e); }
-      });
-    }).on('error', reject).end();
+// Returns true when any individual API has 100% failure rate with HTTP 400 or 401.
+// This indicates a broken test plan (bad request body or missing/invalid auth token)
+// and must trigger healing regardless of the overall run error rate.
+function hasCritical400Or401(reportData) {
+  if (!reportData?.by_api) return false;
+  return reportData.by_api.some(api => {
+    if ((api.error_rate || 0) < 100) return false;
+    const codes = api.response_codes || {};
+    return (codes['400'] || 0) > 0 || (codes['401'] || 0) > 0;
   });
+}
+
+// Builds a targeted heal instruction from JTL errors so the AI knows exactly what to fix.
+// 400 → wrong/missing request body parameters; 401 → broken auth token extraction or passing.
+function buildErrorHealInstruction(errors) {
+  if (!errors || errors.length === 0) return null;
+  const instructions = [];
+
+  const errors400 = errors.filter(e => String(e.response_code) === '400');
+  const errors401 = errors.filter(e => String(e.response_code) === '401');
+
+  if (errors400.length > 0) {
+    const apis = [...new Set(errors400.map(e => e.label))].join(', ');
+    instructions.push(
+      `APIs returning 400 Bad Request: ${apis}.\n` +
+      `Fix request body parameters: verify all required fields are present with correct names, ` +
+      `data types, and values. Compare against the pre-run execution data / previous successful run ` +
+      `to identify what changed. Also check Content-Type header is correct (application/json vs form-encoded).`
+    );
+  }
+
+  if (errors401.length > 0) {
+    const apis = [...new Set(errors401.map(e => e.label))].join(', ');
+    instructions.push(
+      `APIs returning 401 Unauthorized: ${apis}.\n` +
+      `Fix authorization: verify the auth token or session cookie extracted from the login/auth response ` +
+      `is correctly captured (check the variable extractor — regex or JSONPath — and the variable name used), ` +
+      `and that it is passed in the Authorization header (e.g., "Bearer \${token}") or the appropriate ` +
+      `auth field for every request that returns 401.`
+    );
+  }
+
+  return instructions.length > 0 ? instructions.join('\n\n') : null;
+}
+
+async function resolveBranchToCommit(ws, slug, branch, authHeader) {
+  // Try refs/branches?q= filter — branch name is safe in the query string (no %2F encoding issues)
+  const q = `name="${branch}"`;
+  const r = await apiRequest(
+    `https://api.bitbucket.org/2.0/repositories/${ws}/${slug}/refs/branches?q=${encodeURIComponent(q)}&pagelen=1`,
+    'GET', null, { Authorization: authHeader, 'User-Agent': 'PerfStudio' }
+  );
+  if (r.status === 200 && r.body?.values?.[0]?.target?.hash) {
+    return r.body.values[0].target.hash;
+  }
+  // Fallback: direct branch lookup with each segment encoded separately (%2F stays encoded)
+  const encodedBranch = branch.split('/').map(encodeURIComponent).join('%2F');
+  const r2 = await apiRequest(
+    `https://api.bitbucket.org/2.0/repositories/${ws}/${slug}/refs/branches/${encodedBranch}`,
+    'GET', null, { Authorization: authHeader, 'User-Agent': 'PerfStudio' }
+  );
+  if (r2.status === 200 && r2.body?.target?.hash) return r2.body.target.hash;
+  throw new Error(`Branch "${branch}" not found (HTTP ${r.status}/${r2.status})`);
 }
 
 function decryptConfig(cfg) {
@@ -1117,7 +1162,9 @@ pipelines:
               ? base.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(bbUser)}:${encodeURIComponent(rawToken)}@`)
               : base.replace(/^(https?:\/\/)/, `$1x-token-auth:${encodeURIComponent(rawToken)}@`);
           } else {
-            remoteUrl = gitCfg.remote_url.replace(/^(https?:\/\/)[^@]*@?/, `$1${encodeURIComponent(rawToken)}@`);
+            // Strip any existing user@ prefix then inject token before the hostname.
+            // [^@\/]+ stops at the first / so it never eats the hostname when there is no user@ part.
+            remoteUrl = gitCfg.remote_url.replace(/^(https?:\/\/)(?:[^@\/]+@)?/, `$1${encodeURIComponent(rawToken)}@`);
           }
         }
       }
@@ -2353,11 +2400,19 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       }
     }
 
+    // Any individual API with 100% failure and 400/401 → broken request body or auth token.
+    // Mark the run failed and always trigger heal regardless of the auto_heal flag.
+    const isCriticalApiFailure = hasCritical400Or401(reportData);
+    const autoSyncRunStatus = isCriticalApiFailure ? 'failed' : 'completed';
+    if (isCriticalApiFailure) {
+      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+    }
+
     const execInsert = db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'completed', ?, ?, ?, ?, datetime('now'), ?, ?)
+      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, datetime('now'), ?, ?)
     `).run(
-      projectId, suiteId, resultDir,
+      projectId, suiteId, autoSyncRunStatus, resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
@@ -2368,21 +2423,27 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
 
-    // Auto-heal: if the run was triggered with auto_heal=1 and the results show failures, start heal
-    if (run.auto_heal && !run.is_heal_run) {
+    // Auto-heal logic:
+    // • 100% failure (all requests errored) → always heal, regardless of auto_heal flag.
+    //   Build targeted 400/401 instruction so AI knows exactly what to fix.
+    // • Partial failure → only heal if auto_heal was enabled at trigger time (existing behaviour).
+    if (!run.is_heal_run) {
       const totalReqs = reportData?.summary?.total_requests || 0;
       const hasViolations = (reportData?.rule_violations || []).length > 0;
       const hasFailed = totalReqs === 0 || hasViolations ||
         (reportData?.summary?.error_rate != null && reportData.summary.error_rate > 0);
 
-      if (hasFailed) {
-        console.log(`[Auto-sync] CI run #${run.id} auto_heal enabled — starting CI heal (mode: ${run.auto_heal_mode})`);
+      const shouldHeal = isCriticalApiFailure || (run.auto_heal && hasFailed);
+
+      if (shouldHeal) {
+        const healInstruction = buildErrorHealInstruction(reportData?.errors) || run.auto_heal_instruction || null;
+        console.log(`[Auto-sync] CI run #${run.id} — triggering heal (criticalApiFailure=${isCriticalApiFailure}, mode: ${healInstruction ? 'custom' : (run.auto_heal_mode || 'auto')})`);
         const healUserId2 = run.triggered_by || userId;
         setImmediate(() => {
           try {
             startAutoHealCI(healUserId2, run.id, projectId, {
-              mode: run.auto_heal_mode || 'auto',
-              customInstruction: run.auto_heal_instruction || null,
+              mode: healInstruction ? 'custom' : (run.auto_heal_mode || 'auto'),
+              customInstruction: healInstruction,
             });
           } catch (e) {
             console.error('[Auto-sync] Failed to start CI auto heal:', e.message);
@@ -2468,13 +2529,26 @@ router.get('/runs/:runId/status', async (req, res) => {
       // GitHub
       queued: 'pending', in_progress: 'running',
       'success': 'completed', 'failure': 'failed', 'cancelled': 'cancelled',
+      // Bitbucket-specific
+      SUCCESSFUL: 'completed', FAILED: 'failed', ERROR: 'failed',
+      STOPPED: 'cancelled', HALTED: 'cancelled', PAUSED: 'running',
+      IN_PROGRESS: 'running', PENDING: 'pending',
     };
     const mappedStatus = statusMap[status] || status;
 
-    // Update DB
+    // Update DB — but never overwrite a status the sync process already set.
+    // Once an execution_run exists the sync has evaluated the JTL and determined the
+    // correct status (e.g. 'failed' for 400/401 full-failure). The CI provider only
+    // knows the pipeline exit code, not the JTL error rates, so its 'completed' must
+    // not clobber the sync-determined 'failed'.
     const isFinished = ['completed','failed','cancelled','skipped'].includes(mappedStatus);
-    db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=datetime('now')" : '') + ' WHERE id=?')
-      .run(mappedStatus, webUrl, run.id);
+    const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+    if (alreadySynced) {
+      db.prepare('UPDATE ci_pipeline_runs SET web_url=? WHERE id=?').run(webUrl, run.id);
+    } else {
+      db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=datetime('now')" : '') + ' WHERE id=?')
+        .run(mappedStatus, webUrl, run.id);
+    }
 
     // Auto-sync: whenever this run is in a finished state and has no execution_runs record yet,
     // attempt to download artifacts and create the record. Retry on every poll until it succeeds —
@@ -2484,7 +2558,7 @@ router.get('/runs/:runId/status', async (req, res) => {
       const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
       if (!alreadySynced) {
         const runSnapshot = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
-        setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId).catch(() => {}));
+        setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId).catch(e => console.error('[Auto-sync] failed for run', runSnapshot.id, ':', e.message)));
       }
     }
 
@@ -2826,6 +2900,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       suiteId = suite?.id || null;
     }
 
+    // Any individual API with 100% failure and 400/401 → mark run failed and always trigger heal
+    const syncIsFullFailure = hasCritical400Or401(reportData);
+    const syncRunStatus = syncIsFullFailure ? 'failed' : 'completed';
+    if (syncIsFullFailure) {
+      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+    }
+
     const execRunRow = db.prepare(`
       INSERT INTO execution_runs
         (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
@@ -2834,7 +2915,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       req.params.projectId,
       suiteId,
       'jmeter',
-      'completed',
+      syncRunStatus,
       resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
@@ -2880,6 +2961,22 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         console.error('[CI Sync] Alert email failed:', e.message);
       }
     });
+
+    // Trigger auto-heal for 100% failure runs — always, regardless of auto_heal flag
+    if (syncIsFullFailure && !run.is_heal_run) {
+      const syncHealInstruction = buildErrorHealInstruction(reportData?.errors) || run.auto_heal_instruction || null;
+      console.log(`[CI Sync] Run #${run.id} 100% failure — triggering auto-heal`);
+      setImmediate(() => {
+        try {
+          startAutoHealCI(req.userId, run.id, req.params.projectId, {
+            mode: syncHealInstruction ? 'custom' : (run.auto_heal_mode || 'auto'),
+            customInstruction: syncHealInstruction,
+          });
+        } catch (e) {
+          console.error('[CI Sync] Failed to start auto-heal:', e.message);
+        }
+      });
+    }
 
     const savedFiles = fs.readdirSync(resultDir);
     res.json({
@@ -3231,6 +3328,175 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   return { ciRunId: healRunInsert.lastInsertRowid, pipelineUuid, authHeader, bbWs, bbSlug };
 }
 
+// Push fixed JMX to GitHub via Contents API and dispatch workflow_dispatch.
+async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrideVars = {}) {
+  const adminRawCfg = db.prepare(`
+    SELECT cpc.* FROM ci_pipeline_configs cpc
+    JOIN users u ON u.id = cpc.user_id
+    WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
+    ORDER BY cpc.updated_at DESC LIMIT 1
+  `).get(projectId);
+  const userRawCfg = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
+  const adminCfg = decryptConfig(adminRawCfg);
+  const userCfg  = decryptConfig(userRawCfg);
+
+  const effectiveToken = userCfg?.github_token || adminCfg?.github_token || '';
+  const githubRepo     = userCfg?.github_repo  || adminCfg?.github_repo  || '';
+  if (!githubRepo || !effectiveToken) throw new Error('GitHub CI config incomplete');
+
+  const gitCfg      = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
+  const baseBranch  = gitCfg?.base_branch || 'main';
+  const workflowFile = userCfg?.github_workflow_file || adminCfg?.github_workflow_file || 'perf-test.yml';
+
+  const ghHeaders = {
+    Authorization: `token ${effectiveToken}`,
+    'User-Agent': 'PerfStudio',
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+
+  const origVars   = (() => { try { return JSON.parse(originalCiRun.variables || '{}'); } catch { return {}; } })();
+  const mergedVars = { ...origVars, ...overrideVars };
+  const targetRef  = origVars.branch || baseBranch;
+
+  const scriptName    = originalCiRun.script_name || '';
+  const scriptFile    = scriptName.replace(/\\/g, '/').split('/').pop() || 'test.jmx';
+  const healCanonical = buildCanonicalRepoPaths(projectId, scriptName);
+  const jmxDiskPath   = healCanonical.jmxDiskPath;
+
+  // Push fixed JMX to GitHub via Contents API
+  if (jmxDiskPath && fs.existsSync(jmxDiskPath)) {
+    const jmxContent    = fs.readFileSync(jmxDiskPath);
+    const base64Content = jmxContent.toString('base64');
+    const repoFilePath  = healCanonical.scriptRepoPath;
+    // Get current SHA (required for updates; absent for new files)
+    const shaResp = await apiRequest(
+      `https://api.github.com/repos/${githubRepo}/contents/${repoFilePath}?ref=${encodeURIComponent(targetRef)}`,
+      'GET', null, ghHeaders
+    );
+    const existingSha = shaResp.status === 200 ? shaResp.body?.sha : null;
+    const commitBody = {
+      message: `Peako Auto Heal: ${scriptFile} [heal]`,
+      content: base64Content,
+      branch: targetRef,
+      ...(existingSha ? { sha: existingSha } : {}),
+    };
+    const pushResp = await apiRequest(
+      `https://api.github.com/repos/${githubRepo}/contents/${repoFilePath}`,
+      'PUT', commitBody, ghHeaders
+    );
+    if (pushResp.status !== 200 && pushResp.status !== 201) {
+      throw new Error(`GitHub push failed ${pushResp.status}: ${typeof pushResp.body === 'string' ? pushResp.body.slice(0, 300) : JSON.stringify(pushResp.body).slice(0, 300)}`);
+    }
+    console.log(`[CI Heal] Pushed fixed JMX to GitHub ${githubRepo}/${targetRef}`);
+  }
+
+  // Dispatch workflow_dispatch (try filename → full path → numeric ID)
+  const dispatchBody = {
+    ref: baseBranch,
+    inputs: {
+      script_name:     scriptFile,
+      script_path:     healCanonical.scriptRepoPath || '',
+      jmeter_users:    String(mergedVars.jmeter_users    || mergedVars.JMETER_USERS    || HEAL_CI_VUSERS),
+      jmeter_rampup:   String(mergedVars.jmeter_rampup   || mergedVars.JMETER_RAMPUP   || HEAL_CI_RAMPUP),
+      jmeter_loops:    String(mergedVars.jmeter_loops    || mergedVars.JMETER_LOOPS    || '-1'),
+      jmeter_duration: String(mergedVars.jmeter_duration || mergedVars.JMETER_DURATION || HEAL_CI_DURATION),
+      branch:          targetRef,
+    },
+  };
+  let r = await apiRequest(
+    `https://api.github.com/repos/${githubRepo}/actions/workflows/${workflowFile}/dispatches`,
+    'POST', dispatchBody, ghHeaders
+  );
+  if (r.status === 404) {
+    r = await apiRequest(
+      `https://api.github.com/repos/${githubRepo}/actions/workflows/.github%2Fworkflows%2F${workflowFile}/dispatches`,
+      'POST', dispatchBody, ghHeaders
+    );
+  }
+  if (r.status === 404) {
+    const wfList = await apiRequest(`https://api.github.com/repos/${githubRepo}/actions/workflows`, 'GET', null, ghHeaders);
+    const wf = (wfList.body?.workflows || []).find(w =>
+      w.path === `.github/workflows/${workflowFile}` || w.name === 'PerfStudio Performance Test'
+    );
+    if (wf?.id) r = await apiRequest(`https://api.github.com/repos/${githubRepo}/actions/workflows/${wf.id}/dispatches`, 'POST', dispatchBody, ghHeaders);
+  }
+  if (r.status !== 204) throw new Error(`GitHub dispatch failed ${r.status}: ${typeof r.body === 'string' ? r.body.slice(0, 200) : JSON.stringify(r.body).slice(0, 200)}`);
+
+  // Find the new workflow run (poll up to 5 × 2s)
+  const dispatchedAt = new Date();
+  let latestRun = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const runsResp = await apiRequest(
+      `https://api.github.com/repos/${githubRepo}/actions/runs?event=workflow_dispatch&per_page=5`,
+      'GET', null, ghHeaders
+    );
+    const recentRun = (runsResp.body?.workflow_runs || []).find(wr => {
+      const createdAt = new Date(wr.created_at);
+      return createdAt >= new Date(dispatchedAt.getTime() - 5000);
+    });
+    if (recentRun) { latestRun = recentRun; break; }
+  }
+  if (!latestRun) throw new Error('GitHub: no new workflow run found after dispatch');
+
+  const healVars = { ...mergedVars, branch: targetRef, github_run_number: latestRun.run_number };
+  const healRunInsert = db.prepare(
+    'INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, is_heal_run) VALUES (?,?,?,?,?,?,?,?,?,?)'
+  ).run(
+    projectId, 'github', String(latestRun.id),
+    latestRun.html_url || `https://github.com/${githubRepo}/actions`,
+    'pending', scriptName,
+    `Heal_${scriptFile.replace(/\.jmx$/, '')}`,
+    JSON.stringify(healVars), userId, 1
+  );
+  console.log(`[CI Heal] GitHub heal workflow dispatched → run #${latestRun.id}, ci_run #${healRunInsert.lastInsertRowid}`);
+  return { ciRunId: healRunInsert.lastInsertRowid, ghRunId: latestRun.id, githubRepo, authHeader: `token ${effectiveToken}` };
+}
+
+async function pollGitHubUntilDone(githubRepo, ghRunId, authHeader, maxWaitMs = 35 * 60 * 1000) {
+  const POLL_MS = 15_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, POLL_MS));
+    try {
+      const resp = await apiRequest(
+        `https://api.github.com/repos/${githubRepo}/actions/runs/${ghRunId}`,
+        'GET', null,
+        { Authorization: authHeader, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+      );
+      if (resp.body?.status === 'completed') {
+        const success = resp.body.conclusion === 'success';
+        return { done: true, success, result: resp.body.conclusion };
+      }
+    } catch (e) {
+      console.warn('[CI Heal] GitHub poll error:', e.message);
+    }
+  }
+  return { done: false, success: false, result: 'TIMEOUT' };
+}
+
+// Provider-aware wrappers used by healCycleCI
+// Supported: github, bitbucket. Stubs for gitlab, azuredevops, circleci — implement when those providers are added.
+async function pushJmxAndTrigger(userId, projectId, originalCiRun, overrideVars = {}) {
+  const provider = originalCiRun.provider || 'bitbucket';
+  if (provider === 'github')      return pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrideVars);
+  if (provider === 'bitbucket')   return pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, overrideVars);
+  if (provider === 'gitlab')      throw new Error('GitLab auto-heal trigger not yet implemented');
+  if (provider === 'azuredevops') throw new Error('Azure DevOps auto-heal trigger not yet implemented');
+  if (provider === 'circleci')    throw new Error('CircleCI auto-heal trigger not yet implemented');
+  throw new Error(`Unknown CI provider "${provider}" — auto-heal trigger not implemented`);
+}
+
+async function pollCiUntilDone(provider, triggerResult, maxWaitMs) {
+  if (provider === 'github')      return pollGitHubUntilDone(triggerResult.githubRepo, triggerResult.ghRunId, triggerResult.authHeader, maxWaitMs);
+  if (provider === 'bitbucket')   return pollBitbucketUntilDone(triggerResult.bbWs, triggerResult.bbSlug, triggerResult.pipelineUuid, triggerResult.authHeader, maxWaitMs);
+  if (provider === 'gitlab')      throw new Error('GitLab auto-heal polling not yet implemented');
+  if (provider === 'azuredevops') throw new Error('Azure DevOps auto-heal polling not yet implemented');
+  if (provider === 'circleci')    throw new Error('CircleCI auto-heal polling not yet implemented');
+  throw new Error(`Unknown CI provider "${provider}" — auto-heal polling not implemented`);
+}
+
 async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sessionStart) {
   const { buildContext, diagnoseWithAi, classifyErrors } = require('../utils/autoHealer');
   // sessionStart is the first attemptNum of this session; limit retries per session not globally
@@ -3308,7 +3574,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   setCiHealStatus(ciRunId, 'rerunning');
   let quickResult;
   try {
-    quickResult = await pushJmxAndTriggerBitbucket(userId, projectId, ciRun, {
+    quickResult = await pushJmxAndTrigger(userId, projectId, ciRun, {
       jmeter_users:    String(HEAL_CI_VUSERS),
       jmeter_rampup:   String(HEAL_CI_RAMPUP),
       jmeter_duration: String(HEAL_CI_DURATION),
@@ -3325,10 +3591,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(quickCiRunId, ciRunId);
   db.prepare('UPDATE ci_auto_heal_logs SET new_ci_run_id=? WHERE id=?').run(quickCiRunId, lid);
 
-  const quickPoll = await pollBitbucketUntilDone(
-    quickResult.bbWs, quickResult.bbSlug, quickResult.pipelineUuid,
-    quickResult.authHeader, 5 * 60 * 1000
-  );
+  const quickPoll = await pollCiUntilDone(ciRun.provider, quickResult, 5 * 60 * 1000);
   db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
     quickPoll.done ? (quickPoll.success ? 'completed' : 'failed') : 'failed', quickCiRunId
   );
@@ -3384,7 +3647,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   const origVarsForFull = (() => { try { return JSON.parse(ciRun.variables || '{}'); } catch { return {}; } })();
   let fullResult;
   try {
-    fullResult = await pushJmxAndTriggerBitbucket(userId, projectId, ciRun, origVarsForFull);
+    fullResult = await pushJmxAndTrigger(userId, projectId, ciRun, origVarsForFull);
   } catch (e) {
     // Quick passed — still count as healed
     db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
@@ -3397,10 +3660,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
 
   const origDurationS = parseInt(origVarsForFull.jmeter_duration || '300', 10);
   const fullMaxWaitMs = Math.max(20 * 60 * 1000, origDurationS * 3 * 1000 + 5 * 60 * 1000);
-  const fullPoll = await pollBitbucketUntilDone(
-    fullResult.bbWs, fullResult.bbSlug, fullResult.pipelineUuid,
-    fullResult.authHeader, fullMaxWaitMs
-  );
+  const fullPoll = await pollCiUntilDone(ciRun.provider, fullResult, fullMaxWaitMs);
   db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
     fullPoll.done ? (fullPoll.success ? 'completed' : 'failed') : 'failed', fullCiRunId
   );

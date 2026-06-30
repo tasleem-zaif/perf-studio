@@ -333,36 +333,38 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   // folders if they were created after the last push, or this is a fresh clone.
   try {
     const { ensureAllEnvFolders, cleanName: cn } = require('../utils/projectFolders');
-    const projectRow = db.prepare('SELECT folder_path, name FROM projects WHERE id = ?').get(cfg.project_id);
-    // Collections go inside the project subfolder within the git workspace root:
-    // gitRoot/<ProjectName>/<CollectionName>/<Env>/
-    const gitProjectPath = path.join(gitRoot, cn(projectRow?.name || ''));
+    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
+    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
     const collections = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
     for (const col of collections) {
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitProjectPath, col.name, envs);
+      ensureAllEnvFolders(gitRoot, col.name, envs);
     }
 
-    // Copy JMX/JS scripts from admin workspace if they don't exist here yet.
-    // Scripts are generated into the admin workspace; users need them locally
-    // so they can commit to their branch and CI can find the file.
-    const adminWorkspace = path.join(GIT_WORKSPACES_ROOT, getCleanProjectName({ name: cfg.project_id_name || '' }), 'admin');
-    const adminRoot  = projectRow?.folder_path || '';
-    if (adminRoot && fs.existsSync(adminRoot)) {
-      const suites = db.prepare("SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(cfg.project_id);
-      for (const suite of suites) {
-        const srcAbs = suite.jmx_path || suite.js_path;
-        if (!srcAbs || !fs.existsSync(srcAbs)) continue;
-        // Map admin path to equivalent user workspace path
-        const relToAdmin = path.relative(adminRoot, srcAbs);
-        const destAbs    = path.join(gitRoot, relToAdmin);
-        if (!fs.existsSync(destAbs)) {
-          fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-          fs.copyFileSync(srcAbs, destAbs);
-        }
+    // Copy JMX/JS scripts into this workspace if they don't exist here yet.
+    // Destination is always: gitRoot/<CollectionName>/<Env>/script/<filename>
+    const suites = db.prepare(`
+      SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
+      FROM test_suites ts
+      LEFT JOIN collections c ON c.id = ts.collection_id
+      WHERE ts.project_id = ? AND (ts.jmx_path IS NOT NULL OR ts.js_path IS NOT NULL)
+    `).all(cfg.project_id);
+    for (const suite of suites) {
+      const srcAbs = suite.jmx_path || suite.js_path;
+      if (!srcAbs || !fs.existsSync(srcAbs)) continue;
+      const destAbs = path.join(
+        gitRoot,
+        cn(suite.col_name || 'Default'),
+        cn(suite.env || 'Default'),
+        'script',
+        path.basename(srcAbs)
+      );
+      if (!fs.existsSync(destAbs)) {
+        fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+        fs.copyFileSync(srcAbs, destAbs);
       }
     }
   } catch (_) { /* non-fatal — workspace still usable */ }
@@ -601,13 +603,11 @@ router.post('/init', async (req, res) => {
     //   │       └── results/  (gitignored)
     //   ├── .gitignore
     //   └── README.md
-    const cleanProjectName = getCleanProjectName(proj);
     const gitRoot = getUserWorkspace(proj, caller);  // git-workspaces/<ProjectName>/admin/
-    const gitProjectPath = path.join(gitRoot, cleanProjectName);  // project content in named subfolder
 
-    // Create the workspace directories (gitRoot = repo root, gitProjectPath = content subfolder)
+    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
+    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
     fs.mkdirSync(gitRoot, { recursive: true });
-    fs.mkdirSync(gitProjectPath, { recursive: true });
 
     const { ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
 
@@ -618,11 +618,11 @@ router.post('/init', async (req, res) => {
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitProjectPath, col.name, envs);
+      ensureAllEnvFolders(gitRoot, col.name, envs);
     }
 
-    // Update folder_path in DB to the project workspace root
-    db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitProjectPath, proj.id);
+    // Update folder_path in DB to the workspace root
+    db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitRoot, proj.id);
 
     const git = gitInstance(gitRoot, sshEnv);
 
@@ -651,8 +651,8 @@ router.post('/init', async (req, res) => {
       '.env',
     ].join('\n'));
 
-    // Create / update README inside the project subfolder
-    const readme = path.join(gitProjectPath, 'README.md');
+    // Create / update README at the workspace root
+    const readme = path.join(gitRoot, 'README.md');
     fs.writeFileSync(readme,
 `# ${proj.name}
 
@@ -661,18 +661,18 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
 ## Folder Structure
 
 \`\`\`
-${proj.name}/
-├── config/                  # Project-level configuration
-├── <CollectionName>_<id>/   # One folder per API Source
+<repo_root>/
+├── <CollectionName>/         # One folder per API Source
 │   ├── QA/
-│   │   ├── testData/        # CSV files for QA environment
-│   │   ├── scripts/         # Generated JMeter (.jmx) / K6 (.js) scripts
-│   │   ├── results/         # Test run output & reports
-│   │   └── config/          # Environment-specific config (URLs, ports)
+│   │   ├── testData/         # CSV files for QA environment
+│   │   ├── script/           # Generated JMeter (.jmx) / K6 (.js) scripts
+│   │   ├── results/          # Test run output & reports
+│   │   └── config/           # Environment-specific config (URLs, ports)
 │   ├── Staging/
-│   │   └── ...              # Same structure as QA
+│   │   └── ...               # Same structure as QA
 │   └── UAT/
-│       └── ...              # Same structure as QA
+│       └── ...               # Same structure as QA
+├── .github/workflows/        # CI pipeline definition
 └── README.md
 \`\`\`
 
@@ -703,7 +703,7 @@ ${proj.name}/
 
     // Remove stale folders created by earlier incorrect code
     ['_collections_placeholder', 'config'].forEach(sf => {
-      const p = path.join(gitProjectPath, sf);
+      const p = path.join(gitRoot, sf);
       if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
     });
 
@@ -718,13 +718,13 @@ ${proj.name}/
         }
       });
     }
-    removeStaleScriptsDir(gitProjectPath);
+    removeStaleScriptsDir(gitRoot);
 
     if (collections.length > 0) {
       for (const col of collections) {
         // Clean name only — no ID suffix (IDs are stored in DB, not needed in folder names)
         const colFolderName = col.name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-        const colDir = path.join(gitProjectPath, colFolderName);
+        const colDir = path.join(gitRoot, colFolderName);
 
         // .gitkeep directly in collection folder so GitHub shows it as its own folder
         // (without this, GitHub collapses colFolder/env into a single path)
