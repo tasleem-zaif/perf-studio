@@ -31,11 +31,11 @@ pipeline {
                     steps {
                         sh """
                             sudo su - ${DEPLOY_USER} -c '
-                                set -e
-                                cd ${CUSTOM_WORKSPACE}
-                                git stash || true
-                                git fetch --all
-                                git checkout ${GIT_COMMIT}
+                                cd ${CUSTOM_WORKSPACE} && \
+                                git stash && \
+                                git fetch && \
+                                git checkout ${GIT_COMMIT} 
+                                
                             '
                         """
                     }
