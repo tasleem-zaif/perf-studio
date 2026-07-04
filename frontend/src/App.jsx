@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react';
-import { projectDirName, collectionDirName, collectionPathLabel } from './utils/displayName';
 import AcceptInvite from './pages/AcceptInvite';
 import api from './api';
 import Auth from './components/Auth';
-import Sidebar from './components/Sidebar';
+import Logo from './components/Logo';
 import CustomSelect from './components/CustomSelect';
 import Modal from './components/Modal';
 import ConfirmModal from './components/ConfirmModal';
@@ -40,10 +39,12 @@ const PROJECT_PAGES = [
 function pageToUrl(p, projectId) {
   if (p === 'dashboard')          return '/dashboard';
   if (p === 'profile')            return '/myprofile';
+  if (p === 'settings-org')       return '/settings/org';
   if (p === 'settings-users')     return '/settings/users';
   if (p === 'settings-orgs')      return '/settings/orgs';
   if (p === 'settings-ai')        return '/settings/ai';
   if (p === 'settings-smtp')      return '/settings/smtp';
+  if (p === 'settings-licenses')  return '/settings/licenses';
   if (projectId && (p === 'project-home' || PROJECT_PAGES.includes(p)))
     return `/projects/${projectId}`;
   return '/dashboard';
@@ -60,27 +61,6 @@ function urlToPageState(pathname) {
   }
   return { page: 'dashboard', projectId: null };
 }
-
-const PAGE_TITLES = {
-  dashboard: 'Dashboard',
-  'project-home': null,
-  collections: 'API Source',
-  rules: 'Rule Engine',
-  runner: 'Test Execution Engine',
-  'test-suites': 'Test Plans',
-  'test-data': 'Test Data',
-  config: 'Configuration',
-  'settings-users': 'User Management',
-  'settings-orgs':  'Organizations',
-  'settings-ai':   'AI Configuration',
-  'ai-config':     'AI Configuration',
-  'git':           'Git Integration',
-  'settings-smtp': 'SMTP Configuration',
-  profile: 'My Profile',
-  reports: 'JMeter Report',
-  analytics: 'Analytics',
-  alerts: 'Alert Configuration',
-};
 
 const TOP_TABS = [
   { id: 'dashboard',  icon: 'ti-layout-dashboard', label: 'Dashboard' },
@@ -258,24 +238,17 @@ function AppInner() {
       markVisited(urlPage);
       setPage(urlPage);
       setActiveTab(tabFromPage(urlPage));
-    } else if (isSuperAdmin && urlPage && urlPage.startsWith('settings-')) {
-      // super_admin: restore settings page from URL
-      markVisited(urlPage);
-      setPage(urlPage);
-      setActiveTab('settings');
     }
-    // Redirect to default landing page after login
-    if (['/', '', '/sign-in', '/dashboard'].includes(window.location.pathname) || isSuperAdmin) {
-      if (isSuperAdmin) {
-        const settingsUrl = urlPage && urlPage.startsWith('settings-') ? pageToUrl(urlPage) : '/settings/users';
-        const settingsPage = urlPage && urlPage.startsWith('settings-') ? urlPage : 'settings-users';
-        window.history.replaceState(null, '', settingsUrl);
-        markVisited(settingsPage);
-        setPage(settingsPage);
-        setActiveTab('settings');
-      } else if (['/', '', '/sign-in'].includes(window.location.pathname)) {
-        window.history.replaceState(null, '', '/dashboard');
-      }
+    // Redirect to default landing page after login.
+    // Organizations is the Super Admin's only destination (no sidebar to navigate
+    // elsewhere), so always land there regardless of the requested URL.
+    if (isSuperAdmin) {
+      window.history.replaceState(null, '', '/settings/orgs');
+      markVisited('settings-orgs');
+      setPage('settings-orgs');
+      setActiveTab('settings');
+    } else if (['/', '', '/sign-in'].includes(window.location.pathname)) {
+      window.history.replaceState(null, '', '/dashboard');
     }
 
     return ps;
@@ -347,7 +320,7 @@ function AppInner() {
     else if (tab === 'execution') target = 'runner';
     else if (tab === 'settings') {
       const isAdmin = user?.role === 'super_admin' || user?.role === 'org_admin';
-      target = isAdmin ? 'settings-users' : 'settings-smtp';
+      target = isAdmin ? 'settings-org' : 'settings-smtp';
     }
     else if (tab === 'projects') target = 'dashboard';
     else if (tab === 'profile')  target = 'profile';
@@ -453,39 +426,6 @@ function AppInner() {
     window.history.replaceState(null, '', '/sign-in');
   }
 
-  function renderTopbarActions() {
-    switch (page) {
-      case 'dashboard':
-        return user?.role === 'org_admin'
-          ? <button className="btn-primary" onClick={openNewProject}><i className="ti ti-plus" /> New Project</button>
-          : null;
-      case 'project-home':
-        return activeProject ? (
-          <>
-            <button className="btn-secondary btn-sm" onClick={() => nav('collections')}><i className="ti ti-braces" /> API Source</button>
-            <button className="btn-secondary btn-sm" onClick={() => nav('rules')}><i className="ti ti-adjustments-horizontal" /> Rules</button>
-            <button className="btn-secondary btn-sm" onClick={() => nav('test-suites')}><i className="ti ti-test-pipe" /> Test Plans</button>
-            <button className="btn-primary btn-sm" onClick={() => nav('runner')}><i className="ti ti-player-play" /> Run Tests</button>
-          </>
-        ) : null;
-      case 'collections':
-        return <button className="btn-primary" onClick={() => setCollectionModalTrigger(n => n + 1)}><i className="ti ti-plus" /> Add API Source</button>;
-      case 'rules':
-        return <button className="btn-primary" onClick={() => setRuleModalTrigger(n => n + 1)}><i className="ti ti-plus" /> Add Rule</button>;
-      case 'test-suites':
-        return <button className="btn-primary" onClick={() => setTestSuiteModalTrigger(n => n + 1)}><i className="ti ti-plus" /> New Test Plan</button>;
-      case 'test-data':
-        return (
-          <>
-            <button className="btn-secondary" onClick={() => setGenerateDataTrigger(n => n + 1)}><i className="ti ti-wand" /> Generate Data</button>
-            <button className="btn-primary" onClick={() => setTestDataUploadTrigger(n => n + 1)}><i className="ti ti-upload" /> Upload File</button>
-          </>
-        );
-      default:
-        return null;
-    }
-  }
-
   // Pages where the user picks an env via the selector bar (not rules — that's global)
   const ENV_PAGES = new Set(['test-data', 'config', 'test-suites', 'alerts', 'runner', 'analytics', 'reports']);
 
@@ -503,11 +443,6 @@ function AppInner() {
     return e;
   })();
 
-  const pageTitle = page === 'project-home'
-    ? (projectDirName(activeProject) || 'Project')
-    : page === 'runner' && activeCollection && activeEnv
-      ? `Run Tests — ${collectionDirName(activeCollection)} / ${activeEnv}`
-      : (PAGE_TITLES[page] || page);
   const sharedProps = { onNav: nav, onProjectUpdated: refreshProject, collection: activeCollection, env: activeEnv, envs: collectionEnvs, onEnvChange: setActiveEnv };
 
   if (loading) return (
@@ -568,17 +503,8 @@ function AppInner() {
     <div>
       {/* Banner */}
       <div className="app-banner">
-        {/* Left: Quarks logo + subtitle — left aligned */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <img
-            src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-            alt="QTSolv"
-            style={{ height: '30px', width: 'auto', objectFit: 'contain', flexShrink: 0 }}
-          />
-          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', fontWeight: 500, letterSpacing: '.3px' }}>
-            AI-Powered Performance Test Studio
-          </span>
-        </div>
+        {/* Left: Peako logo — left aligned */}
+        <Logo size="md" theme="dark" />
 
         {/* Right: Profile + Logout */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -594,40 +520,13 @@ function AppInner() {
         </div>
       </div>
 
-      {/* Sidebar only for org_admin and super_admin — regular users go straight to dashboard */}
-      {user?.role !== 'user' && (
-        <Sidebar
-          user={user}
-          projects={projects}
-          activeProject={activeProject}
-          activeCollection={activeCollection}
-          activeEnv={activeEnv}
-          page={page}
-          activeTab={activeTab}
-          onNav={nav}
-          onSelectProject={selectProject}
-          onSelectCollection={selectCollection}
-          onNewProject={openNewProject}
-          onAddCollection={openAddCollection}
-          onLogout={logout}
-          onTabChange={changeTab}
-        />
-      )}
-
-      {/* Main content area — no left margin for regular users (no sidebar) */}
-      <div className={`main${user?.role === 'user' ? ' no-topbar' : ''}`}
-        style={user?.role === 'user' ? { marginLeft: 0, width: '100%' } : {}}>
-        {/* Topbar only for admin roles */}
-        {user?.role !== 'user' && (
-          <div className="topbar" style={user?.role === 'user' ? { left: 0 } : {}}>
-            <div className="topbar-title">{pageTitle}</div>
-            <div className="topbar-actions">{renderTopbarActions()}</div>
-          </div>
-        )}
-
+      {/* No sidebar for any role — every page renders full-width; navigation between
+          Dashboard and Organization Administration is via top-right buttons on each page. */}
+      <div className="main no-topbar" style={{ marginLeft: 0, width: '100%' }}>
         {user?.role !== 'super_admin' && (
           <KeepAlive active={page === 'dashboard'} everVisited={everVisited.has('dashboard')}>
             <Dashboard projects={projects} user={user} onSelectProject={selectProject}
+              onNav={nav}
               onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined}
               onNewProject={user?.role === 'org_admin' ? openNewProject : undefined}
               onEditProject={user?.role === 'org_admin' ? openEditProject : undefined} />
@@ -637,7 +536,9 @@ function AppInner() {
         {/* Settings only for admin roles */}
         {user?.role !== 'user' && (
           <KeepAlive active={page.startsWith('settings')} everVisited={[...everVisited].some(p => p.startsWith('settings'))}>
-            <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} projects={projects} />
+            <Settings page={page} theme={theme} onThemeChange={setTheme} user={user} projects={projects}
+              onNav={nav}
+              onDeleteProject={user?.role === 'org_admin' ? deleteProject : undefined} />
           </KeepAlive>
         )}
         {/* NOTE: all project-related pages (project-home, collections, rules, etc.)

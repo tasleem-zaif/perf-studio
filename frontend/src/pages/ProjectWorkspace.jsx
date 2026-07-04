@@ -12,6 +12,7 @@ import Runner      from './Runner';
 import Analytics      from './Analytics';
 import Reports        from './Reports';
 import PipelineConfig from './PipelineConfig';
+import Logo from '../components/Logo';
 
 const NAV_ITEMS = [
   { id: 'overview',    icon: 'ti-layout-dashboard',       label: 'Overview',       sub: 'Project summary',              color: '#22c55e', bg: '#dcfce7' },
@@ -127,7 +128,10 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
       if (!envs.length && col.environment) envs = [col.environment];
       if (envs.length) setActiveEnv(envs[0]);
     }
-  }, [project?.id]);
+    // Re-run whenever the collections list itself changes (e.g. it loads asynchronously
+    // after this project's initial mount) — [project?.id] alone missed that case, leaving
+    // no collection ever auto-selected and the env-scoped Configuration sections stuck hidden.
+  }, [project?.id, collections.length]);
 
   const collectionEnvs = (() => {
     if (!activeCollection) return [];
@@ -227,7 +231,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
               </div>
               {/* Tab content */}
               <div style={{ display: configTab === 'environment' ? 'contents' : 'none' }}>
-                <Config key={`cfg-${project?.id}-${activeCollection?.id}-${activeEnv}`} project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />
+                <Config project={project} />
               </div>
               <div style={{ display: configTab === 'ai' ? 'contents' : 'none' }}>
                 <Settings page="settings-ai" user={user} theme={theme} onThemeChange={onThemeChange} />
@@ -324,10 +328,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
           {/* Left: Logo then Org/Project info below */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <img src="/favicon.svg" alt="Quarks" style={{ height: 40, width: 40 }} />
-              <span style={{ fontSize: 26, fontWeight: 800, color: '#0f172a', letterSpacing: 1.5 }}>QUARKS</span>
-            </div>
+            <Logo size="xl" theme="light" />
             <div>
               <div style={{ fontSize: 22, fontWeight: 700, color: '#0f172a', lineHeight: 1.2 }}>
                 {user?.org_name || 'Organization'} - {project?.name}

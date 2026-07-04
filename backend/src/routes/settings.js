@@ -5,8 +5,8 @@ const { encrypt } = require('../utils/encryption');
 
 router.use(auth);
 
-router.get('/ai', (req, res) => {
-  const row = db.prepare('SELECT provider, model, heal_model, api_key FROM ai_settings WHERE user_id = ?').get(req.userId);
+router.get('/ai', async (req, res) => {
+  const row = await db.prepare('SELECT provider, model, heal_model, api_key FROM ai_settings WHERE user_id = ?').get(req.userId);
   res.json({
     provider:    row?.provider    || 'openai',
     model:       row?.model       || '',
@@ -16,11 +16,11 @@ router.get('/ai', (req, res) => {
   });
 });
 
-router.put('/ai', (req, res) => {
+router.put('/ai', async (req, res) => {
   const { provider, model, heal_model, api_key } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required' });
 
-  const existing = db.prepare('SELECT id FROM ai_settings WHERE user_id = ?').get(req.userId);
+  const existing = await db.prepare('SELECT id FROM ai_settings WHERE user_id = ?').get(req.userId);
   if (existing) {
     const updates = ['provider = ?', 'model = ?', 'heal_model = ?'];
     const values  = [provider, model || '', heal_model || ''];
@@ -29,9 +29,9 @@ router.put('/ai', (req, res) => {
       values.push(encrypt(api_key)); // store encrypted
     }
     values.push(req.userId);
-    db.prepare(`UPDATE ai_settings SET ${updates.join(', ')} WHERE user_id = ?`).run(...values);
+    await db.prepare(`UPDATE ai_settings SET ${updates.join(', ')} WHERE user_id = ?`).run(...values);
   } else {
-    db.prepare('INSERT INTO ai_settings (user_id, provider, model, heal_model, api_key) VALUES (?, ?, ?, ?, ?)')
+    await db.prepare('INSERT INTO ai_settings (user_id, provider, model, heal_model, api_key) VALUES (?, ?, ?, ?, ?)')
       .run(req.userId, provider, model || '', heal_model || '', api_key ? encrypt(api_key) : '');
   }
   res.json({ ok: true });

@@ -17,6 +17,24 @@ version: '3.9'
 
 services:
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: perf_studio_pg
+    environment:
+      POSTGRES_DB: perf_studio
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   PerfStudio:
     image: ${PerfStudio_IMAGE:-tasleemzaif/PerfStudio:latest}
     build:
@@ -35,11 +53,14 @@ services:
       BACKUPS_ROOT: /app/backups
       JMETER_HOME: /opt/jmeter
       K6_BIN: /usr/bin/k6
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/perf_studio
     volumes:
-      - PerfStudio_data:/app/data         # SQLite database
       - PerfStudio_projects:/app/projects # project files, scripts, test data
       - PerfStudio_git:/app/git-workspaces
       - PerfStudio_backups:/app/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
@@ -47,3 +68,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+volumes:
+  pg_data:
+  PerfStudio_projects:
+  PerfStudio_git:
+  PerfStudio_backups:

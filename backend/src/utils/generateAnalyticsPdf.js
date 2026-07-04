@@ -520,7 +520,7 @@ ${CHARTJS_SRC}
   // If no charts registered at all, mark ready immediately
   if (total === 0) window.__chartsReady = true;
   // Fallback: force ready after 3s in case any chart fails to fire onComplete
-  setTimeout(() => { window.__chartsReady = true; }, 3000);
+  setTimeout(async () => { window.__chartsReady = true; }, 3000);
 })();
 </script>
 </html>`;

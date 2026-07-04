@@ -49,6 +49,7 @@ export default function Collections({ project, collection: activeCollection, onN
   const [parsedCurl, setParsedCurl] = useState(null);
   const [parsing, setParsing] = useState(false);
   const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedEnvFile, setSelectedEnvFile] = useState(null);
   // Pre-run state
   const [preRunning, setPreRunning] = useState(null);
   const [preRunData, setPreRunData] = useState({});
@@ -56,6 +57,7 @@ export default function Collections({ project, collection: activeCollection, onN
   const [logModalPos, setLogModalPos] = useState({ x: 0, y: 0 });
   const [expandedLog, setExpandedLog] = useState({});
   const fileRef = useRef(null);
+  const envFileRef = useRef(null);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -80,7 +82,7 @@ export default function Collections({ project, collection: activeCollection, onN
 
   useEffect(() => {
     if (firstRender.current) { firstRender.current = false; return; }
-    if (openModalTrigger > 0) { setForm(DEFAULT_FORM); setError(''); setParsedCurl(null); setSelectedFile(null); setModal('add'); }
+    if (openModalTrigger > 0) { setForm(DEFAULT_FORM); setError(''); setParsedCurl(null); setSelectedFile(null); setSelectedEnvFile(null); setModal('add'); }
   }, [openModalTrigger]);
 
   // Center log modal when it opens
@@ -99,7 +101,7 @@ export default function Collections({ project, collection: activeCollection, onN
     let envs = [];
     try { envs = JSON.parse(c.environments || '[]'); if (!Array.isArray(envs)) envs = []; } catch { envs = []; }
     setForm({ name: c.name, description: c.description, environments: envs, source_type: c.source_type || 'json', tool_target: c.tool_target || 'jmeter', source_content: c.source_content || '', json_content: c.json_content || '[]' });
-    setParsedCurl(null); setSelectedFile(null); setError(''); setModal(c);
+    setParsedCurl(null); setSelectedFile(null); setSelectedEnvFile(null); setError(''); setModal(c);
   }
 
   async function doParseCurl() {
@@ -126,6 +128,7 @@ export default function Collections({ project, collection: activeCollection, onN
 
       if (selectedFile && (form.source_type === 'postman' || form.source_type === 'swagger')) {
         fd.append('file', selectedFile);
+        if (selectedEnvFile && form.source_type === 'postman') fd.append('environment_file', selectedEnvFile);
       } else if (form.source_type === 'curl') {
         fd.append('source_content', form.source_content);
       } else {
@@ -150,7 +153,7 @@ export default function Collections({ project, collection: activeCollection, onN
         }
         setPreRunData(prev => ({ ...prev, ...restored }));
       }).catch(() => {});
-      setModal(null); setSelectedFile(null); setParsedCurl(null);
+      setModal(null); setSelectedFile(null); setSelectedEnvFile(null); setParsedCurl(null);
     } catch (e) {
       setError(e.response?.data?.error || 'Failed to save API source — check the file format, collection name, and selected environments, then try again.');
     } finally { setSaving(false); }
@@ -225,7 +228,7 @@ export default function Collections({ project, collection: activeCollection, onN
     const startX = logModalPos.x;
     const startY = logModalPos.y;
     function onMove(e) {
-      setLogModalPos({ x: startX + e.clientX - startMouseX, y: startY + e.clientY - startMouseY });
+      setLogModalPos({ x: startX + e.clientX - startMouseX, y: Math.max(0, startY + e.clientY - startMouseY) });
     }
     function onUp() {
       document.removeEventListener('mousemove', onMove);
@@ -353,10 +356,10 @@ export default function Collections({ project, collection: activeCollection, onN
 
       {/* Add/Edit Modal */}
       {modal && (
-        <Modal onClose={() => { setModal(null); setSelectedFile(null); setParsedCurl(null); }}>
+        <Modal onClose={() => { setModal(null); setSelectedFile(null); setSelectedEnvFile(null); setParsedCurl(null); }}>
           <div className="modal-hdr">
             <div className="modal-title">{modal === 'add' ? 'Add' : 'Edit'} API Source</div>
-            <button className="btn-icon" onClick={() => { setModal(null); setSelectedFile(null); setParsedCurl(null); }}><i className="ti ti-x" /></button>
+            <button className="btn-icon" onClick={() => { setModal(null); setSelectedFile(null); setSelectedEnvFile(null); setParsedCurl(null); }}><i className="ti ti-x" /></button>
           </div>
           {error && <div className="auth-error">{error}</div>}
 
@@ -407,7 +410,7 @@ export default function Collections({ project, collection: activeCollection, onN
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
               {SOURCE_TYPES.map(st => (
                 <div key={st.value}
-                  onClick={() => { setForm(f => ({ ...f, source_type: st.value, source_content: '' })); setSelectedFile(null); setParsedCurl(null); setError(''); }}
+                  onClick={() => { setForm(f => ({ ...f, source_type: st.value, source_content: '' })); setSelectedFile(null); setSelectedEnvFile(null); setParsedCurl(null); setError(''); }}
                   style={{ padding: '10px 12px', borderRadius: '8px', border: `2px solid ${form.source_type === st.value ? 'var(--accent)' : 'var(--color-border-secondary)'}`, cursor: 'pointer', background: form.source_type === st.value ? 'rgba(74,158,255,0.12)' : 'transparent' }}>
                   <div style={{ fontWeight: 600, fontSize: '13px', color: form.source_type === st.value ? 'var(--accent)' : 'var(--color-text-primary)' }}><i className={`ti ${st.icon}`} style={{ marginRight: '6px' }} />{st.label}</div>
                   <div style={{ fontSize: '11px', color: form.source_type === st.value ? 'var(--color-text-secondary)' : 'var(--color-text-tertiary)', marginTop: '2px' }}>{st.desc}</div>
@@ -430,6 +433,25 @@ export default function Collections({ project, collection: activeCollection, onN
                   : modal !== 'add' && form.source_content
                     ? <span style={{ fontSize: '12px', color: 'var(--color-text-tertiary)' }}>File already imported — upload new to replace</span>
                     : null}
+              </div>
+            </div>
+          )}
+
+          {form.source_type === 'postman' && (
+            <div className="form-group">
+              <label className="form-label">Postman Environment (optional)</label>
+              <input ref={envFileRef} type="file" accept=".json" style={{ display: 'none' }}
+                onChange={e => { setSelectedEnvFile(e.target.files?.[0] || null); setError(''); }} />
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <button className="btn-secondary" type="button" onClick={() => envFileRef.current?.click()}>
+                  <i className="ti ti-upload" /> Choose Environment File
+                </button>
+                {selectedEnvFile
+                  ? <span style={{ fontSize: '13px', color: 'var(--color-text-secondary)' }}>{selectedEnvFile.name}</span>
+                  : null}
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '4px' }}>
+                Upload a Postman environment export (e.g. <code>{'{{url}}'}</code>, <code>{'{{token}}'}</code>) so pre-run can resolve variables instead of failing. Any defaults embedded in the collection itself are picked up automatically.
               </div>
             </div>
           )}
@@ -465,7 +487,7 @@ export default function Collections({ project, collection: activeCollection, onN
           )}
 
           <div className="modal-footer">
-            <button className="btn-secondary" onClick={() => { setModal(null); setSelectedFile(null); setParsedCurl(null); }}>Cancel</button>
+            <button className="btn-secondary" onClick={() => { setModal(null); setSelectedFile(null); setSelectedEnvFile(null); setParsedCurl(null); }}>Cancel</button>
             <button className="btn-primary" onClick={save} disabled={saving}>{saving && <span className="spinner" />}Save</button>
           </div>
         </Modal>
@@ -505,6 +527,8 @@ export default function Collections({ project, collection: activeCollection, onN
             <div style={{
               position: 'absolute', left: logModalPos.x, top: logModalPos.y,
               width: '860px', minWidth: '400px', minHeight: '300px',
+              height: `${Math.min(620, window.innerHeight - logModalPos.y - 24)}px`,
+              maxHeight: `calc(100vh - ${logModalPos.y}px - 24px)`,
               background: 'var(--color-background-primary)', borderRadius: '12px',
               display: 'flex', flexDirection: 'column',
               boxShadow: '0 24px 64px rgba(0,0,0,0.35)',
@@ -604,6 +628,10 @@ export default function Collections({ project, collection: activeCollection, onN
                     </div>
                   );
                 })}
+              </div>
+              {/* Footer — fixed, outside the scrolling body */}
+              <div style={{ flexShrink: 0, display: 'flex', justifyContent: 'flex-end', gap: '8px', padding: '14.4px 20px', borderTop: '1px solid var(--color-border-secondary)' }}>
+                <button className="btn-primary" onClick={() => setLogModalCollection(null)}>Close</button>
               </div>
             </div>
           </div>

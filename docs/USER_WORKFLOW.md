@@ -132,7 +132,7 @@ Pre-Run fires all your API endpoints live to capture real responses, extract aut
 
 1. Open **API Sources**
 2. Find your collection and click **Run Pre-run**
-3. The application fires each endpoint (up to 20) with a 5-second timeout
+3. The application fires every endpoint in the collection (in bounded-concurrency batches, 5-second timeout each)
 4. Results appear showing **pass / fail** for each endpoint
 5. Click **Show Logs** to see the full response for any endpoint
 6. A green indicator confirms the pre-run is fresh

@@ -192,8 +192,8 @@ function createSshEnv(privateKey, remoteUrl = null) {
 
 // Resolve effective auth (SSH or PAT) for a user on a project.
 // Each user's auth_method is their own independent choice — never inherit from project cfg.
-function getAuth(cfg, userId, projectId) {
-  const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+async function getAuth(cfg, userId, projectId) {
+  const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(userId, projectId);
   const authMethod = identity?.auth_method || 'pat';
 
@@ -258,7 +258,7 @@ function getUserWorkspace(proj, user) {
 
 // Clone or pull-update a user's workspace from the remote
 async function ensureUserWorkspace(gitRoot, cfg, user) {
-  const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+  const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(user.id, cfg.project_id);
 
   // Each user's auth_method is their own choice — never inherit from the project cfg.
@@ -276,7 +276,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
     // Try user's own SSH key first; fall back to the admin's key for initial clone
     let rawKey = identity?.ssh_key ? decrypt(identity.ssh_key).trim() : '';
     if (!rawKey && cfg.project_id) {
-      const adminIdentity = db.prepare(
+      const adminIdentity = await db.prepare(
         `SELECT ugc.ssh_key FROM user_git_configs ugc
          JOIN users u ON u.id = ugc.user_id
          WHERE ugc.project_id = ? AND u.role IN ('org_admin','super_admin')
@@ -335,7 +335,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
     const { ensureAllEnvFolders, cleanName: cn } = require('../utils/projectFolders');
     // Collections go DIRECTLY at the workspace root — no project-name subfolder.
     // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
-    const collections = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
+    const collections = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
     for (const col of collections) {
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
@@ -346,7 +346,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
 
     // Copy JMX/JS scripts into this workspace if they don't exist here yet.
     // Destination is always: gitRoot/<CollectionName>/<Env>/script/<filename>
-    const suites = db.prepare(`
+    const suites = await db.prepare(`
       SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
       FROM test_suites ts
       LEFT JOIN collections c ON c.id = ts.collection_id
@@ -470,11 +470,11 @@ async function applyBranchProtection(cfg, branch = 'main') {
 
 // ── GET /config ───────────────────────────────────────────────────────────────
 
-router.get('/config', (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+router.get('/config', async (req, res) => {
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg) return res.json({ config: null });
 
   const rawToken = cfg.auth_token ? decrypt(cfg.auth_token) : '';
@@ -490,23 +490,23 @@ router.get('/config', (req, res) => {
 });
 
 // ── Helper: check if current user is the project owner ────────────────────────
-function isProjectOwner(userId, projectId) {
-  const proj = db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
+async function isProjectOwner(userId, projectId) {
+  const proj = await db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
   return proj && String(proj.user_id) === String(userId);
 }
 
 // ── PUT /config ───────────────────────────────────────────────────────────────
 
-router.put('/config', (req, res) => {
-  const caller = getCaller(req.userId);
+router.put('/config', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller.role)) {
     return res.status(403).json({ error: 'Only org admins can configure git.' });
   }
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
   // Only the project owner can change git setup
-  if (!isProjectOwner(req.userId, req.params.projectId)) {
+  if (!await isProjectOwner(req.userId, req.params.projectId)) {
     return res.status(403).json({
       error: 'Only the project owner can modify the Git repository configuration.',
       owner_only: true,
@@ -514,7 +514,7 @@ router.put('/config', (req, res) => {
   }
 
   const { provider, remote_url, username, email, auth_token, auth_method, base_branch } = req.body;
-  const existing = getGitConfig(req.params.projectId);
+  const existing = await getGitConfig(req.params.projectId);
 
   // Repo is permanently locked after initialization — cannot change remote_url or base_branch
   if (existing?.is_initialized && remote_url && remote_url !== existing.remote_url) {
@@ -532,10 +532,10 @@ router.put('/config', (req, res) => {
   const finalBaseBranch = base_branch || existing?.base_branch || 'main';
 
   if (existing) {
-    db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=?,auth_method=?,base_branch=? WHERE project_id=?`)
+    await db.prepare(`UPDATE git_configs SET provider=?,remote_url=?,username=?,email=?,auth_token=?,auth_method=?,base_branch=? WHERE project_id=?`)
       .run(provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, finalBaseBranch, req.params.projectId);
   } else {
-    db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token,auth_method,base_branch) VALUES (?,?,?,?,?,?,?,?)`)
+    await db.prepare(`INSERT INTO git_configs (project_id,provider,remote_url,username,email,auth_token,auth_method,base_branch) VALUES (?,?,?,?,?,?,?,?)`)
       .run(req.params.projectId, provider||'github', remote_url||'', username||'', email||'', finalToken, finalMethod, finalBaseBranch);
   }
   res.json({ ok: true });
@@ -544,22 +544,22 @@ router.put('/config', (req, res) => {
 // ── POST /init ────────────────────────────────────────────────────────────────
 
 router.post('/init', async (req, res) => {
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller.role)) {
     return res.status(403).json({ error: 'Only org admins can initialize git.' });
   }
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
   // Only the project owner can initialize the repository
-  if (!isProjectOwner(req.userId, req.params.projectId)) {
+  if (!await isProjectOwner(req.userId, req.params.projectId)) {
     return res.status(403).json({
       error: 'Only the project owner can initialize the Git repository.',
       owner_only: true,
     });
   }
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg || !cfg.remote_url) return res.status(400).json({ error: 'Configure git remote URL first.' });
 
   // folder_path is null before first init — that's expected.
@@ -567,12 +567,12 @@ router.post('/init', async (req, res) => {
 
   let sshCleanup = () => {};
   try {
-    const { isSSH, remoteUrl: remoteWithAuth, sshEnv, cleanup } = getAuth(cfg, req.userId, req.params.projectId);
+    const { isSSH, remoteUrl: remoteWithAuth, sshEnv, cleanup } = await getAuth(cfg, req.userId, req.params.projectId);
     sshCleanup = cleanup;
 
     if (!isSSH) {
       // PAT mode — require a token
-      const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+      const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
       const personalToken = identity?.auth_token ? decrypt(identity.auth_token) : '';
       const projectToken  = cfg.auth_token       ? decrypt(cfg.auth_token)       : '';
       if (!personalToken && !projectToken) {
@@ -612,7 +612,7 @@ router.post('/init', async (req, res) => {
     const { ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
 
     // Create collection subfolders for all existing collections
-    const existingCols = db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
+    const existingCols = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
     for (const col of existingCols) {
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
@@ -622,7 +622,7 @@ router.post('/init', async (req, res) => {
     }
 
     // Update folder_path in DB to the workspace root
-    db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitRoot, proj.id);
+    await db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(gitRoot, proj.id);
 
     const git = gitInstance(gitRoot, sshEnv);
 
@@ -697,12 +697,12 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
     }
 
     // 1. Build collection/env structure from DB — only real data, no placeholders
-    const collections = db.prepare(
+    const collections = await db.prepare(
       'SELECT * FROM collections WHERE project_id = ?'
     ).all(req.params.projectId);
 
     // Remove stale folders created by earlier incorrect code
-    ['_collections_placeholder', 'config'].forEach(sf => {
+    ['_collections_placeholder', 'config'].forEach(async sf => {
       const p = path.join(gitRoot, sf);
       if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
     });
@@ -710,7 +710,7 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
     // Remove stale 'scripts' (plural) dirs — app uses 'script' (singular) for generated files
     function removeStaleScriptsDir(dir) {
       if (!fs.existsSync(dir)) return;
-      fs.readdirSync(dir).forEach(entry => {
+      fs.readdirSync(dir).forEach(async entry => {
         const full = path.join(dir, entry);
         if (fs.statSync(full).isDirectory()) {
           if (entry === 'scripts') fs.rmSync(full, { recursive: true, force: true });
@@ -756,7 +756,7 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
       const gk = path.join(dir, '.gitkeep');
       if (!fs.existsSync(gk)) fs.writeFileSync(gk, '');
       // Recurse into all subdirectories
-      fs.readdirSync(dir).forEach(entry => {
+      fs.readdirSync(dir).forEach(async entry => {
         if (entry === '.git' || entry === '.gitkeep') return;
         const full = path.join(dir, entry);
         if (fs.statSync(full).isDirectory()) ensureGitkeepAll(full);
@@ -860,10 +860,10 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
     const protectionResult = await applyBranchProtection(cfg);
 
     // Mark as initialized and save git_root (workspace directory)
-    db.prepare('UPDATE git_configs SET is_initialized=1, git_root=? WHERE project_id=?')
+    await db.prepare('UPDATE git_configs SET is_initialized=1, git_root=? WHERE project_id=?')
       .run(gitRoot, req.params.projectId);
 
-    db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
+    await db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
       .run(req.params.projectId, req.userId, baseBranch, 'Initial commit: PerfStudio project structure', 1);
 
     const protectionWarning = protectionResult?.ok === false
@@ -881,13 +881,13 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
 // ── GET /status ───────────────────────────────────────────────────────────────
 
 router.get('/status', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ initialized: false });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
 
   try {
     const gitDir = getUserWorkspace(proj, caller);
@@ -929,13 +929,13 @@ router.get('/status', async (req, res) => {
 // ── POST /commit ──────────────────────────────────────────────────────────────
 
 router.post('/commit', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized for this project.' });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   const { message } = req.body;
   if (!message?.trim()) return res.status(400).json({ error: 'Commit message required.' });
 
@@ -969,7 +969,7 @@ router.post('/commit', async (req, res) => {
     const commitResult = await git.commit(message.trim());
     const hash = commitResult.commit || '';
 
-    db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,hash) VALUES (?,?,?,?,?)')
+    await db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,hash) VALUES (?,?,?,?,?)')
       .run(req.params.projectId, req.userId, branch, message.trim(), hash);
 
     res.json({ ok: true, hash, branch, message: `Committed to branch "${branch}".` });
@@ -984,19 +984,19 @@ router.post('/commit', async (req, res) => {
 // ── POST /push ────────────────────────────────────────────────────────────────
 
 router.post('/push', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
 
-  const { remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, caller.id, req.params.projectId);
+  const { remoteUrl, sshEnv, cleanup: sshCleanup } = await getAuth(cfg, caller.id, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir, sshEnv);
-    const userIdentity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
+    const userIdentity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(caller.id, req.params.projectId);
 
     const branch = userIdentity?.branch_name || getBranchForUser(caller, cfg);
     await git.addConfig('user.name',  userIdentity?.author_name  || caller.name);
@@ -1031,7 +1031,7 @@ router.post('/push', async (req, res) => {
     gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
     // Mark commits as pushed
-    db.prepare("UPDATE git_commits SET pushed=1 WHERE project_id=? AND branch=? AND pushed=0")
+    await db.prepare("UPDATE git_commits SET pushed=1 WHERE project_id=? AND branch=? AND pushed=0")
       .run(req.params.projectId, branch);
 
     res.json({ ok: true, branch, message: `Pushed to origin/${branch} successfully.` });
@@ -1046,15 +1046,15 @@ router.post('/push', async (req, res) => {
 // ── POST /pull ────────────────────────────────────────────────────────────────
 
 router.post('/pull', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
 
-  const { remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, caller.id, req.params.projectId);
+  const { remoteUrl, sshEnv, cleanup: sshCleanup } = await getAuth(cfg, caller.id, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir, sshEnv);
@@ -1116,13 +1116,13 @@ router.post('/pull', async (req, res) => {
 // ── GET /branches ─────────────────────────────────────────────────────────────
 
 router.get('/branches', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ branches: [], current: null });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
@@ -1145,13 +1145,13 @@ router.get('/branches', async (req, res) => {
 // ── GET /log ──────────────────────────────────────────────────────────────────
 
 router.get('/log', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.json({ commits: [] });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir);
@@ -1164,11 +1164,11 @@ router.get('/log', async (req, res) => {
 
 // ── GET /prs ──────────────────────────────────────────────────────────────────
 
-router.get('/prs', (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+router.get('/prs', async (req, res) => {
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const prs = db.prepare(`
+  const prs = await db.prepare(`
     SELECT p.*, u.name as author_name, u.email as author_email
     FROM git_prs p LEFT JOIN users u ON u.id = p.created_by
     WHERE p.project_id = ? ORDER BY p.created_at DESC
@@ -1180,14 +1180,14 @@ router.get('/prs', (req, res) => {
 // ── POST /prs — create PR ─────────────────────────────────────────────────────
 
 router.post('/prs', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   const { title, description } = req.body;
   if (!title?.trim()) return res.status(400).json({ error: 'PR title required.' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
 
   const baseBranch = getBaseBranch(cfg);
@@ -1221,33 +1221,33 @@ router.post('/prs', async (req, res) => {
     // Continue — store PR locally even if remote fails
   }
 
-  const result = db.prepare(`
+  const result = await db.prepare(`
     INSERT INTO git_prs (project_id, title, description, from_branch, to_branch, created_by, remote_pr_url)
     VALUES (?,?,?,?,?,?,?)
   `).run(req.params.projectId, title.trim(), description||'', branch, baseBranch, req.userId, remotePrUrl);
 
-  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ?').get(result.lastInsertRowid);
+  const pr = await db.prepare('SELECT * FROM git_prs WHERE id = ?').get(result.lastInsertRowid);
   res.json({ ok: true, pr, remote_pr_url: remotePrUrl });
 });
 
 // ── PUT /prs/:prId/merge ──────────────────────────────────────────────────────
 
 router.put('/prs/:prId/merge', async (req, res) => {
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller.role)) {
     return res.status(403).json({ error: 'Only org admins can merge PRs.' });
   }
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
+  const pr = await db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
     .get(req.params.prId, req.params.projectId);
   if (!pr) return res.status(404).json({ error: 'PR not found.' });
   if (pr.status !== 'open') return res.status(400).json({ error: `PR is already ${pr.status}.` });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
 
-  const { remoteUrl: mergeRemoteUrl, sshEnv: mergeSshEnv, cleanup: mergeSshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
+  const { remoteUrl: mergeRemoteUrl, sshEnv: mergeSshEnv, cleanup: mergeSshCleanup } = await getAuth(cfg, req.userId, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
     const git = gitInstance(gitDir, mergeSshEnv);
@@ -1293,9 +1293,9 @@ router.put('/prs/:prId/merge', async (req, res) => {
     }
 
     // Mark PR as merged
-    db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
+    await db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
 
-    db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
+    await db.prepare('INSERT INTO git_commits (project_id,user_id,branch,message,pushed) VALUES (?,?,?,?,?)')
       .run(req.params.projectId, req.userId, baseBranch, `Merge PR: ${pr.title}`, 1);
 
     res.json({ ok: true, message: `PR "${pr.title}" merged into ${baseBranch}.` });
@@ -1310,8 +1310,8 @@ router.put('/prs/:prId/merge', async (req, res) => {
 // ── PUT /prs/:prId/close ──────────────────────────────────────────────────────
 
 router.put('/prs/:prId/close', async (req, res) => {
-  const caller = getCaller(req.userId);
-  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
+  const caller = await getCaller(req.userId);
+  const pr = await db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
     .get(req.params.prId, req.params.projectId);
   if (!pr) return res.status(404).json({ error: 'PR not found.' });
 
@@ -1323,10 +1323,10 @@ router.put('/prs/:prId/close', async (req, res) => {
   // ── Close on GitHub if we have a remote PR URL ────────────────────────────
   if (pr.remote_pr_url) {
     try {
-      const cfg = getGitConfig(req.params.projectId);
+      const cfg = await getGitConfig(req.params.projectId);
 
       // Prefer the closer's personal PAT, fall back to project config token
-      const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+      const userIdentity = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
         .get(req.userId, req.params.projectId);
       const rawToken = userIdentity?.auth_token
         ? decrypt(userIdentity.auth_token)
@@ -1351,16 +1351,16 @@ router.put('/prs/:prId/close', async (req, res) => {
     }
   }
 
-  db.prepare("UPDATE git_prs SET status='closed' WHERE id=?").run(pr.id);
+  await db.prepare("UPDATE git_prs SET status='closed' WHERE id=?").run(pr.id);
   res.json({ ok: true });
 });
 
 // ── GET /identity ─────────────────────────────────────────────────────────────
-router.get('/identity', (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+router.get('/identity', async (req, res) => {
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const caller = getCaller(req.userId);
-  const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+  const caller = await getCaller(req.userId);
+  const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
   const safe = caller.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-');
   const defaultBranch = `feature/${safe}`;
@@ -1378,11 +1378,11 @@ router.get('/identity', (req, res) => {
 });
 
 // ── PUT /identity ─────────────────────────────────────────────────────────────
-router.put('/identity', (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+router.put('/identity', async (req, res) => {
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const { branch_name, author_name, author_email, auth_token, auth_method, ssh_key, git_username } = req.body;
-  const existing = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+  const existing = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
 
   const finalToken = (auth_token && auth_token !== '••••••••')
@@ -1399,10 +1399,10 @@ router.put('/identity', (req, res) => {
   const finalUsername = (git_username !== undefined) ? (git_username || '') : (existing?.git_username || '');
 
   if (existing) {
-    db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=?,auth_method=?,ssh_key=?,git_username=? WHERE user_id=? AND project_id=?')
+    await db.prepare('UPDATE user_git_configs SET branch_name=?,author_name=?,author_email=?,auth_token=?,auth_method=?,ssh_key=?,git_username=? WHERE user_id=? AND project_id=?')
       .run(branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, finalUsername, req.userId, req.params.projectId);
   } else {
-    db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token,auth_method,ssh_key,git_username) VALUES (?,?,?,?,?,?,?,?,?)')
+    await db.prepare('INSERT INTO user_git_configs (user_id,project_id,branch_name,author_name,author_email,auth_token,auth_method,ssh_key,git_username) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(req.userId, req.params.projectId, branch_name||'', author_name||'', author_email||'', finalToken, finalMethod, finalSshKey, finalUsername);
   }
   res.json({ ok: true });
@@ -1410,13 +1410,13 @@ router.put('/identity', (req, res) => {
 
 // ── POST /branch — create/switch to user's personal branch from main ──────────
 router.post('/branch', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.remote_url) return res.status(400).json({ error: 'Repository not configured.' });
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Repository not initialized. Ask an admin to initialize it first.' });
-  const caller = getCaller(req.userId);
-  const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+  const caller = await getCaller(req.userId);
+  const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
 
   // Prefer branch name from request body (current form value) over the saved DB value
@@ -1489,8 +1489,8 @@ router.post('/branch', async (req, res) => {
 // ── PUT /prs/:prId/push-close — force-close on GitHub for already-closed-locally PRs ──
 
 router.put('/prs/:prId/push-close', async (req, res) => {
-  const caller = getCaller(req.userId);
-  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
+  const caller = await getCaller(req.userId);
+  const pr = await db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
     .get(req.params.prId, req.params.projectId);
   if (!pr) return res.status(404).json({ error: 'PR not found.' });
   if (pr.created_by !== req.userId && !['org_admin','super_admin'].includes(caller.role)) {
@@ -1499,8 +1499,8 @@ router.put('/prs/:prId/push-close', async (req, res) => {
   if (!pr.remote_pr_url) return res.status(400).json({ error: 'No remote PR URL found.' });
 
   try {
-    const cfg = getGitConfig(req.params.projectId);
-    const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+    const cfg = await getGitConfig(req.params.projectId);
+    const userIdentity = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
       .get(req.userId, req.params.projectId);
     const rawToken = userIdentity?.auth_token
       ? decrypt(userIdentity.auth_token)
@@ -1517,7 +1517,7 @@ router.put('/prs/:prId/push-close', async (req, res) => {
       pull_number: parseInt(prNumMatch[1]),
       state:       'closed',
     });
-    db.prepare("UPDATE git_prs SET status='closed' WHERE id=?").run(pr.id);
+    await db.prepare("UPDATE git_prs SET status='closed' WHERE id=?").run(pr.id);
     res.json({ ok: true, message: 'PR closed on GitHub.' });
   } catch (e) {
     console.error('[Git] push-close error:', e.message);
@@ -1527,29 +1527,29 @@ router.put('/prs/:prId/push-close', async (req, res) => {
 
 // ── PUT /prs/:prId/mark-merged — admin marks PR merged (when merged outside PerfStudio) ──
 
-router.put('/prs/:prId/mark-merged', (req, res) => {
-  const caller = getCaller(req.userId);
+router.put('/prs/:prId/mark-merged', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller.role)) {
     return res.status(403).json({ error: 'Only org admins can mark PRs as merged.' });
   }
-  const pr = db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
+  const pr = await db.prepare('SELECT * FROM git_prs WHERE id = ? AND project_id = ?')
     .get(req.params.prId, req.params.projectId);
   if (!pr) return res.status(404).json({ error: 'PR not found.' });
 
-  db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
+  await db.prepare("UPDATE git_prs SET status='merged' WHERE id=?").run(pr.id);
   res.json({ ok: true });
 });
 
 // ── POST /prs/sync — sync all open PR statuses from GitHub ───────────────────
 
 router.post('/prs/sync', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.auth_token) return res.json({ ok: true, synced: 0, message: 'No GitHub token configured.' });
 
-  const openPrs = db.prepare(
+  const openPrs = await db.prepare(
     "SELECT * FROM git_prs WHERE project_id = ? AND status = 'open' AND remote_pr_url != ''"
   ).all(req.params.projectId);
 
@@ -1576,7 +1576,7 @@ router.post('/prs/sync', async (req, res) => {
         else if (data.state === 'closed') newStatus = 'closed';
 
         if (newStatus) {
-          db.prepare("UPDATE git_prs SET status=? WHERE id=?").run(newStatus, pr.id);
+          await db.prepare("UPDATE git_prs SET status=? WHERE id=?").run(newStatus, pr.id);
           synced++;
         }
       } catch (_) {}
@@ -1590,11 +1590,11 @@ router.post('/prs/sync', async (req, res) => {
 
 // ── GET /diff — get diff for a specific file ──────────────────────────────────
 router.get('/diff', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   const filePath = req.query.path;
   if (!filePath) return res.status(400).json({ error: 'path query param required' });
   try {
@@ -1637,11 +1637,11 @@ router.get('/diff', async (req, res) => {
 
 // ── POST /discard — discard changes to specific files ────────────────────────
 router.post('/discard', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   const { paths } = req.body; // array of file paths
   if (!paths?.length) return res.status(400).json({ error: 'paths array required' });
   try {
@@ -1685,11 +1685,11 @@ router.post('/discard', async (req, res) => {
 
 // ── POST /fetch — fetch from remote ─────────────────────────────────────────
 router.post('/fetch', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   let sshCleanup = () => {};
   try {
     const gitDir = getUserWorkspace(proj, caller);
@@ -1706,12 +1706,12 @@ router.post('/fetch', async (req, res) => {
 
 // ── POST /test — test remote connection ──────────────────────────────────────
 router.post('/test', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.remote_url) return res.status(400).json({ error: 'Remote URL not configured.' });
 
-  const { isSSH, remoteUrl, sshEnv, cleanup: sshCleanup } = getAuth(cfg, req.userId, req.params.projectId);
+  const { isSSH, remoteUrl, sshEnv, cleanup: sshCleanup } = await getAuth(cfg, req.userId, req.params.projectId);
 
   try {
     if (isSSH) {
@@ -1736,7 +1736,7 @@ router.post('/test', async (req, res) => {
       }
       res.json({ ok: true, message: 'SSH connection successful! Repository is accessible.', token_preview: 'SSH key' });
     } else {
-      const identity = db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+      const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
       const rawToken = identity?.auth_token ? decrypt(identity.auth_token) : (cfg.auth_token ? decrypt(cfg.auth_token) : '');
       if (!rawToken) return res.status(400).json({ error: 'No authentication token configured.' });
       const git = simpleGit();
@@ -1753,11 +1753,11 @@ router.post('/test', async (req, res) => {
 
 // ── POST /sync — sync user branch with latest base branch ────────────────────
 router.post('/sync', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   let sshCleanup = () => {};
   try {
     const gitDir = getUserWorkspace(proj, caller);
@@ -1788,11 +1788,11 @@ const EXEC_ALLOWLIST = new Set([
 ]);
 
 router.post('/exec', async (req, res) => {
-  const proj = getProject(req.userId, req.params.projectId);
+  const proj = await getProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getGitConfig(req.params.projectId);
+  const cfg = await getGitConfig(req.params.projectId);
   if (!cfg?.is_initialized) return res.status(400).json({ error: 'Git not initialized.' });
-  const caller = getCaller(req.userId);
+  const caller = await getCaller(req.userId);
   let { command } = req.body;
   if (!command?.trim()) return res.status(400).json({ error: 'command required' });
   // Strip leading "git " if present

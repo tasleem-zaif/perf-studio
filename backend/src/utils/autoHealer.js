@@ -54,14 +54,14 @@ function getK6Bin(customPath) {
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
-function setHealStatus(runId, status) {
-  db.prepare('UPDATE execution_runs SET heal_status=? WHERE id=?').run(status, runId);
+async function setHealStatus(runId, status) {
+  await db.prepare('UPDATE execution_runs SET heal_status=? WHERE id=?').run(status, runId);
 }
 
-function logHealAttempt(runId, attempt, diagnosis, fix, fixType) {
-  return db.prepare(
+async function logHealAttempt(runId, attempt, diagnosis, fix, fixType) {
+  return (await db.prepare(
     'INSERT INTO auto_heal_logs (run_id, attempt, diagnosis, fix_applied, fix_type) VALUES (?,?,?,?,?)'
-  ).run(runId, attempt, diagnosis, fix, fixType).lastInsertRowid;
+  ).run(runId, attempt, diagnosis, fix, fixType)).lastInsertRowid;
 }
 
 // ── Runtime params: original run values → suite defaults → hard fallback ──────
@@ -133,7 +133,7 @@ function classifyErrors(jtlPath) {
 // mode = 'quick'  → HEAL_VUSERS / HEAL_DURATION (no report generation)
 // mode = 'full'   → exact runtime params from the original failed run
 async function spawnRun(userId, originalRun, suite, project, mode) {
-  const cfgRow   = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
+  const cfgRow   = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
   const engine     = originalRun.engine;
@@ -143,7 +143,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
   }
 
   const projectFolder = project.folder_path || getProjectPath(project.name, project.id);
-  const runCount      = db.prepare('SELECT COUNT(*) as n FROM execution_runs WHERE project_id = ?').get(originalRun.project_id).n;
+  const runCount      = (await db.prepare('SELECT COUNT(*) as n FROM execution_runs WHERE project_id = ?').get(originalRun.project_id)).n;
   const runNumber     = runCount + 1;
   const resultDir     = path.join(projectFolder, 'results', `Run_${runNumber}`);
   fs.mkdirSync(resultDir, { recursive: true });
@@ -163,15 +163,15 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     ? { vusers: HEAL_VUSERS, rampup: HEAL_RAMPUP, iter_mode: 'duration', duration: HEAL_DURATION, loops: 1 }
     : orig;
 
-  const newRunId = db.prepare(`
+  const newRunId = (await db.prepare(`
     INSERT INTO execution_runs
       (project_id, suite_id, engine, status, result_dir, logs, started_at, auto_heal,
        run_vusers, run_rampup, run_duration, run_loops, run_iter_mode)
-    VALUES (?, ?, ?, 'running', ?, '[]', datetime('now'), 1, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, 'running', ?, '[]', NOW(), 1, ?, ?, ?, ?, ?)
   `).run(
     originalRun.project_id, originalRun.suite_id, engine, resultDir,
     p.vusers, p.rampup, p.duration, p.loops, p.iter_mode
-  ).lastInsertRowid;
+  )).lastInsertRowid;
 
   try {
     let cmd, args, reportPath = null, jtlPath = null, jmeterLogPath = null;
@@ -231,7 +231,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     let tailer = null;
     if (jmeterLogPath) {
       let pos = 0;
-      tailer = setInterval(() => {
+      tailer = setInterval(async () => {
         if (!fs.existsSync(jmeterLogPath)) return;
         try {
           const size = fs.statSync(jmeterLogPath).size;
@@ -284,13 +284,13 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
       }
     }
 
-    db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=NOW() WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, newRunId);
     return newRunId;
 
   } catch (e) {
     addLog('err', e.message);
-    db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=NOW() WHERE id=?`)
       .run(JSON.stringify(allLogs), newRunId);
     return newRunId;
   } finally {
@@ -319,10 +319,10 @@ function extractDefinedVars(content) {
     d.add(m[1]);
   // RegexExtractor
   for (const m of content.matchAll(/<stringProp name="RegexExtractor\.refname">([^<]+)<\/stringProp>/g))
-    m[1].split(';').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(';').forEach(async v => v.trim() && d.add(v.trim()));
   // JSONPath extractor
   for (const m of content.matchAll(/<stringProp name="JSONPostProcessor\.referenceNames">([^<]+)<\/stringProp>/g))
-    m[1].split(';').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(';').forEach(async v => v.trim() && d.add(v.trim()));
   // Boundary extractor
   for (const m of content.matchAll(/<stringProp name="BoundaryExtractor\.refname">([^<]+)<\/stringProp>/g))
     d.add(m[1].trim());
@@ -334,12 +334,12 @@ function extractDefinedVars(content) {
     d.add(m[1].trim());
   // CSV DataSet variableNames
   for (const m of content.matchAll(/<stringProp name="variableNames">([^<]+)<\/stringProp>/g))
-    m[1].split(',').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(',').forEach(async v => v.trim() && d.add(v.trim()));
   return [...d];
 }
 
 // Parse JTL comprehensively — group errors by label, code, and failure category
-function parseJtlComprehensive(jtlPath) {
+async function parseJtlComprehensive(jtlPath) {
   const empty = {
     byLabel: {}, byCode: {},
     assertionErrors: [], correlationErrors: [],
@@ -753,24 +753,24 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruc
 //   Phase 2 — Full run      (original params):  confirm fix holds under real load
 async function healCycle(userId, targetRunId, project, suite, attemptNum) {
   if (attemptNum > MAX_ATTEMPTS) {
-    setHealStatus(targetRunId, 'exhausted');
+    await setHealStatus(targetRunId, 'exhausted');
     return;
   }
 
-  setHealStatus(targetRunId, 'diagnosing');
-  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(targetRunId);
+  await setHealStatus(targetRunId, 'diagnosing');
+  const run = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(targetRunId);
   const ctx = await buildContext(run, suite);
 
   // Nothing to fix
-  if (!ctx.hasErrors) { setHealStatus(targetRunId, null); return; }
+  if (!ctx.hasErrors) { await setHealStatus(targetRunId, null); return; }
 
   // Infrastructure failure — script changes won't help
   if (ctx.errorClass.isInfra) {
-    const logId = logHealAttempt(targetRunId, attemptNum,
+    const logId = await logHealAttempt(targetRunId, attemptNum,
       `Infrastructure/server failure: ${ctx.errorClass.summary}. Script changes cannot fix server-side errors.`,
       '', 'no_fix');
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -779,58 +779,58 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
   try {
     aiResp = await diagnoseWithAi(userId, run, suite, ctx, attemptNum);
   } catch (e) {
-    const logId = logHealAttempt(targetRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    const logId = await logHealAttempt(targetRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
-  const logId = logHealAttempt(targetRunId, attemptNum,
+  const logId = await logHealAttempt(targetRunId, attemptNum,
     aiResp.issue   || 'Unknown issue',
     aiResp.fix     || '',
     aiResp.fix_type || 'no_fix'
   );
 
   if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
   // Apply fix (keep .bak of original)
-  setHealStatus(targetRunId, 'applying_fix');
+  await setHealStatus(targetRunId, 'applying_fix');
   try {
     if (ctx.scriptPath) {
       if (fs.existsSync(ctx.scriptPath)) fs.copyFileSync(ctx.scriptPath, ctx.scriptPath + '.bak');
       fs.writeFileSync(ctx.scriptPath, aiResp.fixed_script, 'utf8');
     }
   } catch (e) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
   // ── Phase 1: Quick verify ─────────────────────────────────────────────────
-  setHealStatus(targetRunId, 'rerunning');
+  await setHealStatus(targetRunId, 'rerunning');
   let quickRunId;
   try { quickRunId = await spawnRun(userId, run, suite, project, 'quick'); }
   catch (e) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
-  db.prepare('UPDATE auto_heal_logs SET new_run_id=? WHERE id=?').run(quickRunId, logId);
-  db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(quickRunId, targetRunId);
+  await db.prepare('UPDATE auto_heal_logs SET new_run_id=? WHERE id=?').run(quickRunId, logId);
+  await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(quickRunId, targetRunId);
 
-  const quickRun      = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(quickRunId);
+  const quickRun      = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(quickRunId);
   const quickJtlPath  = path.join(quickRun.result_dir, 'results.jtl');
   const quickInfra    = classifyErrors(quickJtlPath);
 
   // Quick verify hit infra errors — stop immediately
   if (quickInfra.isInfra) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -840,39 +840,39 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
 
   if (!quickPassed) {
     // Script fix didn't help even under minimal load — try again next attempt
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
     if (attemptNum < MAX_ATTEMPTS) {
       await healCycle(userId, quickRunId, project, suite, attemptNum + 1);
-      const fr = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(quickRunId);
-      setHealStatus(targetRunId, fr?.heal_status || 'failed');
-      if (fr?.heal_run_id) db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
+      const fr = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(quickRunId);
+      await setHealStatus(targetRunId, fr?.heal_status || 'failed');
+      if (fr?.heal_run_id) await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
     } else {
-      setHealStatus(targetRunId, 'exhausted');
+      await setHealStatus(targetRunId, 'exhausted');
     }
     return;
   }
 
   // ── Phase 2: Full run with original runtime params ────────────────────────
-  setHealStatus(targetRunId, 'rerunning_full');
+  await setHealStatus(targetRunId, 'rerunning_full');
   let fullRunId;
   try { fullRunId = await spawnRun(userId, run, suite, project, 'full'); }
   catch (e) {
     // Quick verify passed but full run couldn't start — still count as healed at quick level
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
-    setHealStatus(targetRunId, 'healed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
+    await setHealStatus(targetRunId, 'healed');
     return;
   }
 
-  db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fullRunId, targetRunId);
+  await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fullRunId, targetRunId);
 
-  const fullRun     = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(fullRunId);
+  const fullRun     = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(fullRunId);
   const fullJtlPath = path.join(fullRun.result_dir, 'results.jtl');
   const fullInfra   = classifyErrors(fullJtlPath);
 
   if (fullInfra.isInfra) {
     // Server can't handle the original load level — infra problem, not script
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -881,18 +881,18 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     (fullRuleCheck.noRules ? true : fullRuleCheck.passed !== false);
 
   if (fullPassed) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
-    setHealStatus(targetRunId, 'healed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
+    await setHealStatus(targetRunId, 'healed');
   } else {
     // Full run failed — try another healing attempt
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
     if (attemptNum < MAX_ATTEMPTS) {
       await healCycle(userId, fullRunId, project, suite, attemptNum + 1);
-      const fr = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(fullRunId);
-      setHealStatus(targetRunId, fr?.heal_status || 'failed');
-      if (fr?.heal_run_id) db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
+      const fr = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(fullRunId);
+      await setHealStatus(targetRunId, fr?.heal_status || 'failed');
+      if (fr?.heal_run_id) await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
     } else {
-      setHealStatus(targetRunId, 'exhausted');
+      await setHealStatus(targetRunId, 'exhausted');
     }
   }
 }
@@ -906,10 +906,10 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
  *   the heal cycle fully completes (healed or exhausted/failed). Used by the email
  *   alert system so it can wait for the healer before deciding what to send.
  */
-function startAutoHeal(userId, runId, onComplete) {
-  const run     = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
-  const suite   = run && db.prepare('SELECT * FROM test_suites WHERE id = ?').get(run.suite_id);
-  const project = run && db.prepare('SELECT * FROM projects WHERE id = ?').get(run.project_id);
+async function startAutoHeal(userId, runId, onComplete) {
+  const run     = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
+  const suite   = run && await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(run.suite_id);
+  const project = run && await db.prepare('SELECT * FROM projects WHERE id = ?').get(run.project_id);
 
   if (!run || !suite || !project) {
     console.warn(`[AutoHealer] Cannot heal run ${runId} — missing data`);
@@ -917,13 +917,13 @@ function startAutoHeal(userId, runId, onComplete) {
     return;
   }
 
-  setHealStatus(runId, 'pending');
+  await setHealStatus(runId, 'pending');
   setImmediate(async () => {
     try {
       await healCycle(userId, runId, project, suite, 1);
     } catch (e) {
       console.error('[AutoHealer] Unexpected error:', e);
-      setHealStatus(runId, 'failed');
+      await setHealStatus(runId, 'failed');
     }
     // Resolve the final run: follow heal_run_id chain to the last run
     if (onComplete) {
@@ -931,12 +931,12 @@ function startAutoHeal(userId, runId, onComplete) {
         let finalId = runId;
         let hops = 0;
         while (hops < 10) {
-          const r = db.prepare('SELECT heal_run_id, heal_status FROM execution_runs WHERE id = ?').get(finalId);
+          const r = await db.prepare('SELECT heal_run_id, heal_status FROM execution_runs WHERE id = ?').get(finalId);
           if (!r || !r.heal_run_id) break;
           finalId = r.heal_run_id;
           hops++;
         }
-        const finalRun = db.prepare('SELECT status, heal_status FROM execution_runs WHERE id = ?').get(finalId);
+        const finalRun = await db.prepare('SELECT status, heal_status FROM execution_runs WHERE id = ?').get(finalId);
         const succeeded = finalRun?.status === 'completed' || finalRun?.heal_status === 'healed';
         onComplete(finalId, succeeded);
       } catch (e) {
@@ -947,10 +947,10 @@ function startAutoHeal(userId, runId, onComplete) {
   });
 }
 
-function getHealStatus(runId) {
-  const run = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(runId);
+async function getHealStatus(runId) {
+  const run = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(runId);
   if (!run) return null;
-  const logs = db.prepare('SELECT * FROM auto_heal_logs WHERE run_id = ? ORDER BY attempt ASC').all(runId);
+  const logs = await db.prepare('SELECT * FROM auto_heal_logs WHERE run_id = ? ORDER BY attempt ASC').all(runId);
   return { status: run.heal_status, heal_run_id: run.heal_run_id, logs };
 }
 

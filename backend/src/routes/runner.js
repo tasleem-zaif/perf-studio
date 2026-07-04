@@ -4,13 +4,13 @@ const auth = require('../middleware/auth');
 
 router.use(auth);
 
-router.post('/execute', (req, res) => {
+router.post('/execute', async (req, res) => {
   const { script_id, engine, vusers, duration, rampup, target } = req.body;
   if (!engine) return res.status(400).json({ error: 'Engine required' });
 
   let script = null;
   if (script_id) {
-    script = db.prepare('SELECT s.*, p.user_id FROM scripts s JOIN projects p ON p.id = s.project_id WHERE s.id = ?').get(script_id);
+    script = await db.prepare('SELECT s.*, p.user_id FROM scripts s JOIN projects p ON p.id = s.project_id WHERE s.id = ?').get(script_id);
     if (!script || script.user_id !== req.userId) return res.status(404).json({ error: 'Script not found' });
   }
 
@@ -23,7 +23,7 @@ router.post('/execute', (req, res) => {
   const resolvedRampup = rampup || script?.rampup || 30;
 
   if (script_id) {
-    db.prepare('UPDATE scripts SET last_run = CURRENT_TIMESTAMP WHERE id = ?').run(script_id);
+    await db.prepare('UPDATE scripts SET last_run = CURRENT_TIMESTAMP WHERE id = ?').run(script_id);
   }
 
   const rps = Math.floor(80 + Math.random() * 60);

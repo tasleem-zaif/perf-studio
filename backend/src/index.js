@@ -24,6 +24,7 @@ app.use('/api/auth',                                   require('./routes/auth'))
 app.use('/api/auth',                                   require('./routes/passwordReset'));
 app.use('/api/admin',                                  require('./routes/passwordReset'));
 app.use('/api/orgs',                                   require('./routes/orgs'));
+app.use('/api/licenses',                               require('./routes/licenses'));
 app.use('/api/admin',                                  require('./routes/admin'));
 app.use('/api/dashboard',                              require('./routes/dashboard'));
 app.use('/api',                                        require('./routes/summary'));
@@ -77,57 +78,51 @@ app.listen(PORT, () => {
   console.log(`PerfStudio API running on http://localhost:${PORT}`);
 
   // ── On startup: mark orphaned running runs as failed ─────────────────────
-  // If the server was restarted mid-execution, runs stuck in 'running' state
-  // will never complete. Mark them failed so the UI doesn't show stale spinners.
-  try {
-    const db = require('./db');
-    const orphanedExec = db.prepare(
-      "UPDATE execution_runs SET status='failed', finished_at=datetime('now') WHERE status='running'"
-    ).run();
-    const orphanedPipeline = db.prepare(
-      "UPDATE pipeline_runs SET status='failed', finished_at=datetime('now') WHERE status='running'"
-    ).run();
-    if (orphanedExec.changes > 0)    console.log(`[Startup] Marked ${orphanedExec.changes} orphaned execution run(s) as failed`);
-    if (orphanedPipeline.changes > 0) console.log(`[Startup] Marked ${orphanedPipeline.changes} orphaned pipeline run(s) as failed`);
-  } catch (e) { console.error('[Startup] Orphan cleanup error:', e.message); }
+  (async () => {
+    try {
+      const db = require('./db');
+      const orphanedExec = await db.prepare(
+        "UPDATE execution_runs SET status='failed', finished_at=NOW() WHERE status='running'"
+      ).run();
+      const orphanedPipeline = await db.prepare(
+        "UPDATE pipeline_runs SET status='failed', finished_at=NOW() WHERE status='running'"
+      ).run();
+      if (orphanedExec.changes > 0)    console.log(`[Startup] Marked ${orphanedExec.changes} orphaned execution run(s) as failed`);
+      if (orphanedPipeline.changes > 0) console.log(`[Startup] Marked ${orphanedPipeline.changes} orphaned pipeline run(s) as failed`);
+    } catch (e) { console.error('[Startup] Orphan cleanup error:', e.message); }
+  })();
 
   // ── Regenerate all config.json files on startup ─────────────────────────
-  // Ensures every workspace's config.json is always up-to-date with the
-  // latest rules, test plans and settings — regardless of which user last
-  // triggered a save. Runs after the server is ready so it doesn't block startup.
-  setImmediate(() => {
+  setImmediate(async () => {
     try {
       const db = require('./db');
       const { getUserProjectPath, isAdminWorkspace } = require('./utils/projectFolders');
       const { updateCollectionConfigs } = require('./utils/configWriter');
 
-      // For every project, regenerate config for every NON-ADMIN user who has a workspace
-      const projects = db.prepare('SELECT p.*, u.role as user_role FROM projects p JOIN users u ON u.id = p.user_id').all();
+      const projects = await db.prepare('SELECT p.*, u.role as user_role FROM projects p JOIN users u ON u.id = p.user_id').all();
 
       for (const proj of projects) {
         try {
-          const projectFolderPath = getUserProjectPath(proj.user_id, proj.user_role, proj.name);
-          if (isAdminWorkspace(projectFolderPath)) continue; // skip admin workspace
-          const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
+          const projectFolderPath = await getUserProjectPath(proj.user_id, proj.user_role, proj.name);
+          if (isAdminWorkspace(projectFolderPath)) continue;
+          const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
           for (const col of collections) {
             updateCollectionConfigs(col.id, projectFolderPath);
           }
         } catch (_) {}
       }
 
-      // Also regenerate for any other users (non-owners) who have workspaces for a project
-      const allUsers = db.prepare('SELECT id, role FROM users').all();
-      const allProjects = db.prepare('SELECT * FROM projects').all();
+      const allUsers = await db.prepare('SELECT id, role FROM users').all();
+      const allProjects = await db.prepare('SELECT * FROM projects').all();
       for (const user of allUsers) {
         for (const proj of allProjects) {
-          if (proj.user_id === user.id) continue; // already done above
+          if (proj.user_id === user.id) continue;
           try {
-            const projectFolderPath = getUserProjectPath(user.id, user.role, proj.name);
-            if (isAdminWorkspace(projectFolderPath)) continue; // skip admin workspace
+            const projectFolderPath = await getUserProjectPath(user.id, user.role, proj.name);
+            if (isAdminWorkspace(projectFolderPath)) continue;
             const fs = require('fs');
-            const path = require('path');
-            if (!fs.existsSync(projectFolderPath)) continue; // no workspace for this user
-            const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
+            if (!fs.existsSync(projectFolderPath)) continue;
+            const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
             for (const col of collections) {
               updateCollectionConfigs(col.id, projectFolderPath);
             }

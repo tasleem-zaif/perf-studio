@@ -90,12 +90,12 @@ router.use(auth);
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // Per-user CI config: first try (project_id, user_id), fall back to legacy (project_id, NULL)
-function getConfig(projectId, userId) {
+async function getConfig(projectId, userId) {
   if (userId) {
-    const own = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId);
+    const own = await db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId);
     if (own) return own;
     // Fall back to the project admin's config so regular users inherit SSH keys/tokens set up at admin level
-    const adminCfg = db.prepare(`
+    const adminCfg = await db.prepare(`
       SELECT cpc.* FROM ci_pipeline_configs cpc
       JOIN users u ON u.id = cpc.user_id
       WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
@@ -104,7 +104,7 @@ function getConfig(projectId, userId) {
     if (adminCfg) return adminCfg;
   }
   // Legacy shared config (user_id IS NULL)
-  return db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId) || null;
+  return (await db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id IS NULL').get(projectId)) || null;
 }
 
 /**
@@ -113,12 +113,12 @@ function getConfig(projectId, userId) {
  *   Project_Name/Collection_Name/Env/testData
  *   Project_Name/Collection_Name/Env/results
  */
-function buildCanonicalRepoPaths(projectId, scriptName) {
+async function buildCanonicalRepoPaths(projectId, scriptName) {
   const clean = s => (s || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'Default';
   const scriptFile = (scriptName || '').replace(/\\/g, '/').split('/').pop() || scriptName || '';
-  const project    = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
+  const project    = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
   const suite      = scriptFile
-    ? db.prepare(`
+    ? await db.prepare(`
         SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
         FROM test_suites ts
         LEFT JOIN collections c ON c.id = ts.collection_id
@@ -157,6 +157,14 @@ function hasCritical400Or401(reportData) {
     const codes = api.response_codes || {};
     return (codes['400'] || 0) > 0 || (codes['401'] || 0) > 0;
   });
+}
+
+// Returns true when ANY individual API has a 100% failure rate, regardless of status
+// code (500s, timeouts, connection errors, etc — not just 400/401). Per product
+// requirement, a single fully-failing endpoint must always trigger auto-heal.
+function hasAnyApiFullFailure(reportData) {
+  if (!reportData?.by_api) return false;
+  return reportData.by_api.some(api => (api.error_rate || 0) >= 100);
 }
 
 // Builds a targeted heal instruction from JTL errors so the AI knows exactly what to fix.
@@ -225,14 +233,14 @@ function decryptConfig(cfg) {
 }
 
 /** Build correct Bitbucket Basic auth — ATATT tokens require email:token, not username:token */
-function bbBasicAuth(cfg, lookupUserId) {
+async function bbBasicAuth(cfg, lookupUserId) {
   const tok  = (cfg.bitbucket_app_password || '').trim();
   const user = cfg.bitbucket_username || cfg.bitbucket_workspace || '';
   // If it already looks like an email, use it directly
   if (user.includes('@')) return `Basic ${Buffer.from(`${user}:${tok}`).toString('base64')}`;
   // Not an email — look it up from the users table
   const email = lookupUserId
-    ? (db.prepare('SELECT email FROM users WHERE id = ?').get(lookupUserId)?.email || user)
+    ? ((await db.prepare('SELECT email FROM users WHERE id = ?').get(lookupUserId))?.email || user)
     : user;
   return `Basic ${Buffer.from(`${email}:${tok}`).toString('base64')}`;
 }
@@ -302,16 +310,16 @@ function parseOwnerRepo(url) {
 }
 
 // ── Helper: get github_repo from git config remote URL (fallback) ─────────────
-function getRepoFromGit(projectId) {
-  const gitCfg = db.prepare('SELECT remote_url FROM git_configs WHERE project_id = ?').get(projectId);
+async function getRepoFromGit(projectId) {
+  const gitCfg = await db.prepare('SELECT remote_url FROM git_configs WHERE project_id = ?').get(projectId);
   return gitCfg?.remote_url ? parseOwnerRepo(gitCfg.remote_url) : '';
 }
 
 // ── Helper: extract PAT from the git remote URL (ghp_... embedded in URL) ─────
-function getTokenFromGitRemote(projectId) {
+async function getTokenFromGitRemote(projectId) {
   try {
     const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
-    const proj = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
+    const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
     if (!proj) return null;
     // Check both admin and any user-N workspace for a remote URL with an embedded token
     const wsBase = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name));
@@ -347,15 +355,15 @@ function sanitizeGithubRepo(raw) {
 }
 
 // ── GET /config — returns the CALLING USER's own CI config ───────────────────
-router.get('/config', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = getConfig(req.params.projectId, req.userId);
+router.get('/config', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const cfg = await getConfig(req.params.projectId, req.userId);
   if (!cfg) return res.json({ config: null });
 
   // Auto-derive github_repo from the project's git remote URL if the stored
   // value is missing or invalid (e.g. user accidentally entered their email).
   let github_repo = sanitizeGithubRepo(cfg.github_repo);
-  if (!github_repo) github_repo = getRepoFromGit(req.params.projectId);
+  if (!github_repo) github_repo = await getRepoFromGit(req.params.projectId);
 
   res.json({
     config: {
@@ -376,14 +384,14 @@ router.get('/config', (req, res) => {
 });
 
 // ── Helper: project owner check ───────────────────────────────────────────────
-function isProjectOwner(userId, projectId) {
-  const proj = db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
+async function isProjectOwner(userId, projectId) {
+  const proj = await db.prepare('SELECT user_id FROM projects WHERE id = ?').get(projectId);
   return proj && String(proj.user_id) === String(userId);
 }
 
 // ── PUT /config ───────────────────────────────────────────────────────────────
-router.put('/config', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+router.put('/config', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   // Each user saves their OWN CI config — no owner restriction needed
   const {
     gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref,
@@ -396,11 +404,11 @@ router.put('/config', (req, res) => {
 
   // Sanitize github_repo: strip full URLs, reject email addresses
   const github_repo = sanitizeGithubRepo(req.body.github_repo)
-    || getRepoFromGit(req.params.projectId);
+    || await getRepoFromGit(req.params.projectId);
 
   // Look up THIS user's own config row (project_id + user_id)
-  const existing = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(req.params.projectId, req.userId);
-  const gitCfgDefault = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const existing = await db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(req.params.projectId, req.userId);
+  const gitCfgDefault = await db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const defaultBranch = gitCfgDefault?.base_branch || 'main';
 
   const encGitlabToken        = gitlab_token && gitlab_token !== '••••••••'                     ? encrypt(gitlab_token)           : existing?.gitlab_token              || '';
@@ -413,12 +421,12 @@ router.put('/config', (req, res) => {
   const encSshKey             = normalizedSshKey ? encrypt(normalizedSshKey) : (existing?.ssh_private_key || '');
 
   if (existing) {
-    db.prepare(`UPDATE ci_pipeline_configs SET
+    await db.prepare(`UPDATE ci_pipeline_configs SET
       gitlab_enabled=?, gitlab_url=?, gitlab_project_id=?, gitlab_token=?,
       gitlab_trigger_token=?, gitlab_ref=?, gitlab_auth_method=?,
       github_enabled=?, github_repo=?, github_token=?, github_workflow_file=?, github_ref=?, github_auth_method=?,
       bitbucket_enabled=?, bitbucket_workspace=?, bitbucket_username=?, bitbucket_app_password=?, bitbucket_repo_slug=?, bitbucket_ref=?, bitbucket_auth_method=?,
-      ssh_private_key=?, updated_at=datetime('now')
+      ssh_private_key=?, updated_at=NOW()
       WHERE project_id=? AND user_id=?`
     ).run(
       gitlab_enabled ? 1 : 0, gitlab_url || 'https://gitlab.com', gitlab_project_id || '',
@@ -431,7 +439,7 @@ router.put('/config', (req, res) => {
       req.params.projectId, req.userId
     );
   } else {
-    db.prepare(`INSERT INTO ci_pipeline_configs
+    await db.prepare(`INSERT INTO ci_pipeline_configs
       (project_id, user_id, gitlab_enabled, gitlab_url, gitlab_project_id, gitlab_token, gitlab_trigger_token, gitlab_ref, gitlab_auth_method,
        github_enabled, github_repo, github_token, github_workflow_file, github_ref, github_auth_method,
        bitbucket_enabled, bitbucket_workspace, bitbucket_username, bitbucket_app_password, bitbucket_repo_slug, bitbucket_ref, bitbucket_auth_method,
@@ -504,9 +512,9 @@ function testSshConnection(privateKey, host) {
 
 // ── POST /config/test — test connection ───────────────────────────────────────
 router.post('/config/test', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { provider } = req.body;
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'Save CI configuration first.' });
 
   try {
@@ -590,8 +598,8 @@ router.post('/config/test', async (req, res) => {
 
 // ── POST /config/trigger-token — create GitLab trigger token ─────────────────
 router.post('/config/trigger-token', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
   if (!cfg?.gitlab_token)         return res.status(400).json({ error: 'Save GitLab access token first.' });
   if (!cfg?.gitlab_project_id)    return res.status(400).json({ error: 'GitLab project ID/path not set.' });
 
@@ -609,7 +617,7 @@ router.post('/config/trigger-token', async (req, res) => {
     if (r.status === 201) {
       const token = r.body.token;
       // Save encrypted trigger token
-      db.prepare('UPDATE ci_pipeline_configs SET gitlab_trigger_token=? WHERE project_id=?')
+      await db.prepare('UPDATE ci_pipeline_configs SET gitlab_trigger_token=? WHERE project_id=?')
         .run(encrypt(token), req.params.projectId);
       return res.json({ ok: true, message: 'Trigger token created and saved.', token_preview: token.slice(0, 6) + '••••••' });
     }
@@ -621,34 +629,34 @@ router.post('/config/trigger-token', async (req, res) => {
 
 // ── POST /generate-yaml — generate + commit YAML files ───────────────────────
 router.post('/generate-yaml', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const cfg     = decryptConfig(getConfig(req.params.projectId, req.userId));
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const cfg     = decryptConfig(await getConfig(req.params.projectId, req.userId));
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
   const { providers = ['gitlab', 'github'] } = req.body;
 
   // Docker image — read from user's global config, fall back to admin's config, then default
-  const globalCfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const globalCfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const globalCfgAdmin = !globalCfgRow
-    ? db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get()
+    ? await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get()
     : null;
   const globalCfg = JSON.parse((globalCfgRow || globalCfgAdmin)?.config_json || '{}');
   const dockerImage = (globalCfg.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim().toLowerCase();
 
   // Use per-project workspace (new structure: git-workspaces/<ProjectName>/admin/)
-  const callerRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const callerRow = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
   const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder } = require('../utils/projectFolders');
-  const userFolder   = resolveUserFolder(req.userId);
+  const userFolder   = await resolveUserFolder(req.userId);
   const cleanProject = (project.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
   const gitRoot      = path.join(GIT_WORKSPACES_ROOT, cleanProject, userFolder);
   fs.mkdirSync(gitRoot, { recursive: true });
 
   // Get all generated test plans for this project to include as YAML comments
-  const suites = db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
+  const suites = await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
 
-  const gitCfgBase = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const gitCfgBase = await db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const baseBranch = gitCfgBase?.base_branch || 'main';
 
   const created = [];
@@ -753,7 +761,14 @@ run_jmeter:
 
     // The branch where user scripts live — passed as a workflow input so the
     // checkout step fetches the right branch even when the workflow file lives on main.
-    const userBranch = cfg?.github_ref || (isAdmin ? baseBranch : `feature/${(callerRow?.name || 'user').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
+    // For regular users always use their saved git identity branch (user_git_configs.branch_name)
+    // so the YAML targets their personal branch, not the base branch saved in cfg.github_ref.
+    const userGitIdYaml = !isAdmin
+      ? await db.prepare('SELECT branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId)
+      : null;
+    const userBranch = isAdmin
+      ? (cfg?.github_ref || baseBranch)
+      : (userGitIdYaml?.branch_name || `feature/${(callerRow?.name || 'user').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
 
     const scriptList = suites.map(s => {
       const relPath = s.jmx_path
@@ -1106,7 +1121,7 @@ pipelines:
   // The perf-test.yml MUST be on the remote default branch (main) for workflow_dispatch to work.
   let pushMessage = '';
   try {
-    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+    const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
     if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
       const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
@@ -1148,7 +1163,7 @@ pipelines:
       } else {
         // Token-based HTTPS URL — prefer user's personal token, fall back to project-level
         const { decrypt: dec } = require('../utils/encryption');
-        const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+        const userIdentity = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
           .get(req.userId, req.params.projectId);
         const rawToken = (userIdentity?.auth_token ? dec(userIdentity.auth_token) : '')
           || (gitCfg.auth_token ? dec(gitCfg.auth_token) : '');
@@ -1218,10 +1233,10 @@ pipelines:
   // git push above was skipped. The Files API needs no local repo at all.
   if (providers.includes('bitbucket') && !pushMessage.includes('pushed') && cfg?.bitbucket_workspace && cfg?.bitbucket_repo_slug && cfg?.bitbucket_app_password) {
     try {
-      const _bbAuth   = bbBasicAuth(cfg, req.userId);
+      const _bbAuth   = await bbBasicAuth(cfg, req.userId);
       const _bbWs     = cfg.bitbucket_workspace;
       const _bbSlug   = cfg.bitbucket_repo_slug;
-      const gitCfgBb  = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+      const gitCfgBb  = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
       const _bbBranch = gitCfgBb?.base_branch || baseBranch || 'main';
       const _boundary = `bbpush${randomBytes(8).toString('hex')}`;
 
@@ -1283,17 +1298,17 @@ pipelines:
 
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
 router.post('/trigger', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   // Workspace/repo/ref are project-level settings — always from the admin's config.
   // Auth credentials (token, username/email) come from the triggering user's own config,
   // falling back to the admin's config if the user hasn't set their own.
-  const adminRawCfg = db.prepare(`
+  const adminRawCfg = await db.prepare(`
     SELECT cpc.* FROM ci_pipeline_configs cpc
     JOIN users u ON u.id = cpc.user_id
     WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
     ORDER BY cpc.updated_at DESC LIMIT 1
   `).get(req.params.projectId);
-  const userRawCfg  = getConfig(req.params.projectId, req.userId);
+  const userRawCfg  = await getConfig(req.params.projectId, req.userId);
   const adminCfg    = decryptConfig(adminRawCfg);
   const userCfg     = decryptConfig(userRawCfg);
   if (!adminCfg && !userCfg) return res.status(400).json({ error: 'CI configuration not saved yet.' });
@@ -1314,7 +1329,7 @@ router.post('/trigger', async (req, res) => {
   // Build human-readable run_name: {SuiteName}_{N}Users_{D}sDuration (no Run# yet — added on sync)
   const { buildRunDirName } = require('../utils/buildRunName');
   const scriptFile2 = (script_name || '').replace(/\\/g, '/').split('/').pop();
-  const matchedSuite2 = db.prepare("SELECT name FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+  const matchedSuite2 = await db.prepare("SELECT name FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
     .get(req.params.projectId, `%${scriptFile2}`, `%${scriptFile2}`);
   const ciRunDisplayName = buildRunDirName(
     matchedSuite2?.name || scriptFile2.replace(/\.jmx$|\.js$/, ''),
@@ -1325,7 +1340,7 @@ router.post('/trigger', async (req, res) => {
   // 1. CI config token (saved specifically for CI/CD under Configuration → Pipeline)
   // 2. User's Git Identity PAT as fallback
   // The CI config token should have both `repo` + `workflow` scopes.
-  const userIdentity = db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+  const userIdentity = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
     .get(req.userId, req.params.projectId);
   const userToken = userIdentity?.auth_token ? decrypt(userIdentity.auth_token) : null;
 
@@ -1335,7 +1350,7 @@ router.post('/trigger', async (req, res) => {
   // Resolve script name from DB when not provided by the caller (frontend omits it on some flows)
   let resolvedScriptName = script_name;
   if (!resolvedScriptName) {
-    const suiteRow = db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? LIMIT 1').get(req.params.projectId);
+    const suiteRow = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? LIMIT 1').get(req.params.projectId);
     const suiteFile = suiteRow?.jmx_path || suiteRow?.js_path || '';
     resolvedScriptName = suiteFile.replace(/\\/g, '/').split('/').pop() || '';
   }
@@ -1352,9 +1367,9 @@ router.post('/trigger', async (req, res) => {
   };
 
   // ── Compute targetRef here so it is in scope for both auto-push and dispatch ─
-  const callerRow2  = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const callerRow2  = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   const isAdmin2    = ['org_admin', 'super_admin'].includes(callerRow2?.role);
-  const gitCfgTrigger = db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+  const gitCfgTrigger = await db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const baseBranch2 = gitCfgTrigger?.base_branch || 'main';
   // For Bitbucket non-admin users, always use feature/<username> branch regardless of
   // cfg.bitbucket_ref — that field defaults to 'main' from the admin config spread and
@@ -1362,11 +1377,19 @@ router.post('/trigger', async (req, res) => {
   const bbUserBranch = isAdmin2
     ? (cfg.bitbucket_ref || baseBranch2)
     : `feature/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_/-]/g, '-')}`;
+  // For GitHub non-admin users, prefer their saved git identity branch so the trigger
+  // targets their personal branch (where scripts live), not the base branch in cfg.github_ref.
+  const ghUserGitId = !isAdmin2
+    ? await db.prepare('SELECT branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId)
+    : null;
+  const ghUserBranch = isAdmin2
+    ? (cfg.github_ref || baseBranch2)
+    : (ghUserGitId?.branch_name || `feature/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`);
   const targetRef   = provider === 'gitlab'
     ? (cfg.gitlab_ref || baseBranch2)
     : provider === 'bitbucket'
     ? bbUserBranch
-    : (cfg.github_ref || (isAdmin2 ? baseBranch2 : `users/${(callerRow2?.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`));
+    : ghUserBranch;
 
   // Store bb_branch so autoSyncCiRun can fetch results from the right branch
   variables.bb_branch = targetRef;
@@ -1376,8 +1399,8 @@ router.post('/trigger', async (req, res) => {
   // the Patch JMX step will fail with FileNotFoundError.
   try {
     const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder: resolveUF } = require('../utils/projectFolders');
-    const projectRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+    const projectRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+    const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
     // Always use the project's initialized git_root (set by admin) for auto-push,
     // not the triggering user's workspace — the user's workspace may lack .git.
     const wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git')))
@@ -1455,10 +1478,10 @@ router.post('/trigger', async (req, res) => {
       // git reset/merge never reverts to an outdated version lacking the explicit `jmeter` entrypoint.
       if (provider === 'bitbucket') {
         try {
-          const _gcRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
-            || db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
+          const _gcRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
+            || await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
           const _dockerImage = (JSON.parse(_gcRow?.config_json || '{}').jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
-          const _suites = db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
+          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
           const _defScript = _suites.length ? path.basename(_suites[0].jmx_path || _suites[0].js_path || 'test.jmx') : 'test.jmx';
           const _scriptList = _suites.map(s => {
             const f = path.basename(s.jmx_path || s.js_path || '');
@@ -1592,7 +1615,7 @@ pipelines:
       // project.folder_path + script_path which points to the wrong location for new plans.
       if (script_name) {
         const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
-        const suiteRow   = db.prepare(
+        const suiteRow   = await db.prepare(
           "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
         ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
 
@@ -1601,7 +1624,7 @@ pipelines:
         // Fallback: search all workspace roots for the file
         if (!srcAbs || !fs.existsSync(srcAbs)) {
           const { GIT_WORKSPACES_ROOT: _wsRoot2, cleanName: _cn2 } = require('../utils/projectFolders');
-          const pName   = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId)?.name || '';
+          const pName   = (await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId))?.name || '';
           // Search dirs: project-named subfolder AND root-level workspace dirs (covers legacy paths)
           const searchBases = [];
           try { searchBases.push(...fs.readdirSync(path.join(_wsRoot2, _cn2(pName)), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(_wsRoot2, _cn2(pName), d.name))); } catch {}
@@ -1648,7 +1671,7 @@ pipelines:
           bitbucket_app_password: _adminTok,
           bitbucket_username: adminCfg?.bitbucket_username || adminRawCfg?.bitbucket_username || cfg.bitbucket_username || '',
         };
-        const _bbAuth = bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id);
+        const _bbAuth = await bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id);
         const _boundary = 'PeakoBoundary7x3f9z';
         const _fileParts = [];
 
@@ -1702,7 +1725,7 @@ pipelines:
         const _testDataDir = _findTestDataDir(wsRoot, 0);
         if (_testDataDir) {
           try {
-            fs.readdirSync(_testDataDir).forEach(f => {
+            fs.readdirSync(_testDataDir).forEach(async f => {
               if (!f.startsWith('.') && (f.endsWith('.csv') || f.endsWith('.txt') || f.endsWith('.json'))) {
                 _fileParts.push({ name: `${canonicalPaths.testDataPath}/${f}`, content: fs.readFileSync(path.join(_testDataDir, f)) });
               }
@@ -1812,7 +1835,7 @@ pipelines:
       });
 
       if (r.status === 201) {
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId, auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction);
         return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
       }
@@ -1824,7 +1847,7 @@ pipelines:
       if (!effectiveGithubToken) return res.status(400).json({ error: 'No GitHub token available. Save your Personal Access Token in Git Identity (Configuration → Git).' });
 
       // Sanitize at trigger time — catches any stale invalid values in the DB
-      const githubRepo = sanitizeGithubRepo(cfg.github_repo) || getRepoFromGit(req.params.projectId);
+      const githubRepo = sanitizeGithubRepo(cfg.github_repo) || await getRepoFromGit(req.params.projectId);
       if (!githubRepo) return res.status(400).json({ error: 'GitHub repo not set. Open CI Configuration and set it to "owner/repo" (e.g. tasleemzaif85/Project-Demo).' });
       cfg.github_repo = githubRepo;
 
@@ -1955,7 +1978,7 @@ pipelines:
           if (recentRun) { latestRun = recentRun; break; }
         }
 
-        const run = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'github',
             latestRun ? String(latestRun.id) : null,
@@ -1976,7 +1999,7 @@ pipelines:
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
 
       const bbToken = cfg.bitbucket_app_password.trim();
-      const bbAuthHeader = bbBasicAuth(cfg, req.userId);
+      const bbAuthHeader = await bbBasicAuth(cfg, req.userId);
       // targetRef = feature/<username> for non-admin users (holds testData + JMX).
       // The correct YAML (with Peako-Performance-Test + jmeter) is committed to this branch
       // by the Files API auto-push above, so the pipeline trigger will find it.
@@ -2007,7 +2030,7 @@ pipelines:
         const pipelineUuid   = bbResp.body.uuid;
         const bbBuildNumber  = bbResp.body.build_number || null;
         const variablesWithBuild = { ...variables, ...(bbBuildNumber ? { bb_build_number: bbBuildNumber } : {}) };
-        const bbRunInsert = db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        const bbRunInsert = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'bitbucket', pipelineUuid,
             `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`,
@@ -2027,9 +2050,9 @@ pipelines:
 });
 
 // ── GET /runs — run history ───────────────────────────────────────────────────
-router.get('/runs', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const runs = db.prepare(`
+router.get('/runs', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const runs = await db.prepare(`
     SELECT c.*, e.result_dir AS exec_result_dir
     FROM ci_pipeline_runs c
     LEFT JOIN execution_runs e ON e.ci_run_id = c.id
@@ -2046,17 +2069,18 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   const os      = require('os');
   const AdmZip  = require('adm-zip');
   const { parseJtl } = require('../utils/parseJtl');
-  const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('../utils/projectFolders');
 
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   if (!project) return;
 
   // Guard: never create duplicate execution_runs for the same CI run
-  const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (alreadySynced) { console.log(`[Auto-sync] CI run #${run.id} already synced → skipping`); return; }
 
-  const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(userId)?.role;
-  const userProjPath = getUserProjectPath(userId, callerRole, project.name);
+  const callerUser0 = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerUser0?.role;
+  const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
   // Parse CI parameters for the run name
@@ -2070,14 +2094,21 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   let suiteName = null;
   if (run.script_name) {
     const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
-    const suite = db.prepare(`
-      SELECT ts.*, c.name as col_name FROM test_suites ts
+    const suite = await db.prepare(`
+      SELECT ts.*, c.name as col_name, c.environment as col_environment, c.environments as col_environments
+      FROM test_suites ts
       LEFT JOIN collections c ON c.id = ts.collection_id
       WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?) LIMIT 1
     `).get(projectId, `%${scriptFile}`, `%${scriptFile}`);
     suiteName = suite?.name || null;
-    if (suite?.col_name && suite?.env) {
-      const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
+    // resolveSuiteEnv falls back to the collection's own default env when ts.env is
+    // blank, so a collection-scoped suite never drops to the project-level fallback
+    // below just because its env wasn't explicitly recorded.
+    const resolvedEnv = suite?.col_name
+      ? resolveSuiteEnv({ environment: suite.col_environment, environments: suite.col_environments }, suite)
+      : null;
+    if (suite?.col_name && resolvedEnv) {
+      const envPath = getCollectionPath(userProjPath, suite.col_name, resolvedEnv);
       try { require('fs').mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
       let nums = [];
       try { nums = require('fs').readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
@@ -2086,7 +2117,10 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       resultDir = path.join(envPath, 'results', runDirName);
     }
   }
+  // Project-level fallback is only legitimate for a run whose script couldn't be
+  // matched to any collection-scoped test suite at all.
   if (!resultDir) {
+    console.warn(`[Auto-sync] CI run #${run.id} (script "${run.script_name}") — no matching collection-scoped test suite found, falling back to project-level results`);
     try {
       const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
@@ -2139,7 +2173,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       });
     } else if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password / API Token');
-      const bbAuth2Header = bbBasicAuth(cfg, userId);
+      const bbAuth2Header = await bbBasicAuth(cfg, userId);
       const pipelineId2 = (run.external_id || '').replace(/[{}]/g, '');
       const ws2   = cfg.bitbucket_workspace;
       const slug2 = cfg.bitbucket_repo_slug;
@@ -2191,14 +2225,14 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         const noJtlLogs = [{ type: 'error', message: 'JMeter results not uploaded — pipeline failed before JMeter could produce output.' }];
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
-        db.prepare(`
+        await db.prepare(`
           INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
         `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id);
 
         const healUserId = run.triggered_by || userId;
         if (run.auto_heal && !run.is_heal_run) {
-          setImmediate(() => {
+          setImmediate(async () => {
             try {
               startAutoHealCI(healUserId, run.id, projectId, {
                 mode: run.auto_heal_mode || 'auto',
@@ -2234,7 +2268,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       fs.unlinkSync(tmpZip);
 
       // Download html.zip separately from perf-results branch (non-fatal if missing)
-      const _bbAuth3 = bbBasicAuth(cfg, userId);
+      const _bbAuth3 = await bbBasicAuth(cfg, userId);
       const _pid3    = (run.external_id || '').replace(/[{}]/g, '');
       const _ws3     = cfg.bitbucket_workspace;
       const _slug3   = cfg.bitbucket_repo_slug;
@@ -2282,26 +2316,26 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     let suiteId = null;
     if (run.script_name) {
       const sf = run.script_name.split('/').pop();
-      const s = db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${sf}`, `%${sf}`);
+      const s = await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${sf}`, `%${sf}`);
       suiteId = s?.id || null;
     }
 
     const reportData = fs.existsSync(jtlPath) ? parseJtl(jtlPath, {
-      suite_name: suiteId ? db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId)?.name : (run.script_name || 'CI Run'),
+      suite_name: suiteId ? (await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name : (run.script_name || 'CI Run'),
       engine: 'jmeter', started_at: run.started_at,
     }) : null;
 
     const totalRequests = reportData?.summary?.total_requests || 0;
     if (totalRequests === 0) {
       console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — marking run as failed`);
-      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
 
       // Fetch pipeline logs for AI context (helps diagnose why JMeter produced 0 requests)
       let zeroBbLogs = '';
       if (run.provider === 'bitbucket' && cfg.bitbucket_app_password) {
         try {
           zeroBbLogs = await fetchBbPipelineLogs(
-            bbBasicAuth(cfg, userId), cfg.bitbucket_workspace, cfg.bitbucket_repo_slug,
+            await bbBasicAuth(cfg, userId), cfg.bitbucket_workspace, cfg.bitbucket_repo_slug,
             run.external_id || ''
           );
         } catch (_) {}
@@ -2310,15 +2344,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const zeroLogs = [{ type: 'error', message: 'JTL file contains no data rows — JMeter produced 0 samples. The test plan may be malformed or all thread groups are disabled.' }];
       if (zeroBbLogs) zeroLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
 
-      const zeroInsert = db.prepare(`
+      const zeroInsert = await db.prepare(`
         INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
       `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id);
       const zeroRunId = zeroInsert.lastInsertRowid;
 
       const healUserId0 = run.triggered_by || userId;
       if (run.auto_heal && !run.is_heal_run) {
-        setImmediate(() => {
+        setImmediate(async () => {
           try {
             startAutoHealCI(healUserId0, run.id, projectId, {
               mode: run.auto_heal_mode || 'auto',
@@ -2333,7 +2367,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         try {
           const { sendAlertEmail } = require('../utils/emailUtils');
           const suiteName0 = suiteId
-            ? (db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId)?.name || run.script_name || 'CI Run')
+            ? ((await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name || run.script_name || 'CI Run')
             : (run.script_name || 'CI Run');
           await sendAlertEmail(zeroRunId, healUserId0, projectId, {
             meta: { suite_name: suiteName0, engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
@@ -2352,16 +2386,17 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     // Evaluate rule violations before PDF so the PDF shows correct PASSED/FAILED status
     let autoViolations = [];
+    let autoRuleResult = null;
     if (fs.existsSync(jtlPath)) {
       try {
         const { evaluateRules } = require('../utils/ruleEvaluator');
-        const rr = evaluateRules(projectId, jtlPath);
-        autoViolations = rr?.violations || [];
+        autoRuleResult = await evaluateRules(projectId, jtlPath);
+        autoViolations = autoRuleResult?.violations || [];
       } catch (_) {}
     }
     if (reportData) reportData.rule_violations = autoViolations;
 
-    const suiteLookup = suiteId ? db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
+    const suiteLookup = suiteId ? await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
     const emailData = {
       ...(reportData || {
         meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'completed' },
@@ -2400,17 +2435,20 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       }
     }
 
-    // Any individual API with 100% failure and 400/401 → broken request body or auth token.
-    // Mark the run failed and always trigger heal regardless of the auto_heal flag.
-    const isCriticalApiFailure = hasCritical400Or401(reportData);
-    const autoSyncRunStatus = isCriticalApiFailure ? 'failed' : 'completed';
-    if (isCriticalApiFailure) {
-      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+    // Any individual API at 100% failure → always trigger heal regardless of the auto_heal flag.
+    const autoApiFullFailure = hasAnyApiFullFailure(reportData);
+    // Overall pass/fail mirrors the rule engine (what the alert email/PDF already show) —
+    // falls back to raw failure count when the project has no rules configured.
+    const autoRunFailed = autoApiFullFailure || autoRuleResult?.passed === false ||
+      (autoRuleResult?.noRules && (reportData?.summary?.total_failed || 0) > 0);
+    const autoSyncRunStatus = autoRunFailed ? 'failed' : 'completed';
+    if (autoRunFailed) {
+      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
     }
 
-    const execInsert = db.prepare(`
+    const execInsert = await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?)
     `).run(
       projectId, suiteId, autoSyncRunStatus, resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
@@ -2433,13 +2471,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const hasFailed = totalReqs === 0 || hasViolations ||
         (reportData?.summary?.error_rate != null && reportData.summary.error_rate > 0);
 
-      const shouldHeal = isCriticalApiFailure || (run.auto_heal && hasFailed);
+      const shouldHeal = autoApiFullFailure || (run.auto_heal && hasFailed);
 
       if (shouldHeal) {
         const healInstruction = buildErrorHealInstruction(reportData?.errors) || run.auto_heal_instruction || null;
-        console.log(`[Auto-sync] CI run #${run.id} — triggering heal (criticalApiFailure=${isCriticalApiFailure}, mode: ${healInstruction ? 'custom' : (run.auto_heal_mode || 'auto')})`);
+        console.log(`[Auto-sync] CI run #${run.id} — triggering heal (apiFullFailure=${autoApiFullFailure}, mode: ${healInstruction ? 'custom' : (run.auto_heal_mode || 'auto')})`);
         const healUserId2 = run.triggered_by || userId;
-        setImmediate(() => {
+        setImmediate(async () => {
           try {
             startAutoHealCI(healUserId2, run.id, projectId, {
               mode: healInstruction ? 'custom' : (run.auto_heal_mode || 'auto'),
@@ -2470,11 +2508,11 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
 // ── GET /runs/:runId/status — poll live status from provider ─────────────────
 router.get('/runs/:runId/status', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const run = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
   if (!run.external_id || !cfg) return res.json({ run });
 
   try {
@@ -2507,7 +2545,7 @@ router.get('/runs/:runId/status', async (req, res) => {
     if (run.provider === 'bitbucket') {
       const r = await apiRequest(
         `https://api.bitbucket.org/2.0/repositories/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/${run.external_id}`,
-        'GET', null, { Authorization: bbBasicAuth(cfg, req.userId), 'User-Agent': 'PerfStudio' }
+        'GET', null, { Authorization: await bbBasicAuth(cfg, req.userId), 'User-Agent': 'PerfStudio' }
       );
       if (r.status === 200) {
         const stName = r.body.state?.name;        // PENDING | IN_PROGRESS | COMPLETED | ERROR
@@ -2542,11 +2580,11 @@ router.get('/runs/:runId/status', async (req, res) => {
     // knows the pipeline exit code, not the JTL error rates, so its 'completed' must
     // not clobber the sync-determined 'failed'.
     const isFinished = ['completed','failed','cancelled','skipped'].includes(mappedStatus);
-    const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+    const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
     if (alreadySynced) {
-      db.prepare('UPDATE ci_pipeline_runs SET web_url=? WHERE id=?').run(webUrl, run.id);
+      await db.prepare('UPDATE ci_pipeline_runs SET web_url=? WHERE id=?').run(webUrl, run.id);
     } else {
-      db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=datetime('now')" : '') + ' WHERE id=?')
+      await db.prepare('UPDATE ci_pipeline_runs SET status=?, web_url=?' + (isFinished ? ", finished_at=NOW()" : '') + ' WHERE id=?')
         .run(mappedStatus, webUrl, run.id);
     }
 
@@ -2555,9 +2593,9 @@ router.get('/runs/:runId/status', async (req, res) => {
     // the first auto-sync attempt may have failed silently (e.g. JTL not yet on perf-results branch).
     const wasFinished = ['completed','failed','cancelled','skipped'].includes(run.status);
     if (['completed','failed'].includes(mappedStatus)) {
-      const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+      const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
       if (!alreadySynced) {
-        const runSnapshot = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
+        const runSnapshot = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
         setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId).catch(e => console.error('[Auto-sync] failed for run', runSnapshot.id, ':', e.message)));
       }
     }
@@ -2605,30 +2643,31 @@ router.get('/runs/:runId/status', async (req, res) => {
 
 // ── POST /runs/:runId/sync-results — download artifacts and save to env results folder ──
 router.post('/runs/:runId/sync-results', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
-  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  const run = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
 
   // Guard: don't create a second execution_runs record for the same CI run
-  const alreadySynced = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (alreadySynced) return res.json({ ok: true, already_synced: true, execution_run_id: alreadySynced.id, message: 'Already synced — results are already in Analytics.' });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
 
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
   const AdmZip = require('adm-zip');
   const os = require('os');
-  const { getUserProjectPath, getCollectionPath } = require('../utils/projectFolders');
+  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('../utils/projectFolders');
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
   // ── Determine results directory ────────────────────────────────────────────
-  const callerRole  = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
-  const userProjPath = getUserProjectPath(req.userId, callerRole, project.name);
+  const callerUser1 = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  const callerRole  = callerUser1?.role;
+  const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name);
 
   // Parse CI parameters for the run name
   const ciVars2  = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
@@ -2640,8 +2679,9 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   let syncSuiteName = null;
   if (run.script_name) {
     const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
-    const suite = db.prepare(`
-      SELECT ts.*, c.name as col_name FROM test_suites ts
+    const suite = await db.prepare(`
+      SELECT ts.*, c.name as col_name, c.environment as col_environment, c.environments as col_environments
+      FROM test_suites ts
       LEFT JOIN collections c ON c.id = ts.collection_id
       WHERE ts.project_id = ?
         AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
@@ -2649,8 +2689,14 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     `).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
 
     syncSuiteName = suite?.name || null;
-    if (suite?.col_name && suite?.env) {
-      const envPath = getCollectionPath(userProjPath, suite.col_name, suite.env);
+    // resolveSuiteEnv falls back to the collection's own default env when ts.env is
+    // blank, so a collection-scoped suite never drops to the project-level fallback
+    // below just because its env wasn't explicitly recorded.
+    const syncResolvedEnv = suite?.col_name
+      ? resolveSuiteEnv({ environment: suite.col_environment, environments: suite.col_environments }, suite)
+      : null;
+    if (suite?.col_name && syncResolvedEnv) {
+      const envPath = getCollectionPath(userProjPath, suite.col_name, syncResolvedEnv);
       try { fs.mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
       let nums = [];
       try { nums = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
@@ -2660,8 +2706,10 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     }
   }
 
-  // Fallback to project-level results
+  // Project-level fallback is only legitimate for a run whose script couldn't be
+  // matched to any collection-scoped test suite at all.
   if (!resultDir) {
+    console.warn(`[CI Sync] Run #${run.id} (script "${run.script_name}") — no matching collection-scoped test suite found, falling back to project-level results`);
     try {
       const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
@@ -2765,7 +2813,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
-      const bbAuthHdr3 = bbBasicAuth(cfg, req.userId);
+      const bbAuthHdr3 = await bbBasicAuth(cfg, req.userId);
       const pid3       = (run.external_id || '').replace(/[{}]/g, '');
       const ciVars3    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
       const branch3      = ciVars3.bb_branch || 'perf-results';
@@ -2853,6 +2901,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     // ── Generate analytics PDF from JTL ──────────────────────────────────────
     let pdfPath = null;
     let reportData = null;
+    let ruleResult = null;
     if (fs.existsSync(jtlPath)) {
       try {
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
@@ -2861,7 +2910,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
         // Parse JTL with the full parser (timeline, errors, bytes, latency, connect)
         const { parseJtl } = require('../utils/parseJtl');
-        const suite = db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
+        const suite = await db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
         reportData = parseJtl(jtlPath, {
           suite_name: suite?.name || run.script_name || 'CI Run',
           engine: 'jmeter',
@@ -2877,8 +2926,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
             // Evaluate rules so PDF shows PASSED/FAILED correctly
             try {
               const { evaluateRules } = require('../utils/ruleEvaluator');
-              const rr = evaluateRules(req.params.projectId, jtlPath);
-              reportData.rule_violations = rr?.violations || [];
+              ruleResult = await evaluateRules(req.params.projectId, jtlPath);
+              reportData.rule_violations = ruleResult?.violations || [];
             } catch (_) {}
 
             await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
@@ -2895,22 +2944,26 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     let suiteId = null;
     if (run.script_name) {
       const scriptFile = run.script_name.split('/').pop();
-      const suite = db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+      const suite = await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
         .get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
       suiteId = suite?.id || null;
     }
 
-    // Any individual API with 100% failure and 400/401 → mark run failed and always trigger heal
-    const syncIsFullFailure = hasCritical400Or401(reportData);
-    const syncRunStatus = syncIsFullFailure ? 'failed' : 'completed';
-    if (syncIsFullFailure) {
-      db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+    // Any individual API at 100% failure → mark run failed and always trigger heal, regardless of status code.
+    const syncApiFullFailure = hasAnyApiFullFailure(reportData);
+    // Overall pass/fail mirrors the rule engine (what the alert email/PDF already show) —
+    // falls back to raw failure count when the project has no rules configured.
+    const syncRunFailed = syncApiFullFailure || ruleResult?.passed === false ||
+      (ruleResult?.noRules && (reportData?.summary?.total_failed || 0) > 0);
+    const syncRunStatus = syncRunFailed ? 'failed' : 'completed';
+    if (syncRunFailed) {
+      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
     }
 
-    const execRunRow = db.prepare(`
+    const execRunRow = await db.prepare(`
       INSERT INTO execution_runs
         (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
     `).run(
       req.params.projectId,
       suiteId,
@@ -2925,7 +2978,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     );
 
     // Update ci_pipeline_run with result_dir reference
-    db.prepare("UPDATE ci_pipeline_runs SET variables = ? WHERE id = ?")
+    await db.prepare("UPDATE ci_pipeline_runs SET variables = ? WHERE id = ?")
       .run(JSON.stringify({ ...JSON.parse(run.variables || '{}'), result_dir: resultDir }), run.id);
 
     // ── Send email alert for CI run ───────────────────────────────────────────
@@ -2942,7 +2995,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         // Use the actual suite name from the test_suites table (suiteId resolved above)
         let resolvedSuiteName = emailData.meta.suite_name;
         if (suiteId) {
-          const sRow = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId);
+          const sRow = await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId);
           if (sRow?.name) { emailData.meta.suite_name = sRow.name; resolvedSuiteName = sRow.name; }
         }
         emailData.meta.run_id = newRunId;
@@ -2951,7 +3004,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         emailData.rule_violations = violations;
         // Send rule violation email first (as soon as violations are known, before full report)
         if (violations.length > 0) {
-          const proj = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+          const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
           await sendRuleViolationEmail(newRunId, req.userId, req.params.projectId, violations, resolvedSuiteName, proj?.name || '');
         }
         // Send full report email
@@ -2962,11 +3015,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       }
     });
 
-    // Trigger auto-heal for 100% failure runs — always, regardless of auto_heal flag
-    if (syncIsFullFailure && !run.is_heal_run) {
+    // Auto-heal: any single API at 100% failure always heals, regardless of the auto_heal flag;
+    // otherwise heal only if auto_heal was enabled at trigger time and the run failed.
+    const syncShouldHeal = syncApiFullFailure || (run.auto_heal && syncRunFailed);
+    if (syncShouldHeal && !run.is_heal_run) {
       const syncHealInstruction = buildErrorHealInstruction(reportData?.errors) || run.auto_heal_instruction || null;
-      console.log(`[CI Sync] Run #${run.id} 100% failure — triggering auto-heal`);
-      setImmediate(() => {
+      console.log(`[CI Sync] Run #${run.id} failed (apiFullFailure=${syncApiFullFailure}) — triggering auto-heal`);
+      setImmediate(async () => {
         try {
           startAutoHealCI(req.userId, run.id, req.params.projectId, {
             mode: syncHealInstruction ? 'custom' : (run.auto_heal_mode || 'auto'),
@@ -2996,12 +3051,12 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
 // ── GET /runs/:runId/steps — live step details from GitHub/GitLab ─────────────
 router.get('/runs/:runId/steps', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const run = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.json({ steps: [], status: run.status });
 
-  const cfg = decryptConfig(getConfig(req.params.projectId, req.userId));
+  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
   if (!cfg) return res.json({ steps: [], status: run.status });
 
   try {
@@ -3077,8 +3132,8 @@ router.get('/runs/:runId/steps', async (req, res) => {
     }
 
     if (run.provider === 'bitbucket') {
-      const mergedCfg = (() => {
-        const adminRaw = db.prepare(`
+      const mergedCfg = await (async () => {
+        const adminRaw = await db.prepare(`
           SELECT cpc.* FROM ci_pipeline_configs cpc
           JOIN users u ON u.id = cpc.user_id
           WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
@@ -3128,8 +3183,8 @@ const HEAL_CI_VUSERS       = 3;
 const HEAL_CI_DURATION     = 20;
 const HEAL_CI_RAMPUP       = 2;
 
-function generateHealSummary(ciRunId) {
-  const logs = db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(ciRunId);
+async function generateHealSummary(ciRunId) {
+  const logs = await db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(ciRunId);
   if (!logs.length) return 'Auto-heal exhausted — no attempt logs found.';
   const lines = [`Auto-heal exhausted after ${logs.length} attempt(s). The script could not be automatically fixed.\n`];
   for (const log of logs) {
@@ -3147,19 +3202,20 @@ function generateHealSummary(ciRunId) {
   return lines.join('\n');
 }
 
-function setCiHealStatus(ciRunId, status) {
+async function setCiHealStatus(ciRunId, status) {
   if (status === 'exhausted') {
-    const summary = generateHealSummary(ciRunId);
-    db.prepare('UPDATE ci_pipeline_runs SET heal_status=?, heal_summary=? WHERE id=?').run(status, summary, ciRunId);
+    const summary = await generateHealSummary(ciRunId);
+    await db.prepare('UPDATE ci_pipeline_runs SET heal_status=?, heal_summary=? WHERE id=?').run(status, summary, ciRunId);
   } else {
-    db.prepare('UPDATE ci_pipeline_runs SET heal_status=? WHERE id=?').run(status, ciRunId);
+    await db.prepare('UPDATE ci_pipeline_runs SET heal_status=? WHERE id=?').run(status, ciRunId);
   }
 }
 
-function logCiHealAttempt(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId = null) {
-  return db.prepare(
+async function logCiHealAttempt(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId = null) {
+  const r = await db.prepare(
     'INSERT INTO ci_auto_heal_logs (ci_run_id, attempt, diagnosis, fix_applied, fix_type, new_ci_run_id) VALUES (?,?,?,?,?,?)'
-  ).run(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId).lastInsertRowid;
+  ).run(ciRunId, attempt, diagnosis, fix, fixType, newCiRunId);
+  return r.lastInsertRowid;
 }
 
 async function pollBitbucketUntilDone(ws, slug, pipelineUuid, authHeader, maxWaitMs = 35 * 60 * 1000) {
@@ -3188,13 +3244,13 @@ async function pollBitbucketUntilDone(ws, slug, pipelineUuid, authHeader, maxWai
 // Push fixed JMX to Bitbucket Files API and trigger the pipeline.
 // overrideVars replaces matching keys from the original run's variables.
 async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, overrideVars = {}) {
-  const adminRawCfg = db.prepare(`
+  const adminRawCfg = await db.prepare(`
     SELECT cpc.* FROM ci_pipeline_configs cpc
     JOIN users u ON u.id = cpc.user_id
     WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
     ORDER BY cpc.updated_at DESC LIMIT 1
   `).get(projectId);
-  const userRawCfg = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
+  const userRawCfg = await db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
   const adminCfg = decryptConfig(adminRawCfg);
   const userCfg  = decryptConfig(userRawCfg);
   const cfg = {
@@ -3206,9 +3262,9 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   const bbSlug = cfg.bitbucket_repo_slug;
   if (!bbWs || !bbSlug || !cfg.bitbucket_app_password) throw new Error('Bitbucket CI config incomplete');
 
-  const callerRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  const callerRow = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
-  const gitCfg    = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
+  const gitCfg    = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
   const baseBranch = gitCfg?.base_branch || 'main';
   const bbBranch = isAdmin
     ? (cfg.bitbucket_ref || baseBranch)
@@ -3219,7 +3275,7 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
 
   const adminTok = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
   const adminForAuth = { ...cfg, bitbucket_app_password: adminTok, bitbucket_username: adminCfg?.bitbucket_username || cfg.bitbucket_username || '' };
-  const authHeader = bbBasicAuth(adminForAuth, adminRawCfg?.user_id);
+  const authHeader = await bbBasicAuth(adminForAuth, adminRawCfg?.user_id);
 
   // Locate the fixed JMX on disk and build canonical repo paths
   const scriptName   = originalCiRun.script_name || '';
@@ -3315,7 +3371,7 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
     ...(pipelineBuildNum ? { bb_build_number: pipelineBuildNum } : {}),
   };
 
-  const healRunInsert = db.prepare(
+  const healRunInsert = await db.prepare(
     'INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, is_heal_run) VALUES (?,?,?,?,?,?,?,?,?,?)'
   ).run(
     projectId, 'bitbucket', pipelineUuid,
@@ -3330,13 +3386,13 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
 
 // Push fixed JMX to GitHub via Contents API and dispatch workflow_dispatch.
 async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrideVars = {}) {
-  const adminRawCfg = db.prepare(`
+  const adminRawCfg = await db.prepare(`
     SELECT cpc.* FROM ci_pipeline_configs cpc
     JOIN users u ON u.id = cpc.user_id
     WHERE cpc.project_id = ? AND u.role IN ('org_admin','super_admin')
     ORDER BY cpc.updated_at DESC LIMIT 1
   `).get(projectId);
-  const userRawCfg = db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
+  const userRawCfg = await db.prepare('SELECT * FROM ci_pipeline_configs WHERE project_id = ? AND user_id = ?').get(projectId, userId) || adminRawCfg;
   const adminCfg = decryptConfig(adminRawCfg);
   const userCfg  = decryptConfig(userRawCfg);
 
@@ -3344,7 +3400,7 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
   const githubRepo     = userCfg?.github_repo  || adminCfg?.github_repo  || '';
   if (!githubRepo || !effectiveToken) throw new Error('GitHub CI config incomplete');
 
-  const gitCfg      = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
+  const gitCfg      = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(projectId);
   const baseBranch  = gitCfg?.base_branch || 'main';
   const workflowFile = userCfg?.github_workflow_file || adminCfg?.github_workflow_file || 'perf-test.yml';
 
@@ -3441,7 +3497,7 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
   if (!latestRun) throw new Error('GitHub: no new workflow run found after dispatch');
 
   const healVars = { ...mergedVars, branch: targetRef, github_run_number: latestRun.run_number };
-  const healRunInsert = db.prepare(
+  const healRunInsert = await db.prepare(
     'INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, is_heal_run) VALUES (?,?,?,?,?,?,?,?,?,?)'
   ).run(
     projectId, 'github', String(latestRun.id),
@@ -3508,8 +3564,8 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
 
   setCiHealStatus(ciRunId, 'diagnosing');
 
-  const ciRun  = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
-  const execRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(ciRunId);
+  const ciRun  = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+  const execRun = await db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(ciRunId);
   if (!execRun || !execRun.result_dir) {
     console.warn(`[CI Heal] No execution_run for CI run #${ciRunId}`);
     setCiHealStatus(ciRunId, 'failed');
@@ -3518,7 +3574,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
 
   const scriptFile = (ciRun?.script_name || '').replace(/\\/g, '/').split('/').pop();
   const suite = scriptFile
-    ? db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+    ? await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
         .get(projectId, `%${scriptFile}`, `%${scriptFile}`)
     : null;
   if (!suite) {
@@ -3534,8 +3590,8 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   if (!ctx.hasErrors) { setCiHealStatus(ciRunId, null); return; }
 
   if (ctx.errorClass.isInfra) {
-    const lid = logCiHealAttempt(ciRunId, attemptNum, `Infrastructure/server failure: ${ctx.errorClass.summary}`, '', 'no_fix');
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('infra_error', lid);
+    const lid = await logCiHealAttempt(ciRunId, attemptNum, `Infrastructure/server failure: ${ctx.errorClass.summary}`, '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('infra_error', lid);
     setCiHealStatus(ciRunId, 'infra_error');
     return;
   }
@@ -3544,16 +3600,16 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   try {
     aiResp = await diagnoseWithAi(userId, execRun, suite, ctx, attemptNum, options.customInstruction || null);
   } catch (e) {
-    const lid = logCiHealAttempt(ciRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    const lid = await logCiHealAttempt(ciRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
 
-  const lid = logCiHealAttempt(ciRunId, attemptNum, aiResp.issue || 'Unknown issue', aiResp.fix || '', aiResp.fix_type || 'no_fix');
+  const lid = await logCiHealAttempt(ciRunId, attemptNum, aiResp.issue || 'Unknown issue', aiResp.fix || '', aiResp.fix_type || 'no_fix');
 
   if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('no_fix', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('no_fix', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
@@ -3565,7 +3621,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
     if (jmxPath) fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
   } catch (e) {
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
@@ -3582,42 +3638,42 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     });
   } catch (e) {
     console.error('[CI Heal] Phase 1 trigger error:', e.message);
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
 
   const quickCiRunId = quickResult.ciRunId;
-  db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(quickCiRunId, ciRunId);
-  db.prepare('UPDATE ci_auto_heal_logs SET new_ci_run_id=? WHERE id=?').run(quickCiRunId, lid);
+  await db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(quickCiRunId, ciRunId);
+  await db.prepare('UPDATE ci_auto_heal_logs SET new_ci_run_id=? WHERE id=?').run(quickCiRunId, lid);
 
   const quickPoll = await pollCiUntilDone(ciRun.provider, quickResult, 5 * 60 * 1000);
-  db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
+  await db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
     quickPoll.done ? (quickPoll.success ? 'completed' : 'failed') : 'failed', quickCiRunId
   );
 
   if (quickPoll.done) {
     try {
-      const quickCiRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
-      const quickCfg   = decryptConfig(getConfig(projectId, userId));
+      const quickCiRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+      const quickCfg   = decryptConfig(await getConfig(projectId, userId));
       await autoSyncCiRun(quickCiRow, quickCfg, projectId, userId);
     } catch (e) { console.warn('[CI Heal] quick sync error:', e.message); }
   }
 
   // Guarantee execution_runs exists for quickCiRunId so the next attempt can read context.
   // If autoSyncCiRun failed (JTL missing, wrong path, etc.) create a minimal fallback record.
-  const quickExecCheck = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(quickCiRunId);
+  const quickExecCheck = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(quickCiRunId);
   if (!quickExecCheck) {
     const fallbackDir = path.join(os.tmpdir(), `ci_heal_nojtl_${quickCiRunId}`);
     try { fs.mkdirSync(fallbackDir, { recursive: true }); } catch (_) {}
-    const quickCiRunRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+    const quickCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
     const quickScriptFile2 = (quickCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
     const quickSuite2 = quickScriptFile2
-      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
       : null;
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, datetime('now'), datetime('now'), ?)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
     `).run(
       projectId, quickSuite2?.id || null, fallbackDir,
       JSON.stringify([{ type: 'error', message: `Heal pipeline run ${quickCiRunId} failed — results not uploaded. Re-attempting fix.` }]),
@@ -3626,15 +3682,15 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     console.log(`[CI Heal] Created fallback execRun for heal run #${quickCiRunId}`);
   }
 
-  const quickExecRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(quickCiRunId);
+  const quickExecRun = await db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(quickCiRunId);
   const quickTotal   = (() => { try { return JSON.parse(quickExecRun?.report_data || 'null')?.summary?.total_requests || 0; } catch { return 0; } })();
   const quickPassed  = quickPoll.success && quickExecRun?.status === 'completed' && quickTotal > 0;
 
   if (!quickPassed) {
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
     if (attemptNum < sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
       await healCycleCI(userId, quickCiRunId, projectId, options, attemptNum + 1, sessionStart);
-      const latest = db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
+      const latest = await db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
       if (latest?.heal_status) setCiHealStatus(ciRunId, latest.heal_status);
     } else {
       setCiHealStatus(ciRunId, 'exhausted');
@@ -3650,42 +3706,42 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     fullResult = await pushJmxAndTrigger(userId, projectId, ciRun, origVarsForFull);
   } catch (e) {
     // Quick passed — still count as healed
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
     setCiHealStatus(ciRunId, 'healed');
     return;
   }
 
   const fullCiRunId = fullResult.ciRunId;
-  db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(fullCiRunId, ciRunId);
+  await db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(fullCiRunId, ciRunId);
 
   const origDurationS = parseInt(origVarsForFull.jmeter_duration || '300', 10);
   const fullMaxWaitMs = Math.max(20 * 60 * 1000, origDurationS * 3 * 1000 + 5 * 60 * 1000);
   const fullPoll = await pollCiUntilDone(ciRun.provider, fullResult, fullMaxWaitMs);
-  db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
+  await db.prepare('UPDATE ci_pipeline_runs SET status=? WHERE id=?').run(
     fullPoll.done ? (fullPoll.success ? 'completed' : 'failed') : 'failed', fullCiRunId
   );
 
   if (fullPoll.done) {
     try {
-      const fullCiRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
-      const fullCfg   = decryptConfig(getConfig(projectId, userId));
+      const fullCiRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+      const fullCfg   = decryptConfig(await getConfig(projectId, userId));
       await autoSyncCiRun(fullCiRow, fullCfg, projectId, userId);
     } catch (e) { console.warn('[CI Heal] full sync error:', e.message); }
   }
 
   // Guarantee execution_runs for fullCiRunId before any retry
-  const fullExecCheck = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(fullCiRunId);
+  const fullExecCheck = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(fullCiRunId);
   if (!fullExecCheck) {
     const fallbackDir2 = path.join(os.tmpdir(), `ci_heal_nojtl_${fullCiRunId}`);
     try { fs.mkdirSync(fallbackDir2, { recursive: true }); } catch (_) {}
-    const fullCiRunRow = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+    const fullCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
     const fullScriptFile2 = (fullCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
     const fullSuite2 = fullScriptFile2
-      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
       : null;
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, datetime('now'), datetime('now'), ?)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
     `).run(
       projectId, fullSuite2?.id || null, fallbackDir2,
       JSON.stringify([{ type: 'error', message: `Full heal pipeline run ${fullCiRunId} failed — results not uploaded.` }]),
@@ -3693,18 +3749,18 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     );
   }
 
-  const fullExecRun = db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(fullCiRunId);
+  const fullExecRun = await db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(fullCiRunId);
   const fullTotal   = (() => { try { return JSON.parse(fullExecRun?.report_data || 'null')?.summary?.total_requests || 0; } catch { return 0; } })();
   const fullPassed  = fullPoll.success && fullExecRun?.status === 'completed' && fullTotal > 0;
 
   if (fullPassed) {
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
     setCiHealStatus(ciRunId, 'healed');
   } else {
-    db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('still_failing', lid);
     if (attemptNum < sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
       await healCycleCI(userId, fullCiRunId, projectId, options, attemptNum + 1, sessionStart);
-      const latest = db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
+      const latest = await db.prepare('SELECT heal_status FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
       if (latest?.heal_status) setCiHealStatus(ciRunId, latest.heal_status);
     } else {
       setCiHealStatus(ciRunId, 'exhausted');
@@ -3712,12 +3768,12 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   }
 }
 
-function startAutoHealCI(userId, ciRunId, projectId, options = {}) {
-  const ciRun = db.prepare('SELECT id FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+async function startAutoHealCI(userId, ciRunId, projectId, options = {}) {
+  const ciRun = await db.prepare('SELECT id FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
   if (!ciRun) { console.warn(`[CI Heal] CI run ${ciRunId} not found`); return; }
   setCiHealStatus(ciRunId, 'pending');
   // Continue attempt numbering across sessions so logs show Attempt 1, 2, 3… globally
-  const prevAttempts = db.prepare('SELECT COUNT(*) AS cnt FROM ci_auto_heal_logs WHERE ci_run_id = ?').get(ciRunId)?.cnt || 0;
+  const prevAttempts = (await db.prepare('SELECT COUNT(*) AS cnt FROM ci_auto_heal_logs WHERE ci_run_id = ?').get(ciRunId))?.cnt || 0;
   const startAttempt = prevAttempts + 1;
   setImmediate(async () => {
     try {
@@ -3731,33 +3787,33 @@ function startAutoHealCI(userId, ciRunId, projectId, options = {}) {
 
 // ── POST /runs/:runId/heal ─────────────────────────────────────────────────────
 router.post('/runs/:runId/heal', async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
-  const run = db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
+  const run = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
     .get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'CI run not found' });
 
-  let execRun = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+  let execRun = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (!execRun) {
     // No synced results — create a minimal execution_runs record so healCycleCI can proceed.
     // The AI healer reads the JMX file directly from the test suite; an empty result_dir is fine.
     const scriptFile = (run.script_name || '').replace(/\\/g, '/').split('/').pop();
     const suiteRow = scriptFile
-      ? db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
           .get(run.project_id, `%${scriptFile}`, `%${scriptFile}`)
       : null;
     const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
     fs.mkdirSync(resultDir, { recursive: true });
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, datetime('now'), NULL, ?)
+      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
     `).run(
       run.project_id, suiteRow?.id || null, resultDir,
       JSON.stringify([{ type: 'error', message: `CI pipeline run failed on ${run.provider}. No results were uploaded. Heal triggered manually.` }]),
       run.started_at || new Date().toISOString(),
       run.id
     );
-    execRun = db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
+    execRun = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   }
   if (!execRun) return res.status(400).json({ error: 'Run not synced yet — sync results first, then start heal.' });
 
@@ -3776,14 +3832,14 @@ router.post('/runs/:runId/heal', async (req, res) => {
 });
 
 // ── GET /runs/:runId/heal-status ──────────────────────────────────────────────
-router.get('/runs/:runId/heal-status', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+router.get('/runs/:runId/heal-status', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
-  const run = db.prepare('SELECT heal_status, heal_ci_run_id, heal_summary FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
+  const run = await db.prepare('SELECT heal_status, heal_ci_run_id, heal_summary FROM ci_pipeline_runs WHERE id = ? AND project_id = ?')
     .get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'CI run not found' });
 
-  const logs = db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(req.params.runId);
+  const logs = await db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(req.params.runId);
   res.json({ status: run.heal_status, heal_ci_run_id: run.heal_ci_run_id, logs, heal_summary: run.heal_summary || null });
 });
 

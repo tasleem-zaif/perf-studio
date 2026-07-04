@@ -16,12 +16,12 @@ const nodemailer = require('nodemailer');
 const RESET_EXPIRY_MINUTES = 30;
 
 // ── Helper: get SMTP transport (same fallback logic as invites) ──────────────
-function getTransport(userId) {
+async function getTransport(userId) {
   const { decrypt } = require('../utils/encryption');
-  let cfg = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
+  let cfg = await db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
   if (!cfg?.smtp_host || !cfg?.from_email || !cfg?.smtp_pass) {
-    const superAdmin = db.prepare("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1").get();
-    if (superAdmin) cfg = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(superAdmin.id);
+    const superAdmin = await db.prepare("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1").get();
+    if (superAdmin) cfg = await db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(superAdmin.id);
   }
   if (!cfg?.smtp_host || !cfg?.from_email) return null;
   return { transport: nodemailer.createTransport({
@@ -38,16 +38,16 @@ router.post('/forgot-password', async (req, res) => {
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
   // Always respond OK — don't reveal whether email exists (security best practice)
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (!user) return res.json({ ok: true, message: 'If that email exists, a reset link has been sent.' });
 
   // Expire any existing tokens for this user
-  db.prepare("UPDATE password_resets SET used=1 WHERE user_id=? AND used=0").run(user.id);
+  await db.prepare("UPDATE password_resets SET used=1 WHERE user_id=? AND used=0").run(user.id);
 
   // Create new token (valid for 30 min)
   const token     = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + RESET_EXPIRY_MINUTES * 60 * 1000).toISOString();
-  db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?,?,?)')
+  await db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?,?,?)')
     .run(user.id, token, expiresAt);
 
   // Build reset URL from request origin header
@@ -55,7 +55,7 @@ router.post('/forgot-password', async (req, res) => {
   const resetUrl    = `${frontendUrl}/reset-password/${token}`;
 
   // Send email
-  const result = getTransport(user.id);
+  const result = await getTransport(user.id);
   if (result) {
     const { transport, cfg } = result;
     try {
@@ -110,32 +110,32 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 // ── POST /auth/reset-password ─────────────────────────────────────────────────
-router.post('/reset-password', (req, res) => {
+router.post('/reset-password', async (req, res) => {
   const { token, password } = req.body;
   if (!token || !password) return res.status(400).json({ error: 'Token and password are required.' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
 
-  const reset = db.prepare("SELECT * FROM password_resets WHERE token=? AND used=0").get(token);
+  const reset = await db.prepare("SELECT * FROM password_resets WHERE token=? AND used=0").get(token);
   if (!reset) return res.status(404).json({ error: 'Reset link is invalid or already used.' });
   if (new Date(reset.expires_at) < new Date()) {
     return res.status(410).json({ error: `Reset link has expired (${RESET_EXPIRY_MINUTES}-minute limit). Request a new one.` });
   }
 
   const hash = bcrypt.hashSync(password, 10);
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, reset.user_id);
-  db.prepare('UPDATE password_resets SET used=1 WHERE id=?').run(reset.id);
+  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, reset.user_id);
+  await db.prepare('UPDATE password_resets SET used=1 WHERE id=?').run(reset.id);
 
   res.json({ ok: true, message: 'Password reset successfully. You can now sign in.' });
 });
 
 // ── POST /admin/users/:id/reset-password (admin overrides a user's password) ──
-router.post('/users/:id/reset-password', auth, (req, res) => {
-  const caller = db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(req.userId);
+router.post('/users/:id/reset-password', auth, async (req, res) => {
+  const caller = await db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(req.userId);
   if (!caller || !['super_admin', 'org_admin'].includes(caller.role)) {
     return res.status(403).json({ error: 'Only admins can reset passwords.' });
   }
 
-  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const target = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found.' });
   if (target.role === 'super_admin') return res.status(403).json({ error: 'Cannot reset super admin password.' });
 
@@ -150,7 +150,7 @@ router.post('/users/:id/reset-password', auth, (req, res) => {
   }
 
   const hash = bcrypt.hashSync(new_password, 10);
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, target.id);
+  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, target.id);
 
   res.json({ ok: true, message: `Password for ${target.name} reset successfully.` });
 });

@@ -20,6 +20,31 @@ function isSafeUrl(url) {
     : false;
 }
 
+// Replace {{key}} tokens with values from the collection's env config (e.g. {{url}}, {{token}}).
+// Unresolved tokens are left as-is so the caller can report exactly which variable is missing.
+function substituteVars(str, vars) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/\{\{(\w+)\}\}/g, (match, key) =>
+    Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : match);
+}
+
+function findMissingVars(str) {
+  if (typeof str !== 'string') return [];
+  return [...str.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]);
+}
+
+// parseCollection.js stores an endpoint's query params separately from its URL
+// (ep.queryParams) — they must be appended before firing, or the request silently
+// goes out with no query string at all.
+function appendQueryParams(url, queryParams, vars) {
+  const entries = Object.entries(queryParams || {}).filter(([k]) => k);
+  if (!entries.length) return url;
+  const qs = entries
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(substituteVars(String(v ?? ''), vars))}`)
+    .join('&');
+  return url + (url.includes('?') ? '&' : '?') + qs;
+}
+
 // Recursively search an object for common token field names
 const TOKEN_KEYS = ['token', 'access_token', 'accessToken', 'jwt', 'id_token', 'idToken',
                     'auth_token', 'authToken', 'bearer', 'Bearer', 'sessionToken', 'session_token'];
@@ -68,27 +93,44 @@ router.post('/pre-run', async (req, res) => {
   const { collection_id, project_id, suite_id } = req.body;
   if (!collection_id || !project_id) return res.status(400).json({ error: 'collection_id and project_id required' });
 
-  if (!ownsProject(req.userId, project_id)) return res.status(404).json({ error: 'Project not found' });
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(collection_id, project_id);
+  if (!await ownsProject(req.userId, project_id)) return res.status(404).json({ error: 'Project not found' });
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(collection_id, project_id);
   if (!collection) return res.status(404).json({ error: 'Collection not found' });
 
   let endpoints = [];
   try { endpoints = JSON.parse(collection.json_content); } catch { return res.status(400).json({ error: 'Invalid collection data' }); }
 
-  const batch = endpoints.slice(0, 20);
+  // Load {{var}} values for this collection's default environment (set at import time,
+  // from a collection's own `variable` defaults and/or an uploaded Postman environment file).
+  const envRow = await db.prepare(
+    'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
+  ).get(collection_id, collection.environment);
+  let variables = {};
+  try { variables = JSON.parse(envRow?.config_json || '{}').variables || {}; } catch {}
 
-  // Phase 1: fire all requests in parallel (5s timeout each)
+  // Phase 1: fire all requests, in bounded-concurrency chunks (5s timeout each) — not
+  // capped to a subset, but never all fired at once either, to avoid hammering the
+  // target server with a huge burst of simultaneous requests on large collections.
   async function fireEndpoint(ep, extraHeaders = {}) {
-    if (!ep.url || !isSafeUrl(ep.url)) {
-      return { endpoint: ep.name || ep.url, url: ep.url, method: ep.method || 'GET', skipped: true, reason: 'URL blocked or invalid', success: false };
+    const url = appendQueryParams(substituteVars(ep.url, variables), ep.queryParams, variables);
+    const headers = { 'Content-Type': 'application/json', ...(ep.headers || {}), ...extraHeaders };
+    for (const k of Object.keys(headers)) headers[k] = substituteVars(headers[k], variables);
+    let body = ep.body;
+    if (typeof body === 'string') body = substituteVars(body, variables);
+
+    const missing = findMissingVars(url);
+    if (missing.length) {
+      return { endpoint: ep.name || ep.url, url, method: ep.method || 'GET', skipped: true, reason: `Missing value for variable(s): ${missing.join(', ')} — set them in this collection's environment config`, success: false };
+    }
+    if (!url || !isSafeUrl(url)) {
+      return { endpoint: ep.name || ep.url, url, method: ep.method || 'GET', skipped: true, reason: 'URL blocked or invalid', success: false };
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const headers = { 'Content-Type': 'application/json', ...(ep.headers || {}), ...extraHeaders };
     const fetchOpts = { method: ep.method || 'GET', headers, signal: controller.signal };
-    if (ep.body && ep.method !== 'GET') fetchOpts.body = typeof ep.body === 'string' ? ep.body : JSON.stringify(ep.body);
+    if (body && ep.method !== 'GET') fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
     try {
-      const r = await fetch(ep.url, fetchOpts);
+      const r = await fetch(url, fetchOpts);
       clearTimeout(timer);
       const text = await r.text();
       let body;
@@ -97,7 +139,7 @@ router.post('/pre-run', async (req, res) => {
       const extracted = extractToken(body, responseHeaders);
       const newCookies = extractCookies(responseHeaders);
       return {
-        endpoint: ep.name || ep.url, method: ep.method || 'GET', url: ep.url,
+        endpoint: ep.name || ep.url, method: ep.method || 'GET', url,
         status: r.status, statusText: r.statusText,
         requestHeaders: headers, requestBody: fetchOpts.body || null,
         responseHeaders, body,
@@ -107,12 +149,17 @@ router.post('/pre-run', async (req, res) => {
       };
     } catch (e) {
       clearTimeout(timer);
-      return { endpoint: ep.name || ep.url, method: ep.method || 'GET', url: ep.url, error: e.name === 'AbortError' ? 'Request timed out (5s limit)' : e.message, success: false };
+      return { endpoint: ep.name || ep.url, method: ep.method || 'GET', url, error: e.name === 'AbortError' ? 'Request timed out (5s limit)' : e.message, success: false };
     }
   }
 
-  // Run all in parallel
-  const rawResults = await Promise.all(batch.map(ep => fireEndpoint(ep)));
+  const CHUNK_SIZE = 20; // concurrency per chunk — matches the old single-batch size
+  const rawResults = [];
+  for (let i = 0; i < endpoints.length; i += CHUNK_SIZE) {
+    const chunk = endpoints.slice(i, i + CHUNK_SIZE);
+    rawResults.push(...await Promise.all(chunk.map(ep => fireEndpoint(ep))));
+    if (i + CHUNK_SIZE < endpoints.length) await new Promise(r => setTimeout(r, 250));
+  }
 
   // Extract any auth token from the first successful response that has one
   let authToken = null;
@@ -124,7 +171,7 @@ router.post('/pre-run', async (req, res) => {
 
   // Phase 2: retry endpoints that got 401 and we now have a token
   const responses = await Promise.all(rawResults.map(async (r, i) => {
-    const ep = batch[i];
+    const ep = endpoints[i];
     if (r.status === 401 && authToken) {
       const retry = await fireEndpoint(ep, {
         Authorization: `Bearer ${authToken}`,
@@ -142,10 +189,10 @@ router.post('/pre-run', async (req, res) => {
 
   // Persist results — always on collection, also on test_suite when suite_id provided (legacy)
   const hash = simpleHash(collection.json_content || '');
-  db.prepare('UPDATE collections SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
+  await db.prepare('UPDATE collections SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
     .run(JSON.stringify(responses), hash, collection_id);
   if (suite_id) {
-    db.prepare('UPDATE test_suites SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
+    await db.prepare('UPDATE test_suites SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
       .run(JSON.stringify(responses), hash, suite_id);
   }
 

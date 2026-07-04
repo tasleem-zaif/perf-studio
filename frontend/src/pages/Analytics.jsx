@@ -457,7 +457,11 @@ function DashboardTab({ data }) {
     datasets: [{ label:'Avg RT', data: TOP5_SLOW.map(a=>a.avg), backgroundColor:['#ef4444cc','#f97316cc','#f59e0bcc','#eab308cc','#84cc16cc'], borderColor:['#ef4444','#f97316','#f59e0b','#eab308','#84cc16'], borderWidth:1, borderRadius:4 }],
   };
 
-  const chartH = Math.max(180, labels.length * 32 + 50);
+  // Fixed height — these are vertical bar charts (API names on the x-axis), so the
+  // number of APIs doesn't need extra vertical room the way it would for a horizontal
+  // bar chart. A fixed height lets Chart.js auto-scale the y-axis ticks proportionally
+  // to the actual data range instead of stretching sparse gridlines across a tall canvas.
+  const chartH = 300;
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
@@ -522,7 +526,8 @@ function TransactionTab({ data }) {
     ],
   };
 
-  const chartH = Math.max(160, data.by_api.length * 30 + 50);
+  // Fixed height — see DashboardTab's chartH for why this shouldn't scale with API count.
+  const chartH = 300;
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>

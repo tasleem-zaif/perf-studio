@@ -8,7 +8,7 @@ const DEFAULT_MODELS = {
   claude: 'claude-sonnet-4-5',
 };
 
-function getSettings() {
+async function getSettings() {
   return db.prepare(`
     SELECT ai.* FROM ai_settings ai
     JOIN users u ON u.id = ai.user_id
@@ -25,7 +25,7 @@ function getSettings() {
  * @param {'script'|'heal'} [purpose='script'] — selects which saved model to use
  */
 async function callAi(userId, systemPrompt, userPrompt, purpose = 'script') {
-  const settings = getSettings();
+  const settings = await getSettings();
   if (!settings || !settings.api_key) {
     throw new Error('AI not configured. Go to Settings → AI Configuration to add your API key.');
   }

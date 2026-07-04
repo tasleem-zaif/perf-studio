@@ -14,6 +14,9 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [depsChecked, setDepsChecked] = useState(false);
   const [checkingDeps, setCheckingDeps] = useState(false);
   const [installingDep, setInstallingDep] = useState(null);
+  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/Peako:latest');
+  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/Peako:latest');
+  const [pullingImage, setPullingImage] = useState(null); // 'jmeter' | 'k6' | null
   const [runParams, setRunParams] = useState({ vusers: 50, rampup: 30, iter_mode: 'duration', loops: 1, duration: 300 });
   const [running, setRunning] = useState(false);
   const [autoHeal, setAutoHeal] = useState(true);
@@ -28,6 +31,14 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   const selectedProject = activeProject;
   const selectedProjectId = activeProject?.id || '';
+
+  // Load the configured Docker image names (used for both CI YAML and local pulls)
+  useEffect(() => {
+    api.get('/config').then(({ data }) => {
+      if (data.config?.jmeter_docker_image) setJmeterDockerImage(data.config.jmeter_docker_image);
+      if (data.config?.k6_docker_image) setK6DockerImage(data.config.k6_docker_image);
+    }).catch(() => {});
+  }, []);
 
   // Load all generated suites when active project changes
   useEffect(() => {
@@ -216,6 +227,55 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   function addLog(type, message) {
     setLogs(prev => [...prev, { type, message }]);
+  }
+
+  async function saveDockerImages() {
+    try {
+      const { data } = await api.get('/config');
+      await api.put('/config', { config: { ...(data.config || {}), jmeter_docker_image: jmeterDockerImage, k6_docker_image: k6DockerImage } });
+      toast('Docker images saved.', 'ok');
+    } catch { toast('Failed to save.', 'err'); }
+  }
+
+  async function pullImage(tool) {
+    const image = tool === 'k6' ? k6DockerImage : jmeterDockerImage;
+    setPullingImage(tool);
+    addLog('info', `━━━ Pulling ${image} ━━━`);
+    try {
+      const token = localStorage.getItem('ps_token');
+      const response = await fetch('/api/execution/jmeter/pull-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ image }),
+      });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop();
+        for (const event of events) {
+          const line = event.trim();
+          if (!line.startsWith('data:')) continue;
+          try {
+            const data = JSON.parse(line.slice(5).trim());
+            if (data.done) {
+              if (data.error) addLog('err', 'Pull failed: ' + data.error);
+              else addLog('ok', `${image} is ready.`);
+            } else {
+              addLog(data.type || 'info', data.message || '');
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      addLog('err', 'Pull error: ' + e.message);
+    } finally {
+      setPullingImage(null);
+    }
   }
 
   function startHealPolling(runId) {
@@ -1302,8 +1362,45 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         )}
         <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
           <i className="ti ti-brand-docker" style={{ marginRight: '4px', color: '#2496ed' }} />
-          All tests run inside Docker containers. Images are configured in{' '}
-          <button onClick={() => onNav('config')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: '11px', padding: 0, fontFamily: 'inherit' }}>Configuration</button>.
+          All tests run inside Docker containers — configure the image below.
+        </div>
+
+        {/* Docker Image — used for both local pulls and generated CI YAML */}
+        <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid var(--color-border-secondary)' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <i className="ti ti-brand-docker" style={{ color: '#0ea5e9', fontSize: '14px' }} />
+            Docker Image
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
+            Contains JMeter, K6, Java and Node.js. The image name here is also embedded in generated CI YAML files — update it before generating YAML if you use a custom image. Pull is only needed for local execution; cloud CI pulls automatically on the runner.
+          </div>
+          <div style={{ display: 'flex', gap: '6px', maxWidth: 520, marginBottom: '10px' }}>
+            <input
+              type="text"
+              value={jmeterDockerImage}
+              onChange={e => setJmeterDockerImage(e.target.value)}
+              placeholder="tasleemzaif/Peako:latest"
+              style={{ flex: 1, minWidth: 0 }}
+            />
+            <button
+              className="btn-primary btn-sm"
+              onClick={() => pullImage('jmeter')}
+              disabled={!!pullingImage || !jmeterDockerImage.trim() || (depsChecked && deps[0]?.status !== 'ok')}
+              style={{ whiteSpace: 'nowrap' }}
+              title={depsChecked && deps[0]?.status !== 'ok' ? 'Start Docker Desktop first to pull locally' : 'docker pull'}
+            >
+              {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
+            </button>
+          </div>
+          <button className="btn-secondary btn-sm" onClick={saveDockerImages}>
+            <i className="ti ti-device-floppy" /> Save Image
+          </button>
+          {depsChecked && deps[0]?.status !== 'ok' && (
+            <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--warn)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <i className="ti ti-alert-triangle" />
+              Docker Desktop is not running — Pull is disabled. Check Docker above first, or use cloud CI which pulls automatically.
+            </div>
+          )}
         </div>
       </div>
 

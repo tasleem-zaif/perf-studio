@@ -8,31 +8,31 @@ const { parseJtl } = require('../utils/parseJtl');
 router.use(auth);
 
 // ── GET / — list all pipelines for project ────────────────────────────────────
-router.get('/', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const pipelines = db.prepare('SELECT * FROM pipeline_configs WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+router.get('/', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const pipelines = await db.prepare('SELECT * FROM pipeline_configs WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
   res.json({ pipelines });
 });
 
 // ── POST / — create pipeline ──────────────────────────────────────────────────
-router.post('/', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+router.post('/', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { name, description, steps, stop_on_failure, environment } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Pipeline name is required' });
-  const result = db.prepare(
+  const result = await db.prepare(
     'INSERT INTO pipeline_configs (project_id, name, description, steps, stop_on_failure, environment) VALUES (?,?,?,?,?,?)'
   ).run(req.params.projectId, name.trim(), description || '', JSON.stringify(steps || []), stop_on_failure !== false ? 1 : 0, environment || '');
-  const pipeline = db.prepare('SELECT * FROM pipeline_configs WHERE id = ?').get(result.lastInsertRowid);
+  const pipeline = await db.prepare('SELECT * FROM pipeline_configs WHERE id = ?').get(result.lastInsertRowid);
   res.json({ pipeline });
 });
 
 // ── PUT /:id — update pipeline ────────────────────────────────────────────────
-router.put('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+router.put('/:id', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { name, description, steps, stop_on_failure, environment } = req.body;
-  const existing = db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const existing = await db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!existing) return res.status(404).json({ error: 'Pipeline not found' });
-  db.prepare('UPDATE pipeline_configs SET name=?, description=?, steps=?, stop_on_failure=?, environment=? WHERE id=?')
+  await db.prepare('UPDATE pipeline_configs SET name=?, description=?, steps=?, stop_on_failure=?, environment=? WHERE id=?')
     .run(
       name || existing.name,
       description ?? existing.description,
@@ -41,36 +41,36 @@ router.put('/:id', (req, res) => {
       environment ?? existing.environment,
       req.params.id
     );
-  res.json({ pipeline: db.prepare('SELECT * FROM pipeline_configs WHERE id = ?').get(req.params.id) });
+  res.json({ pipeline: await db.prepare('SELECT * FROM pipeline_configs WHERE id = ?').get(req.params.id) });
 });
 
 // ── DELETE /:id — delete pipeline ─────────────────────────────────────────────
-router.delete('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  db.prepare('DELETE FROM pipeline_configs WHERE id = ? AND project_id = ?').run(req.params.id, req.params.projectId);
+router.delete('/:id', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  await db.prepare('DELETE FROM pipeline_configs WHERE id = ? AND project_id = ?').run(req.params.id, req.params.projectId);
   res.json({ ok: true });
 });
 
 // ── GET /:id/runs — run history ───────────────────────────────────────────────
-router.get('/:id/runs', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const runs = db.prepare('SELECT id, pipeline_id, project_id, status, steps_result, started_at, finished_at FROM pipeline_runs WHERE pipeline_id = ? ORDER BY started_at DESC LIMIT 20').all(req.params.id);
+router.get('/:id/runs', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const runs = await db.prepare('SELECT id, pipeline_id, project_id, status, steps_result, started_at, finished_at FROM pipeline_runs WHERE pipeline_id = ? ORDER BY started_at DESC LIMIT 20').all(req.params.id);
   res.json({ runs });
 });
 
 // ── GET /runs/:runId — single run status ──────────────────────────────────────
-router.get('/runs/:runId', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const run = db.prepare('SELECT * FROM pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
+router.get('/runs/:runId', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const run = await db.prepare('SELECT * FROM pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   res.json({ run });
 });
 
 // ── POST /:id/run — trigger pipeline run with SSE streaming ───────────────────
 router.post('/:id/run', auth, async (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
-  const pipeline = db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const pipeline = await db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!pipeline) return res.status(404).json({ error: 'Pipeline not found' });
 
   const steps = JSON.parse(pipeline.steps || '[]');
@@ -102,19 +102,19 @@ router.post('/:id/run', auth, async (req, res) => {
   }
 
   // Keep-alive ping so proxies don't close the connection
-  const heartbeat = setInterval(() => {
+  const heartbeat = setInterval(async () => {
     try { if (!res.writableEnded) res.write(': ping\n\n'); } catch {}
   }, 1000);
 
   // ── Create run record ─────────────────────────────────────────────────────
   const stepsResult = steps.map(s => ({ suite_id: s.suite_id, name: s.name, engine: s.engine, status: 'pending', error: null }));
-  const runRow = db.prepare(
+  const runRow = await db.prepare(
     'INSERT INTO pipeline_runs (pipeline_id, project_id, status, steps_result, triggered_by) VALUES (?,?,?,?,?)'
   ).run(pipeline.id, req.params.projectId, 'running', JSON.stringify(stepsResult), req.userId);
   const runId = runRow.lastInsertRowid;
 
-  function saveSteps() {
-    db.prepare('UPDATE pipeline_runs SET steps_result=? WHERE id=?').run(JSON.stringify(stepsResult), runId);
+  async function saveSteps() {
+    await db.prepare('UPDATE pipeline_runs SET steps_result=? WHERE id=?').run(JSON.stringify(stepsResult), runId);
   }
 
   // ── Header ────────────────────────────────────────────────────────────────
@@ -150,9 +150,9 @@ router.post('/:id/run', auth, async (req, res) => {
 
     // Create execution_runs record so Analytics can track this step
     const stepEngine = step.engine || 'jmeter';
-    const execRow = db.prepare(
+    const execRow = await db.prepare(
       `INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at)
-       VALUES (?, ?, ?, 'running', NULL, NULL, '[]', datetime('now'))`
+       VALUES (?, ?, ?, 'running', NULL, NULL, '[]', NOW())`
     ).run(req.params.projectId, step.suite_id, stepEngine);
     const execRunId = execRow.lastInsertRowid;
     stepsResult[i].execution_run_id = execRunId;
@@ -177,7 +177,7 @@ router.post('/:id/run', auth, async (req, res) => {
 
       // Parse JTL now so Analytics never needs to read from disk later
       const jtlPath    = result.jtlPath || null;
-      const stepSuite  = db.prepare('SELECT name FROM test_suites WHERE id = ?').get(step.suite_id);
+      const stepSuite  = await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(step.suite_id);
       const cachedData = jtlPath ? parseJtl(jtlPath, {
         run_id: execRunId, suite_name: stepSuite?.name || step.name,
         engine: stepEngine, started_at: stepsResult[i].started_at,
@@ -191,8 +191,8 @@ router.post('/:id/run', auth, async (req, res) => {
         finalStatus = 'failed';
         send({ step_update: { index: i, status: 'failed', name: step.name, error: result.error } });
         saveSteps();
-        db.prepare(
-          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        await db.prepare(
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=NOW() WHERE id=?`
         ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
 
@@ -201,8 +201,8 @@ router.post('/:id/run', auth, async (req, res) => {
         log('ok',  `└─ ✔ PASSED`);
         send({ step_update: { index: i, status: 'completed', name: step.name } });
         saveSteps();
-        db.prepare(
-          `UPDATE execution_runs SET status='completed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        await db.prepare(
+          `UPDATE execution_runs SET status='completed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=NOW() WHERE id=?`
         ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
 
       } else {
@@ -211,8 +211,8 @@ router.post('/:id/run', auth, async (req, res) => {
         finalStatus = 'failed';
         send({ step_update: { index: i, status: 'failed', name: step.name } });
         saveSteps();
-        db.prepare(
-          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=datetime('now') WHERE id=?`
+        await db.prepare(
+          `UPDATE execution_runs SET status='failed', result_dir=?, report_path=?, logs=?, report_data=?, finished_at=NOW() WHERE id=?`
         ).run(resultDir, reportPath, JSON.stringify(stepLogs), reportDataJson, execRunId);
         if (pipeline.stop_on_failure) { stoppedAt = i; break; }
       }
@@ -223,8 +223,8 @@ router.post('/:id/run', auth, async (req, res) => {
       finalStatus = 'failed';
       send({ step_update: { index: i, status: 'failed', name: step.name, error: e.message } });
       saveSteps();
-      db.prepare(
-        `UPDATE execution_runs SET status='failed', logs=?, finished_at=datetime('now') WHERE id=?`
+      await db.prepare(
+        `UPDATE execution_runs SET status='failed', logs=?, finished_at=NOW() WHERE id=?`
       ).run(JSON.stringify(stepLogs), execRunId);
       if (pipeline.stop_on_failure) { stoppedAt = i; break; }
     }
@@ -255,7 +255,7 @@ router.post('/:id/run', auth, async (req, res) => {
 
   // ── Persist final state ───────────────────────────────────────────────────
   clearInterval(heartbeat);
-  db.prepare(`UPDATE pipeline_runs SET status=?, finished_at=datetime('now'), logs=?, steps_result=? WHERE id=?`)
+  await db.prepare(`UPDATE pipeline_runs SET status=?, finished_at=NOW(), logs=?, steps_result=? WHERE id=?`)
     .run(finalStatus, JSON.stringify(allLogs), JSON.stringify(stepsResult), runId);
 
   // ── Send pipeline completion alert email ──────────────────────────────────
@@ -266,8 +266,8 @@ router.post('/:id/run', auth, async (req, res) => {
       const recipients = getRecipients(req.userId, req.params.projectId);
       if (!cfg?.smtp_host || !cfg?.from_email || !recipients.length) return;
 
-      const project  = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
-      const userRow  = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(req.userId);
+      const project  = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+      const userRow  = await db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(req.userId);
       const orgName  = userRow?.org_name || userRow?.name || 'PerfStudio';
       const finished = new Date().toLocaleString();
 

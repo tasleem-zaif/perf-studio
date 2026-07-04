@@ -11,14 +11,14 @@ const db = require('../db');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function getAlertConfig(userId) {
+async function getAlertConfig(userId) {
   // Try the triggering user's own SMTP config first
-  const row = db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
+  const row = await db.prepare('SELECT * FROM alert_configs WHERE user_id = ?').get(userId);
   if (row?.smtp_host) return row;
 
   // Fallback: use any org_admin or super_admin's SMTP config
   // This means regular users benefit from the admin's email setup automatically
-  const adminCfg = db.prepare(`
+  const adminCfg = await db.prepare(`
     SELECT ac.* FROM alert_configs ac
     JOIN users u ON u.id = ac.user_id
     WHERE u.role IN ('org_admin', 'super_admin')
@@ -29,12 +29,12 @@ function getAlertConfig(userId) {
   return adminCfg || null;
 }
 
-function getRecipients(userId, projectId) {
+async function getRecipients(userId, projectId) {
   // Collect ALL relevant recipients:
   // 1. Global recipients configured by this user
   // 2. Global recipients configured by any admin (so admin-configured lists apply to all runs)
   // 3. Project-specific recipients (tied to projectId regardless of who configured them)
-  return db.prepare(`
+  return await db.prepare(`
     SELECT DISTINCT ar.email, ar.name FROM alert_recipients ar
     LEFT JOIN users u ON u.id = ar.user_id
     WHERE (
@@ -297,14 +297,14 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
  */
 async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, reportDir) {
   try {
-    const cfg = getAlertConfig(userId);
+    const cfg = await getAlertConfig(userId);
     if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
 
-    const recipients = getRecipients(userId, projectId);
+    const recipients = await getRecipients(userId, projectId);
     if (!recipients.length) return;
 
     // Get org name
-    const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
+    const userRow = await db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
     const orgName = userRow?.org_name || userRow?.name || 'Peako';
 
     // Build attachments
@@ -490,13 +490,13 @@ function buildBreachEmailBody(params, orgName, recipientName) {
  */
 async function sendBreachAlertEmail(runId, userId, projectId, params) {
   try {
-    const cfg = getAlertConfig(userId);
+    const cfg = await getAlertConfig(userId);
     if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
 
-    const recipients = getRecipients(userId, projectId);
+    const recipients = await getRecipients(userId, projectId);
     if (!recipients.length) return;
 
-    const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
+    const userRow = await db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
     const orgName = userRow?.org_name || userRow?.name || 'Peako';
 
     const transport = createTransport(cfg);
@@ -637,16 +637,16 @@ function buildRuleViolationEmailBody(runId, suiteName, projectName, violations, 
 async function sendRuleViolationEmail(runId, userId, projectId, violations, suiteName, projectName) {
   try {
     if (!violations || violations.length === 0) return;
-    const cfg = getAlertConfig(userId);
+    const cfg = await getAlertConfig(userId);
     if (!cfg || !cfg.smtp_host || !cfg.from_email) return;
 
-    const recipients = getRecipients(userId, projectId);
+    const recipients = await getRecipients(userId, projectId);
     if (!recipients.length) return;
 
-    const userRow = db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
+    const userRow = await db.prepare('SELECT u.name, o.name as org_name FROM users u LEFT JOIN organizations o ON u.org_id = o.id WHERE u.id = ?').get(userId);
     const orgName = userRow?.org_name || userRow?.name || 'Peako';
 
-    const runRow = db.prepare('SELECT result_dir FROM execution_runs WHERE id = ?').get(runId);
+    const runRow = await db.prepare('SELECT result_dir FROM execution_runs WHERE id = ?').get(runId);
     const runNum = (runRow?.result_dir?.match(/Run_?(\d+)/i) || [])[1] || runId;
 
     const transport = createTransport(cfg);

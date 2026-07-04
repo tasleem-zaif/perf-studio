@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import api from '../api';
+import Logo from './Logo';
 
 /* ── Feature highlights shown on the left branding panel ── */
 const FEATURES = [
@@ -57,15 +58,8 @@ export default function Auth({ onLogin }) {
         {/* ── LEFT — Branding & Features ── */}
         <div className="auth-left">
           {/* Logo */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 28 }}>
-            <img src="/favicon.svg" alt="Peako" style={{ height: 52, width: 'auto' }} />
-            <div>
-              <div style={{ lineHeight: 1.3 }}>
-                <span style={{ fontSize: 26, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Peako</span>
-                <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.65)', marginLeft: 4 }}>- Next Gen Performance Testing</span>
-              </div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>by Quarks Technosoft</div>
-            </div>
+          <div style={{ marginBottom: 28 }}>
+            <Logo size="lg" theme="dark" />
           </div>
 
           {/* Headline */}

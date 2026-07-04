@@ -1,11 +1,11 @@
 const jwt = require('jsonwebtoken');
 const db  = require('../db');
+const { getOrgAccessStatus } = require('../utils/license');
 const JWT_SECRET = process.env.JWT_SECRET || 'perf_studio_secret_change_in_prod';
 
-// Sessions idle for longer than this are treated as expired.
 const INACTIVITY_MINUTES = 30;
 
-module.exports = function authMiddleware(req, res, next) {
+module.exports = async function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -17,26 +17,33 @@ module.exports = function authMiddleware(req, res, next) {
       return res.status(401).json({ error: 'Session expired. Please sign in again.' });
     }
 
-    // A valid session must:
-    //   1. Exist in user_sessions with matching jti
-    //   2. Not have passed its absolute expiry (7 days)
-    //   3. Have been active within the inactivity window
-    //      (COALESCE: use last_used_at if set, otherwise fall back to created_at)
-    const session = db.prepare(`
+    const session = await db.prepare(`
       SELECT id FROM user_sessions
       WHERE user_id = ? AND jti = ?
-        AND expires_at > datetime('now')
-        AND datetime(COALESCE(last_used_at, created_at), '+${INACTIVITY_MINUTES} minutes') > datetime('now')
+        AND expires_at > NOW()
+        AND COALESCE(last_used_at, created_at) + interval '${INACTIVITY_MINUTES} minutes' > NOW()
     `).get(payload.userId, payload.jti);
 
     if (!session) {
-      // Clean up the dead session so it cannot be replayed later
-      db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(payload.userId, payload.jti);
+      await db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(payload.userId, payload.jti);
       return res.status(401).json({ error: 'Session expired. Please sign in again.' });
     }
 
-    // Keep last_used_at fresh — heartbeat / any API call resets the inactivity clock
-    db.prepare('UPDATE user_sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(session.id);
+    await db.prepare('UPDATE user_sessions SET last_used_at = NOW() WHERE id = ?').run(session.id);
+
+    // Org-level license check — super admins have no org and are exempt;
+    // every org_admin/user request is gated the same way here.
+    const caller = await db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(payload.userId);
+    if (caller && caller.role !== 'super_admin' && caller.org_id) {
+      const access = await getOrgAccessStatus(caller.org_id);
+      if (!access.isValid) {
+        return res.status(403).json(
+          access.isDisabled
+            ? { error: 'org_disabled', message: 'Your organization\'s access has been disabled. Contact your administrator.' }
+            : { error: 'license_expired', message: 'Your organization\'s license has expired. Contact your administrator to renew.' }
+        );
+      }
+    }
 
     req.userId = payload.userId;
     next();
