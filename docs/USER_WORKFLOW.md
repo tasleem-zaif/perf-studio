@@ -8,7 +8,7 @@ This guide walks you through using Performance Studio from start to finish — f
 
 1. [Roles Overview](#1-roles-overview)
 2. [Getting Started — First Login](#2-getting-started--first-login)
-3. [Super Admin — Organisation & User Setup](#3-super-admin--organisation--user-setup)
+3. [Super Admin — Organisation & Licensing Setup](#3-super-admin--organisation--licensing-setup)
 4. [Org Admin — Project Setup](#4-org-admin--project-setup)
 5. [Adding an API Source (Collection)](#5-adding-an-api-source-collection)
 6. [Running Pre-Run on an API Source](#6-running-pre-run-on-an-api-source)
@@ -30,8 +30,8 @@ Performance Studio has three user roles. Each role sees a different set of featu
 
 | Role | Who | Can Do |
 |---|---|---|
-| **Super Admin** | Platform administrator | Create organisations, invite Org Admins, manage all users |
-| **Org Admin** | Team lead / QA Manager | Create projects, configure AI & Git, invite users, approve PRs |
+| **Super Admin** | Platform administrator | Create organisations, set license plans/limits/expiry, invite Org Admins — no project-level access of their own |
+| **Org Admin** | Team lead / QA Manager | Create projects (up to the org's license limit), configure AI & Git, invite users, approve PRs |
 | **User** | QA Engineer / Developer | Access assigned projects, create test plans, run tests, push to feature branch |
 
 ---
@@ -46,29 +46,49 @@ Performance Studio has three user roles. Each role sees a different set of featu
 
 ---
 
-## 3. Super Admin — Organisation & User Setup
+## 3. Super Admin — Organisation & Licensing Setup
 
-> This section is for Super Admins only.
+> This section is for Super Admins only. Super Admins have no Sidebar — the **Organizations** console described below is their only page after login.
 
-### 3.1 Create an Organisation
+### 3.1 The Organizations Console
 
-1. Go to **Organisations** in the left sidebar
-2. Click **New Organisation**
-3. Enter the organisation name and click **Create**
+Stat cards at the top show org and license-plan counts at a glance. Below that is an org list on the left and a detail panel on the right with four tabs once you select an org:
 
-### 3.2 Invite an Org Admin
+| Tab | Purpose |
+|---|---|
+| **Overview** | Read-only summary — plan, user/project counts vs. limits, status |
+| **Edit Details** | Name, description, website, industry |
+| **License & Limits** | Change plan tier, clear/extend expiry, enable or disable the org |
+| **Org Admins** | View/manage the org's admin users; configure org-wide SMTP for this org |
 
-1. Go to **User Management** in the sidebar
-2. Click **Invite User**
-3. Enter the email address, select role **Org Admin**, select the organisation
-4. Click **Send Invite**
-5. The invited person receives an email with a registration link
+### 3.2 Create an Organisation
 
-### 3.3 Manage Users
+1. Click **New Organization**
+2. Enter the name, description, website, industry
+3. Pick a **plan tier** — trial / starter / growth / business / enterprise (see table below); each tier sets max users, max projects, and a default license duration
+4. Optionally enter an **admin email** to send the first Org Admin invite immediately — leave blank to invite one later from the **Org Admins** tab
+5. Click **Create Organization**
 
-- **Suspend** a user to temporarily block access
-- **Activate** a suspended user to restore access
-- All invited users appear in the user list with their status
+| Plan | Max Users | Max Projects | Duration |
+|---|---|---|---|
+| Trial (default) | 2 | 1 | 7 days |
+| Starter | 5 | 3 | 180 days |
+| Growth | 15 | 10 | 180 days |
+| Business | 30 | 20 | 180 days |
+| Enterprise | Unlimited | Unlimited | 180 days |
+
+### 3.3 Manage an Organisation's License
+
+From the **License & Limits** tab you can:
+- Change the plan tier (updates user/project limits and resets the expiry window to that plan's default)
+- Disable an org — blocks login/access for every user in that org except super admins, immediately
+- Re-enable a disabled org
+
+When an org's license expires or is disabled, non-super-admin users in that org get a clear "license expired" / "organization disabled" error instead of a generic failure.
+
+### 3.4 Manage Org Admins
+
+From the **Org Admins** tab you can view existing org admins for the selected organisation and invite additional ones — same invite-by-email flow as creating the org's first admin.
 
 ---
 
