@@ -1,5 +1,5 @@
 {
-  "name": "perf-studio-backend",
+  "name": "PerfStudio-backend",
   "version": "1.0.0",
   "main": "src/index.js",
   "scripts": {
@@ -21,6 +21,7 @@
     "nodemailer": "^8.0.10",
     "openai": "^6.38.0",
     "pdfkit": "^0.18.0",
+    "pg": "^8.22.0",
     "puppeteer": "^25.0.4",
     "simple-git": "^3.36.0"
   },

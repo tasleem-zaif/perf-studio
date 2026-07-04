@@ -26,7 +26,7 @@ function parsePostman(json) {
       // Preserve Postman v2.1 query params (req.url.query = [{ key, value, disabled }])
       const queryParams = {};
       const urlQuery = typeof req.url === 'object' ? (req.url?.query || []) : [];
-      urlQuery.forEach(q => { if (q.key && !q.disabled) queryParams[q.key] = q.value ?? ''; });
+      urlQuery.forEach(async q => { if (q.key && !q.disabled) queryParams[q.key] = q.value ?? ''; });
 
       // Store the top-level folder name (first ancestor) and full folder path
       const folder     = folderPath && folderPath.length ? folderPath[0] : null;
@@ -61,7 +61,7 @@ function parseSwagger(obj) {
       const reqBody = op.requestBody?.content?.['application/json']?.example;
       if (reqBody) body = JSON.stringify(reqBody);
       const queryParams = {};
-      (op.parameters || []).forEach(param => {
+      (op.parameters || []).forEach(async param => {
         if (param.in === 'query' && param.name) {
           queryParams[param.name] = param.example ?? param.default ?? param.schema?.example ?? param.schema?.default ?? '';
         }
@@ -90,4 +90,32 @@ function parseCollection(content, sourceType) {
   return [];
 }
 
-module.exports = { parseCollection };
+// Postman environment export: { values: [{ key, value, enabled }] } → { key: value } (enabled only)
+function parsePostmanEnvironment(content) {
+  const obj = JSON.parse(content);
+  const values = Array.isArray(obj.values) ? obj.values : [];
+  const vars = {};
+  for (const v of values) {
+    if (v.key && v.enabled !== false) vars[v.key] = v.value ?? '';
+  }
+  return vars;
+}
+
+// Postman collections can embed default values in a top-level `variable` array
+// (e.g. {{prod_url}}). Harvest these as a fallback when no environment file is uploaded.
+function extractCollectionVariables(content, sourceType) {
+  if (sourceType !== 'postman') return {};
+  try {
+    const obj = JSON.parse(content);
+    const list = Array.isArray(obj.variable) ? obj.variable : [];
+    const vars = {};
+    for (const v of list) {
+      if (v.key) vars[v.key] = v.value ?? '';
+    }
+    return vars;
+  } catch {
+    return {};
+  }
+}
+
+module.exports = { parseCollection, parsePostmanEnvironment, extractCollectionVariables };

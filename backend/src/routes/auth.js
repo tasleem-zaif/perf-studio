@@ -26,12 +26,12 @@ function userPayload(u, org) {
 }
 
 // POST /auth/register
-router.post('/register', (req, res) => {
+router.post('/register', async (req, res) => {
   const { email, name, password, role, org_id, org_name } = req.body;
   if (!email || !name || !password) return res.status(400).json({ error: 'Name, email and password are required' });
   if (!['org_admin', 'user'].includes(role)) return res.status(400).json({ error: 'Select a role to continue' });
 
-  if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+  if (await db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
     return res.status(409).json({ error: 'Email already registered' });
   }
 
@@ -39,32 +39,30 @@ router.post('/register', (req, res) => {
 
   if (role === 'org_admin') {
     if (org_id) {
-      // Joining an existing organization as admin
-      if (!db.prepare('SELECT id FROM organizations WHERE id = ?').get(org_id)) {
+      if (!await db.prepare('SELECT id FROM organizations WHERE id = ?').get(org_id)) {
         return res.status(400).json({ error: 'Organization not found' });
       }
       resolvedOrgId = org_id;
     } else if (org_name?.trim()) {
-      // Creating a new organization
       const slug = makeSlug(org_name.trim());
-      if (db.prepare('SELECT id FROM organizations WHERE slug = ?').get(slug)) {
+      if (await db.prepare('SELECT id FROM organizations WHERE slug = ?').get(slug)) {
         return res.status(409).json({ error: 'An organization with this name already exists' });
       }
-      const result = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)').run(org_name.trim(), slug);
+      const result = await db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)').run(org_name.trim(), slug);
       resolvedOrgId = result.lastInsertRowid;
     } else {
       return res.status(400).json({ error: 'Select an existing organization or provide a new organization name' });
     }
   } else {
     if (!org_id) return res.status(400).json({ error: 'Please select an organization' });
-    if (!db.prepare('SELECT id FROM organizations WHERE id = ?').get(org_id)) {
+    if (!await db.prepare('SELECT id FROM organizations WHERE id = ?').get(org_id)) {
       return res.status(400).json({ error: 'Organization not found' });
     }
     resolvedOrgId = org_id;
   }
 
   const hash = bcrypt.hashSync(password, 10);
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO users (email, name, password_hash, role, org_id, status)
     VALUES (?, ?, ?, ?, ?, 'pending')
   `).run(email, name, hash, role, resolvedOrgId);
@@ -73,11 +71,11 @@ router.post('/register', (req, res) => {
 });
 
 // POST /auth/login
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
@@ -88,75 +86,95 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: 'Your account request was rejected. Please contact your administrator.' });
   }
 
-  // Single-session enforcement
-  db.prepare("DELETE FROM user_sessions WHERE expires_at <= datetime('now')").run(); // purge expired first
-  const existing = db.prepare('SELECT id, last_used_at FROM user_sessions WHERE user_id = ?').get(user.id);
-  if (existing) {
-    const lastUsed = existing.last_used_at ? new Date(existing.last_used_at + 'Z') : null;
-    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
-    const isActiveSession = lastUsed && lastUsed > thirtyMinutesAgo;
+  await db.prepare('DELETE FROM user_sessions WHERE expires_at <= NOW()').run();
 
-    if (isActiveSession && !req.body.force) {
-      // A real active session exists in another browser — ask the user to confirm
-      return res.status(409).json({
-        error: 'You are already signed in from another location. Sign out there first, or click below to sign in here and end the other session.',
-        code: 'SESSION_ACTIVE',
-      });
-    }
-    // Orphaned/stale session (not used in 30+ min) or force override — clear it silently
-    db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(user.id);
+  const activeSession = await db.prepare(`
+    SELECT id FROM user_sessions
+    WHERE user_id = ?
+      AND expires_at > NOW()
+      AND COALESCE(last_used_at, created_at) + interval '10 seconds' > NOW()
+  `).get(user.id);
+
+  if (activeSession && !req.body.force) {
+    return res.status(409).json({
+      error: 'You are already signed in from another location.',
+      code: 'SESSION_ACTIVE',
+    });
   }
 
-  const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
+  const org = user.org_id ? await db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
   const jti = crypto.randomUUID();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
   const token = jwt.sign({ userId: user.id, jti }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
-  db.prepare('INSERT INTO user_sessions (user_id, jti, expires_at) VALUES (?, ?, ?)').run(user.id, jti, expiresAt);
+
+  // Atomically replace the old session with the new one.
+  await db.transaction(async (client) => {
+    await client.query('DELETE FROM user_sessions WHERE user_id = $1', [user.id]);
+    await client.query(
+      'INSERT INTO user_sessions (user_id, jti, expires_at) VALUES ($1, $2, $3)',
+      [user.id, jti, expiresAt]
+    );
+  });
 
   res.json({ token, user: userPayload(user, org) });
 });
 
 // POST /auth/logout
-router.post('/logout', auth, (req, res) => {
+router.post('/logout', async (req, res) => {
+  let rawToken = null;
   const header = req.headers.authorization;
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET);
-    db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND jti = ?').run(req.userId, payload.jti);
-  } catch (_) {}
+  if (header?.startsWith('Bearer ')) {
+    rawToken = header.slice(7);
+  } else if (req.body?.token) {
+    rawToken = req.body.token;
+  }
+  if (rawToken) {
+    try {
+      const payload = jwt.verify(rawToken, JWT_SECRET, { ignoreExpiration: true });
+      if (payload.userId) {
+        await db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(payload.userId);
+      }
+    } catch (_) {}
+  }
+  res.json({ ok: true });
+});
+
+// POST /auth/heartbeat
+router.post('/heartbeat', auth, (req, res) => {
   res.json({ ok: true });
 });
 
 // GET /auth/me
-router.get('/me', auth, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+router.get('/me', auth, async (req, res) => {
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
+  const org = user.org_id ? await db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
   res.json({ user: userPayload(user, org) });
 });
 
 // PUT /auth/me
-router.put('/me', auth, (req, res) => {
+router.put('/me', auth, async (req, res) => {
   const { name, email } = req.body;
   if (!name?.trim() || !email?.trim()) return res.status(400).json({ error: 'Name and email required' });
-  if (db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId)) {
+  if (await db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId)) {
     return res.status(409).json({ error: 'Email already in use' });
   }
-  db.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?').run(name.trim(), email.trim(), req.userId);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
-  const org = user.org_id ? db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
+  await db.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?').run(name.trim(), email.trim(), req.userId);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const org = user.org_id ? await db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(user.org_id) : null;
   res.json({ user: userPayload(user, org) });
 });
 
 // PUT /auth/me/password
-router.put('/me/password', auth, (req, res) => {
+router.put('/me/password', auth, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password) return res.status(400).json({ error: 'Both fields required' });
   if (new_password.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   if (!bcrypt.compareSync(current_password, user.password_hash)) {
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(new_password, 10), req.userId);
+  await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(new_password, 10), req.userId);
   res.json({ ok: true });
 });
 

@@ -17,12 +17,12 @@ const DEFAULT_ENV_CONFIG = {
 
 router.use(auth);
 
-router.get('/:env', (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+router.get('/:env', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
   const { collectionId, env } = req.params;
-  const row = db.prepare(
+  const row = await db.prepare(
     'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
   ).get(collectionId, env);
 
@@ -31,8 +31,8 @@ router.get('/:env', (req, res) => {
   const envCfg = row ? JSON.parse(row.config_json || '{}') : null;
 
   // Global + project kept for execution-time merging inside the test runner only
-  const globalRow  = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
-  const projectRow = db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
+  const globalRow  = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const projectRow = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
   const globalCfg  = globalRow  ? JSON.parse(globalRow.config_json  || '{}') : {};
   const projectCfg = projectRow ? JSON.parse(projectRow.config_json || '{}') : {};
 
@@ -48,36 +48,37 @@ router.get('/:env', (req, res) => {
   });
 });
 
-router.put('/:env', (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+router.put('/:env', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
   const { collectionId, env } = req.params;
   const cfg = req.body.config || req.body;
 
-  const existing = db.prepare(
+  const existing = await db.prepare(
     'SELECT id FROM collection_env_config WHERE collection_id = ? AND env = ?'
   ).get(collectionId, env);
 
   if (existing) {
-    db.prepare(
+    await db.prepare(
       'UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?'
     ).run(JSON.stringify(cfg), collectionId, env);
   } else {
-    db.prepare(
+    await db.prepare(
       'INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)'
     ).run(collectionId, env, JSON.stringify(cfg));
   }
 
   // Refresh config.json in the current user's workspace
-  setImmediate(() => {
+  setImmediate(async () => {
     try {
       const { getUserProjectPath } = require('../utils/projectFolders');
       const db = require('../db');
-      const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
-      const projRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-      const userProjPath = getUserProjectPath(req.userId, callerRole, projRow?.name || '');
-      updateCollectionConfigs(collectionId, userProjPath);
+      const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+      const callerRole = callerUser?.role;
+      const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+      const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '');
+      await updateCollectionConfigs(collectionId, userProjPath);
     } catch (_) {}
   });
 

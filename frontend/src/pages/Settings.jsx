@@ -4,6 +4,9 @@ import CustomSelect from '../components/CustomSelect';
 import { useConfirm } from '../hooks/useConfirm';
 import ConfirmModal from '../components/ConfirmModal';
 import { useToast } from '../hooks/useToast';
+import OrganizationsAdmin from './OrganizationsAdmin';
+import OrgAdministration from './OrgAdministration';
+import SMTPConfigPanel from '../components/SMTPConfigPanel';
 
 const PROVIDERS = [
   { value: 'openai', label: 'OpenAI' },
@@ -50,110 +53,6 @@ function StatusBadge({ status }) {
   );
 }
 
-/* ── Standalone Organizations panel (super_admin only) ─────────────────── */
-function OrganizationsPanel({ user }) {
-  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
-  const { toast } = useToast();
-  const [orgs,        setOrgs]        = useState([]);
-  const [newOrgName,  setNewOrgName]  = useState('');
-  const [savingOrg,   setSavingOrg]   = useState(false);
-  const [editingOrg,  setEditingOrg]  = useState(null);
-
-  useEffect(() => {
-    api.get('/orgs').then(r => setOrgs(r.data.orgs || [])).catch(() => {});
-  }, []);
-
-  async function createOrg() {
-    if (!newOrgName.trim()) return;
-    setSavingOrg(true);
-    try {
-      const { data } = await api.post('/orgs', { name: newOrgName.trim() });
-      setOrgs(prev => [data.org, ...prev]);
-      setNewOrgName('');
-      toast(`Organization "${data.org.name}" created`, 'success');
-    } catch (e) { toast(e.response?.data?.error || 'Create failed', 'error'); }
-    finally { setSavingOrg(false); }
-  }
-
-  async function saveOrgEdit() {
-    if (!editingOrg?.name?.trim()) return;
-    try {
-      await api.put(`/orgs/${editingOrg.id}`, { name: editingOrg.name });
-      setOrgs(prev => prev.map(o => o.id === editingOrg.id ? { ...o, name: editingOrg.name } : o));
-      setEditingOrg(null);
-      toast('Organization updated', 'success');
-    } catch (e) { toast(e.response?.data?.error || 'Update failed', 'error'); }
-  }
-
-  async function deleteOrg(org) {
-    const ok = await confirm(`Delete "${org.name}"? All associated users will lose access.`, 'Delete Organization');
-    if (!ok) return;
-    try {
-      await api.delete(`/orgs/${org.id}`);
-      setOrgs(prev => prev.filter(o => o.id !== org.id));
-      toast('Organization deleted', 'success');
-    } catch (e) { toast(e.response?.data?.error || 'Delete failed', 'error'); }
-  }
-
-  return (
-    <div className="page fade-in">
-      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
-      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '16px' }}>
-        Create and manage organizations. Invite Org Admins under a specific organization.
-      </div>
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px', maxWidth: 480 }}>
-        <input type="text" value={newOrgName} onChange={e => setNewOrgName(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && createOrg()}
-          placeholder="New organization name…" style={{ flex: 1 }} autoComplete="off" />
-        <button className="btn-primary" onClick={createOrg} disabled={savingOrg || !newOrgName.trim()}>
-          {savingOrg ? <span className="spinner" /> : <i className="ti ti-plus" />} Add
-        </button>
-      </div>
-      {orgs.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--color-text-tertiary)' }}>
-          No organizations yet. Create one above.
-        </div>
-      ) : orgs.map(org => (
-        <div key={org.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', background: 'var(--color-background-secondary)', borderRadius: '8px', border: '1px solid var(--color-border-secondary)', marginBottom: '8px' }}>
-          <div style={{ width: 36, height: 36, borderRadius: '8px', background: 'rgba(73,204,61,0.12)', border: '1px solid rgba(73,204,61,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-            <i className="ti ti-building" style={{ color: 'var(--accent)', fontSize: '16px' }} />
-          </div>
-          {editingOrg?.id === org.id ? (
-            <input type="text" value={editingOrg.name}
-              onChange={e => setEditingOrg(o => ({ ...o, name: e.target.value }))}
-              onKeyDown={e => { if (e.key === 'Enter') saveOrgEdit(); if (e.key === 'Escape') setEditingOrg(null); }}
-              style={{ flex: 1, fontSize: '13px' }} autoFocus />
-          ) : (
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--color-text-primary)' }}>{org.name}</div>
-              <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-                {org.member_count || 0} member{(org.member_count || 0) !== 1 ? 's' : ''}
-                {org.admins && <span> · Admin: {org.admins}</span>}
-              </div>
-            </div>
-          )}
-          <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
-            {editingOrg?.id === org.id ? (
-              <>
-                <button className="btn-primary btn-sm" onClick={saveOrgEdit}><i className="ti ti-check" /> Save</button>
-                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg(null)}>Cancel</button>
-              </>
-            ) : (
-              <>
-                <button className="btn-secondary btn-sm" onClick={() => setEditingOrg({ id: org.id, name: org.name })}>
-                  <i className="ti ti-pencil" />
-                </button>
-                <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={() => deleteOrg(org)}>
-                  <i className="ti ti-trash" />
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
 
 /* ── User Management panel ────────────────────────────────────────────── */
 function UserManagementPanel({ user, projects = [] }) {
@@ -853,190 +752,96 @@ function AIConfigPanel({ user }) {
   );
 }
 
-const BLANK_SMTP = { smtp_host: '', smtp_port: '587', smtp_secure: false, smtp_user: '', smtp_pass: '', from_name: 'Performance Studio', from_email: '' };
+/* ── Licensing panel (super_admin manages all orgs, org_admin views their own) ── */
 
-/** Detect SMTP host/port from email domain */
-function detectSmtpFromEmail(email) {
-  if (!email || !email.includes('@')) return {};
-  const domain = email.split('@')[1].toLowerCase();
-  const providers = {
-    'gmail.com':                { smtp_host: 'smtp.gmail.com',          smtp_port: '587' },
-    'googlemail.com':           { smtp_host: 'smtp.gmail.com',          smtp_port: '587' },
-    'outlook.com':              { smtp_host: 'smtp-mail.outlook.com',   smtp_port: '587' },
-    'hotmail.com':              { smtp_host: 'smtp-mail.outlook.com',   smtp_port: '587' },
-    'live.com':                 { smtp_host: 'smtp-mail.outlook.com',   smtp_port: '587' },
-    'msn.com':                  { smtp_host: 'smtp-mail.outlook.com',   smtp_port: '587' },
-    'yahoo.com':                { smtp_host: 'smtp.mail.yahoo.com',     smtp_port: '587' },
-    'yahoo.co.uk':              { smtp_host: 'smtp.mail.yahoo.com',     smtp_port: '587' },
-    'icloud.com':               { smtp_host: 'smtp.mail.me.com',        smtp_port: '587' },
-    'me.com':                   { smtp_host: 'smtp.mail.me.com',        smtp_port: '587' },
-    'protonmail.com':           { smtp_host: 'smtp.protonmail.com',     smtp_port: '587' },
-    'proton.me':                { smtp_host: 'smtp.protonmail.com',     smtp_port: '587' },
-    'zoho.com':                 { smtp_host: 'smtp.zoho.com',           smtp_port: '587' },
-  };
-  return providers[domain] || { smtp_host: `smtp.${domain}`, smtp_port: '587' };
+const PLAN_META = {
+  trial:      { label: 'Trial',      color: '#d97706', bg: 'rgba(217,119,6,0.12)' },
+  starter:    { label: 'Starter',    color: '#2563eb', bg: 'rgba(37,99,235,0.12)' },
+  growth:     { label: 'Growth',     color: '#7c3aed', bg: 'rgba(124,58,237,0.12)' },
+  business:   { label: 'Business',   color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
+  enterprise: { label: 'Enterprise', color: '#475569', bg: 'rgba(71,85,105,0.12)' },
+};
+
+function PlanBadge({ plan }) {
+  const meta = PLAN_META[plan] || { label: plan, color: '#64748b', bg: 'rgba(100,116,139,0.12)' };
+  return (
+    <span style={{ padding: '2px 9px', borderRadius: '10px', fontSize: '11px', fontWeight: 700, letterSpacing: '.02em', textTransform: 'uppercase', background: meta.bg, color: meta.color }}>
+      {meta.label}
+    </span>
+  );
 }
 
-function SMTPConfigPanel({ currentUser }) {
-  const { toast } = useToast();
-  const [cfg, setCfg]           = useState({ ...BLANK_SMTP });
-  const [saving, setSaving]     = useState(false);
-  const [testing, setTesting]   = useState(false);
-  const [testEmail, setTestEmail] = useState('');
-  const [autoDetected, setAutoDetected] = useState(false);
+function UsageBar({ label, used, max }) {
+  const unlimited = max === null || max === undefined;
+  const pct = unlimited ? 0 : Math.min(100, Math.round((used / Math.max(max, 1)) * 100));
+  const atLimit = !unlimited && used >= max;
+  return (
+    <div style={{ minWidth: 140 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: '3px' }}>
+        <span>{label}</span>
+        <span style={{ color: atLimit ? 'var(--danger)' : 'var(--color-text-secondary)', fontWeight: 600 }}>
+          {used} / {unlimited ? '∞' : max}
+        </span>
+      </div>
+      {!unlimited && (
+        <div style={{ height: 5, borderRadius: 3, background: 'var(--color-background-tertiary, #e2e8f0)', overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${pct}%`, borderRadius: 3, background: atLimit ? 'var(--danger)' : 'var(--accent)', transition: 'width .2s' }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExpiryNote({ license }) {
+  if (!license.expiresAt) return <span style={{ color: 'var(--color-text-tertiary)' }}>No expiry</span>;
+  if (license.isExpired) return <span style={{ color: 'var(--danger)', fontWeight: 600 }}>Expired {new Date(license.expiresAt).toLocaleDateString()}</span>;
+  return <span style={{ color: 'var(--color-text-tertiary)' }}>{license.daysRemaining} day{license.daysRemaining === 1 ? '' : 's'} left</span>;
+}
+
+/* Org Admin — read-only view of their own org's license and usage.
+   (Super Admin manages licenses under Organizations > License & Limits instead.) */
+function LicenseSelfPanel() {
+  const [license, setLicense] = useState(null);
+  const [error,   setError]   = useState('');
 
   useEffect(() => {
-    api.get('/alerts/config').then(({ data }) => {
-      if (data.config) {
-        const c = data.config;
-        setCfg({ ...BLANK_SMTP, ...c, smtp_pass: c.smtp_pass || '' });
-        if (c.inherited_from_super_admin) setAutoDetected('super_admin');
-      } else if (currentUser?.email) {
-        // No config at all — auto-detect from user's own email
-        const detected = detectSmtpFromEmail(currentUser.email);
-        setCfg(prev => ({
-          ...prev, ...detected,
-          smtp_user: currentUser.email,
-          from_email: currentUser.email,
-          from_name: currentUser.name || 'Performance Studio',
-        }));
-        setAutoDetected('email');
-      }
-    }).catch(() => {});
-  }, [currentUser?.email]);
+    api.get('/licenses/mine')
+      .then(r => setLicense(r.data.license))
+      .catch(e => setError(e.response?.data?.error || 'Failed to load license'));
+  }, []);
 
-  async function save() {
-    setSaving(true);
-    try {
-      await api.put('/alerts/config', cfg);
-      toast('SMTP configuration saved', 'success');
-    } catch (e) {
-      toast(e.response?.data?.error || 'Failed to save SMTP configuration — check the host, port and credentials are correct.', 'error');
-    } finally { setSaving(false); }
-  }
-
-  async function testConnection() {
-    setTesting(true);
-    try {
-      const { data } = await api.post('/alerts/test-smtp');
-      toast(data.message, 'success');
-    } catch (e) {
-      toast(e.response?.data?.error || 'Connection failed', 'error');
-    } finally { setTesting(false); }
-  }
-
-  async function sendTest() {
-    if (!testEmail) return toast('Enter a recipient email first', 'warn');
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(testEmail)) return toast(`"${testEmail}" is not a valid email`, 'error');
-    setTesting(true);
-    try {
-      const { data } = await api.post('/alerts/send-test', { to: testEmail });
-      toast(data.message, 'success');
-    } catch (e) {
-      toast(e.response?.data?.error || 'Send failed', 'error');
-    } finally { setTesting(false); }
-  }
-
-  function set(k, v) { setCfg(c => ({ ...c, [k]: v })); }
+  if (error) return <div style={{ padding: '20px', color: 'var(--danger)' }}>{error}</div>;
+  if (!license) return <div style={{ padding: '20px', color: 'var(--color-text-tertiary)' }}>Loading…</div>;
 
   return (
-    <div className="page fade-in" style={{ maxWidth: 600 }}>
+    <div className="page fade-in">
       <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '16px' }}>
-        Configure SMTP to send invite emails and post-test alert emails to users.
+        Your organization's current plan and usage. Contact your Super Admin to upgrade.
       </div>
-
-      {autoDetected === 'super_admin' && (
-        <div style={{ padding: '10px 14px', background: 'rgba(73,204,61,0.08)', border: '1px solid rgba(73,204,61,0.25)', borderRadius: '8px', marginBottom: '16px', fontSize: '12px', color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
-          <i className="ti ti-shield-check" style={{ color: 'var(--accent)', fontSize: '14px', flexShrink: 0, marginTop: '1px' }} />
-          <div>
-            <strong style={{ color: 'var(--accent)' }}>Pre-filled from Super Admin's SMTP configuration.</strong>{' '}
-            The SMTP server settings have been copied from the Super Admin's configuration.
-            Just enter your <strong>SMTP Password</strong> and update <strong>From Name / From Email</strong> if needed, then save.
-          </div>
+      <div style={{ maxWidth: 420, padding: '18px', background: 'var(--color-background-secondary)', borderRadius: '10px', border: '1px solid var(--color-border-secondary)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+          <PlanBadge plan={license.plan} />
+          {license.isDisabled
+            ? <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--danger)' }}>DISABLED</span>
+            : license.isExpired
+              ? <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--danger)' }}>EXPIRED</span>
+              : <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-tertiary)' }}><ExpiryNote license={license} /></span>}
         </div>
-      )}
-      {autoDetected === 'email' && (
-        <div style={{ padding: '10px 14px', background: 'rgba(73,204,61,0.08)', border: '1px solid rgba(73,204,61,0.25)', borderRadius: '8px', marginBottom: '16px', fontSize: '12px', color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
-          <i className="ti ti-sparkles" style={{ color: 'var(--accent)', fontSize: '14px', flexShrink: 0, marginTop: '1px' }} />
-          <div>
-            <strong style={{ color: 'var(--accent)' }}>Auto-detected from your email ({currentUser?.email}).</strong>{' '}
-            Just enter your <strong>SMTP Password</strong> and <strong>From Name</strong> to complete setup.
-          </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <UsageBar label="Users" used={license.userCount} max={license.maxUsers} />
+          <UsageBar label="Projects" used={license.projectCount} max={license.maxProjects} />
         </div>
-      )}
-
-      {/* SMTP fields */}
-      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 80px', gap: 10, marginBottom: 10 }}>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">SMTP Host</label>
-          <input type="text" value={cfg.smtp_host} onChange={e => set('smtp_host', e.target.value)} placeholder="smtp.gmail.com" />
-        </div>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">Port</label>
-          <input type="number" value={cfg.smtp_port} onChange={e => set('smtp_port', e.target.value)} placeholder="587" />
-        </div>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">SSL/TLS</label>
-          <div style={{ display: 'flex', alignItems: 'center', height: 34, gap: 8 }}>
-            <input type="checkbox" checked={!!cfg.smtp_secure} onChange={e => set('smtp_secure', e.target.checked)} style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
-            <span style={{ fontSize: 12 }}>Secure</span>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">SMTP Username</label>
-          <input type="text" value={cfg.smtp_user} onChange={e => set('smtp_user', e.target.value)} placeholder="user@gmail.com" autoComplete="new-password" />
-        </div>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">SMTP Password</label>
-          <input type="password" value={cfg.smtp_pass} onChange={e => set('smtp_pass', e.target.value)} placeholder="App password" autoComplete="new-password" />
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">From Name</label>
-          <input type="text" value={cfg.from_name} onChange={e => set('from_name', e.target.value)} placeholder="Performance Studio" />
-        </div>
-        <div className="form-group" style={{ marginBottom: 0 }}>
-          <label className="form-label">From Email</label>
-          <input type="email" value={cfg.from_email} onChange={e => set('from_email', e.target.value)} placeholder="alerts@yourcompany.com" />
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 20 }}>
-        <button className="btn-primary btn-sm" onClick={save} disabled={saving}>
-          {saving ? <><span className="spinner" />Saving…</> : <><i className="ti ti-device-floppy" />Save Config</>}
-        </button>
-        <button className="btn-secondary btn-sm" onClick={testConnection} disabled={testing}>
-          {testing ? <><span className="spinner" />Testing…</> : <><i className="ti ti-plug" />Test Connection</>}
-        </button>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 'auto' }}>
-          <input type="email" value={testEmail} onChange={e => setTestEmail(e.target.value)} placeholder="recipient@example.com"
-            style={{ fontSize: 12, padding: '5px 10px', width: 200 }} data-form-type="other" />
-          <button className="btn-secondary btn-sm" onClick={sendTest} disabled={testing}>
-            <i className="ti ti-send" />Send Test
-          </button>
-        </div>
-      </div>
-
-      {/* Provider help */}
-      <div style={{ padding: '12px 14px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px', fontSize: '12px', color: 'var(--color-text-secondary)' }}>
-        <div style={{ fontWeight: 600, marginBottom: 6 }}><i className="ti ti-bulb" style={{ marginRight: 6, color: 'var(--accent)' }} />Recommended: Gmail</div>
-        <div>Host: <code>smtp.gmail.com</code> · Port: <code>587</code> · Secure: OFF</div>
-        <div style={{ marginTop: 4 }}>Use an <strong>App Password</strong> (not your Gmail password) — generate at <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>myaccount.google.com/apppasswords</a></div>
       </div>
     </div>
   );
 }
 
-export default function Settings({ page, theme, onThemeChange, user, projects }) {
-  if (page === 'settings-users') return <UserManagementPanel user={user} projects={projects || []} />;
-  if (page === 'settings-orgs')  return <OrganizationsPanel user={user} />;
-  if (page === 'settings-ai')    return <AIConfigPanel user={user} />;
-  if (page === 'settings-smtp')  return <SMTPConfigPanel currentUser={user} />;
+export default function Settings({ page, theme, onThemeChange, user, projects, onNav, onDeleteProject }) {
+  if (page === 'settings-org')      return <OrgAdministration user={user} projects={projects || []} onNav={onNav} onDeleteProject={onDeleteProject} />;
+  if (page === 'settings-users')    return <UserManagementPanel user={user} projects={projects || []} />;
+  if (page === 'settings-orgs')     return <OrganizationsAdmin user={user} />;
+  if (page === 'settings-ai')       return <AIConfigPanel user={user} />;
+  if (page === 'settings-smtp')     return <SMTPConfigPanel currentUser={user} />;
+  if (page === 'settings-licenses') return <LicenseSelfPanel />;
   return null;
 }

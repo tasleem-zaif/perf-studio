@@ -19,8 +19,8 @@ const auth   = require('../middleware/auth');
  * Returns a sub-query string + params array that resolves to the set of
  * project IDs the calling user is allowed to access (role-based).
  */
-function accessibleProjects(userId) {
-  const caller = db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(userId);
+async function accessibleProjects(userId) {
+  const caller = await db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(userId);
 
   if (caller.role === 'super_admin') {
     return { sub: 'SELECT id FROM projects', params: [] };
@@ -42,10 +42,10 @@ function accessibleProjects(userId) {
 }
 
 /* ── GET /api/collections ───────────────────────────────────────────────── */
-router.get('/collections', auth, (req, res) => {
+router.get('/collections', auth, async (req, res) => {
   try {
-    const { sub, params } = accessibleProjects(req.userId);
-    const collections = db.prepare(`
+    const { sub, params } = await accessibleProjects(req.userId);
+    const collections = await db.prepare(`
       SELECT c.id, c.name, c.description, c.source_type, c.tool_target, c.created_at,
              p.id   AS project_id,
              p.name AS project_name
@@ -63,10 +63,10 @@ router.get('/collections', auth, (req, res) => {
 });
 
 /* ── GET /api/rules ─────────────────────────────────────────────────────── */
-router.get('/rules', auth, (req, res) => {
+router.get('/rules', auth, async (req, res) => {
   try {
-    const { sub, params } = accessibleProjects(req.userId);
-    const rules = db.prepare(`
+    const { sub, params } = await accessibleProjects(req.userId);
+    const rules = await db.prepare(`
       SELECT r.id, r.metric, r.operator, r.value, r.unit, r.severity, r.created_at,
              p.id   AS project_id,
              p.name AS project_name
@@ -84,10 +84,10 @@ router.get('/rules', auth, (req, res) => {
 });
 
 /* ── GET /api/test-plans ────────────────────────────────────────────────── */
-router.get('/test-plans', auth, (req, res) => {
+router.get('/test-plans', auth, async (req, res) => {
   try {
-    const { sub, params } = accessibleProjects(req.userId);
-    const testPlans = db.prepare(`
+    const { sub, params } = await accessibleProjects(req.userId);
+    const testPlans = await db.prepare(`
       SELECT ts.id, ts.name, ts.test_type, ts.engine, ts.status, ts.created_at,
              p.id   AS project_id,
              p.name AS project_name
@@ -105,10 +105,10 @@ router.get('/test-plans', auth, (req, res) => {
 });
 
 /* ── GET /api/test-data ─────────────────────────────────────────────────── */
-router.get('/test-data', auth, (req, res) => {
+router.get('/test-data', auth, async (req, res) => {
   try {
-    const { sub, params } = accessibleProjects(req.userId);
-    const files = db.prepare(`
+    const { sub, params } = await accessibleProjects(req.userId);
+    const files = await db.prepare(`
       SELECT tdf.id, tdf.filename, tdf.original_name, tdf.columns, tdf.created_at,
              p.id   AS project_id,
              p.name AS project_name

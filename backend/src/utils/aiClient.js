@@ -8,8 +8,13 @@ const DEFAULT_MODELS = {
   claude: 'claude-sonnet-4-5',
 };
 
-function getSettings(userId) {
-  return db.prepare('SELECT * FROM ai_settings WHERE user_id = ?').get(userId);
+async function getSettings() {
+  return db.prepare(`
+    SELECT ai.* FROM ai_settings ai
+    JOIN users u ON u.id = ai.user_id
+    WHERE u.role IN ('org_admin', 'super_admin') AND ai.api_key IS NOT NULL AND ai.api_key != ''
+    ORDER BY ai.id DESC LIMIT 1
+  `).get();
 }
 
 /**
@@ -20,7 +25,7 @@ function getSettings(userId) {
  * @param {'script'|'heal'} [purpose='script'] — selects which saved model to use
  */
 async function callAi(userId, systemPrompt, userPrompt, purpose = 'script') {
-  const settings = getSettings(userId);
+  const settings = await getSettings();
   if (!settings || !settings.api_key) {
     throw new Error('AI not configured. Go to Settings → AI Configuration to add your API key.');
   }

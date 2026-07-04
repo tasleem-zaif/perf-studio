@@ -201,7 +201,7 @@ function buildHtml({ summary, by_api, timeline, errors, meta, rule_violations },
       ${sh('','Error Details')}
       ${tableWrap(['API / Sampler','Code','Count','Response Message','Failure Message'],errRows,['30%','8%','8%','27%','27%'])}` : ''}
     </div>
-    <div class="footer">Error Analysis · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+    <div class="footer">Error Analysis · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
   </div>` : '';
 
   return `<!DOCTYPE html>
@@ -268,7 +268,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
       </div>
     </div>
   </div>
-  <div class="footer">Summary Report · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+  <div class="footer">Summary Report · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
 </div>
 
 <!-- ═══ PAGE 2: DASHBOARD ═════════════════════════════════════════════════ -->
@@ -289,7 +289,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
       <div style="height:130px"><canvas id="c_slow"></canvas></div>
     </div>
   </div>
-  <div class="footer">Performance Dashboard · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+  <div class="footer">Performance Dashboard · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
 </div>
 
 <!-- ═══ PAGE 3: TRANSACTIONS ══════════════════════════════════════════════ -->
@@ -303,7 +303,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
     <div class="card-title" style="margin-bottom:6px">Full Transaction Table</div>
     ${tableWrap(['API / Sampler','Req','Pass','Fail','Err%','Avg RT','Min','Max','P90','P95','TTFB','Connect','TPS'],txRows,['22%','5%','5%','5%','5%','7%','6%','7%','6%','6%','6%','6%','5%'])}
   </div>
-  <div class="footer">Transaction Breakdown · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+  <div class="footer">Transaction Breakdown · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
 </div>
 
 <!-- ═══ PAGE 4: TREND ANALYSIS ════════════════════════════════════════════ -->
@@ -320,7 +320,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
       <div class="card"><div class="card-title">Concurrent Users (Active Threads)</div><div style="height:150px"><canvas id="c_thread_trend"></canvas></div></div>
     </div>` : '<div style="padding:60px;text-align:center;color:#6b7280;font-size:12px">No timeline data available for this run.</div>'}
   </div>
-  <div class="footer">Trend Analysis · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+  <div class="footer">Trend Analysis · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
 </div>
 
 <!-- ═══ PAGE 5: RESOURCE UTILIZATION ═════════════════════════════════════ -->
@@ -340,7 +340,7 @@ code { font-family:monospace; background:#1e2535; padding:1px 4px; border-radius
     <div class="card-title" style="margin-bottom:6px">Per-API Timing Breakdown</div>
     ${tableWrap(['API / Sampler','Avg RT','Avg TTFB','Avg Connect','Processing','Avg Bytes'],resRows,['34%','13%','13%','13%','13%','14%'])}
   </div>
-  <div class="footer">Resource Utilization · ${esc(suiteName)} · ${esc(runLabel)} · Performance Studio</div>
+  <div class="footer">Resource Utilization · ${esc(suiteName)} · ${esc(runLabel)} · PerfStudio</div>
 </div>
 
 ${errPage}
@@ -520,7 +520,7 @@ ${CHARTJS_SRC}
   // If no charts registered at all, mark ready immediately
   if (total === 0) window.__chartsReady = true;
   // Fallback: force ready after 3s in case any chart fails to fire onComplete
-  setTimeout(() => { window.__chartsReady = true; }, 3000);
+  setTimeout(async () => { window.__chartsReady = true; }, 3000);
 })();
 </script>
 </html>`;
@@ -552,7 +552,7 @@ async function renderPdf(data, runNum) {
       const el = pageEls[i];
       // Force page height to exactly 794px (A4 landscape) so screenshots are uniform
       await page.evaluate(e => { e.style.minHeight = '794px'; e.style.height = '794px'; e.style.overflow = 'hidden'; }, el);
-      const tmpPath = path.join(os.tmpdir(), `perfstudio_page_${process.pid}_${i}.jpg`);
+      const tmpPath = path.join(os.tmpdir(), `PerfStudio_page_${process.pid}_${i}.jpg`);
       await el.screenshot({ type: 'jpeg', quality: 95, path: tmpPath });
       tmpFiles.push(tmpPath);
     }

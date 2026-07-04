@@ -22,13 +22,24 @@ export default function CustomSelect({ value, onChange, children, className = ''
 
   const selected = options.find(o => String(o.value) === String(value));
 
+  // The app renders at `html { zoom: 0.9 }` (see index.css). getBoundingClientRect()
+  // returns coordinates already scaled by that zoom, but a position:fixed element
+  // (this dropdown is portaled to document.body, still under the zoomed <html>) has
+  // its own top/left/width re-scaled by the browser on top of that — a double-zoom.
+  // Dividing by the zoom factor before writing the inline style cancels it out.
+  function getZoom() {
+    const z = parseFloat(getComputedStyle(document.documentElement).zoom);
+    return z && !isNaN(z) ? z : 1;
+  }
+
   // Calculate dropdown position using getBoundingClientRect (no overflow hacks)
   useLayoutEffect(() => {
     if (!open || !wrapRef.current) return;
     const r = wrapRef.current.getBoundingClientRect();
+    const zoom = getZoom();
     const dropH = Math.min(options.length * 36 + 8, 260);
     const flipUp = window.innerHeight - r.bottom < dropH + 8 && r.top > dropH + 8;
-    setDropPos({ top: r.bottom + 3, bottom: r.top - 3, left: r.left, width: r.width, flipUp });
+    setDropPos({ top: (r.bottom + 3) / zoom, bottom: (r.top - 3) / zoom, left: r.left / zoom, width: r.width / zoom, flipUp });
   }, [open]);
 
   // Recalculate on scroll/resize while open
@@ -37,9 +48,10 @@ export default function CustomSelect({ value, onChange, children, className = ''
     function update() {
       if (!wrapRef.current) return;
       const r = wrapRef.current.getBoundingClientRect();
+      const zoom = getZoom();
       const dropH = Math.min(options.length * 36 + 8, 260);
       const flipUp = window.innerHeight - r.bottom < dropH + 8 && r.top > dropH + 8;
-      setDropPos({ top: r.bottom + 3, bottom: r.top - 3, left: r.left, width: r.width, flipUp });
+      setDropPos({ top: (r.bottom + 3) / zoom, bottom: (r.top - 3) / zoom, left: r.left / zoom, width: r.width / zoom, flipUp });
     }
     window.addEventListener('scroll', update, true);
     window.addEventListener('resize', update);

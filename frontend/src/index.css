@@ -97,6 +97,7 @@ input, select, textarea {
   transition: border-color .15s;
 }
 input:focus, select:focus, textarea:focus { border-color: var(--input-focus); }
+input[type="radio"], input[type="checkbox"] { width: auto; height: auto; padding: 0; border: none; background: none; }
 textarea { resize: vertical; min-height: 80px; }
 a { text-decoration: none; }
 select option { background: var(--input-bg); color: var(--color-text-primary); }
@@ -479,9 +480,22 @@ tr:hover td { background: var(--color-background-secondary); }
   box-shadow: var(--shadow-modal);
 }
 
-.modal-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+/* Sticky within .modal's own scroll area: negative margin + matching padding keeps the
+   header/footer visually anchored at the padded edge before scrolling, then pins them
+   flush against the scrollport once content scrolls underneath — buttons/icons never scroll away. */
+.modal-hdr {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;
+  position: sticky; top: -21.6px; z-index: 2;
+  margin-top: -21.6px; padding-top: 21.6px;
+  background: var(--modal-bg);
+}
 .modal-title { font-size: 16px; font-weight: 600; color: var(--color-text-primary); }
-.modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 14.4px; border-top: 1px solid var(--color-border-secondary); }
+.modal-footer {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 14.4px; border-top: 1px solid var(--color-border-secondary);
+  position: sticky; bottom: -21.6px; z-index: 2;
+  margin-bottom: -21.6px; padding-bottom: 21.6px;
+  background: var(--modal-bg);
+}
 
 /* JSON VIEWER */
 .json-viewer {

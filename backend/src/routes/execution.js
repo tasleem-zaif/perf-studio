@@ -12,14 +12,14 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const db = require('../db');
 const ownsProject = require('../utils/ownsProject');
-const { getProjectPath, PROJECTS_ROOT } = require('../utils/projectFolders');
+const { getProjectPath, PROJECTS_ROOT, resolveSuiteEnv } = require('../utils/projectFolders');
 const { generateAnalyticsPdf } = require('../utils/generateAnalyticsPdf');
 const { startAutoHeal, getHealStatus } = require('../utils/autoHealer');
 const { evaluateRules } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
 const { parseJtl } = require('../utils/parseJtl');
 
-const PERFSTUDIO_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.perfstudio');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // Converts a container-internal path to the equivalent HOST-machine path for
 // Docker -v volume mount arguments. When the backend runs inside Docker Compose,
@@ -48,7 +48,7 @@ function getJMeterBin(customPath) {
 
   const candidates = [
     ...(customPath ? [resolveJmeterPath(customPath)] : []),
-    path.join(PERFSTUDIO_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -71,7 +71,7 @@ function getJMeterBin(customPath) {
 function getK6Bin(customPath) {
   const candidates = [
     ...(customPath ? [customPath] : []),
-    path.join(PERFSTUDIO_DIR, 'k6', 'k6.exe'),
+    path.join(PerfStudio_DIR, 'k6', 'k6.exe'),
   ];
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
@@ -86,27 +86,27 @@ function getK6Bin(customPath) {
 
 const resetSequence = require('../utils/resetSequence');
 
-function cleanStaleRuns(projectId) {
+async function cleanStaleRuns(projectId) {
   // Remove any non-running run whose result_dir no longer exists on disk.
   // Skip 'running' status to avoid cleaning up in-progress or CI-synced runs.
-  const runs = db.prepare(
+  const runs = await db.prepare(
     "SELECT id, result_dir, status FROM execution_runs WHERE project_id = ?"
   ).all(projectId);
   let deleted = false;
   for (const run of runs) {
     if (run.status === 'running') continue;
     if (run.result_dir && !fs.existsSync(run.result_dir)) {
-      db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
+      await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
       deleted = true;
     }
   }
   if (deleted) resetSequence('execution_runs');
 }
 
-function getNextRunNumber(projectId) {
+async function getNextRunNumber(projectId) {
   cleanStaleRuns(projectId);
   const { extractRunNumber } = require('../utils/buildRunName');
-  const rows = db.prepare('SELECT result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
+  const rows = await db.prepare('SELECT result_dir FROM execution_runs WHERE project_id = ?').all(projectId);
   let maxNum = 0;
   for (const r of rows) {
     const n = extractRunNumber(r.result_dir);
@@ -117,13 +117,13 @@ function getNextRunNumber(projectId) {
 
 const MAX_CONCURRENT_RUNS = 5; // soft cap per user
 
-function countActiveRuns(userId) {
-  // Count running/pending runs across all projects owned by this user
-  return db.prepare(`
+async function countActiveRuns(userId) {
+  const row = await db.prepare(`
     SELECT COUNT(*) as n FROM execution_runs r
     JOIN projects p ON p.id = r.project_id
     WHERE p.user_id = ? AND r.status = 'running'
-  `).get(userId)?.n || 0;
+  `).get(userId);
+  return row?.n || 0;
 }
 
 // Check whether we're running in native mode (JMeter/K6 in PATH) or Docker mode
@@ -131,7 +131,7 @@ function isNativeMode() {
   return process.env.EXECUTION_MODE === 'native' || !!getJMeterBin(null) || !!getK6Bin(null);
 }
 
-router.get('/check-deps', auth, (req, res) => {
+router.get('/check-deps', auth, async (req, res) => {
   const native = isNativeMode();
   const deps = [];
 
@@ -173,7 +173,7 @@ router.get('/check-deps', auth, (req, res) => {
 });
 
 // Standalone Docker check — used by the Configuration page
-router.get('/check-docker', auth, (req, res) => {
+router.get('/check-docker', auth, async (req, res) => {
   let status = 'missing', version = null;
   try {
     version = execSync('docker --version 2>&1', { timeout: 5000 }).toString().trim();
@@ -192,7 +192,7 @@ router.get('/check-docker', auth, (req, res) => {
 
 // Start Docker Desktop — fires the launch command and returns immediately.
 // The frontend polls /system-check every 5s to detect when the daemon is ready.
-router.post('/start-docker', auth, (req, res) => {
+router.post('/start-docker', auth, async (req, res) => {
   const platform = process.platform;
   try {
     if (platform === 'win32') {
@@ -222,7 +222,7 @@ router.post('/start-docker', auth, (req, res) => {
 // Enable Hyper-V, WSL2 and VirtualMachinePlatform via elevated dism commands (Windows only).
 // Writes a temp PS1 script and launches it in an elevated PowerShell window (UAC prompt).
 // A system restart is required after the features are enabled.
-router.post('/enable-virtualization', auth, (req, res) => {
+router.post('/enable-virtualization', auth, async (req, res) => {
   if (process.platform !== 'win32') {
     return res.status(400).json({ ok: false, message: 'Only supported on Windows.' });
   }
@@ -442,7 +442,7 @@ router.get('/system-check', auth, async (req, res) => {
   }
 
   // 8 & 9. Docker images (JMeter, K6)
-  const cfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
   const jmeterImage = savedCfg.jmeter_docker_image || process.env.JMETER_DOCKER_IMAGE || 'justb4/jmeter:latest';
   const k6Image     = savedCfg.k6_docker_image     || process.env.K6_DOCKER_IMAGE     || 'grafana/k6:latest';
@@ -521,7 +521,7 @@ async function setJavaEnvVarsPermanently(platform, javaHome, sendLog) {
       path.join(process.env.HOME, '.profile'),
       path.join(process.env.HOME, '.bashrc'),
     ];
-    const exportLines = `\n# Java (set by Performance Studio)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
+    const exportLines = `\n# Java (set by PerfStudio)\nexport JAVA_HOME="${javaHome}"\nexport PATH="$JAVA_HOME/bin:$PATH"\n`;
     for (const pf of profileFiles) {
       try {
         const existing = fs.existsSync(pf) ? fs.readFileSync(pf, 'utf8') : '';
@@ -702,7 +702,7 @@ router.post('/run', auth, async (req, res) => {
     return done({ ok: false, error: 'Missing required parameters' });
   }
 
-  const project = ownsProject(req.userId, project_id);
+  const project = await ownsProject(req.userId, project_id);
   if (!project) { log('err', 'Access denied'); return done({ ok: false, error: 'Forbidden' }); }
 
   // Git repository must be initialized before running tests
@@ -712,13 +712,13 @@ router.post('/run', auth, async (req, res) => {
   }
 
   // Soft concurrency cap — prevent accidental resource exhaustion
-  const activeCount = countActiveRuns(req.userId);
+  const activeCount = await countActiveRuns(req.userId);
   if (activeCount >= MAX_CONCURRENT_RUNS) {
     log('err', `Too many concurrent runs (${activeCount} active). Wait for a run to finish before starting another.`);
     return done({ ok: false, error: `Too many concurrent runs. Max ${MAX_CONCURRENT_RUNS} simultaneous runs allowed.` });
   }
 
-  const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suite_id, project_id);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suite_id, project_id);
   if (!suite) { log('err', `Test suite not found (id=${suite_id})`); return done({ ok: false, error: 'Test suite not found' }); }
 
   const scriptPath = engine === 'jmeter' ? suite.jmx_path : suite.js_path;
@@ -730,7 +730,7 @@ router.post('/run', auth, async (req, res) => {
 
   // ── Preparation summary ──────────────────────────────────────────────────
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  log('info', '  PERFORMANCE STUDIO  —  TEST EXECUTION ENGINE');
+  log('info', '  PerfStudio  —  TEST EXECUTION ENGINE');
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   log('info', `  Engine     : ${engine.toUpperCase()} (Docker)`);
   log('info', `  Test Plan  : ${suite.name}`);
@@ -755,29 +755,35 @@ router.post('/run', auth, async (req, res) => {
   const effectiveIterMode = iteration_mode || suite.iter_mode || 'duration';
   const runDirName = buildRunDirName(suite.name, effectiveUsers, effectiveIterMode, effectiveLoops, effectiveDuration, runNumber);
 
-  // Results go into collection/env/results/{runDirName}/ — tracked per environment in git
+  // Results go into collection/env/results/{runDirName}/ — tracked per environment in git.
+  // resolveSuiteEnv falls back to the collection's own default env when suite.env is
+  // blank, so a collection-scoped suite never drops to the project-level fallback below
+  // just because its env wasn't explicitly set.
   let resultDir;
-  if (suite.collection_id && suite.env && projectFolderPath) {
+  if (suite.collection_id && projectFolderPath) {
     try {
-      const suiteCol = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
-      if (suiteCol) {
+      const suiteCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      const resolvedEnv = resolveSuiteEnv(suiteCol, suite);
+      if (suiteCol && resolvedEnv) {
         const { getCollectionPath } = require('../utils/projectFolders');
-        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, suite.env);
+        const envPath = getCollectionPath(projectFolderPath, suiteCol.name, resolvedEnv);
         resultDir = path.join(envPath, 'results', runDirName);
       }
-    } catch (_) {}
+    } catch (e) {
+      log('warn', `Collection/env result path resolution failed, falling back to project-level results: ${e.message}`);
+    }
   }
-  // Fallback to project-level results
+  // Project-level fallback is only legitimate for a suite with no collection at all.
   if (!resultDir) resultDir = path.join(projectFolderPath, 'results', runDirName);
   fs.mkdirSync(resultDir, { recursive: true });
   log('info', `  Result dir : ${resultDir}`);
   log('info', `  Run #      : ${runNumber}`);
 
-  const runRow = db.prepare(`
+  const runRow = await db.prepare(`
     INSERT INTO execution_runs
       (project_id, suite_id, engine, status, result_dir, logs, started_at, auto_heal,
        run_vusers, run_rampup, run_duration, run_loops, run_iter_mode)
-    VALUES (?, ?, ?, 'running', ?, '[]', datetime('now'), ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, 'running', ?, '[]', NOW(), ?, ?, ?, ?, ?, ?)
   `).run(
     project_id, suite_id, engine, resultDir, auto_heal ? 1 : 0,
     vusers    || null,
@@ -788,13 +794,13 @@ router.post('/run', auth, async (req, res) => {
   );
   const runId = runRow.lastInsertRowid;
 
-  const cfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
   let patchedJmx = null;
   // SSE keepalive — forces buffered proxies (Vite dev server, nginx, etc.) to flush
   // every second so log lines reach the browser in real-time.
-  const heartbeat = setInterval(() => {
+  const heartbeat = setInterval(async () => {
     try { if (!res.writableEnded) res.write(': ping\n\n'); } catch {}
   }, 1000);
 
@@ -822,7 +828,7 @@ router.post('/run', auth, async (req, res) => {
       // Fall back to project/testData for legacy scripts
       let testDataHostDir, testDataExists;
       const suiteCollection = suite.collection_id
-        ? db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+        ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
         : null;
       const suiteEnvName = suite.env || '';
 
@@ -958,7 +964,7 @@ router.post('/run', auth, async (req, res) => {
     let logTailer = null;
     if (jmeterLogPath) {
       let filePos = 0;
-      logTailer = setInterval(() => {
+      logTailer = setInterval(async () => {
         if (!fs.existsSync(jmeterLogPath)) return;
         try {
           const size = fs.statSync(jmeterLogPath).size;
@@ -989,7 +995,7 @@ router.post('/run', auth, async (req, res) => {
     const { sendRuleViolationEmail: sendMidRunViolationEmail } = require('../utils/emailUtils');
     const alertedRuleIds = new Set();   // track which rule IDs already fired an alert
     const testStartMs    = Date.now();
-    const project        = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
+    const project        = await db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
     const suiteName      = suite?.name || 'Test Run';
     const projectName    = project?.name || '';
 
@@ -1026,11 +1032,11 @@ router.post('/run', auth, async (req, res) => {
         if (!newViolations.length) return;
 
         // Mark as alerted — each rule fires at most once per run
-        newViolations.forEach(v => alertedRuleIds.add(v.rule.id));
+        newViolations.forEach(async v => alertedRuleIds.add(v.rule.id));
 
         const elapsedSec = Math.floor((Date.now() - testStartMs) / 1000);
         log('warn', `  [Rules] ⚡ ${newViolations.length} rule breach(es) detected at ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s — sending alert…`);
-        newViolations.forEach(v => log('warn', `          ${v.label} [${v.rule.severity}]`));
+        newViolations.forEach(async v => log('warn', `          ${v.label} [${v.rule.severity}]`));
 
         // Send rule violation alert email (non-blocking) — fires once per rule per run
         sendMidRunViolationEmail(
@@ -1156,7 +1162,7 @@ router.post('/run', auth, async (req, res) => {
       log('err', '     Likely cause: target URL not configured for this environment.');
       log('err', '     Fix: Configuration → select env → add target URL → Save Config.');
     } else if (jtlPath && fs.existsSync(jtlPath)) {
-      const ruleResult = evaluateRules(project_id, jtlPath);
+      const ruleResult = await evaluateRules(project_id, jtlPath);
       if (!ruleResult.noRules) {
         ruleViolations = ruleResult.violations || [];
         const errorViolations = ruleViolations.filter(v => v.rule.severity === 'error');
@@ -1176,7 +1182,7 @@ router.post('/run', auth, async (req, res) => {
       }
     }
 
-    db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=NOW() WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, runId);
 
     // ── Auto-zip JMeter HTML report into results folder ───────────────────────
@@ -1218,7 +1224,7 @@ router.post('/run', auth, async (req, res) => {
         const { sendAlertEmail } = require('../utils/emailUtils');
         const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
 
-        const runRow = db.prepare(`
+        const runRow = await db.prepare(`
           SELECT r.*, s.name AS suite_name
           FROM execution_runs r LEFT JOIN test_suites s ON s.id = r.suite_id
           WHERE r.id = ?
@@ -1244,7 +1250,7 @@ router.post('/run', auth, async (req, res) => {
         // Evaluate rules against this run's JTL so violations appear in the email
         let ruleViolationsForEmail = [];
         try {
-          const rr = evaluateRules(runRow.project_id, jtlPath);
+          const rr = await evaluateRules(runRow.project_id, jtlPath);
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
@@ -1252,7 +1258,7 @@ router.post('/run', auth, async (req, res) => {
 
         // Cache parsed data so Analytics page never needs to re-read the JTL
         try {
-          db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
+          await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
             .run(JSON.stringify(parsed), targetRunId);
         } catch (_) {}
 
@@ -1264,7 +1270,7 @@ router.post('/run', auth, async (req, res) => {
           // Primary: save directly to result_dir so it persists
           const resultPdf = runRow.result_dir && fs.existsSync(runRow.result_dir)
             ? path.join(runRow.result_dir, `${suiteName}_Run${runNum}_Analytics.pdf`)
-            : path.join(os.tmpdir(), `perfstudio_run_${targetRunId}_${Date.now()}.pdf`);
+            : path.join(os.tmpdir(), `PerfStudio_run_${targetRunId}_${Date.now()}.pdf`);
           await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
           pdfPath = resultPdf;
           console.log('[Alerts] Analytics PDF saved:', pdfPath);
@@ -1309,7 +1315,7 @@ router.post('/run', auth, async (req, res) => {
     log('err', `  ✘  TEST EXECUTION FAILED`);
     log('err', `  Error: ${err.message}`);
     log('err', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=NOW() WHERE id=?`)
       .run(JSON.stringify(allLogs), runId);
     if (auto_heal) {
       log('warn', '');
@@ -1323,11 +1329,11 @@ router.post('/run', auth, async (req, res) => {
   }
 });
 
-router.get('/runs', auth, (req, res) => {
+router.get('/runs', auth, async (req, res) => {
   const { project_id } = req.query;
   if (!project_id) return res.status(400).json({ error: 'project_id is required' });
 
-  const project = ownsProject(req.userId, project_id);
+  const project = await ownsProject(req.userId, project_id);
   if (!project) return res.status(403).json({ error: 'Forbidden' });
 
   cleanStaleRuns(project_id);
@@ -1338,10 +1344,10 @@ router.get('/runs', auth, (req, res) => {
   try {
     // Only auto-sync runs completed within the last 7 days — older ones likely
     // have expired artifacts and must not trigger email notifications retroactively.
-    const unsyncedCiRuns = db.prepare(`
+    const unsyncedCiRuns = await db.prepare(`
       SELECT * FROM ci_pipeline_runs
       WHERE project_id = ? AND status = 'completed'
-        AND finished_at >= datetime('now', '-7 days')
+        AND finished_at >= NOW() - INTERVAL '7 days'
         AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
     `).all(project_id);
 
@@ -1373,7 +1379,7 @@ router.get('/runs', auth, (req, res) => {
   }
 
   const includeArchived = req.query.include_archived === 'true';
-  const runs = db.prepare(`
+  const runs = await db.prepare(`
     SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id,
            ci.web_url as ci_web_url, ci.provider as ci_provider, ci.external_id as ci_external_id
     FROM execution_runs r
@@ -1413,10 +1419,10 @@ router.get('/runs', auth, (req, res) => {
 // ── Delete / archive a run ────────────────────────────────────────────────────
 // delete_files=true  → hard delete (wipe disk files + remove DB record, unrecoverable)
 // delete_files=false → soft delete (set archived=1, hide from list, fully recoverable)
-router.delete('/runs/:id', auth, (req, res) => {
-  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
+router.delete('/runs/:id', auth, async (req, res) => {
+  const run = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   if (run.status === 'running') return res.status(400).json({ error: 'Cannot delete a run that is currently in progress' });
 
   if (req.query.delete_files === 'true') {
@@ -1424,42 +1430,42 @@ router.delete('/runs/:id', auth, (req, res) => {
     if (run.result_dir && fs.existsSync(run.result_dir)) {
       try { fs.rmSync(run.result_dir, { recursive: true, force: true }); } catch (_) {}
     }
-    db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
+    await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
     res.json({ deleted: true, archived: false, id: run.id });
   } else {
     // Soft delete — archive only; disk files and DB record are preserved for recovery
-    db.prepare('UPDATE execution_runs SET archived=1 WHERE id=?').run(run.id);
+    await db.prepare('UPDATE execution_runs SET archived=1 WHERE id=?').run(run.id);
     res.json({ deleted: false, archived: true, id: run.id });
   }
 });
 
 // ── Restore a soft-deleted (archived) run ────────────────────────────────────
-router.patch('/runs/:id/restore', auth, (req, res) => {
-  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
+router.patch('/runs/:id/restore', auth, async (req, res) => {
+  const run = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
-  db.prepare('UPDATE execution_runs SET archived=0 WHERE id=?').run(run.id);
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  await db.prepare('UPDATE execution_runs SET archived=0 WHERE id=?').run(run.id);
   res.json({ restored: true, id: run.id });
 });
 
-router.get('/runs/:id/heal-status', auth, (req, res) => {
-  const run = db.prepare('SELECT r.project_id FROM execution_runs r WHERE r.id = ?').get(req.params.id);
+router.get('/runs/:id/heal-status', auth, async (req, res) => {
+  const run = await db.prepare('SELECT r.project_id FROM execution_runs r WHERE r.id = ?').get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   const result = getHealStatus(req.params.id);
   if (!result) return res.status(404).json({ error: 'No heal data' });
   res.json(result);
 });
 
-router.get('/runs/:id/report-data', auth, (req, res) => {
-  const run = db.prepare(`
+router.get('/runs/:id/report-data', auth, async (req, res) => {
+  const run = await db.prepare(`
     SELECT r.*, s.name as suite_name
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
     WHERE r.id = ?
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   if (run.engine !== 'jmeter') return res.status(400).json({ error: 'Custom analytics only available for JMeter runs' });
 
   const storedLogs = JSON.parse(run.logs || '[]');
@@ -1504,7 +1510,7 @@ router.get('/runs/:id/report-data', auth, (req, res) => {
 
   // Backfill cache so next request is instant
   try {
-    db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
+    await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?')
       .run(JSON.stringify(parsed), run.id);
   } catch (_) {}
 
@@ -1513,14 +1519,14 @@ router.get('/runs/:id/report-data', auth, (req, res) => {
 
 // ── Export analytics as a real server-side PDF ────────────────────────────────
 router.get('/runs/:id/export-pdf', auth, async (req, res) => {
-  const run = db.prepare(`
+  const run = await db.prepare(`
     SELECT r.*, s.name as suite_name
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
     WHERE r.id = ?
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
   if (run.engine !== 'jmeter') return res.status(400).json({ error: 'PDF export only available for JMeter runs' });
 
   // ── resolve report data (DB cache → disk fallback) ─────────────────────────
@@ -1540,7 +1546,7 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
     reportData = parseJtl(jtlPath, runMeta);
     if (!reportData) return res.status(400).json({ error: 'JTL file contains no data rows' });
     // Backfill cache
-    try { db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(reportData), run.id); } catch (_) {}
+    try { await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(reportData), run.id); } catch (_) {}
   }
 
   const runNum    = (run.result_dir?.match(/Run_(\d+)/) || [])[1] || run.id;
@@ -1553,15 +1559,15 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
   await generateAnalyticsPdf(reportData, runNum, res);
 });
 
-router.get('/runs/:id/download-report', auth, (req, res) => {
-  const run = db.prepare(`
+router.get('/runs/:id/download-report', auth, async (req, res) => {
+  const run = await db.prepare(`
     SELECT r.*, s.name as suite_name
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
     WHERE r.id = ?
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  if (!ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
 
   // Prefer deriving reportDir from report_path (exact stored path)
   let reportDir;
@@ -1589,8 +1595,8 @@ router.get('/runs/:id/download-report', auth, (req, res) => {
 });
 
 // ── Patch jmeter.properties to enable latency + bytes recording ──────────────
-router.post('/jmeter/enable-latency', auth, (req, res) => {
-  const cfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+router.post('/jmeter/enable-latency', auth, async (req, res) => {
+  const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
   // Use stored path directly if valid, otherwise fall back to getJMeterBin() discovery
@@ -1646,8 +1652,8 @@ router.post('/jmeter/enable-latency', auth, (req, res) => {
 });
 
 // ── Check whether jmeter.properties already has latency props set ─────────────
-router.get('/jmeter/latency-status', auth, (req, res) => {
-  const cfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+router.get('/jmeter/latency-status', auth, async (req, res) => {
+  const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
   let binDir;
@@ -1680,8 +1686,8 @@ router.get('/jmeter/latency-status', auth, (req, res) => {
 });
 
 // ── Pull JMeter Docker image ─────────────────────────────────────────────────
-router.post('/jmeter/pull-image', auth, (req, res) => {
-  const cfgRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+router.post('/jmeter/pull-image', auth, async (req, res) => {
+  const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
   const image = (req.body.image || savedCfg.jmeter_docker_image || 'justb4/jmeter:latest').trim();
 
@@ -1694,6 +1700,17 @@ router.post('/jmeter/pull-image', auth, (req, res) => {
 
   function sendLog(type, msg) { res.write('data: ' + JSON.stringify({ type, message: msg }) + '\n\n'); }
   function sendDone(result) { res.write('data: ' + JSON.stringify({ done: true, ...result }) + '\n\n'); res.end(); }
+
+  // Check Docker daemon is running before attempting pull
+  try {
+    execSync('docker info', { timeout: 6000, stdio: 'pipe' });
+  } catch (_) {
+    sendLog('warn', 'Docker Desktop is not running on this machine.');
+    sendLog('info', 'Local pull is only needed if you want to run tests directly on this machine.');
+    sendLog('info', 'Cloud CI (GitHub Actions, GitLab CI, Bitbucket Pipelines) pulls the image automatically on the CI runner — no local Docker required.');
+    sendDone({ ok: false, error: 'Docker daemon not running' });
+    return;
+  }
 
   sendLog('info', `Pulling Docker image: ${image}`);
   sendLog('info', 'This may take a few minutes on first pull...');

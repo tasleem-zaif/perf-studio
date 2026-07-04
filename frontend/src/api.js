@@ -20,6 +20,7 @@ api.interceptors.response.use(
       // calling code handle it and show an inline error message instead.
       if (localStorage.getItem('ps_token')) {
         localStorage.removeItem('ps_token');
+        localStorage.removeItem('ps_user');
         window.location.reload();
       }
     }

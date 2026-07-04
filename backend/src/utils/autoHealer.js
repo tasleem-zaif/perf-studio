@@ -9,7 +9,7 @@ const { evaluateRules } = require('./ruleEvaluator');
 const { patchJmxForParams } = require('./patchJmx');
 
 const MAX_ATTEMPTS   = 3;
-const PERFSTUDIO_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.perfstudio');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // Phase-1 quick-verify params — just enough to confirm the script fix is valid.
 // Runs in ~20 seconds regardless of original test duration.
@@ -33,7 +33,7 @@ function getJMeterBin(customPath) {
   };
   const candidates = [
     ...(customPath ? [resolve(customPath)] : []),
-    path.join(PERFSTUDIO_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -46,7 +46,7 @@ function getJMeterBin(customPath) {
 function getK6Bin(customPath) {
   const candidates = [
     ...(customPath ? [customPath] : []),
-    path.join(PERFSTUDIO_DIR, 'k6', 'k6.exe'),
+    path.join(PerfStudio_DIR, 'k6', 'k6.exe'),
   ];
   for (const p of candidates) if (p && fs.existsSync(p)) return p;
   try { execSync('k6 version 2>&1', { timeout: 5000 }); return 'k6'; } catch {}
@@ -54,14 +54,14 @@ function getK6Bin(customPath) {
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
-function setHealStatus(runId, status) {
-  db.prepare('UPDATE execution_runs SET heal_status=? WHERE id=?').run(status, runId);
+async function setHealStatus(runId, status) {
+  await db.prepare('UPDATE execution_runs SET heal_status=? WHERE id=?').run(status, runId);
 }
 
-function logHealAttempt(runId, attempt, diagnosis, fix, fixType) {
-  return db.prepare(
+async function logHealAttempt(runId, attempt, diagnosis, fix, fixType) {
+  return (await db.prepare(
     'INSERT INTO auto_heal_logs (run_id, attempt, diagnosis, fix_applied, fix_type) VALUES (?,?,?,?,?)'
-  ).run(runId, attempt, diagnosis, fix, fixType).lastInsertRowid;
+  ).run(runId, attempt, diagnosis, fix, fixType)).lastInsertRowid;
 }
 
 // ── Runtime params: original run values → suite defaults → hard fallback ──────
@@ -133,7 +133,7 @@ function classifyErrors(jtlPath) {
 // mode = 'quick'  → HEAL_VUSERS / HEAL_DURATION (no report generation)
 // mode = 'full'   → exact runtime params from the original failed run
 async function spawnRun(userId, originalRun, suite, project, mode) {
-  const cfgRow   = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
+  const cfgRow   = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
   const engine     = originalRun.engine;
@@ -143,7 +143,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
   }
 
   const projectFolder = project.folder_path || getProjectPath(project.name, project.id);
-  const runCount      = db.prepare('SELECT COUNT(*) as n FROM execution_runs WHERE project_id = ?').get(originalRun.project_id).n;
+  const runCount      = (await db.prepare('SELECT COUNT(*) as n FROM execution_runs WHERE project_id = ?').get(originalRun.project_id)).n;
   const runNumber     = runCount + 1;
   const resultDir     = path.join(projectFolder, 'results', `Run_${runNumber}`);
   fs.mkdirSync(resultDir, { recursive: true });
@@ -163,15 +163,15 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     ? { vusers: HEAL_VUSERS, rampup: HEAL_RAMPUP, iter_mode: 'duration', duration: HEAL_DURATION, loops: 1 }
     : orig;
 
-  const newRunId = db.prepare(`
+  const newRunId = (await db.prepare(`
     INSERT INTO execution_runs
       (project_id, suite_id, engine, status, result_dir, logs, started_at, auto_heal,
        run_vusers, run_rampup, run_duration, run_loops, run_iter_mode)
-    VALUES (?, ?, ?, 'running', ?, '[]', datetime('now'), 1, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, 'running', ?, '[]', NOW(), 1, ?, ?, ?, ?, ?)
   `).run(
     originalRun.project_id, originalRun.suite_id, engine, resultDir,
     p.vusers, p.rampup, p.duration, p.loops, p.iter_mode
-  ).lastInsertRowid;
+  )).lastInsertRowid;
 
   try {
     let cmd, args, reportPath = null, jtlPath = null, jmeterLogPath = null;
@@ -231,7 +231,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     let tailer = null;
     if (jmeterLogPath) {
       let pos = 0;
-      tailer = setInterval(() => {
+      tailer = setInterval(async () => {
         if (!fs.existsSync(jmeterLogPath)) return;
         try {
           const size = fs.statSync(jmeterLogPath).size;
@@ -284,13 +284,13 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
       }
     }
 
-    db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=NOW() WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, newRunId);
     return newRunId;
 
   } catch (e) {
     addLog('err', e.message);
-    db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=datetime('now') WHERE id=?`)
+    await db.prepare(`UPDATE execution_runs SET status='failed', logs=?, finished_at=NOW() WHERE id=?`)
       .run(JSON.stringify(allLogs), newRunId);
     return newRunId;
   } finally {
@@ -319,10 +319,10 @@ function extractDefinedVars(content) {
     d.add(m[1]);
   // RegexExtractor
   for (const m of content.matchAll(/<stringProp name="RegexExtractor\.refname">([^<]+)<\/stringProp>/g))
-    m[1].split(';').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(';').forEach(async v => v.trim() && d.add(v.trim()));
   // JSONPath extractor
   for (const m of content.matchAll(/<stringProp name="JSONPostProcessor\.referenceNames">([^<]+)<\/stringProp>/g))
-    m[1].split(';').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(';').forEach(async v => v.trim() && d.add(v.trim()));
   // Boundary extractor
   for (const m of content.matchAll(/<stringProp name="BoundaryExtractor\.refname">([^<]+)<\/stringProp>/g))
     d.add(m[1].trim());
@@ -334,12 +334,12 @@ function extractDefinedVars(content) {
     d.add(m[1].trim());
   // CSV DataSet variableNames
   for (const m of content.matchAll(/<stringProp name="variableNames">([^<]+)<\/stringProp>/g))
-    m[1].split(',').forEach(v => v.trim() && d.add(v.trim()));
+    m[1].split(',').forEach(async v => v.trim() && d.add(v.trim()));
   return [...d];
 }
 
 // Parse JTL comprehensively — group errors by label, code, and failure category
-function parseJtlComprehensive(jtlPath) {
+async function parseJtlComprehensive(jtlPath) {
   const empty = {
     byLabel: {}, byCode: {},
     assertionErrors: [], correlationErrors: [],
@@ -515,8 +515,27 @@ async function buildContext(run, suite) {
   };
 }
 
+// Escape bare control characters (0x00–0x1F) that appear inside JSON string
+// literals — the AI sometimes embeds multi-line JMX/XML without escaping newlines.
+function sanitizeJsonControlChars(s) {
+  const ESC = { '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f' };
+  let inString = false, escaped = false, out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escaped)             { out += c; escaped = false; continue; }
+    if (c === '\\' && inString) { out += c; escaped = true;  continue; }
+    if (c === '"')           { inString = !inString; out += c; continue; }
+    if (inString && c.charCodeAt(0) < 0x20) {
+      out += ESC[c] || `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 // ── AI diagnosis with category-specific guidance ──────────────────────────────
-async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
+async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruction = null) {
   const isJmeter    = run.engine === 'jmeter';
   const engineLabel = isJmeter ? 'JMeter 5.6' : 'k6 v0.50';
   const allCount    = ctx.allLabels.length;
@@ -524,16 +543,34 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
   const jtl         = ctx.jtl;
 
   // ── Detect active failure categories ────────────────────────────────────────
+  const zeroSamples = ctx.allLabels.length === 0;
   const cats = [];
-  if (jtl.dnsErrors.length)         cats.push('DNS_HOST_FAILURE');
-  if (jtl.correlationErrors.length) cats.push('CORRELATION_PARAMETERIZATION');
-  if (jtl.assertionErrors.length)   cats.push('ASSERTION_FAILURE');
-  if (jtl.variableErrors.length || ctx.missingVars.length) cats.push('VARIABLE_REFERENCE');
-  if (jtl.requestErrors.length)     cats.push('REQUEST_MALFUNCTION');
-  if (!cats.length)                 cats.push('UNKNOWN');
+  if (zeroSamples)                                          cats.push('ZERO_SAMPLES');
+  if (!zeroSamples && jtl.dnsErrors.length)                cats.push('DNS_HOST_FAILURE');
+  if (!zeroSamples && jtl.correlationErrors.length)        cats.push('CORRELATION_PARAMETERIZATION');
+  if (!zeroSamples && jtl.assertionErrors.length)          cats.push('ASSERTION_FAILURE');
+  if (!zeroSamples && (jtl.variableErrors.length || ctx.missingVars.length)) cats.push('VARIABLE_REFERENCE');
+  if (!zeroSamples && jtl.requestErrors.length)            cats.push('REQUEST_MALFUNCTION');
+  if (!cats.length)                                         cats.push('UNKNOWN');
 
   // ── Category-specific fix instructions ──────────────────────────────────────
   const catGuidance = [];
+  if (cats.includes('ZERO_SAMPLES')) {
+    catGuidance.push(
+      `ZERO SAMPLES — JMeter produced NO requests at all. This means either JMeter didn't start properly or the test plan is structurally broken.\n` +
+      `Common root causes (check the pipeline logs and script carefully):\n` +
+      `  1. ThreadGroup has enabled="false" — ALL thread groups must have enabled="true"\n` +
+      `  2. Thread count or duration is 0 — jmeter_users / jmeter_rampup / jmeter_duration variables may not be substituted\n` +
+      `  3. ${isJmeter ? 'HTTPSamplerProxy' : 'http.get/post'} elements disabled — check enabled attributes\n` +
+      `  4. Variable reference ${isJmeter ? '${jmeter_users}, ${jmeter_rampup}, ${jmeter_duration}' : 'VU/duration overrides'} missing from test plan\n` +
+      `  5. XML/JMX is malformed — TestPlan or ThreadGroup element broken\n` +
+      `→ REGENERATE the complete script. Ensure:\n` +
+      `  • All ThreadGroup elements: enabled="true", num_threads="\${jmeter_users}", ramp_time="\${jmeter_rampup}", duration="\${jmeter_duration}"\n` +
+      `  • TestPlan scheduler enabled where duration is used\n` +
+      `  • Every ${isJmeter ? 'HTTPSamplerProxy' : 'request'} element: enabled="true"\n` +
+      `  • User Defined Variables element defines defaults for any variable used that may not be passed at runtime`
+    );
+  }
   if (cats.includes('DNS_HOST_FAILURE')) {
     const dnsLines = Object.entries(ctx.endpointStatus)
       .map(([h, r]) => `  ${h}: ${r.ok ? 'RESOLVES → ' + r.addresses.join(',') : 'UNREACHABLE — ' + r.error}`).join('\n');
@@ -604,6 +641,12 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     .join('\n') || '  (not checked)';
 
   // ── System prompt ────────────────────────────────────────────────────────────
+  const samplerRule = zeroSamples
+    ? `1. REGENERATE the complete ${engineLabel} script from scratch — fix ALL structural issues so JMeter actually executes requests.\n` +
+      `   The regenerated script must have all thread groups enabled and all variable references correct.\n`
+    : `1. The fixed script MUST contain ALL ${allCount || 'original'} ${samplerTag} elements — zero may be removed.\n` +
+      `2. Only modify elements directly responsible for FAILING requests. Preserve PASSING requests byte-for-byte.\n`;
+
   const systemPrompt =
     `You are an expert ${engineLabel} performance test auto-healer with deep knowledge of:\n` +
     `  • HTTP request construction (methods, headers, body formats, URL encoding)\n` +
@@ -613,18 +656,17 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     `  • CSV DataSet configuration and parameterization\n` +
     `  • JMeter timers (Constant Timer, Gaussian, Uniform) and connection settings\n\n` +
     `## ABSOLUTE RULES — never break these:\n` +
-    `1. The fixed script MUST contain ALL ${allCount || 'original'} ${samplerTag} elements — zero may be removed.\n` +
-    `2. Only modify elements directly responsible for FAILING requests. Preserve PASSING requests byte-for-byte.\n` +
-    `3. Maintain original sampler ORDER — reorder only if a dependency requires it (e.g. extractor before consumer).\n` +
-    `4. When adding extractors, place them as post-processors on the RESPONSE that contains the value.\n` +
-    `5. Fix the root cause — do not mask failures by removing assertions or catching all errors.\n` +
-    `6. Output ONLY a single valid JSON object — no markdown fences, no explanation outside JSON.\n\n` +
+    samplerRule +
+    (zeroSamples ? '' : `3. Maintain original sampler ORDER — reorder only if a dependency requires it (e.g. extractor before consumer).\n`) +
+    (zeroSamples ? '' : `4. When adding extractors, place them as post-processors on the RESPONSE that contains the value.\n`) +
+    `${zeroSamples ? '2' : '5'}. Fix the root cause — do not mask failures by removing assertions or catching all errors.\n` +
+    `${zeroSamples ? '3' : '6'}. Output ONLY a single valid JSON object — no markdown fences, no explanation outside JSON.\n\n` +
     `JSON schema (all fields required):\n` +
     `{\n` +
-    `  "issue":        "root cause in 1-3 sentences — be specific (e.g. login response token not extracted)",\n` +
-    `  "fix":          "exactly what was changed and why — reference sampler names and element types",\n` +
+    `  "issue":        "root cause in 1-3 sentences — be specific (e.g. all thread groups were disabled)",\n` +
+    `  "fix":          "exactly what was changed and why — reference element names and types",\n` +
     `  "fix_type":     "script_rewrite" | "no_fix",\n` +
-    `  "fixed_script": "complete corrected script — every original sampler present"\n` +
+    `  "fixed_script": "${zeroSamples ? 'complete regenerated script with all thread groups enabled and variable references fixed' : 'complete corrected script — every original sampler present'}"\n` +
     `}`;
 
   // ── User prompt ───────────────────────────────────────────────────────────────
@@ -665,7 +707,11 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
     ctx.scriptContent || '(script file not found)',
   ].join('\n');
 
-  const raw = await callAi(userId, systemPrompt, userPrompt, 'heal');
+  const customPrefix = customInstruction
+    ? `=== USER INSTRUCTION (APPLY THIS FIX — HIGHEST PRIORITY) ===\n${customInstruction}\n\nThe above instruction MUST be implemented in the fixed_script. Also address any other issues found below.\n\n`
+    : '';
+
+  const raw = await callAi(userId, systemPrompt, customPrefix + userPrompt, 'heal');
 
   // Extract JSON — handle both plain and markdown-fenced responses
   const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
@@ -676,7 +722,16 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
 
   let parsed;
   try { parsed = JSON.parse(jsonStr.trim()); }
-  catch (e) { return { fix_type: 'no_fix', issue: `JSON parse error: ${e.message}`, fix: '', fixed_script: '' }; }
+  catch {
+    // AI sometimes embeds the JMX with bare newlines/tabs inside a JSON string value.
+    // Sanitize control characters that are inside string literals and retry.
+    try {
+      const sanitized = sanitizeJsonControlChars(jsonStr.trim());
+      parsed = JSON.parse(sanitized);
+    } catch (e2) {
+      return { fix_type: 'no_fix', issue: `JSON parse error: ${e2.message}`, fix: '', fixed_script: '' };
+    }
+  }
 
   // Guard: reject if AI dropped any sampler label
   if (parsed.fix_type === 'script_rewrite' && parsed.fixed_script && ctx.allLabels.length > 0) {
@@ -698,24 +753,24 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum) {
 //   Phase 2 — Full run      (original params):  confirm fix holds under real load
 async function healCycle(userId, targetRunId, project, suite, attemptNum) {
   if (attemptNum > MAX_ATTEMPTS) {
-    setHealStatus(targetRunId, 'exhausted');
+    await setHealStatus(targetRunId, 'exhausted');
     return;
   }
 
-  setHealStatus(targetRunId, 'diagnosing');
-  const run = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(targetRunId);
+  await setHealStatus(targetRunId, 'diagnosing');
+  const run = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(targetRunId);
   const ctx = await buildContext(run, suite);
 
   // Nothing to fix
-  if (!ctx.hasErrors) { setHealStatus(targetRunId, null); return; }
+  if (!ctx.hasErrors) { await setHealStatus(targetRunId, null); return; }
 
   // Infrastructure failure — script changes won't help
   if (ctx.errorClass.isInfra) {
-    const logId = logHealAttempt(targetRunId, attemptNum,
+    const logId = await logHealAttempt(targetRunId, attemptNum,
       `Infrastructure/server failure: ${ctx.errorClass.summary}. Script changes cannot fix server-side errors.`,
       '', 'no_fix');
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -724,58 +779,58 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
   try {
     aiResp = await diagnoseWithAi(userId, run, suite, ctx, attemptNum);
   } catch (e) {
-    const logId = logHealAttempt(targetRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    const logId = await logHealAttempt(targetRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
-  const logId = logHealAttempt(targetRunId, attemptNum,
+  const logId = await logHealAttempt(targetRunId, attemptNum,
     aiResp.issue   || 'Unknown issue',
     aiResp.fix     || '',
     aiResp.fix_type || 'no_fix'
   );
 
   if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
   // Apply fix (keep .bak of original)
-  setHealStatus(targetRunId, 'applying_fix');
+  await setHealStatus(targetRunId, 'applying_fix');
   try {
     if (ctx.scriptPath) {
       if (fs.existsSync(ctx.scriptPath)) fs.copyFileSync(ctx.scriptPath, ctx.scriptPath + '.bak');
       fs.writeFileSync(ctx.scriptPath, aiResp.fixed_script, 'utf8');
     }
   } catch (e) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
   // ── Phase 1: Quick verify ─────────────────────────────────────────────────
-  setHealStatus(targetRunId, 'rerunning');
+  await setHealStatus(targetRunId, 'rerunning');
   let quickRunId;
   try { quickRunId = await spawnRun(userId, run, suite, project, 'quick'); }
   catch (e) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
-    setHealStatus(targetRunId, 'failed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
+    await setHealStatus(targetRunId, 'failed');
     return;
   }
 
-  db.prepare('UPDATE auto_heal_logs SET new_run_id=? WHERE id=?').run(quickRunId, logId);
-  db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(quickRunId, targetRunId);
+  await db.prepare('UPDATE auto_heal_logs SET new_run_id=? WHERE id=?').run(quickRunId, logId);
+  await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(quickRunId, targetRunId);
 
-  const quickRun      = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(quickRunId);
+  const quickRun      = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(quickRunId);
   const quickJtlPath  = path.join(quickRun.result_dir, 'results.jtl');
   const quickInfra    = classifyErrors(quickJtlPath);
 
   // Quick verify hit infra errors — stop immediately
   if (quickInfra.isInfra) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -785,39 +840,39 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
 
   if (!quickPassed) {
     // Script fix didn't help even under minimal load — try again next attempt
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
     if (attemptNum < MAX_ATTEMPTS) {
       await healCycle(userId, quickRunId, project, suite, attemptNum + 1);
-      const fr = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(quickRunId);
-      setHealStatus(targetRunId, fr?.heal_status || 'failed');
-      if (fr?.heal_run_id) db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
+      const fr = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(quickRunId);
+      await setHealStatus(targetRunId, fr?.heal_status || 'failed');
+      if (fr?.heal_run_id) await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
     } else {
-      setHealStatus(targetRunId, 'exhausted');
+      await setHealStatus(targetRunId, 'exhausted');
     }
     return;
   }
 
   // ── Phase 2: Full run with original runtime params ────────────────────────
-  setHealStatus(targetRunId, 'rerunning_full');
+  await setHealStatus(targetRunId, 'rerunning_full');
   let fullRunId;
   try { fullRunId = await spawnRun(userId, run, suite, project, 'full'); }
   catch (e) {
     // Quick verify passed but full run couldn't start — still count as healed at quick level
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
-    setHealStatus(targetRunId, 'healed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
+    await setHealStatus(targetRunId, 'healed');
     return;
   }
 
-  db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fullRunId, targetRunId);
+  await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fullRunId, targetRunId);
 
-  const fullRun     = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(fullRunId);
+  const fullRun     = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(fullRunId);
   const fullJtlPath = path.join(fullRun.result_dir, 'results.jtl');
   const fullInfra   = classifyErrors(fullJtlPath);
 
   if (fullInfra.isInfra) {
     // Server can't handle the original load level — infra problem, not script
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
-    setHealStatus(targetRunId, 'infra_error');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('infra_error', logId);
+    await setHealStatus(targetRunId, 'infra_error');
     return;
   }
 
@@ -826,18 +881,18 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     (fullRuleCheck.noRules ? true : fullRuleCheck.passed !== false);
 
   if (fullPassed) {
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
-    setHealStatus(targetRunId, 'healed');
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('healed', logId);
+    await setHealStatus(targetRunId, 'healed');
   } else {
     // Full run failed — try another healing attempt
-    db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('still_failing', logId);
     if (attemptNum < MAX_ATTEMPTS) {
       await healCycle(userId, fullRunId, project, suite, attemptNum + 1);
-      const fr = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(fullRunId);
-      setHealStatus(targetRunId, fr?.heal_status || 'failed');
-      if (fr?.heal_run_id) db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
+      const fr = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(fullRunId);
+      await setHealStatus(targetRunId, fr?.heal_status || 'failed');
+      if (fr?.heal_run_id) await db.prepare('UPDATE execution_runs SET heal_run_id=? WHERE id=?').run(fr.heal_run_id, targetRunId);
     } else {
-      setHealStatus(targetRunId, 'exhausted');
+      await setHealStatus(targetRunId, 'exhausted');
     }
   }
 }
@@ -851,10 +906,10 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
  *   the heal cycle fully completes (healed or exhausted/failed). Used by the email
  *   alert system so it can wait for the healer before deciding what to send.
  */
-function startAutoHeal(userId, runId, onComplete) {
-  const run     = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
-  const suite   = run && db.prepare('SELECT * FROM test_suites WHERE id = ?').get(run.suite_id);
-  const project = run && db.prepare('SELECT * FROM projects WHERE id = ?').get(run.project_id);
+async function startAutoHeal(userId, runId, onComplete) {
+  const run     = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
+  const suite   = run && await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(run.suite_id);
+  const project = run && await db.prepare('SELECT * FROM projects WHERE id = ?').get(run.project_id);
 
   if (!run || !suite || !project) {
     console.warn(`[AutoHealer] Cannot heal run ${runId} — missing data`);
@@ -862,13 +917,13 @@ function startAutoHeal(userId, runId, onComplete) {
     return;
   }
 
-  setHealStatus(runId, 'pending');
+  await setHealStatus(runId, 'pending');
   setImmediate(async () => {
     try {
       await healCycle(userId, runId, project, suite, 1);
     } catch (e) {
       console.error('[AutoHealer] Unexpected error:', e);
-      setHealStatus(runId, 'failed');
+      await setHealStatus(runId, 'failed');
     }
     // Resolve the final run: follow heal_run_id chain to the last run
     if (onComplete) {
@@ -876,12 +931,12 @@ function startAutoHeal(userId, runId, onComplete) {
         let finalId = runId;
         let hops = 0;
         while (hops < 10) {
-          const r = db.prepare('SELECT heal_run_id, heal_status FROM execution_runs WHERE id = ?').get(finalId);
+          const r = await db.prepare('SELECT heal_run_id, heal_status FROM execution_runs WHERE id = ?').get(finalId);
           if (!r || !r.heal_run_id) break;
           finalId = r.heal_run_id;
           hops++;
         }
-        const finalRun = db.prepare('SELECT status, heal_status FROM execution_runs WHERE id = ?').get(finalId);
+        const finalRun = await db.prepare('SELECT status, heal_status FROM execution_runs WHERE id = ?').get(finalId);
         const succeeded = finalRun?.status === 'completed' || finalRun?.heal_status === 'healed';
         onComplete(finalId, succeeded);
       } catch (e) {
@@ -892,11 +947,11 @@ function startAutoHeal(userId, runId, onComplete) {
   });
 }
 
-function getHealStatus(runId) {
-  const run = db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(runId);
+async function getHealStatus(runId) {
+  const run = await db.prepare('SELECT heal_status, heal_run_id FROM execution_runs WHERE id = ?').get(runId);
   if (!run) return null;
-  const logs = db.prepare('SELECT * FROM auto_heal_logs WHERE run_id = ? ORDER BY attempt ASC').all(runId);
+  const logs = await db.prepare('SELECT * FROM auto_heal_logs WHERE run_id = ? ORDER BY attempt ASC').all(runId);
   return { status: run.heal_status, heal_run_id: run.heal_run_id, logs };
 }
 
-module.exports = { startAutoHeal, getHealStatus };
+module.exports = { startAutoHeal, getHealStatus, buildContext, diagnoseWithAi, classifyErrors };

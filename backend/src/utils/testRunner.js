@@ -19,15 +19,15 @@ const os    = require('os');
 const db    = require('../db');
 const { patchJmxForParams }  = require('./patchJmx');
 const { evaluateRules }       = require('./ruleEvaluator');
-const { getUserProjectPath, getCollectionPath } = require('./projectFolders');
+const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('./projectFolders');
 
-const PERFSTUDIO_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.perfstudio');
+const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // ── Binary detection (mirrors execution.js) ───────────────────────────────────
 
 function getJMeterBin() {
   const candidates = [
-    path.join(PERFSTUDIO_DIR, 'jmeter', 'bin', 'jmeter.bat'),
+    path.join(PerfStudio_DIR, 'jmeter', 'bin', 'jmeter.bat'),
     'C:\\apache-jmeter\\bin\\jmeter.bat',
     'C:\\jmeter\\bin\\jmeter.bat',
     'C:\\Program Files\\Apache\\JMeter\\bin\\jmeter.bat',
@@ -44,7 +44,7 @@ function getJMeterBin() {
 }
 
 function getK6Bin() {
-  const candidates = [path.join(PERFSTUDIO_DIR, 'k6', 'k6.exe')];
+  const candidates = [path.join(PerfStudio_DIR, 'k6', 'k6.exe')];
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
   }
@@ -58,9 +58,9 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   const log = (type, msg) => logFn(type, msg);
 
   // ── Resolve suite and project ─────────────────────────────────────────────
-  const suite   = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
+  const suite   = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
   if (!suite)   return { passed: false, error: `Test suite not found (id=${suiteId})` };
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   if (!project) return { passed: false, error: 'Project not found' };
 
   const engine     = suite.engine || 'jmeter';
@@ -71,8 +71,9 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   }
 
   // ── Resolve result directory ──────────────────────────────────────────────
-  const callerRole  = db.prepare('SELECT role FROM users WHERE id = ?').get(userId)?.role;
-  const userProjPath = getUserProjectPath(userId, callerRole, project.name);
+  const callerRoleRow  = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerRoleRow?.role;
+  const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
   const { buildRunDirName, extractRunNumber } = require('./buildRunName');
 
   function nextRunNum(dir) {
@@ -90,17 +91,24 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
 
   let resultDir;
   try {
-    if (suite.collection_id && suite.env) {
-      const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
-      if (col) {
-        const envPath = getCollectionPath(userProjPath, col.name, suite.env);
+    if (suite.collection_id) {
+      const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      // resolveSuiteEnv falls back to the collection's own default env when suite.env
+      // is blank — a collection-scoped suite should never drop to the project-level
+      // fallback below just because its env wasn't explicitly set.
+      const resolvedEnv = resolveSuiteEnv(col, suite);
+      if (col && resolvedEnv) {
+        const envPath = getCollectionPath(userProjPath, col.name, resolvedEnv);
         fs.mkdirSync(path.join(envPath, 'results'), { recursive: true });
         const n = nextRunNum(path.join(envPath, 'results'));
         resultDir = path.join(envPath, 'results', buildRunDirName(suite.name, trVusers, trIterMode, trLoops, trDuration, n));
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    console.warn(`[testRunner] Collection/env result path resolution failed for suite ${suite.id}, falling back to project-level results:`, e.message);
+  }
 
+  // Project-level fallback is only legitimate for a suite with no collection at all.
   if (!resultDir) {
     fs.mkdirSync(path.join(userProjPath, 'results'), { recursive: true });
     const n = nextRunNum(path.join(userProjPath, 'results'));
@@ -152,16 +160,16 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
       proc.stdout.on('data', handleOutput);
       proc.stderr.on('data', handleOutput);
 
-      proc.on('close', code => {
+      proc.on('close', async code => {
         log('info', `  JMeter exited (code ${code})`);
         // Evaluate rules against JTL
         let passed = true;
         try {
           if (fs.existsSync(jtlPath)) {
-            const ruleResult = evaluateRules(projectId, jtlPath);
+            const ruleResult = await evaluateRules(projectId, jtlPath);
             if (!ruleResult.noRules) {
               passed = ruleResult.passed;
-              (ruleResult.violations || []).forEach(v => log('warn', `  ⚠ Rule: ${v.label}`));
+              (ruleResult.violations || []).forEach(async v => log('warn', `  ⚠ Rule: ${v.label}`));
               if (passed) log('ok', '  ✔ All rules passed');
               else        log('err', '  ✘ Rule violations detected');
             } else {
@@ -198,8 +206,8 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
 
     return new Promise(resolve => {
       const proc = spawn(`"${k6Bin}"`, args, { shell: true });
-      proc.stdout.on('data', c => c.toString().split('\n').forEach(l => l.trim() && log('info', `  ${l.trim()}`)));
-      proc.stderr.on('data', c => c.toString().split('\n').forEach(l => l.trim() && log('info', `  ${l.trim()}`)));
+      proc.stdout.on('data', c => c.toString().split('\n').forEach(async l => l.trim() && log('info', `  ${l.trim()}`)));
+      proc.stderr.on('data', c => c.toString().split('\n').forEach(async l => l.trim() && log('info', `  ${l.trim()}`)));
       proc.on('close', code => resolve({ passed: code === 0, exit_code: code, jtlPath }));
       proc.on('error', err => resolve({ passed: false, error: err.message, jtlPath: null }));
     });

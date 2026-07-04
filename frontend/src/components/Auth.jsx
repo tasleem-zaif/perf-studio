@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import api from '../api';
+import Logo from './Logo';
 
 /* ── Feature highlights shown on the left branding panel ── */
 const FEATURES = [
@@ -57,23 +58,14 @@ export default function Auth({ onLogin }) {
         {/* ── LEFT — Branding & Features ── */}
         <div className="auth-left">
           {/* Logo */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 }}>
-            <img
-              src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-              alt="Quarks"
-              style={{ height: 36, width: 'auto' }}
-            />
-            <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.15)' }} />
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Performance Studio</div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>by Quarks Technosoft</div>
-            </div>
+          <div style={{ marginBottom: 28 }}>
+            <Logo size="lg" theme="dark" />
           </div>
 
           {/* Headline */}
           <div style={{ marginBottom: 8 }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: '#fff', lineHeight: 1.25, letterSpacing: '-0.3px' }}>
-              AI-Powered<br />
+              Next Gen<br />
               <span style={{ color: '#22c55e' }}>Performance Testing</span><br />
               Platform
             </div>
@@ -153,7 +145,7 @@ export default function Auth({ onLogin }) {
                       justifyContent: 'center', gap: 6,
                     }}>
                     {loading ? <span className="spinner" /> : <i className="ti ti-logout" />}
-                    Sign out other session &amp; sign in here
+                    Logout from other devices and Sign In
                   </button>
                 )}
               </div>

@@ -39,15 +39,15 @@ function writeJson(filePath, data) {
 
 // ── Core: write comprehensive config.json for one collection + env ────────────
 
-function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
+async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
   try {
-    const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
+    const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
 
     const envName = env || col.environment || 'Default';
     const { cleanName } = require('./projectFolders');
 
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
+    const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
     let envPath;
 
     // Use explicitly passed folder path (user's workspace). Do NOT fall back to
@@ -68,7 +68,7 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     try { endpointCount = JSON.parse(col.json_content || '[]').length; } catch {}
 
     // Rules for this project
-    const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(col.project_id)
+    const rules = (await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(col.project_id))
       .map(r => {
         const rule = {
           id: r.id, metric: r.metric, operator: r.operator,
@@ -84,7 +84,7 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
       });
 
     // Test plans linked to this collection
-    const testPlans = db.prepare('SELECT * FROM test_suites WHERE collection_id = ?').all(collectionId)
+    const testPlans = (await db.prepare('SELECT * FROM test_suites WHERE collection_id = ?').all(collectionId))
       .map(s => ({
         id: s.id, name: s.name, engine: s.engine,
         test_type: s.test_type || 'load',
@@ -94,8 +94,8 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
       }));
 
     // Config (merge global + project)
-    const globalRow  = project ? db.prepare('SELECT config_json FROM global_config  WHERE user_id    = ?').get(project.user_id) : null;
-    const projectRow = project ? db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(project.id)      : null;
+    const globalRow  = project ? await db.prepare('SELECT config_json FROM global_config  WHERE user_id    = ?').get(project.user_id) : null;
+    const projectRow = project ? await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(project.id)      : null;
     const globalCfg  = globalRow  ? JSON.parse(globalRow.config_json  || '{}') : {};
     const projectCfg = projectRow ? JSON.parse(projectRow.config_json || '{}') : {};
     // Strip deprecated fields — paths handled by Docker, load params stored in test plans
@@ -135,15 +135,15 @@ function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
 
 // ── Update all env folders for a collection ───────────────────────────────────
 
-function updateCollectionConfigs(collectionId, projectFolderPath) {
+async function updateCollectionConfigs(collectionId, projectFolderPath) {
   try {
-    const col = db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
+    const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
     let envs = [];
     try { envs = JSON.parse(col.environments || '[]'); } catch {}
     if (!envs.length) envs = col.environment ? [col.environment] : ['Default'];
     for (const env of envs) {
-      writeCollectionEnvConfig(collectionId, env, projectFolderPath);
+      await writeCollectionEnvConfig(collectionId, env, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateCollectionConfigs error:', e.message);
@@ -152,14 +152,14 @@ function updateCollectionConfigs(collectionId, projectFolderPath) {
 
 // ── Update all collections for a project ─────────────────────────────────────
 
-function updateProjectCollectionConfigs(projectId, projectFolderPath) {
+async function updateProjectCollectionConfigs(projectId, projectFolderPath) {
   // When no explicit user workspace path is provided, skip writing to avoid
   // accidentally writing to the wrong (e.g. admin) workspace.
   if (!projectFolderPath) return;
   try {
-    const collections = db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
+    const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
     for (const col of collections) {
-      updateCollectionConfigs(col.id, projectFolderPath);
+      await updateCollectionConfigs(col.id, projectFolderPath);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateProjectCollectionConfigs error:', e.message);
@@ -171,25 +171,25 @@ function writeProjectConfig() { /* no-op */ }
 function writeGlobalConfig()   { /* no-op */ }
 
 // ── Legacy stubs (no-ops kept for backward compat) ───────────────────────────
-function writeCollectionConfig(collection, projectFolderPath) {
-  if (collection?.id) updateCollectionConfigs(collection.id, projectFolderPath);
+async function writeCollectionConfig(collection, projectFolderPath) {
+  if (collection?.id) await updateCollectionConfigs(collection.id, projectFolderPath);
 }
 function writeRulesConfig()         { /* no-op: use updateProjectCollectionConfigs */ }
-function writeProjectLevelConfig(projectId) {
-  if (projectId) updateProjectCollectionConfigs(projectId);
+async function writeProjectLevelConfig(projectId) {
+  if (projectId) await updateProjectCollectionConfigs(projectId);
 }
-function writeProjectSnapshot(project, userId) {
+async function writeProjectSnapshot(project, userId) {
   if (!project?.folder_path) return;
   writeProjectConfig(project);
   writeGlobalConfig(userId, project.folder_path);
-  updateProjectCollectionConfigs(project.id);
+  await updateProjectCollectionConfigs(project.id);
 }
 
 // ── Auto-populate project config from all collections (called on first config load) ─
 
-function autoPopulateFromCollections(projectId) {
+async function autoPopulateFromCollections(projectId) {
   try {
-    const cols = db.prepare('SELECT json_content FROM collections WHERE project_id = ?').all(projectId);
+    const cols = await db.prepare('SELECT json_content FROM collections WHERE project_id = ?').all(projectId);
     const seen    = new Set();
     const urlSets = [];
 
@@ -204,8 +204,10 @@ function autoPopulateFromCollections(projectId) {
           const u   = new URL(raw);
           const protocol = u.protocol.replace(':', '');
           const hostname  = u.hostname;
-          if (!hostname) continue;
-          const port = u.port || (protocol === 'https' ? '443' : '80');
+          // Skip unresolved Postman {{var}} templates — not a real hostname.
+          if (!hostname || hostname.includes('{{')) continue;
+          // Only use the port if the URL actually specified one — don't assume 443/80.
+          const port = u.port || '';
           const key  = `${protocol}|${hostname}|${port}`;
           if (!seen.has(key)) { seen.add(key); urlSets.push({ protocol, url: hostname, port }); }
         } catch { continue; }
@@ -214,7 +216,7 @@ function autoPopulateFromCollections(projectId) {
 
     if (!urlSets.length) return;
 
-    const existing    = db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(projectId);
+    const existing    = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(projectId);
     const cfg         = existing ? JSON.parse(existing.config_json || '{}') : {};
     const existingKeys = new Set((cfg.urls || []).map(u => `${u.protocol}|${u.url}|${u.port}`));
     const newUrls      = urlSets.filter(u => !existingKeys.has(`${u.protocol}|${u.url}|${u.port}`));
@@ -222,9 +224,9 @@ function autoPopulateFromCollections(projectId) {
 
     cfg.urls = [...(cfg.urls || []), ...newUrls];
     if (existing) {
-      db.prepare('UPDATE project_config SET config_json = ? WHERE project_id = ?').run(JSON.stringify(cfg), projectId);
+      await db.prepare('UPDATE project_config SET config_json = ? WHERE project_id = ?').run(JSON.stringify(cfg), projectId);
     } else {
-      db.prepare('INSERT INTO project_config (project_id, config_json) VALUES (?, ?)').run(projectId, JSON.stringify(cfg));
+      await db.prepare('INSERT INTO project_config (project_id, config_json) VALUES (?, ?)').run(projectId, JSON.stringify(cfg));
     }
   } catch (e) {
     console.error('[ConfigWriter] autoPopulateFromCollections error:', e.message);

@@ -1,0 +1,29 @@
+## Summary
+
+This PR consolidates a large set of features, fixes, and documentation updates across the `fixes` branch.
+
+### Features
+- **Pre-run migrated to API Sources** — Pre-run functionality moved from Test Plans to Collections (API Sources). Each collection now has its own pre-run action with a draggable log modal. Test Plans gate script generation until the linked collection pre-run is fresh (hash-checked).
+- **Test Data CSV search** — Search/filter input in the New/Edit Test Plan modal for matching CSV files by filename with live highlighting.
+- **CI Pipeline results in Analytics** — Pipeline step executions now create `execution_runs` records so results appear in the Analytics dashboard alongside direct test runs.
+- **Analytics PDF export** — Replaced server-side Puppeteer PDF (canvas elements rendered blank) with a frontend html2canvas + jsPDF approach that captures each tab exactly as the user sees it, including all Chart.js charts.
+
+### Bug Fixes
+- **Stale/deleted runs in Analytics** — Removed 24-hour restriction from cleanStaleRuns; any completed/failed run whose result_dir no longer exists is now cleaned up immediately on page load.
+- **Duplicate run numbers in Analytics** — Run numbers now use the DB id directly instead of extracting from result_dir path, eliminating collisions between direct runs and pipeline-created runs.
+- **Pre-run gate restored** — Script generation is blocked with an amber warning banner until pre-run is executed on the linked API Source collection.
+
+### Documentation
+- **ARCHITECTURE.md** fully rewritten with 14 Mermaid-diagrammed sections: system architecture, ER data model (24+ tables), user journey (17 steps), role-based access model, AI script generation sequence, pre-run sequence, test execution flow, auto-heal sequence, git and CI integration, CI pipeline flow, alert/email flow, multi-environment isolation, security model, and tech stack table.
+- User journey corrected: invite regular users moved to step 7, rules engine added as step 11, CI pipeline and analytics added to the Run test step.
+- Docker image references updated to perf-studio-runner (Java, JMeter, K6, Node.js).
+
+## Test Plan
+- [ ] Run pre-run on an API Source and verify pass/fail counts and draggable log modal
+- [ ] Attempt to generate a script without pre-run and verify amber warning banner with Go to API Sources link
+- [ ] Run a CI pipeline and verify each step appears in Analytics dropdown
+- [ ] Select a run in Analytics and click Export PDF and verify all 6 tabs captured with visible charts
+- [ ] Delete a result directory from disk, reload Analytics, verify deleted run no longer appears
+- [ ] Create two runs for the same test plan and verify run numbers are unique in the dropdown
+
+Generated with Claude Code

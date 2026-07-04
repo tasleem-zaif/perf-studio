@@ -6,22 +6,23 @@ const auth   = require('../middleware/auth');
 const resetSequence = require('../utils/resetSequence');
 const { writeProjectSnapshot } = require('../utils/configWriter');
 const { ensureProjectFolders, deleteProjectFolder, backupAndDeleteProjectFolder, BACKUPS_ROOT } = require('../utils/projectFolders');
+const { getOrgLicenseStatus } = require('../utils/license');
 
 const COLORS = ['#1a6bff','#00c896','#ef9f27','#e24b4a','#8b5cf6','#06b6d4'];
 const BKGS   = ['#e8f0ff','#e0faf3','#faeeda','#fcebeb','#ede9fe','#e0f2fe'];
 
 router.use(auth);
 
-function getCaller(userId) {
+async function getCaller(userId) {
   return db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(userId);
 }
 
-router.get('/', (req, res) => {
-  const caller = getCaller(req.userId);
+router.get('/', async (req, res) => {
+  const caller = await getCaller(req.userId);
 
   let projects;
   if (caller.role === 'super_admin') {
-    projects = db.prepare(`
+    projects = await db.prepare(`
       SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
              COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
@@ -31,7 +32,7 @@ router.get('/', (req, res) => {
       ORDER BY o.name ASC, p.created_at DESC
     `).all();
   } else if (caller.role === 'org_admin') {
-    projects = db.prepare(`
+    projects = await db.prepare(`
       SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
              COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
@@ -43,7 +44,7 @@ router.get('/', (req, res) => {
     `).all(caller.org_id);
   } else if (caller.role === 'user') {
     // Regular users see only projects explicitly assigned to them
-    projects = db.prepare(`
+    projects = await db.prepare(`
       SELECT p.*, u.name as owner_name, o.name as org_name, o.id as org_id,
              COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
@@ -54,7 +55,7 @@ router.get('/', (req, res) => {
       ORDER BY p.created_at DESC
     `).all(req.userId);
   } else {
-    projects = db.prepare(`
+    projects = await db.prepare(`
       SELECT p.*, COALESCE(gc.is_initialized, 0) as git_initialized
       FROM projects p
       LEFT JOIN git_configs gc ON gc.project_id = p.id
@@ -66,67 +67,80 @@ router.get('/', (req, res) => {
   res.json({ projects });
 });
 
-router.post('/', (req, res) => {
-  const caller = getCaller(req.userId);
+router.post('/', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot create projects. Contact your org admin.' });
+
+  // Org admins are capped by their org's plan. Super admins create projects
+  // outside any org's license, so they're unaffected.
+  if (caller.role === 'org_admin') {
+    const license = await getOrgLicenseStatus(caller.org_id);
+    if (license.projectsAtLimit) {
+      return res.status(400).json({
+        error: 'project_limit_reached',
+        message: `Your organization has reached its project limit (${license.maxProjects}) for the ${license.plan} plan. Upgrade the plan to create more projects.`,
+      });
+    }
+  }
+
   const { name, description } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
-  const count = db.prepare('SELECT COUNT(*) as n FROM projects WHERE user_id = ?').get(req.userId).n;
+  const count = (await db.prepare('SELECT COUNT(*) as n FROM projects WHERE user_id = ?').get(req.userId)).n;
   const idx   = count % COLORS.length;
   // Generate unique 6-digit numeric ID; retry if already taken
   let uuid;
   do {
     uuid = String(Math.floor(100000 + Math.random() * 900000));
-  } while (db.prepare('SELECT id FROM projects WHERE uuid = ?').get(uuid));
+  } while (await db.prepare('SELECT id FROM projects WHERE uuid = ?').get(uuid));
 
-  const result = db.prepare(
+  const result = await db.prepare(
     'INSERT INTO projects (user_id, name, description, color, bg, uuid) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(req.userId, name, description || '', COLORS[idx], BKGS[idx], uuid);
 
   // folder_path is null until Org Admin initializes the Git repository.
   // The folder structure is created inside git-workspaces during git init.
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
   res.json({ project });
 });
 
-router.put('/:id', (req, res) => {
-  const caller = getCaller(req.userId);
+router.put('/:id', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot edit projects.' });
   const project = caller.role === 'super_admin'
-    ? db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
-    : db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+    ? await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
+    : await db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   if (!project) return res.status(404).json({ error: 'Project not found or you do not have permission to edit it.' });
   const { name, description } = req.body;
-  db.prepare('UPDATE projects SET name = ?, description = ? WHERE id = ?')
+  await db.prepare('UPDATE projects SET name = ?, description = ? WHERE id = ?')
     .run(name || project.name, description ?? project.description, req.params.id);
-  const updated = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+  const updated = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
   // no-op: collection config.json contains effective project data
   res.json({ project: updated });
 });
 
 router.delete('/:id', async (req, res) => {
   try {
-    const caller = getCaller(req.userId);
+    const caller = await getCaller(req.userId);
     if (caller.role === 'user') return res.status(403).json({ error: 'Regular users cannot delete projects.' });
     let project;
     if (caller.role === 'super_admin') {
-      project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+      project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
     } else if (caller.role === 'org_admin') {
-      project = db.prepare(`
+      project = await db.prepare(`
         SELECT p.* FROM projects p
         JOIN users u ON p.user_id = u.id
         WHERE p.id = ? AND u.org_id = ?
       `).get(req.params.id, caller.org_id);
     } else {
-      project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+      project = await db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
     }
     if (!project) return res.status(404).json({ error: 'Project not found or you do not have permission to delete it.' });
 
     // Capture git config BEFORE deleting from DB — CASCADE will delete it
-    const gitCfg = db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
+    const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
 
     // Delete from DB immediately and respond — git cleanup + folder backup run in background
-    db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
+    await db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
     resetSequence('projects');
     res.json({ ok: true });
 
@@ -199,17 +213,17 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-router.post('/:id/ensure-folders', (req, res) => {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+router.post('/:id/ensure-folders', async (req, res) => {
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   if (!project) return res.status(404).json({ error: 'Project not found — please refresh the page and try again.' });
   const folderPath = ensureProjectFolders(project.name, project.id, project.uuid || project.environment);
-  db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, req.params.id);
+  await db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, req.params.id);
   res.json({ ok: true, folder_path: folderPath });
 });
 
 // ── GET /backups — list all project backup ZIPs (admin only) ─────────────────
-router.get('/backups', (req, res) => {
-  const caller = getCaller(req.userId);
+router.get('/backups', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller?.role)) {
     return res.status(403).json({ error: 'Admin only' });
   }
@@ -229,8 +243,8 @@ router.get('/backups', (req, res) => {
 });
 
 // ── GET /backups/:filename — download a backup ZIP (admin only) ───────────────
-router.get('/backups/:filename', (req, res) => {
-  const caller = getCaller(req.userId);
+router.get('/backups/:filename', async (req, res) => {
+  const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller?.role)) {
     return res.status(403).json({ error: 'Admin only' });
   }

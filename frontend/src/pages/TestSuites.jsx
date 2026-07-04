@@ -83,6 +83,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       setTestDataFiles(data.files || []);
     } catch (e) {
       console.error('Failed to load test data files:', e.response?.data || e.message);
+      setTestDataFiles([]);
     }
   }
 
@@ -250,7 +251,12 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                     <i className={`ti ${ti.icon}`} style={{ color: ti.color }} />
                   </div>
                   <div>
-                    <div style={{ fontWeight: 600, fontSize: '15px' }}>{s.name}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                      <span style={{ fontWeight: 600, fontSize: '15px' }}>{s.name}</span>
+                      {linkedCollection && (
+                        <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 12, background: '#dcfce7', color: '#16a34a' }}>{linkedCollection.name}</span>
+                      )}
+                    </div>
                     <div style={{ display: 'flex', gap: '6px', marginTop: '4px', flexWrap: 'wrap' }}>
                       <span className="tag tag-blue">{ti.label}</span>
                       <span className="tag tag-gray"><i className="ti ti-tool" style={{ fontSize: '11px' }} /> {s.engine === 'jmeter' ? 'JMeter' : 'K6'}</span>
