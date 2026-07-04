@@ -1,0 +1,36 @@
+sequenceDiagram
+    participant TE as Test Executor
+    participant AH as autoHealer.js
+    participant DB as Database (Postgres)
+    participant AC as aiClient.js
+    participant LLM as LLM Provider
+    participant FS as File System
+
+    TE->>AH: triggerHeal(runId, suiteId, projectId, errorLog)
+
+    loop Up to 3 attempts
+        AH->>DB: INSERT auto_heal_logs (attempt, run_id)
+        AH->>FS: Read current JMX/K6 script
+        AH->>DB: Read ai_settings (heal_model)
+        AH->>AC: callAi - fix this script given these errors
+        AC->>LLM: generateText(heal prompt)
+        LLM-->>AC: Fixed script content
+        AC-->>AH: Fixed script
+        AH->>AH: cleanScript() - validate output
+        AH->>FS: Overwrite script file with fix
+        AH->>DB: UPDATE auto_heal_logs SET fix_applied = diff
+        AH->>TE: Re-run test suite (new execution_run)
+        TE-->>AH: passed or error
+
+        alt passed
+            AH->>DB: UPDATE auto_heal_logs SET result = healed
+            AH->>DB: UPDATE execution_runs SET heal_status = healed
+            AH->>AH: sendAlertEmail (heal success report)
+            AH-->>TE: done
+        else still failing
+            AH->>DB: UPDATE auto_heal_logs SET result = failed
+            Note over AH: Continue to next attempt
+        end
+    end
+
+    AH->>DB: UPDATE execution_runs SET heal_status = exhausted
