@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import api from '../api';
 import { useConfirm } from '../hooks/useConfirm';
 import ConfirmModal from '../components/ConfirmModal';
+import Modal from '../components/Modal';
 import { useToast } from '../hooks/useToast';
 import { projectDirName } from '../utils/displayName';
 import SMTPConfigPanel from '../components/SMTPConfigPanel';
@@ -83,6 +84,7 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
 
   const [assigningProject, setAssigningProject] = useState(null);
   const [selectedUserIds, setSelectedUserIds] = useState([]);
+  const selectAllRef = useRef(null);
 
   function reloadAll() {
     Promise.all([
@@ -163,6 +165,16 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
     setAssigningProject(project);
     setSelectedUserIds(orgUsers.filter(u => (u.assigned_project_ids || []).includes(project.id)).map(u => u.id));
   }
+
+  function toggleSelectAllUsers(checked) {
+    setSelectedUserIds(checked ? orgUsers.map(u => u.id) : []);
+  }
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selectedUserIds.length > 0 && selectedUserIds.length < orgUsers.length;
+    }
+  }, [selectedUserIds, orgUsers]);
 
   async function saveProjectAssignment() {
     if (!assigningProject) return;
@@ -450,30 +462,51 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
 
       {/* Assign users to project modal */}
       {assigningProject && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div style={{ background: 'var(--color-background-primary)', borderRadius: '12px', padding: '24px', width: '460px', maxWidth: '95vw', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <div style={{ fontWeight: 700, fontSize: '16px' }}>Assign Users — {projectDirName(assigningProject)}</div>
-              <button className="btn-icon" onClick={() => setAssigningProject(null)}><i className="ti ti-x" /></button>
-            </div>
-            <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {orgUsers.length === 0 ? (
-                <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--color-text-tertiary)', fontSize: 13 }}>No regular users to assign yet.</div>
-              ) : orgUsers.map(u => (
-                <label key={u.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px', background: 'var(--color-background-secondary)', borderRadius: '8px', border: `1px solid ${selectedUserIds.includes(u.id) ? 'var(--accent)' : 'var(--color-border-secondary)'}`, cursor: 'pointer' }}>
-                  <input type="checkbox" checked={selectedUserIds.includes(u.id)}
-                    onChange={e => setSelectedUserIds(prev => e.target.checked ? [...prev, u.id] : prev.filter(id => id !== u.id))}
-                    style={{ accentColor: 'var(--accent)', width: 16, height: 16, flexShrink: 0 }} />
-                  <span style={{ fontSize: '13px', fontWeight: 500 }}>{u.name || u.email}</span>
-                </label>
-              ))}
-            </div>
-            <div style={{ display: 'flex', gap: '10px', marginTop: '16px', justifyContent: 'flex-end' }}>
-              <button className="btn-secondary" onClick={() => setAssigningProject(null)}>Cancel</button>
-              <button className="btn-primary" onClick={saveProjectAssignment}><i className="ti ti-check" /> Save Access</button>
-            </div>
+        <Modal onClose={() => setAssigningProject(null)} style={{ width: '640px' }}>
+          <div className="modal-hdr">
+            <div className="modal-title">Assign Users — {projectDirName(assigningProject)}</div>
+            <button className="btn-icon" onClick={() => setAssigningProject(null)}><i className="ti ti-x" /></button>
           </div>
-        </div>
+
+          {orgUsers.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--color-text-tertiary)', fontSize: 13 }}>No regular users to assign yet.</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={{ width: 36 }}>
+                    <input type="checkbox" ref={selectAllRef}
+                      checked={selectedUserIds.length === orgUsers.length}
+                      onChange={e => toggleSelectAllUsers(e.target.checked)}
+                      style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
+                  </th>
+                  <th>User Name</th>
+                  <th>User Email</th>
+                  <th>Role</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orgUsers.map(u => (
+                  <tr key={u.id}>
+                    <td>
+                      <input type="checkbox" checked={selectedUserIds.includes(u.id)}
+                        onChange={e => setSelectedUserIds(prev => e.target.checked ? [...prev, u.id] : prev.filter(id => id !== u.id))}
+                        style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
+                    </td>
+                    <td style={{ fontWeight: 500 }}>{u.name || '—'}</td>
+                    <td>{u.email}</td>
+                    <td><RoleBadge role={u.role} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div className="modal-footer">
+            <button className="btn-secondary" onClick={() => setAssigningProject(null)}>Cancel</button>
+            <button className="btn-primary" onClick={saveProjectAssignment}><i className="ti ti-check" /> Save Access</button>
+          </div>
+        </Modal>
       )}
     </div>
   );
