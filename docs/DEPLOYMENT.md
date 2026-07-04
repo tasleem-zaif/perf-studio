@@ -1,7 +1,7 @@
 # Peako — Production Deployment Manual
 
-**Version:** 1.0  
-**Stack:** Node.js 22 · React (Vite) · SQLite · JMeter · K6  
+**Version:** 1.1  
+**Stack:** Node.js 22 · React (Vite) · PostgreSQL 16 · JMeter · K6  
 **Maintained by:** Quarks Technosoft
 
 ---
@@ -35,15 +35,15 @@ Nginx (port 80/443)          ← optional but recommended
   ▼
 Node.js Backend (port 3001)  ← serves API + built React frontend
   │
-  ├── SQLite DB  (/app/data/perf_studio.db)
-  ├── Projects   (/app/projects)
-  ├── Git workspaces (/app/git-workspaces)
-  └── Backups    (/app/backups)
+  ├── PostgreSQL 16   (separate service — DATABASE_URL)
+  ├── Projects        (/app/projects)
+  ├── Git workspaces  (/app/git-workspaces)
+  └── Backups         (/app/backups)
 ```
 
 - The backend serves **both** the API (`/api/*`) and the built React frontend (static files).
 - No separate frontend server is needed in production.
-- All data lives on disk — no external database server required.
+- PostgreSQL is a **required external service** — run it as a Docker Compose service (default), a managed Postgres instance, or a self-hosted server. Project files, scripts, and results still live on disk.
 
 ---
 
@@ -129,13 +129,15 @@ ENCRYPTION_KEY=REPLACE_WITH_GENERATED_KEY
 FRONTEND_URL=http://YOUR_SERVER_IP_OR_DOMAIN:3001
 CORS_ORIGIN=http://YOUR_SERVER_IP_OR_DOMAIN:3001
 
-# Database path inside the container (mapped to a Docker volume)
-DB_PATH=/app/data/perf_studio.db
+# Postgres connection — points at the `postgres` service in docker-compose.yml
+DATABASE_URL=postgresql://postgres:postgres@postgres:5432/perf_studio
 
 # Storage paths inside the container
 PROJECTS_ROOT=/app/projects
 BACKUPS_ROOT=/app/backups
 ```
+
+> Change the Postgres username/password from the `postgres`/`postgres` default before exposing this to a network you don't fully trust — update both `docker-compose.yml`'s `postgres` service environment and `DATABASE_URL` to match.
 
 Generate the secrets:
 ```bash
@@ -146,34 +148,47 @@ node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-### Step 4 — Build the Docker image
+### Step 4 — Start with Docker Compose (recommended)
+
+`docker-compose.yml` at the repo root already defines both services — a `postgres:16-alpine` database and the all-in-one app container — wired together via `DATABASE_URL`. This is the simplest path and the one actually exercised in this repo:
+
+```bash
+docker compose --env-file backend/.env.docker up -d --build
+```
+
+This takes 5–10 minutes on first build (downloads JMeter, K6, Java) and also pulls/starts Postgres.
+
+> **Important — schema is not auto-applied.** Neither the app container's startup nor the `postgres` service runs `schema.sql` automatically (no `docker-entrypoint-initdb.d` mount, no migration step in the app's boot sequence). On a **fresh** Postgres volume, run the migration once before the app can serve real requests:
+> ```bash
+> docker compose exec PerfStudio node backend/src/db/migrate.js
+> ```
+> Safe to re-run any time (idempotent `CREATE TABLE IF NOT EXISTS`) — re-run it after every upgrade that adds new tables/columns to `schema.sql`.
+
+### Step 5 (alternative) — Plain `docker run`, without Compose
+
+Only use this if you specifically don't want Compose managing Postgres. You must run Postgres yourself and point `DATABASE_URL` at it:
 
 ```bash
 docker build -t perfstudio:latest .
-```
 
-This takes 5–10 minutes on first build (downloads JMeter, K6, Java).
+docker run -d --name perfstudio-pg --restart unless-stopped \
+  -e POSTGRES_DB=perf_studio -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -v perfstudio_pg_data:/var/lib/postgresql/data \
+  postgres:16-alpine
 
-### Step 5 — Start the container
-
-```bash
 docker run -d \
   --name perfstudio \
   --restart unless-stopped \
   -p 3001:3001 \
+  --link perfstudio-pg:postgres \
   --env-file backend/.env.docker \
-  -v perfstudio_data:/app/data \
   -v perfstudio_projects:/app/projects \
   -v perfstudio_git:/app/git-workspaces \
   -v perfstudio_backups:/app/backups \
   perfstudio:latest
 ```
 
-Or using Docker Compose:
-
-```bash
-docker compose up -d
-```
+(`--link` gives the app container a `postgres` hostname resolving to the DB container, matching the `DATABASE_URL` above — on a real deployment prefer a user-defined Docker network over `--link`, which is deprecated in modern Docker.)
 
 ### Step 6 — Verify it is running
 
@@ -245,6 +260,20 @@ sudo apt-get install -y k6
 k6 version
 ```
 
+### Step 5b — Install PostgreSQL 16
+
+```bash
+sudo apt-get install -y postgresql-16
+sudo systemctl enable --now postgresql
+
+# Create the database and a dedicated user
+sudo -u postgres psql -c "CREATE DATABASE perf_studio;"
+sudo -u postgres psql -c "CREATE USER perfstudio WITH PASSWORD 'CHANGE_ME';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE perf_studio TO perfstudio;"
+```
+
+(Skip this step and use a managed Postgres instance instead if you have one — just note its connection string for Step 9.)
+
 ### Step 6 — Get the source code
 
 ```bash
@@ -291,7 +320,7 @@ ENCRYPTION_KEY=REPLACE_WITH_GENERATED_KEY
 FRONTEND_URL=http://YOUR_SERVER_IP_OR_DOMAIN
 CORS_ORIGIN=http://YOUR_SERVER_IP_OR_DOMAIN
 
-DB_PATH=/opt/perfstudio/data/perf_studio.db
+DATABASE_URL=postgresql://perfstudio:CHANGE_ME@localhost:5432/perf_studio
 
 PROJECTS_ROOT=/opt/perfstudio/projects
 BACKUPS_ROOT=/opt/perfstudio/backups
@@ -301,13 +330,16 @@ K6_BIN=/usr/bin/k6
 EXECUTION_MODE=native
 ```
 
-### Step 10 — Create data directories
+### Step 10 — Create data directories and apply the database schema
 
 ```bash
-mkdir -p /opt/perfstudio/data
 mkdir -p /opt/perfstudio/projects
 mkdir -p /opt/perfstudio/backups
 mkdir -p /opt/perfstudio/git-workspaces
+
+# Applies schema.sql against DATABASE_URL — idempotent, safe to re-run
+cd /opt/perfstudio/backend
+node src/db/migrate.js
 ```
 
 ### Step 11 — Start the backend
@@ -316,6 +348,8 @@ mkdir -p /opt/perfstudio/git-workspaces
 cd /opt/perfstudio/backend
 NODE_ENV=production node src/index.js
 ```
+
+A `super_admin` account (`admin@perfstudio.com` / `Admin@123`) is seeded automatically on first boot if the `users` table has none yet — no separate seed command needed.
 
 Or in background:
 
@@ -344,7 +378,7 @@ File location: `backend/.env`
 | `ENCRYPTION_KEY` | **Yes** | — | AES key for encrypting SSH keys and API tokens in DB. 32-byte hex. |
 | `FRONTEND_URL` | Yes | `http://localhost:5173` | Public URL — used in invite and password reset emails |
 | `CORS_ORIGIN` | Yes | `http://localhost:5173` | Allowed CORS origin. Set same as FRONTEND_URL. |
-| `DB_PATH` | No | `backend/data/perf_studio.db` | Full path to the SQLite database file |
+| `DATABASE_URL` | **Yes** | — | PostgreSQL connection string, e.g. `postgresql://user:pass@host:5432/perf_studio` |
 | `PROJECTS_ROOT` | No | `../projects` | Directory for project files and test scripts |
 | `BACKUPS_ROOT` | No | `../backups` | Directory for database backups |
 | `JMETER_BIN` | No | auto-detected | Full path to `jmeter` binary |
@@ -365,13 +399,13 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 ## 6. Database
 
-This application uses **SQLite**. There is no external database server.
+This application uses **PostgreSQL 16**, connected via `DATABASE_URL`. It's an external service — run it as the `postgres` service in `docker-compose.yml` (default), a self-installed server (Method B, Step 5b), or a managed Postgres instance (RDS, Cloud SQL, etc.).
 
-- **File:** `perf_studio.db` (location set by `DB_PATH` env var)
-- **Auto-created** on first start with all tables and a default super admin
-- **WAL mode** is enabled — safe for concurrent reads
+- **Schema**: `backend/src/db/schema.sql`, applied by `node src/db/migrate.js` — idempotent `CREATE TABLE IF NOT EXISTS`, safe to re-run, does not touch existing data.
+- **Super admin seeding**: `backend/src/db/index.js` checks for an existing `super_admin` row every time the backend boots and inserts one if none exists — no separate seed command needed, and it never overwrites an existing super admin.
+- **Licensing**: every organization gets an `org_licenses` row (plan/limits/expiry) lazily created on first access — see [PROJECT_MAP.md](../PROJECT_MAP.md#licensing-system-added) for plan tiers.
 
-### Default super admin (created on first start)
+### Default super admin (seeded on first boot if none exists)
 | Field | Value |
 |---|---|
 | Email | `admin@perfstudio.com` |
@@ -382,20 +416,23 @@ This application uses **SQLite**. There is no external database server.
 ### Inspect the database
 
 ```bash
-# Install sqlite3 CLI
-sudo apt-get install -y sqlite3
+# Using the Postgres container directly (Docker Compose deployment)
+docker exec -it perf_studio_pg psql -U postgres -d perf_studio
 
-# Open the database
-sqlite3 /opt/perfstudio/data/perf_studio.db
+# Or, if you have the psql client installed locally and DATABASE_URL is reachable:
+psql "$DATABASE_URL"
 
 # List tables
-.tables
+\dt
 
 # View users
 SELECT id, email, name, role FROM users;
 
+# View org licenses
+SELECT org_id, plan, max_users, max_projects, status, expires_at FROM org_licenses;
+
 # Exit
-.quit
+\q
 ```
 
 ---
@@ -593,17 +630,20 @@ sudo systemctl restart perfstudio
 ### Backup
 
 The entire application state is in:
-1. `perf_studio.db` — the SQLite database (users, projects, configs, run history)
+1. **PostgreSQL database** (users, orgs, licenses, projects, configs, run history) — dumped with `pg_dump`, not a file copy
 2. `projects/` directory — test scripts, generated JMX/JS files, test data
 3. `git-workspaces/` directory — local git clones
 
 ```bash
-# Create a timestamped backup
+# Create a timestamped backup directory
 BACKUP_DIR="/opt/perfstudio/backups/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
-# Backup database (safe even while running — WAL mode)
-cp /opt/perfstudio/data/perf_studio.db "$BACKUP_DIR/"
+# Backup database — Docker Compose deployment
+docker exec perf_studio_pg pg_dump -U postgres perf_studio | gzip > "$BACKUP_DIR/perf_studio.sql.gz"
+
+# Backup database — Method B (Postgres on the host)
+pg_dump "$DATABASE_URL" | gzip > "$BACKUP_DIR/perf_studio.sql.gz"
 
 # Backup project files
 cp -r /opt/perfstudio/projects "$BACKUP_DIR/"
@@ -619,23 +659,27 @@ crontab -e
 
 Add:
 ```cron
-0 2 * * * cp /opt/perfstudio/data/perf_studio.db /opt/perfstudio/backups/db_$(date +\%Y\%m\%d).db
+0 2 * * * docker exec perf_studio_pg pg_dump -U postgres perf_studio | gzip > /opt/perfstudio/backups/db_$(date +\%Y\%m\%d).sql.gz
 ```
 
 ### Restore
 
 ```bash
 # Stop the backend first
-sudo systemctl stop perfstudio
+sudo systemctl stop perfstudio    # or: docker compose stop PerfStudio
 
-# Restore database
-cp /opt/perfstudio/backups/20240101_020000/perf_studio.db /opt/perfstudio/data/
+# Restore database — Docker Compose deployment (drops and recreates first)
+gunzip -c /opt/perfstudio/backups/20260101_020000/perf_studio.sql.gz | \
+  docker exec -i perf_studio_pg psql -U postgres -d perf_studio
+
+# Restore database — Method B (Postgres on the host)
+gunzip -c /opt/perfstudio/backups/20260101_020000/perf_studio.sql.gz | psql "$DATABASE_URL"
 
 # Restore projects
-cp -r /opt/perfstudio/backups/20240101_020000/projects /opt/perfstudio/
+cp -r /opt/perfstudio/backups/20260101_020000/projects /opt/perfstudio/
 
 # Start the backend
-sudo systemctl start perfstudio
+sudo systemctl start perfstudio   # or: docker compose start PerfStudio
 ```
 
 ---
@@ -665,32 +709,23 @@ npm run build
 cp -r dist ../backend/public
 ```
 
-### Step 4 — Restart the backend
+### Step 4 — Apply any new schema changes, then restart
 
 ```bash
+cd /opt/perfstudio/backend
+node src/db/migrate.js       # idempotent — only adds what's missing
 sudo systemctl restart perfstudio
 ```
 
-Database migrations run automatically on startup — no manual SQL needed.
+Unlike the old SQLite setup, schema changes are **not** applied automatically on startup — always re-run `migrate.js` after pulling code that touches `schema.sql`, before restarting.
 
-### Docker upgrade
+### Docker Compose upgrade
 
 ```bash
 cd /opt/perfstudio
 git pull origin main
-docker build -t perfstudio:latest .
-docker stop perfstudio
-docker rm perfstudio
-docker run -d \
-  --name perfstudio \
-  --restart unless-stopped \
-  -p 3001:3001 \
-  --env-file backend/.env.docker \
-  -v perfstudio_data:/app/data \
-  -v perfstudio_projects:/app/projects \
-  -v perfstudio_git:/app/git-workspaces \
-  -v perfstudio_backups:/app/backups \
-  perfstudio:latest
+docker compose --env-file backend/.env.docker up -d --build
+docker compose exec PerfStudio node backend/src/db/migrate.js
 ```
 
 ---
@@ -716,13 +751,20 @@ sudo kill $(sudo lsof -ti:3001)
 curl -v http://localhost:3001/api/health
 ```
 
-### Database permission error
+### Database connection errors
 
 ```bash
-# Fix ownership
-sudo chown -R ubuntu:ubuntu /opt/perfstudio/data
-chmod 755 /opt/perfstudio/data
-chmod 644 /opt/perfstudio/data/perf_studio.db
+# "relation \"users\" does not exist" — schema was never applied to this Postgres instance
+cd /opt/perfstudio/backend && node src/db/migrate.js
+# (Docker Compose): docker compose exec PerfStudio node backend/src/db/migrate.js
+
+# "ECONNREFUSED" / "could not connect to server" — Postgres isn't reachable at DATABASE_URL
+docker ps | grep postgres          # is the postgres container running/healthy?
+docker compose logs postgres       # check its own startup logs
+psql "$DATABASE_URL" -c "SELECT 1;"  # test the connection string directly
+
+# "password authentication failed" — DATABASE_URL doesn't match the postgres service's
+# POSTGRES_USER/POSTGRES_PASSWORD in docker-compose.yml (or the role you created in Method B)
 ```
 
 ### Frontend shows blank page

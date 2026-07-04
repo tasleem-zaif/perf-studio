@@ -1,0 +1,50 @@
+sequenceDiagram
+    actor User
+    participant PC as PipelineConfig.jsx
+    participant CI as pipelines.js + ciPipeline.js
+    participant DB as Database (Postgres)
+    participant FS as File System
+    participant CIP as GitHub Actions / GitLab CI
+
+    rect rgb(255, 245, 200)
+    Note over User,CIP: Setup - configure pipeline
+    User->>PC: Create pipeline (name, test plan steps, stop_on_failure)
+    PC->>CI: POST /api/projects/:id/pipelines
+    CI->>DB: INSERT pipeline_configs (steps as JSON array)
+    CI-->>PC: Pipeline saved
+
+    User->>PC: Generate CI YAML file
+    PC->>CI: POST /api/projects/:id/ci/generate-yaml
+    CI->>DB: Fetch test suites to get script paths
+    CI->>CI: Resolve workspace - admin or per-user
+    CI->>DB: Fetch user branch from user_git_configs
+    CI->>FS: Write gitlab-ci.yml / github-actions.yml with branch refs
+    CI-->>PC: Generated, push to branch
+
+    User->>PC: Commit and push YAML via GitPanel
+    PC->>CIP: CI provider detects workflow file
+    end
+
+    rect rgb(210, 235, 255)
+    Note over User,CIP: Runtime - trigger pipeline run
+    User->>PC: Click Run Pipeline
+    PC->>CI: POST /api/projects/:id/pipelines/:id/run
+    CI->>DB: INSERT pipeline_runs (status running)
+    CI->>CI: Open SSE stream to frontend
+
+    loop For each step, sequential
+        CI->>CI: runSuite(suiteId, projectId, userId)
+        CI->>CI: docker run JMeter/K6 for this step
+        CI->>CI: Evaluate rules - pass or fail
+        CI->>DB: UPDATE pipeline_runs steps_result
+        CI-->>PC: SSE step_update
+        alt stop_on_failure true AND step failed
+            CI->>CI: Mark remaining steps as skipped
+            Note over CI: Break loop
+        end
+    end
+
+    CI->>DB: UPDATE pipeline_runs SET status completed or failed
+    CI->>CI: sendAlertEmail (pipeline summary)
+    CI-->>PC: SSE done, passed, failed, skipped
+    end

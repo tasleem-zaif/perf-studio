@@ -1,0 +1,42 @@
+sequenceDiagram
+    actor User
+    participant CJ as Collections.jsx
+    participant AI as ai.js Route
+    participant DB as Database (Postgres)
+    participant EP as External API Endpoints
+
+    User->>CJ: Click "Run Pre-run" on an API Source
+    CJ->>AI: POST /api/ai/pre-run (collection_id, project_id)
+    AI->>DB: Verify ownsProject(userId, project_id)
+    AI->>DB: SELECT * FROM collections WHERE id = collection_id
+    AI->>AI: Parse json_content into endpoints array (max 20)
+
+    rect rgb(255, 245, 200)
+    Note over AI: Phase 1 - Fire all endpoints in parallel
+    loop For each endpoint
+        AI->>AI: isSafeUrl()? Block RFC1918 + loopback (SSRF protection)
+        AI->>EP: fetch endpoint (5s timeout)
+        EP-->>AI: status, headers, body
+        AI->>AI: extractToken() - checks token/access_token/jwt/bearer keys
+        AI->>AI: extractCookies(set-cookie header)
+    end
+    end
+
+    AI->>AI: Find first extracted auth token from successful responses
+
+    rect rgb(255, 245, 200)
+    Note over AI: Phase 2 - Retry any 401s with extracted token
+    loop For each 401 response
+        AI->>EP: Retry with Authorization Bearer token
+        EP-->>AI: status, body
+        AI->>AI: Mark tokenInjected true
+    end
+    end
+
+    AI->>AI: simpleHash(collection.json_content) - freshness hash
+    AI->>DB: UPDATE collections SET pre_run_data, pre_run_collection_hash
+    AI-->>CJ: responses, extractedToken present
+    CJ->>CJ: Store pre-run data, re-fetch collections
+    CJ->>CJ: Show pass/fail counts + Show Logs button
+
+    Note over CJ: Freshness gate in Test Plans - hash of<br/>current collection must match pre_run_collection_hash<br/>before "Generate Script" is enabled

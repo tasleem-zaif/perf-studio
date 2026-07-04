@@ -1,0 +1,35 @@
+flowchart TB
+    subgraph Auth["Authentication"]
+        A1["JWT HS256<br/>7-day expiry<br/>stored in localStorage"]
+        A2["bcrypt, 10 rounds<br/>password hashing"]
+        A3["Password Reset<br/>30-min token, expires on use"]
+    end
+
+    subgraph Authz["Authorization"]
+        Z1["auth middleware<br/>verifies JWT + session on every route"]
+        Z2["Role checks<br/>super_admin, org_admin, user"]
+        Z3["ownsProject()<br/>owner, assigned, or org scope"]
+    end
+
+    subgraph Lic["License Enforcement"]
+        L1["getOrgAccessStatus()<br/>checked on every request"]
+        L2["403 org_disabled / license_expired<br/>when disabled or past expiry"]
+    end
+
+    subgraph Enc["Encryption at Rest"]
+        E1["AES-256-CBC<br/>all secrets in PostgreSQL"]
+        E2["Encrypted: AI API keys, Git PATs,<br/>SMTP passwords, CI tokens"]
+    end
+
+    subgraph Net["Network Security"]
+        N1["Strict CORS<br/>CORS_ORIGIN env var"]
+        N2["SSRF Protection<br/>blocks RFC1918 + loopback in pre-run"]
+        N3["PAT injection<br/>at runtime only, never in .git/config"]
+    end
+
+    subgraph Cont["Container Security"]
+        C1["Non-root user<br/>in JMeter + K6 containers"]
+        C2["Read-only source mounts<br/>for script files"]
+    end
+
+    Auth --> Authz --> Lic --> Enc --> Net --> Cont

@@ -2,7 +2,7 @@
 
 Compressed reference for a new developer taking over this codebase. See also the hand-written docs in [docs/](docs/) (`ARCHITECTURE.md` has Mermaid diagrams, `USER_WORKFLOW.md` is the end-user guide) — this file cross-references them rather than duplicating.
 
-> ⚠️ **Migration in progress (uncommitted):** the working tree is mid-migration from SQLite → PostgreSQL. The docs (README/ARCHITECTURE/DEPLOYMENT) still describe SQLite as the database, but nearly every backend file has been rewritten to use async Postgres calls (see [Known TODOs / Developer Notes](#known-todos--in-progress-work)). Treat "SQLite" in the docs as stale until this lands.
+> ✅ **Migration complete**: SQLite → PostgreSQL migration is fully committed — `db/index.js` is now the Postgres entry point (no legacy SQLite code remains in `backend/src`). Docs (README/ARCHITECTURE/DEPLOYMENT/LOCAL_SETUP) have been updated to reflect Postgres as of 2026-07-04.
 
 ---
 
@@ -12,7 +12,7 @@ Compressed reference for a new developer taking over this codebase. See also the
 |---|---|
 | Frontend | React 18, Vite 5, axios, Chart.js / react-chartjs-2, html2canvas, jsPDF, xlsx |
 | Backend | Node.js, Express 4, nodemon (dev) |
-| Database | **Migrating**: `node:sqlite` (legacy, `db/index.js`) → PostgreSQL via `pg` (new, `db/pg.js`) |
+| Database | PostgreSQL via `pg` (`db/index.js` is the entry point all routes import — it re-exports `db/pg.js`'s async wrapper and seeds the super admin on first boot; `schema.sql` applied by `migrate.js`). No SQLite code remains in `backend/src` — the old `node:sqlite`/`DatabaseSync` module is gone, only referenced in a comment. |
 | AI | OpenAI GPT-4o (`openai` SDK) and Anthropic Claude — routed through one client (`aiClient.js`); Anthropic called via an OpenAI-compatible endpoint shape |
 | Load-test engines | Apache JMeter 5.6.3, Grafana K6 — bundled inside the Docker image (native execution) or spawned as containers (`EXECUTION_MODE=docker`) |
 | Git integration | `simple-git` (local ops), `@octokit/rest` (GitHub), raw HTTP for GitLab/Bitbucket REST APIs |
@@ -36,7 +36,7 @@ Browser (React SPA)
    ▼
 Express API (backend/src/index.js) ── mounts ~23 route modules under /api/*
    │
-   ├─ Postgres (or legacy SQLite) ── users, projects, collections, rules, test_suites, execution_runs, git_*, ci_*, ...
+   ├─ PostgreSQL ── users, projects, collections, rules, test_suites, execution_runs, git_*, ci_*, ...
    ├─ Filesystem workspaces (git-workspaces/<Project>/<admin|user-N>/<Collection>/<Env>/{config,testData,script,results})
    ├─ AI provider (OpenAI/Anthropic) ── script generation + auto-heal diagnosis
    ├─ JMeter / K6 binaries (native) or Docker containers ── test execution
@@ -60,7 +60,7 @@ perf-studio/
 │   ├── routes/       23 Express route modules (see API Endpoints below)
 │   ├── utils/        AI client, auto-healer, rule evaluator, test runner, PDF/email generation,
 │   │                 workspace path resolution, encryption helpers
-│   └── db/           index.js (legacy SQLite), pg.js (new Postgres compat shim), schema.sql, migrate.js
+│   └── db/           index.js (Postgres entry point + super-admin seed), pg.js (async pg wrapper), schema.sql, migrate.js
 ├── frontend/src/
 │   ├── pages/        19 route-level page components
 │   ├── components/   Sidebar, Auth, EnvBar, Modal/ConfirmModal, Toast, CustomSelect, ErrorBoundary
@@ -140,7 +140,7 @@ All routes are mounted under `/api` in `backend/src/index.js`. Nearly every rout
 
 ## Database Models
 
-Schema currently exists in two forms: legacy `backend/src/db/index.js` (SQLite) and the new `backend/src/db/schema.sql` (Postgres, applied by `migrate.js` — a one-time idempotent `CREATE TABLE IF NOT EXISTS` bootstrap, **not** a SQLite→Postgres data migrator).
+Schema is `backend/src/db/schema.sql`, applied by `migrate.js` — an idempotent `CREATE TABLE IF NOT EXISTS` bootstrap, safe to re-run, **not** a SQLite→Postgres data migrator (there was never production data to migrate). `db/index.js` seeds a `super_admin` (`admin@perfstudio.com` / `Admin@123`) on first boot if none exists yet, non-blocking at require time.
 
 **Core tables** (Postgres, all with `SERIAL id`): `organizations`, `users`, `projects`, `collections`, `rules`, `scripts`, `test_suites`, `test_data_files`, `execution_runs`, `auto_heal_logs`.
 
@@ -251,8 +251,7 @@ Org-level plan/entitlement system, modeled on Quarks' other product (Autonix) bu
 | `ENCRYPTION_KEY` | Recommended | AES-256-CBC key for encrypting stored API keys/SMTP passwords/git tokens |
 | `FRONTEND_URL` | ✅ | Used in invite/reset-password email links |
 | `CORS_ORIGIN` | ✅ | Allowed origin for the API |
-| `DATABASE_URL` | ✅ (Postgres mode) | Postgres connection string, e.g. `postgresql://postgres:postgres@postgres:5432/perf_studio` |
-| `DB_PATH` | Legacy | SQLite file path — ignored once `DATABASE_URL` is set |
+| `DATABASE_URL` | ✅ | Postgres connection string, e.g. `postgresql://postgres:postgres@postgres:5432/perf_studio` — the only DB config read; no SQLite fallback exists |
 | `PORT` / `BACKEND_PORT` | Optional | Backend port (default 3001) |
 | `FRONTEND_PORT` | Optional | Frontend port (default 5173) |
 | `HOST_PROJECTS_ROOT` / `HOST_BACKUPS_ROOT` | ✅ (Docker) | Host paths for volume mounts |
@@ -282,9 +281,9 @@ Org-level plan/entitlement system, modeled on Quarks' other product (Autonix) bu
 
 ## Known TODOs / In-Progress Work
 
-- **SQLite → PostgreSQL migration is uncommitted and incomplete-looking from docs' perspective**: `backend/src/db/pg.js`, `schema.sql`, `migrate.js` are new/untracked; nearly every route/util file is modified to `await` DB calls. `docker-compose.yml` now provisions a `postgres` service and drops the old SQLite volume. Docs (README, ARCHITECTURE.md, DEPLOYMENT.md) still describe SQLite as current — **update these once the migration is committed**, and confirm `db/index.js` (legacy SQLite) is fully retired or intentionally kept as a fallback.
-- Stray/junk files present in the working tree that look like accidental artifacts and probably want cleanup or a `.gitignore` entry: `backend/C:UsersTasleemAppDataLocalTemprurl.txt`, `backend/UsersTasleemperf-studiogit-workspaces...` (a filename that looks like a mangled absolute path), and an untracked `quarks-user/` directory at repo root that duplicates `git-workspaces/quarks-user/`.
-- `.claude/launch.json` originally had no `cwd` for either service — fixed during this session to point `frontend`→`frontend/` and add a `backend`→`backend/` entry; worth committing if this file is meant to be shared.
+- Stray/junk file still present in the working tree as of 2026-07-04: `backend/UsersTasleemperf-studiogit-workspaces...` (a mangled-absolute-path filename) — likely wants cleanup or a `.gitignore` entry.
+- **`schema.sql` is never applied automatically** — no `docker-entrypoint-initdb.d` mount on the `postgres` service, no migration call in `backend/src/index.js`'s boot sequence or `docker-entrypoint.sh`. A fresh Postgres volume needs `node backend/src/db/migrate.js` run manually (once, and again after any schema change) before the app can serve real requests — documented in deployment docs as of 2026-07-04, but worth fixing at the infra level (e.g. entrypoint script) if this trips people up in practice.
+- `.claude/launch.json` has `cwd` set correctly for both `frontend` and `backend` entries (this was previously a gap; now resolved and committed).
 
 ---
 
@@ -297,7 +296,7 @@ frontend (React/Vite)
 backend/index.js
    → routes/*  (23 modules)
         → utils/ownsProject, utils/projectFolders   (nearly all)
-        → db (pg.js compat shim → Postgres, or legacy index.js → SQLite)
+        → db (index.js entry point → pg.js compat shim → PostgreSQL)
         → utils/aiClient → OpenAI / Anthropic APIs        (ai.js, testSuites.js, autoHealer.js)
         → utils/testRunner → JMeter/K6 binaries or Docker  (execution.js, pipelines.js, ciPipeline.js)
         → utils/ruleEvaluator                              (testRunner.js, autoHealer.js, ciPipeline.js)
@@ -313,6 +312,6 @@ backend/index.js
 ## Developer Notes
 
 - Product is branded **"Peako"** in the frontend UI/HTML title (`<title>Peako | Quarks</title>`) but the codebase, Docker images, and docs all use **"PerfStudio"** — same product, two names in use; don't be thrown by the mismatch.
-- Default seeded credentials per README: `admin@perfstudio.com` / `Admin@123` (super admin) — presumably created on first boot; verify where that seeding happens if it's not obvious (not confirmed by this pass — check `migrate.js` or an init script if you need to reproduce a clean environment).
+- Default seeded credentials: `admin@perfstudio.com` / `Admin@123` (super admin) — seeded by `db/index.js` at require time (checks for an existing `super_admin` row, inserts one if none exists), non-blocking, runs every backend boot. Not part of `migrate.js` (which only applies schema).
 - Built by Quarks Technosoft PVT. LTD. (QTSolv) — proprietary, not open source, despite the public GitHub repo used for the Docker Hub CI badge in README.
 - End-to-end user workflow (org setup → API source import → pre-run → rules → env config → test plan → script generation → CI pipeline → analytics → PDF export → git commit/PR) is documented step-by-step in [docs/USER_WORKFLOW.md](docs/USER_WORKFLOW.md) — read that before touching any single feature in isolation, since most features exist to serve this one linear flow.
