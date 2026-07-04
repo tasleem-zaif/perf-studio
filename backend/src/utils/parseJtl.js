@@ -29,7 +29,7 @@ function parseJtl(jtlPath, runMeta = {}) {
   function parseRow(line) {
     const parts = line.split(',');
     const row = {};
-    headers.forEach((h, i) => { row[h] = (parts[i] || '').replace(/^"|"$/g, '').trim(); });
+    headers.forEach(async (h, i) => { row[h] = (parts[i] || '').replace(/^"|"$/g, '').trim(); });
     return row;
   }
 

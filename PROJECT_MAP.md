@@ -1,0 +1,318 @@
+# PROJECT_MAP.md — Peako / PerfStudio
+
+Compressed reference for a new developer taking over this codebase. See also the hand-written docs in [docs/](docs/) (`ARCHITECTURE.md` has Mermaid diagrams, `USER_WORKFLOW.md` is the end-user guide) — this file cross-references them rather than duplicating.
+
+> ⚠️ **Migration in progress (uncommitted):** the working tree is mid-migration from SQLite → PostgreSQL. The docs (README/ARCHITECTURE/DEPLOYMENT) still describe SQLite as the database, but nearly every backend file has been rewritten to use async Postgres calls (see [Known TODOs / Developer Notes](#known-todos--in-progress-work)). Treat "SQLite" in the docs as stale until this lands.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, Vite 5, axios, Chart.js / react-chartjs-2, html2canvas, jsPDF, xlsx |
+| Backend | Node.js, Express 4, nodemon (dev) |
+| Database | **Migrating**: `node:sqlite` (legacy, `db/index.js`) → PostgreSQL via `pg` (new, `db/pg.js`) |
+| AI | OpenAI GPT-4o (`openai` SDK) and Anthropic Claude — routed through one client (`aiClient.js`); Anthropic called via an OpenAI-compatible endpoint shape |
+| Load-test engines | Apache JMeter 5.6.3, Grafana K6 — bundled inside the Docker image (native execution) or spawned as containers (`EXECUTION_MODE=docker`) |
+| Git integration | `simple-git` (local ops), `@octokit/rest` (GitHub), raw HTTP for GitLab/Bitbucket REST APIs |
+| Email | `nodemailer` (SMTP) |
+| PDF | `puppeteer` (HTML→screenshot) + `pdfkit` (page stitching) |
+| Auth | `jsonwebtoken` (JWT HS256), `bcryptjs` (password hashing) |
+| File uploads | `multer` |
+| Backups | `archiver` (ZIP) |
+| Containerization | Docker, Docker Compose |
+| CI/CD (of PerfStudio itself) | GitHub Actions → Docker Hub (`.github/workflows/docker-publish.yml`) |
+
+---
+
+## Architecture
+
+Peako/PerfStudio is a **performance-testing platform**: users import an API definition (Postman collection / Swagger / cURL / raw JSON), the platform fires the endpoints live ("pre-run") to learn auth tokens and response shapes, an AI model generates a JMeter or K6 load-test script from all of that plus user-configured rules/test-data, and the script is executed either natively, in a spawned Docker container, or via an external CI provider (GitLab/GitHub Actions/Bitbucket). Results are parsed, evaluated against pass/fail rules, emailed, and rendered as analytics dashboards / PDF reports.
+
+```
+Browser (React SPA)
+   │ axios, JWT in Authorization header
+   ▼
+Express API (backend/src/index.js) ── mounts ~23 route modules under /api/*
+   │
+   ├─ Postgres (or legacy SQLite) ── users, projects, collections, rules, test_suites, execution_runs, git_*, ci_*, ...
+   ├─ Filesystem workspaces (git-workspaces/<Project>/<admin|user-N>/<Collection>/<Env>/{config,testData,script,results})
+   ├─ AI provider (OpenAI/Anthropic) ── script generation + auto-heal diagnosis
+   ├─ JMeter / K6 binaries (native) or Docker containers ── test execution
+   ├─ Git provider (GitHub/GitLab/Bitbucket) ── script versioning, PRs, CI triggers
+   └─ SMTP ── alert emails, invites, password reset
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Mermaid diagrams (system architecture, data model, auto-heal flow, CI pipeline flow, security model, multi-env isolation).
+
+**Multi-environment / multi-tenant isolation model:**
+- Every project has one workspace folder per **environment** (QA/Staging/UAT/Production) and one per **actor**: an `admin/` workspace (org admin, pushes to `main`) and one `user-<id>/` workspace per regular user (pushes to `users/<name>`, merges via PR).
+- Config, test data, scripts, and results are always scoped by `collection_id + env` at the DB layer — switching env in the UI can never leak another env's data.
+
+---
+
+## Folder Responsibilities
+
+```
+perf-studio/
+├── backend/src/
+│   ├── routes/       23 Express route modules (see API Endpoints below)
+│   ├── utils/        AI client, auto-healer, rule evaluator, test runner, PDF/email generation,
+│   │                 workspace path resolution, encryption helpers
+│   └── db/           index.js (legacy SQLite), pg.js (new Postgres compat shim), schema.sql, migrate.js
+├── frontend/src/
+│   ├── pages/        19 route-level page components
+│   ├── components/   Sidebar, Auth, EnvBar, Modal/ConfirmModal, Toast, CustomSelect, ErrorBoundary
+│   └── api.js         axios instance + JWT/session handling
+├── git-workspaces/   Per-project/per-user working copies (gitignored; runtime-generated)
+├── projects/         Per-project data root referenced by PROJECTS_ROOT (gitignored)
+├── backups/          ZIP backups made on project delete (gitignored)
+├── docs/             ARCHITECTURE.md, DEPLOYMENT.md, LOCAL_SETUP.md, USER_WORKFLOW.md
+└── docker-compose.yml, Dockerfile, backend/Dockerfile, frontend/Dockerfile
+```
+
+---
+
+## Backend Services (utils/)
+
+| File | Purpose |
+|---|---|
+| `aiClient.js` | Single entry point for LLM calls (`callAi(userId, systemPrompt, userPrompt, purpose)`). Routes to OpenAI or Anthropic based on the admin's saved `ai_settings`; decrypts the stored API key; `purpose='script'` vs `'heal'` selects a different model. Anthropic is called through an OpenAI-compatible endpoint. Temperature fixed at 0.2. |
+| `autoHealer.js` | 3-attempt, 2-phase auto-heal loop for failed runs. Classifies JTL errors (DNS, auth/correlation, assertion, variable-reference, request-malformed, or ≥70% infra failures), builds a diagnostic prompt, asks the AI for a JSON fix (`{issue, fix, fix_type, fixed_script}`), applies it, quick-verifies (3 VUsers/20s), then does a full re-run with original params. Max 3 attempts; rejects fixes that drop any sampler/endpoint. |
+| `ruleEvaluator.js` | Parses a JTL file into metrics (error rate, avg RT, P90/P95, throughput) and evaluates them against the project's `rules` rows (`>`, `>=`, `<`, `<=`, `==`, `between`). `severity=error` rules must all pass for the run to pass; `warn` rules are logged only. |
+| `testRunner.js` | Spawns the actual JMeter/K6 subprocess natively, patches runtime params into the JMX, streams stdout, and calls `ruleEvaluator` on the resulting JTL. Locates binaries via a fallback chain (bundled → common install paths → PATH). |
+| `generateAnalyticsPdf.js` | Renders a 6-page analytics report (Summary, Dashboard, Transactions, Trend, Resource Utilization, Errors) as HTML with inlined Chart.js, screenshots each page via Puppeteer, stitches into a PDF with `pdfkit`. |
+| `emailUtils.js` | Three email types: post-run summary (KPI grid + PDF), mid-run rule-breach alert, post-run violation summary. Resolves SMTP config from the user's own settings, falling back to an org/super admin's SMTP config; merges recipients from user, admin, and project-specific lists. |
+| `projectFolders.js` | Computes/creates the `git-workspaces/<Project>/<admin|user-N>/...` folder tree; distinguishes admin vs. per-user workspaces; zips + deletes on project removal. |
+| `ownsProject.js` | Central authorization check — owner, project-assignment, org-admin-of-owner's-org, or super-admin all grant access. |
+| `configWriter.js` | Regenerates each collection/env's `config.json` snapshot (project info, rules, test plans, merged URL config) whenever rules/config/collections change. |
+| `parseCollection.js` | Converts an uploaded Postman v2.1 collection or Swagger/OpenAPI spec into Peako's internal flat endpoint list (`{name, folder, method, url, headers, body, queryParams}`). **Does not execute Postman pre-request scripts or resolve `{{var}}` — see Business Logic note below.** |
+| `resetSequence.js` | After bulk deletes, resets a Postgres `SERIAL` sequence to `MAX(id)` to avoid ID gaps. |
+
+---
+
+## Frontend Architecture
+
+- **No Redux/Zustand** — all app state (`user`, `projects`, `activeProject/Collection/Env`, `page`) lives in `useState` at the top of `App.jsx` and is prop-drilled down. `ToastProvider`/`useToast` and a promise-based `useConfirm` are the only context-like abstractions.
+- **Routing** is manual (no react-router visible from the report) — `page` state + `popstate` listener; a `ProjectWorkspace` wrapper renders project-scoped sub-pages (`collections`, `test-data`, `rules`, `config`, `test-suites`, `alerts`, `runner`, `analytics`, `reports`, `ai-config`, `git`) sharing `activeProject/Collection/Env` context.
+- **Fixed: active-collection auto-select had a mount-timing race**. `ProjectWorkspace.jsx` auto-selects `collections[0]` as `activeCollection` (and its first env as `activeEnv`) via a `useEffect` — this is the **only** place either gets set anywhere in the file, there's no manual collection/env picker UI. The effect's dependency array was `[project?.id]` only, so if `project.collections` arrived asynchronously *after* that first run (a real, reproducible race — confirmed on a fresh login), no collection ever got auto-selected. Symptom: `Config.jsx` (and any other page needing `collection`/`env`) permanently fell back to its "no collection selected" branch — no EnvBar, no per-collection Environment Config/Variables section, even though the project genuinely had collections. Fixed by adding `collections.length` to the dependency array so the effect re-evaluates once the list actually arrives, not just once at mount.
+- **Auth**: JWT stored in `localStorage` as `ps_token`, attached via an axios request interceptor; a 1-second heartbeat to `/api/auth/heartbeat` detects a session being taken over from another tab/device and force-logs-out; 401 responses clear storage and reload.
+- **19 pages**: Dashboard, ProjectHome, ProjectWorkspace, Collections, Rules, Runner, TestSuites, TestData, Config, Settings, Profile, Alerts, Analytics, Reports, GitPanel, PipelineConfig, Auth, ForgotPassword, ResetPassword, AcceptInvite.
+- **Key components**: `Sidebar` (hierarchical project→collection→workflow-step nav), `EnvBar` (env pill selector on env-aware pages), `GitPanel` (status/diff/commit/branch/PR UI).
+
+---
+
+## API Endpoints
+
+All routes are mounted under `/api` in `backend/src/index.js`. Nearly every router calls `router.use(auth)` — exceptions are noted. `:projectId`-scoped routers additionally check `ownsProject()` per request.
+
+| Mount | Router file | Notes |
+|---|---|---|
+| `/api/auth` | `auth.js` + `passwordReset.js` | `POST /register`, `POST /login`, `POST /logout`, `POST /heartbeat`🔒, `GET/PUT /me`🔒, `PUT /me/password`🔒, `POST /forgot-password`, `POST /reset-password` (all public except marked 🔒) |
+| `/api/admin` | `admin.js` + `passwordReset.js` | `GET /users`, `PUT /users/:id/status`, `DELETE /users/:id`, `POST /users/:id/reset-password` — admin-only |
+| `/api/orgs` | `orgs.js` | Full CRUD, super-admin only except public `GET /` (signup org list) |
+| `/api/dashboard` | `dashboard.js` | `GET /stats` |
+| `/api` (bare) | `summary.js` | `GET /collections`, `/rules`, `/test-plans`, `/test-data` — auth applied **per-route**, not globally (must not shadow public routes like invite validation) |
+| `/api/projects` | `projects.js` | CRUD, `POST /:id/ensure-folders`, `GET /backups`, `GET /backups/:filename` |
+| `/api/projects/:projectId/collections` | `collections.js` | `GET /`, `POST /parse-curl`, `POST /` (upload+parse; accepts `file` + optional `environment_file` — a Postman environment export used to seed `{{var}}` values), `PUT/DELETE /:id` |
+| `/api/projects/:projectId/rules` | `rules.js` | CRUD |
+| `/api/projects/:projectId/scripts` | `scripts.js` | CRUD |
+| `/api/projects/:projectId/test-suites` | `testSuites.js` | CRUD, `POST /:id/generate` (AI script gen), `GET /:id/download/:type` |
+| `/api/projects/:projectId/test-data` | `testData.js` | Upload/list/edit/delete CSV, `POST /:id/open-external` |
+| `/api/projects/:projectId/config` | `projectConfig.js` | `GET/PUT /` |
+| `/api/projects/:projectId/collections/:collectionId/env-config` | `envConfig.js` | `GET/PUT /:env` — strict per-env isolation |
+| `/api/config` | `config.js` | Global user-level URL/port/protocol default |
+| `/api/ai` | `ai.js` | `POST /pre-run` — fires live requests, extracts auth tokens, SSRF-guarded |
+| `/api/settings` | `settings.js` | `GET/PUT /ai` — OpenAI/Anthropic provider config, key never returned raw |
+| `/api/runner` | `runner.js` | `POST /execute` — **mock/simulated** run for UI testing, not real execution |
+| `/api/execution` | `execution.js` | Real execution: dep checks, Docker mgmt, `POST /run`, run lifecycle, PDF export, JMeter latency sim |
+| `/api/alerts` | `alerts.js` | SMTP config, test-send, global + per-project recipients |
+| `/api/invites` | `invites.js` | Invite CRUD; `GET /validate/:token` and `POST /accept/:token` are public |
+| `/api/projects/:projectId/git` | `git.js` | Config, init, status/diff, commit/push/pull, branches, PRs, identity |
+| `/api/projects/:projectId/pipelines` | `pipelines.js` | Internal sequential test-plan pipelines (SSE-streamed runs) — **not** external CI |
+| `/api/projects/:projectId/ci` | `ciPipeline.js` | External CI/CD: GitLab/GitHub Actions/Bitbucket config, YAML gen, trigger, run status/steps/sync-results, CI-context auto-heal |
+| `/api/health` | (inline in `index.js`) | Liveness check, no auth |
+
+**Naming gotcha**: `runner.js` (mock) vs `execution.js` (real) and `pipelines.js` (internal test-plan sequencing) vs `ciPipeline.js` (external CI providers) are easy to confuse — they are deliberately separate subsystems.
+
+---
+
+## Database Models
+
+Schema currently exists in two forms: legacy `backend/src/db/index.js` (SQLite) and the new `backend/src/db/schema.sql` (Postgres, applied by `migrate.js` — a one-time idempotent `CREATE TABLE IF NOT EXISTS` bootstrap, **not** a SQLite→Postgres data migrator).
+
+**Core tables** (Postgres, all with `SERIAL id`): `organizations`, `users`, `projects`, `collections`, `rules`, `scripts`, `test_suites`, `test_data_files`, `execution_runs`, `auto_heal_logs`.
+
+**Config tables**: `global_config`, `project_config`, `collection_env_config` (per-collection-per-env, unique on `collection_id+env`; `config_json` shape is `{ urls: [{protocol,url,port}], variables: {key: value} }` — `variables` added to support `{{var}}` substitution in pre-run, see Business Logic below), `ai_settings`.
+
+**Auth/session**: `user_sessions` (JWT `jti` tracking — single active session enforcement), `password_resets`, `invites`, `project_assignments`.
+
+**Git**: `git_configs` (project-level), `user_git_configs` (per-user override, unique on `user_id+project_id`), `git_commits`, `git_prs`.
+
+**Pipelines/CI**: `pipeline_configs`, `pipeline_runs` (internal); `ci_pipeline_configs` (unique `project_id+user_id`), `ci_pipeline_runs`, `ci_auto_heal_logs` (external CI).
+
+**Alerts**: `alert_configs` (SMTP, per-user), `alert_recipients`.
+
+**Key FKs**: `users.org_id→organizations`, `projects.user_id→users`, `collections/rules/scripts/test_suites/execution_runs.project_id→projects` (CASCADE), `test_suites.collection_id→collections` (SET NULL at the DB level, but see below — app code now deletes instead of relying on this), `execution_runs.suite_id→test_suites` (SET NULL). No explicit secondary indexes beyond PK/UNIQUE constraints.
+
+---
+
+## Authentication
+
+- JWT (HS256, `JWT_SECRET` env, 7-day expiry per `auth.js`'s `JWT_EXPIRES`; docs say 14-day — verify against `passwordReset`/`auth.js` at time of reading).
+- Every token carries a `jti`; `user_sessions` tracks one active session per user server-side — logging in elsewhere invalidates the old session (`SESSION_ACTIVE` conflict unless `force: true` is passed). Session also expires after 30 minutes of inactivity, tracked via `last_used_at`.
+- `middleware/auth.js` validates the Bearer token, checks the session row hasn't expired/gone stale, and updates `last_used_at` on every authenticated request.
+- Passwords: bcrypt, 10 rounds.
+- Roles: `super_admin` (all orgs), `org_admin` (own org's projects, can invite/approve), `user` (only explicitly assigned projects). Role checks are enforced both in route handlers and via `ownsProject()`.
+- Secrets at rest (API keys, SMTP passwords, git PATs/SSH keys) are AES-256-CBC encrypted; never returned raw over the API (masked or presence-flagged instead).
+
+---
+
+## Licensing System (added)
+
+Org-level plan/entitlement system, modeled on Quarks' other product (Autonix) but adapted to Peako's architecture (no external package registry, so no "Registry Token" concept — enforcement is direct at the auth layer instead).
+
+- **Schema**: `org_licenses` table (one row per org: `plan`, `max_users`, `max_projects` — `NULL` = unlimited, `status` active/disabled, `expires_at`). `organizations` gained `description`/`website`/`industry` columns.
+- **Plan tiers** (`backend/src/utils/license.js`, `PLAN_DEFAULTS`): trial (2u/1p/7d), starter (5u/3p/180d), growth (15u/10p/180d), business (30u/20p/180d), enterprise (∞/∞/180d). `getOrCreateOrgLicense()` lazily creates a `trial` row for any org with none yet.
+- **Enforcement**: `middleware/auth.js` checks `getOrgAccessStatus()` on every request for non-super-admin users with an org — `403 org_disabled`/`license_expired` if invalid. `invites.js` (invite creation + accept) and `projects.js` (creation) additionally check `usersAtLimit`/`projectsAtLimit`.
+- **API**: `routes/licenses.js` (`/api/licenses/*` — plans, mine, per-org CRUD, status toggle). `orgs.js` extended: `POST /` now accepts `plan`/`admin_email` (creates org + license + optionally sends the first org_admin invite via `invites.js`'s exported `createInviteCore()`), `GET /:id/admins`, `GET /managed` includes `pending_invites`.
+- **Super Admin UI**: consolidated into one page, `frontend/src/pages/OrganizationsAdmin.jsx` (route `settings-orgs`) — stat cards, org list + detail with **Overview / Edit Details / License & Limits / Org Admins** tabs. Super admin's Sidebar/topbar are removed entirely (`App.jsx`, role check `!== 'org_admin'`) — Organizations is their only destination, so the page renders full-width; default-landing logic always redirects super_admin to `/settings/orgs`. The old standalone "Licenses" and "User Management" nav items are gone for super_admin only — **org_admin's own nav/pages are untouched** (`settings-users`, `settings-smtp`, `settings-licenses` read-only self-view all still exist for that role).
+- **Shared component gotcha**: `SMTPConfigPanel` (`frontend/src/components/SMTPConfigPanel.jsx`) is used both as org_admin's standalone page (`standalone=true` default, shows Gmail help box) and embedded inside `OrganizationsAdmin`'s Org Admins tab (`standalone={false} showHelp={false}` — its `.page` class reserves topbar-offset padding that's wrong when nested).
+- **Org slug**: `orgs.js` used to always suffix `-${Date.now()}` for uniqueness (ugly, e.g. `/quarks-1780771234809`) — fixed to only disambiguate (`-2`, `-3`...) on an actual collision.
+
+---
+
+## Business Logic — Notable / Non-Obvious
+
+- **Postman `{{var}}` handling**: `parseCollection.js` stores the raw URL string as-is, including any `{{var}}` template text — it does **not** execute Postman pre-request scripts or resolve Postman environment/collection variables at parse time. Downstream, `testSuites.js`'s `normalizeEp()`/`toJmeterVar()` extracts just the **path** portion (discarding whatever precedes it, including `{{url}}`) and rewrites any remaining `{{var}}` in query params to JMeter's `${var}` syntax.
+- **Added: multi-host JMeter script generation — a single collection covering several API families with different base URLs (e.g. Binance's Spot/Futures/Options/Wallet/Convert APIs, each on its own subdomain via a distinct `{{var}}`) now generates ONE JMX with multiple hosts, instead of forcing every sampler onto a single host.** This supersedes the earlier "each family must be a separate API Source" limitation for the common case where the multi-host-ness is expressed via distinct `{{var}}` tokens (still true if a collection mixes literal hostnames with no variable at all — that genuinely can't be disambiguated). `testSuites.js`'s new `resolveEndpointHost(rawUrl, variables)` resolves each endpoint's own leading `{{var}}` token against `cfg.variables` (the collection's harvested variable map — same one `collections.js`'s `seedEnvVariables`/`autoPopulateProjectConfig` populate) independently at generation time, grouping endpoints by distinct resolved `{protocol,host,port}`. `buildJmxTemplate()`/`buildSamplerXml()`: if only one distinct host is used, behavior is unchanged (plain `PROTOCOL`/`SERVER`/`PORT` UDVs, all samplers reference them). If more than one, it instead emits indexed `PROTOCOL_1/SERVER_1/PORT_1`, `PROTOCOL_2/SERVER_2/PORT_2`, ... (no plain/unindexed set — would just duplicate whichever host came first) and wires each `HTTPSamplerProxy`'s domain/port/protocol to the `_N` triplet matching its own endpoint's resolved host; an endpoint whose host can't be resolved (relative path, unknown variable) defaults to host `_1`. "HTTP Request Defaults" and the runtime-override XML comment (`-JSERVER_1=... -JSERVER_2=...`) follow the same indexing. Script generation's pre-check (`POST /:id/generate`) also now accepts "at least one endpoint resolves a host via `cfg.variables`" as satisfying the "has a target URL" requirement, not just a saved `collection_env_config.urls` entry — keeps a freshly-imported multi-host collection generatable even before `collection_env_config.urls` (a flat single-array field, not host-aware) catches up.
+- **At script-generation time, the target host/port/protocol comes from Peako's own per-collection-per-env config (`envConfig.js` / `collection_env_config.urls` for the single-host default, `.variables` for multi-host per-endpoint resolution above) — never from a *literal* base URL embedded in the imported collection itself**, only from `{{var}}` tokens resolved against the collection's own variable map. A collection using literal (non-`{{var}}`) hostnames for different families with no distinguishing variable at all still can't be split automatically — import each such family as a separate API Source.
+- **Fixed: importing a `{{var}}`-only collection (base URL only ever referenced as `{{alpha_url}}`, never literal) left that collection's `collection_env_config.urls` completely empty, forcing the user to manually type in the URL under Config > Environment Config even after uploading a Postman environment file that already had the real value.** `collections.js`'s `autoPopulateProjectConfig()` builds its hostname list by `new URL()`-parsing each endpoint's raw URL and skipping anything still containing `{{` — for a collection whose *every* endpoint uses a template base URL, this produced zero `urlSets`, so the function returned at line 46 before ever writing `collection_env_config` (see the CI-status/heal fix entry below for how this empty config then leaked another collection's URL into script generation). Fixed by resolving `{{key}}` tokens in each endpoint's raw URL against the collection's already-computed `collectionVariables` map (collection's own `variable` array defaults, overridden by an uploaded `.postman_environment.json` — the same map `seedEnvVariables()` stores) *before* the `{{`-skip check — `autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables)` now takes that map as a 4th arg, passed from both `POST /` and `PUT /:id`. A collection like Binance whose endpoints are all `{{alpha_url}}/...` now gets its env config auto-filled with the real resolved host/protocol/port (port stays `''` if the variable's value didn't specify one) the moment it's imported — no manual Environment Config edit needed for the common case. Still manual-only when the base URL isn't captured by any variable or literal URL at all (genuinely no way to infer it). `configWriter.js`'s parallel `autoPopulateFromCollections()` (only touches project-wide `project_config`, a display-only reference value, not read by script generation since the collection-scoping fix above) was intentionally left as-is.
+- **Pre-run `{{var}}` substitution (added)**: `collection_env_config.config_json` now supports an optional `variables: { [key]: value }` map alongside `urls`, keyed per collection+env like everything else in that table. It's populated two ways at collection import/update time (`collections.js`): (1) auto-harvested from the Postman collection's own top-level `variable` array if present (`extractCollectionVariables`), and (2) from an optional second file upload — a Postman `.postman_environment.json` export (`environment_file` form field, parsed by `parsePostmanEnvironment`) — whose values win over the collection's own defaults. Re-uploading a collection never clobbers variable values a user already has stored for an env (`seedEnvVariables` only fills in missing keys). `ai.js`'s `POST /pre-run` looks up the collection's **default** environment's variables (`collections.environment` — pre-run itself has no per-env selector in the UI today) and substitutes `{{key}}` in the URL/headers/body before the SSRF `isSafeUrl()` check and before firing the request; if a token is still unresolved after substitution, pre-run now returns a clear `Missing value for variable(s): x, y` skip reason instead of the old generic "URL blocked or invalid". Script generation's `{{var}}`→`${var}` behavior (above) is unchanged by this — this fix is specific to pre-run's live HTTP calls.
+- **Pre-run used to hard-cap at the first 20 endpoints (`endpoints.slice(0, 20)`), removed**: now fires every endpoint in the collection, not a subset — this was a real, documented limitation (`docs/USER_WORKFLOW.md` used to say "up to 20"), not something the user was doing wrong. To avoid hammering the target server with a huge simultaneous burst on large collections, endpoints are still processed in bounded-concurrency chunks (`CHUNK_SIZE = 20`, same concurrency as the old single batch) with a 250ms pause between chunks, rather than one giant `Promise.all` over the whole list. Confirmed on a real 56-endpoint collection: all 56 fired (previously would've silently stopped at 20), completed in ~4.6s.
+- **Pre-run was also never appending query params (separate bug, fixed)**: `parseCollection.js` stores an endpoint's query params separately (`ep.queryParams`, e.g. `{symbol: "BTCUSDT"}`) from its URL (`ep.url` has no query string). `ai.js`'s `fireEndpoint` only ever fetched `ep.url` directly, silently dropping every query param on every pre-run request — endpoints requiring a mandatory param (e.g. Binance's `symbol`) failed with `400`/`-1102 "Mandatory parameter ... was not sent"` even though the collection had the param stored. Fixed with `appendQueryParams(url, ep.queryParams, variables)` (builds `?k=v&...`, substituting `{{var}}` in values too) before firing — confirmed with a real Binance collection: fixed 400s across an entire API family and several others outright. Any params still failing afterward are almost always a genuinely different problem — the *value* stored is a Postman placeholder (e.g. `symbol_example`, `INTERVAL_1m`) rather than a real one, which surfaces as Binance's own validation errors (`-1121 Invalid symbol`, `-1120 Invalid interval`) — that's a collection data-quality issue to fix in the source values, not a Peako bug.
+- **Some endpoints need a real API key even in a "no-signature" collection (known limitation, not a bug)**: Binance classifies some endpoints (e.g. `listenKey` management, futures `historicalTrades`) as needing an `X-MBX-APIKEY` header without needing a full HMAC signature — filtering a collection down to "no signature required" doesn't fully capture "needs zero credentials". Peako has no way to supply a real key for these (the stored header value is blank, not a `{{var}}` token, since Postman's own collection relied on a pre-request script to inject it, which Peako doesn't run) — they'll show `401`/`-2014 "API-key format invalid"` until a real key is wired into that specific header manually.
+- **Pre-run** (`ai.js`) must be run and "fresh" (hash-matched to the current collection) before script generation is allowed — this gates `testSuites.js`'s `POST /:id/generate`.
+- **Fixed: `{{var}}`-as-hostname pollution in the URL auto-populate logic**: `collections.js`'s `autoPopulateProjectConfig()`, `configWriter.js`'s `autoPopulateFromCollections()`, and `Config.jsx`'s frontend `autoPopulateFromCollection()` all independently did `new URL('https://' + rawUrl)` on every endpoint URL to seed `project_config`/`collection_env_config.urls` — with no check for `{{var}}` templates, this happily "parsed" e.g. `{{alpha_url}}` as a literal hostname and always defaulted its port to `443` (since no real port was ever present to parse), producing confusing garbage rows in the **Endpoint Details** panel (project-level `urls`, shown in Config.jsx when no collection/env is selected — a completely different, unrelated panel from the collection+env-scoped **Variables** section described above). All three now skip any hostname containing `{{`. **This panel was never the place to set `{{var}}` values anyway** — that's the Variables section under Environment Config, scoped per collection+env; Endpoint Details is for literal, real base URLs only (a separate, project-wide config unrelated to pre-run's variable substitution). **Also fixed in the same pass**: all three no longer default a missing port to `443`/`80` (`u.port || (protocol==='https'?'443':'80')` → `u.port || ''`) — a URL with no explicit port now shows an empty port field instead of an assumed one, so the UI reflects only what was actually in the collection.
+- **Fixed: `Config.jsx`'s `normalizeConfig()` treated a missing `urls` key differently from an explicit empty array**. A config saved with no `urls` key at all (e.g. one that only ever had `variables` set, like a `{{var}}`-only collection after the fix above) fell through to a `else` branch that synthesized one blank template row (`[{...BLANK_URL}]`) — while an explicit `urls: []` correctly rendered zero rows. Same real-world meaning ("no URLs configured"), two different UI results: a confusing phantom blank row sitting right next to a "0 URL(s)" badge. Both cases now normalize to `[]` — a genuinely empty `urls` list means zero rendered rows, full stop; "+ Add URL Set" is how a user adds one on demand, nothing should auto-inject a blank row by default.
+- **Fixed a real data-leakage bug: deleted collections' env config could silently "leak" into a brand new, unrelated collection.** `collection_env_config` and `test_data_files` both store `collection_id` as a plain `INTEGER` with **no foreign key / cascade at all** (confirmed in `schema.sql`) — deleting a collection (`collections.js`'s `DELETE /:id`) only ever removed the `collections` row itself, never these two tables' rows for that id. Compounding this, the same handler calls `resetSequence('collections')` on every delete specifically so the next inserted collection can reuse the freed id — meaning a brand new collection could immediately inherit a deleted, unrelated collection's leftover `urls`/`variables` (env config) or test-data-file associations, purely by chance of getting the same recycled id. Confirmed live: a freshly created test collection showed another (already-deleted) collection's Binance API variables and a stale `{{url}}`/port-443 entry. Fixed by explicitly deleting `collection_env_config`/`test_data_files` rows for that `collection_id` before deleting the collection itself. Also did a one-time cleanup of 25 already-orphaned `collection_env_config` rows left over from before this fix existed. `test_suites.collection_id` was already safe — it has a proper FK with `ON DELETE SET NULL`; only these other two tables had the gap.
+- **Environment file is saved alongside the collection source**: when an `environment_file` is uploaded with a collection, `collections.js`'s `setupCollectionFolder()` writes it to the same `testData/` folder as the collection's own source file — `<Collection>_source.json` and `<Collection>_environment.json` side by side, per environment folder, for every environment the collection was created/updated with.
+- **`Config.jsx` restructured: local collection+env picker, no more global-state dependency**. It used to receive `collection`/`env`/`envs`/`onEnvChange` as props from `ProjectWorkspace.jsx`'s single global `activeCollection`/`activeEnv` — meaning a project with multiple collections could only ever have its *first* collection's env config edited from this page, with no way to switch. `Config` now takes only `project` and manages its own local `selectedCollectionId`/`selectedEnv` state, with an explicit collection dropdown and a matching **env dropdown** (both `CustomSelect`, not the shared `EnvBar` pill component) — switching here no longer affects (or is affected by) the sidebar's globally active collection/env used by other pages (Test Data, Test Suites, etc.), which is intentional: this page's job is per-collection config, not app-wide navigation context. Note: `EnvBar` (the pill-style selector) is still used as-is on every other env-aware page (Collections, Test Data, Test Suites, Alerts, Runner, Analytics, Reports) — only this one page's env selector was swapped to a dropdown, deliberately not a global component change.
+- **Removed from `Config.jsx`, entirely**: the "{env} Environment Readiness" tile (Target URLs/Test Data Files/Test Plans/Generated Scripts counts) and the "Docker Engine" tile (install/check/start Docker, virtualization enable, CI Docker image config) — both were removed per explicit request, not just hidden. Docker's check/install functionality already existed independently on `Runner.jsx` (the "Dependencies" card, local-execution-only) — the CI/local Docker **image name** configuration (previously Config.jsx-only: `jmeter_docker_image`/`k6_docker_image` fields, Pull, Save) was moved into that same Runner.jsx card so image configuration and the check/install flow live in one place, scoped to actually running tests locally rather than general project configuration.
+- **Fixed: script generation could silently target another collection's server (cross-collection URL leak).** `testSuites.js`'s `POST /:id/generate` merges config as `{...DEFAULT_CONFIG, ...globalCfg, ...projCfg, ...envCfg, ...suiteCfg}`, where `envCfg` is the correctly-scoped `collection_env_config` row (`collection_id+env`). But `collections.js`'s `autoPopulateProjectConfig()` skips any endpoint whose hostname contains `{{` (unresolved Postman variable, e.g. Binance's `{{alpha_url}}`-style collections) when seeding both `project_config.urls` (project-wide "reference only") **and** `collection_env_config.urls` — and short-circuits (`if (!urlSets.length) return`) before writing `collection_env_config` at all when a collection has zero literal hostnames. Net effect: a `{{var}}`-only collection's `collection_env_config` never gets a `urls` key, so the merge's `...envCfg` spread doesn't shadow `...projCfg`, and the generated script silently inherits whichever OTHER collection's server happened to auto-populate `project_config.urls` first — producing a JMX that looks valid but hits the wrong host (100% failures with no obvious cause). Fixed by stripping `urls`/`protocol`/`url`/`port` from `globalCfg`/`projCfg` before merging whenever `suite.collection_id` is set (target-URL fields for a collection-scoped suite now come only from `envCfg`/`suiteCfg`, never the project-wide reference config), and added a clear 400 error ("No target URL configured for this collection's environment...") when that leaves no URL at all, instead of silently generating a script with an empty/wrong host. **Known follow-on gap (not yet fixed):** `generateK6()` reads `cfg.protocol`/`cfg.url`/`cfg.port` as flat fields, which no config source ever actually sets (everything stores a `urls: [{protocol,url,port}]` array) — k6 script generation always bakes in an empty URL regardless of env config; `generateJmx()` correctly reads `cfg.urls?.[0]`.
+- **Fixed: CI run "completed" status could contradict the rule-violation email/PDF, and auto-heal silently skipped non-400/401 100%-failures.** `ciPipeline.js`'s manual `POST /runs/:runId/sync-results` and the internal `autoSyncCiRun()` (background polling) both call `evaluateRules()` to build `reportData.rule_violations` for the PDF/email, but were discarding the returned `passed` boolean — `ci_pipeline_runs.status`/`execution_runs.status` were instead derived solely from `hasCritical400Or401()`, a narrow helper that only flags an API as failed when it's at 100% error rate **and** returned specifically 400 or 401. Any other 100%-failing API (500, timeout, connection refused, etc.) left the CI run marked `completed` in CI Run History even though the rule engine/email correctly called it Failed, and — worse — never triggered auto-heal in the manual sync-results path regardless of the `auto_heal` flag. Fixed by adding `hasAnyApiFullFailure()` (any API at ≥100% error rate, any status code) and deriving run-failed status from `apiFullFailure || rulePassed===false || (noRules && total_failed>0)` in both places; heal now triggers on `apiFullFailure` (always) OR `auto_heal && runFailed` (respecting the flag for non-critical failures) — previously the manual route ignored `auto_heal` entirely for its heal decision.
+- **Fixed: Analytics per-API bar chart tiles (`Analytics.jsx`'s `DashboardTab`'s "Avg Response Time per API"/"TPS per API", `TransactionTab`'s "P90 & P95 per API") had a fixed height calc tied to endpoint count** (`Math.max(180, labels.length*32+50)`), a formula that makes sense for a horizontal bar chart but not these vertical ones (API names on the x-axis) — with many endpoints the tile grew very tall, spreading the y-axis auto-ticks across a mostly-empty canvas (e.g. only "140ms"/"120ms" visible before scrolling). Both now use a flat `chartH = 300` so Chart.js's default `beginAtZero` auto-scaling produces a proportionate, densely-ticked axis regardless of API count.
+- **Fixed: deleting a collection orphaned its test plans instead of removing them.** `test_suites.collection_id` has a real FK (`ON DELETE SET NULL`), so `collections.js`'s `DELETE /:id` previously left a deleted collection's test plans behind with `collection_id=NULL` — still listed, still (confusingly) generatable/runnable, just silently disconnected from the collection they belonged to. `DELETE /:id` now explicitly runs `DELETE FROM test_suites WHERE collection_id=?` before deleting the collection (same pattern already used for `collection_env_config`/`test_data_files`, which have no FK at all) and calls `resetSequence('test_suites')` alongside the existing `resetSequence('collections')`. Their script/result files on disk are already covered by the same handler's wholesale `fs.rmSync()` of the collection's folder.
+- **Added: a collection-name tag on Test Plans, matching the one Test Data Files already had.** `TestSuites.jsx` now renders the same green pill (`linkedCollection.name`, `#dcfce7`/`#16a34a`) next to each test plan's title that `TestData.jsx` already showed per test-data file — `test_suites.collection_id` was always there, this was purely a missing UI affordance for the same data.
+- **Fixed: results could land in a flat `<userWorkspace>/results/` folder instead of the standard `<Collection>/<Env>/results/` path**, even for a suite with a real `collection_id`. Four separate call sites (`testRunner.js`'s native execution, `execution.js`'s Docker-mode route, and `ciPipeline.js`'s `autoSyncCiRun()` + manual `sync-results` route) all gated the correct path on `suite.collection_id && suite.env` — if `suite.env` was ever blank (or, for the two CI paths, if the `test_suites` SQL join simply found no row) the result silently fell all the way back to the project-level folder instead of trying the collection's own default env first. Added `resolveSuiteEnv(collection, suite)` to `projectFolders.js` (falls back to `collection.environments[0]` / `collection.environment` / `'Default'` when `suite.env` is blank) and wired it into all four call sites — a collection-scoped suite now only hits the project-level fallback if it genuinely has no collection at all, and the two CI paths now `console.warn` when that fallback fires so a silent mismatch is visible in logs instead of just showing up as a mystery folder later. **Not addressed**: any *already-created* stray `results/` folders from before this fix are left in place — this only prevents new ones.
+- **Auto-heal** classifies ≥70% server-side failures as infrastructure errors and stops iterating rather than repeatedly "fixing" a script that isn't the problem.
+- **Rules with no config** (`noRules=true`) fall back to raw fail-count pass/fail rather than blocking entirely.
+- **CSV test data** auto-copies across all environments if uploaded without a specific env.
+- **Branch strategy**: org/super admins commit straight to `main`; regular users always work on `users/<name>` and must PR into `main`.
+
+---
+
+## Third-Party Integrations
+
+| Integration | Used for | Where |
+|---|---|---|
+| OpenAI (GPT-4o) / Anthropic (Claude) | Script generation, auto-heal diagnosis | `utils/aiClient.js`, `routes/ai.js`, `routes/testSuites.js` |
+| GitHub (`@octokit/rest`) | Repo ops, PRs, Actions `workflow_dispatch` trigger | `routes/git.js`, `routes/ciPipeline.js` |
+| GitLab REST API | Pipeline trigger tokens, job status/logs, artifacts | `routes/ciPipeline.js` |
+| Bitbucket Pipelines | Legacy CI path with a Python JMX patcher (`patch_jmx.py`) | `routes/ciPipeline.js` |
+| SMTP (any provider via `nodemailer`) | Invites, password reset, alerts, breach notifications | `utils/emailUtils.js`, `routes/alerts.js`, `routes/invites.js`, `routes/passwordReset.js` |
+| Docker Engine | Optional containerized JMeter/K6 execution (`EXECUTION_MODE=docker`) | `routes/execution.js` |
+| JMeter / K6 binaries | Native load-test execution (bundled in the Docker image) | `utils/testRunner.js` |
+
+---
+
+## Build & Deployment
+
+**Docker Compose topology** (current, post-migration edits): `postgres` (postgres:16-alpine, healthchecked) + `PerfStudio` (all-in-one image, `depends_on: postgres: service_healthy`, `DATABASE_URL` pointing at the postgres service). Volumes: `pg_data`, `PerfStudio_projects`, `PerfStudio_git`, `PerfStudio_backups` (the old `PerfStudio_data` SQLite volume was removed in this change).
+
+**Images**:
+- Root `Dockerfile` — multi-stage, all-in-one: builds the React frontend, then an Ubuntu 22.04 runtime with Java 17, JMeter 5.6.3 (+ plugins), K6, Node 22, Git; serves frontend as static files from the backend. This is the image actually referenced by `docker-compose.yml` (`tasleemzaif/PerfStudio:latest`).
+- `backend/Dockerfile` / `frontend/Dockerfile` — separate lightweight images (Node 18-alpine backend, nginx-served frontend) published to Docker Hub by CI but not what `docker-compose.yml` runs by default.
+
+**CI/CD of PerfStudio itself**: `.github/workflows/docker-publish.yml` — on push/tag to `main`, builds and pushes `tasleemzaif/PerfStudio-backend` and `tasleemzaif/PerfStudio-frontend` to Docker Hub (skips push on PRs).
+
+**Local dev**: `cd backend && npm run dev` (nodemon, port 3001), `cd frontend && npm run dev` (Vite, port 5173). `.claude/launch.json` in this repo needs a `cwd` per service (`backend`/`frontend`) — the root has no `dev` script itself.
+
+**Scripts**: `setup.sh` / `docker-start.bat` (auto-generate `.env` with a random `JWT_SECRET`, `docker compose up --build -d`), `docker-build.ps1` (manual image build/push), `start.bat` (spawns backend+frontend in separate windows for Windows local dev without Docker).
+
+---
+
+## Important Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `JWT_SECRET` | ✅ | JWT signing secret |
+| `ENCRYPTION_KEY` | Recommended | AES-256-CBC key for encrypting stored API keys/SMTP passwords/git tokens |
+| `FRONTEND_URL` | ✅ | Used in invite/reset-password email links |
+| `CORS_ORIGIN` | ✅ | Allowed origin for the API |
+| `DATABASE_URL` | ✅ (Postgres mode) | Postgres connection string, e.g. `postgresql://postgres:postgres@postgres:5432/perf_studio` |
+| `DB_PATH` | Legacy | SQLite file path — ignored once `DATABASE_URL` is set |
+| `PORT` / `BACKEND_PORT` | Optional | Backend port (default 3001) |
+| `FRONTEND_PORT` | Optional | Frontend port (default 5173) |
+| `HOST_PROJECTS_ROOT` / `HOST_BACKUPS_ROOT` | ✅ (Docker) | Host paths for volume mounts |
+| `PROJECTS_ROOT` / `BACKUPS_ROOT` | Optional | Container-internal paths |
+| `EXECUTION_MODE` | Optional | `native` (bundled binaries) vs `docker` (spawn containers) |
+| `JMETER_DOCKER_IMAGE` / `K6_DOCKER_IMAGE` | Optional | Only relevant in docker execution mode |
+| `JMETER_BIN` / `K6_BIN` | Optional | Explicit binary path override |
+| `SMTP_*` (`HOST`,`PORT`,`USER`,`PASS`,`FROM`) | Optional | Fallback/default SMTP if not configured per-user in-app |
+| `APP_LOGO_URL` | Optional | Branding in UI/emails |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | ✅ (compose) | Postgres container credentials |
+
+---
+
+## Coding Conventions
+
+- Routes: Express `Router()` per resource, `router.use(auth)` near the top except where a route must stay public (invite validation, password reset, health check) — those files apply `auth` per-route instead.
+- Authorization pattern: every project-scoped route calls `ownsProject(userId, projectId)` and 404s if it returns falsy (never 403 — avoids leaking existence).
+- DB access: `db.prepare(sql).get/all/run(...params)` — SQLite-style call sites preserved even after the Postgres migration via the `pg.js` compatibility shim (auto-converts `?` → `$1`, appends `RETURNING id` to INSERTs). New Postgres-specific code should still use `?` placeholders, not `$1`, to stay compatible with this shim.
+- Config-on-write pattern: mutating rules/config/collections triggers a `setImmediate`-deferred background rewrite of the affected workspace's `config.json`, not a synchronous one (keeps request latency low).
+- No comments-heavy style; the codebase favors short inline comments only where a decision is non-obvious (e.g. SSRF guards, Windows-specific git auth workarounds).
+- No TODO/FIXME/HACK markers found anywhere in `backend/src` or `frontend/src` at time of writing — the codebase does not use that convention for tracking debt.
+- **The whole app renders at `html { zoom: 0.9 }`** (`index.css`) — "zoom:0.9 is the only way to scale ALL px/em/rem values uniformly," per the comment there. Only the login page overrides it back to `zoom: 1 !important` (so `100vh` behaves normally on `#auth-screen`). **This has a real, confirmed consequence for any code that reads `getBoundingClientRect()` and reapplies those pixel values to a `position: fixed`/`position: absolute` element** (portals especially): `getBoundingClientRect()` returns coordinates already scaled by the 0.9 zoom, but a fixed-position descendant of the zoomed `<html>` gets that raw pixel value re-scaled by the browser *again* when resolving its own position — a double-zoom. Confirmed by exact math: a computed `top: 341.469px` rendered at `307.3px` (341.469 × 0.9 = 307.3). Fixed in `CustomSelect.jsx` (its dropdown is portaled to `document.body`) by dividing every measured coordinate (`top`/`bottom`/`left`/`width`) by the current zoom factor (read via `getComputedStyle(document.documentElement).zoom`, not hardcoded, since it's `1` on the login page) before writing it into the portal's inline style. **Any new code that portals an element and positions it via `getBoundingClientRect()` needs the same zoom-correction — this is not specific to `CustomSelect`, it's a property of the whole app's zoom approach.**
+- **Modal header/footer are sticky by default (global CSS, not per-modal JSX)**: every standard modal in the app follows the shared `<Modal>` (`components/Modal.jsx`) + `.modal-hdr` + arbitrary content + `.modal-footer` structure, and `.modal` itself is the scrolling container (`overflow-y: auto`). `.modal-hdr`/`.modal-footer` in `index.css` use `position: sticky` (with the negative-margin/matching-padding trick to stay flush with `.modal`'s own padding) so close icons and action buttons never scroll away regardless of content length — this was a deliberate fix (previously they scrolled with the content). New modals get this for free automatically as long as they use the standard `.modal-hdr`/`.modal-footer` classes; don't reinvent scroll handling per-modal.
+- **Exception — custom draggable/resizable popups don't use `<Modal>`**: e.g. Collections.jsx's "Pre-run Logs" window is hand-built (`position: fixed` overlay + `position: absolute` box with its own drag handle and `resize: both`), not the shared component, so it doesn't inherit the sticky-header CSS above. It replicates the same look/behavior manually with three stacked flex children, each `flexShrink: 0` except the middle one: a fixed header (drag handle + title + close icon), a scrollable body (`overflowY: 'auto', flex: 1, minHeight: 0`), and a fixed footer (border-top + right-aligned `btn-primary` "Close" button, styled to match `.modal-footer` visually without reusing that class directly — `.modal-footer`'s sticky/negative-margin CSS is tuned for `.modal`'s own padding box and would misbehave outside it). The body only actually scrolls if the outer box has a height ceiling — it originally had none (only `minHeight`), so long content just grew the whole popup past the viewport instead of scrolling. Fixed with `maxHeight: calc(100vh - ${logModalPos.y}px - 24px)` (dynamic, tied to the popup's current drag position `logModalPos.y`) rather than a flat value — a flat cap (e.g. `80vh`) would make the native `resize: both` handle feel broken once content reaches it, since height can never be dragged past a fixed ceiling regardless of how much empty space is actually below the popup. **`max-height` alone wasn't enough**, though: with no explicit `height`, the box only auto-sized to its content and left unused space below rather than stretching to fill the available room — an explicit `height: ${Math.min(620, window.innerHeight - logModalPos.y - 24)}px` (plain JS-computed pixels, not a nested CSS `min()`/`calc()` — some environments choke on `min()` wrapping `calc()`) was needed so the body's `flex: 1` has an actual bounded space to grow into. The header drag handler (`onLogDragStart`) also clamps `y` to `Math.max(0, ...)` so the popup's top can never be dragged above the visible viewport. Any future custom (non-`<Modal>`) draggable popup needs all three: an explicit `height` (not just `max-height` — `flex: 1` + `overflow-y: auto` on a child does nothing without a bounded parent height to grow into), a `max-height` ceiling, and a drag-position clamp to stay on-screen.
+
+---
+
+## Known TODOs / In-Progress Work
+
+- **SQLite → PostgreSQL migration is uncommitted and incomplete-looking from docs' perspective**: `backend/src/db/pg.js`, `schema.sql`, `migrate.js` are new/untracked; nearly every route/util file is modified to `await` DB calls. `docker-compose.yml` now provisions a `postgres` service and drops the old SQLite volume. Docs (README, ARCHITECTURE.md, DEPLOYMENT.md) still describe SQLite as current — **update these once the migration is committed**, and confirm `db/index.js` (legacy SQLite) is fully retired or intentionally kept as a fallback.
+- Stray/junk files present in the working tree that look like accidental artifacts and probably want cleanup or a `.gitignore` entry: `backend/C:UsersTasleemAppDataLocalTemprurl.txt`, `backend/UsersTasleemperf-studiogit-workspaces...` (a filename that looks like a mangled absolute path), and an untracked `quarks-user/` directory at repo root that duplicates `git-workspaces/quarks-user/`.
+- `.claude/launch.json` originally had no `cwd` for either service — fixed during this session to point `frontend`→`frontend/` and add a `backend`→`backend/` entry; worth committing if this file is meant to be shared.
+
+---
+
+## Dependency Graph (high level)
+
+```
+frontend (React/Vite)
+   → backend REST API (axios, JWT bearer)
+
+backend/index.js
+   → routes/*  (23 modules)
+        → utils/ownsProject, utils/projectFolders   (nearly all)
+        → db (pg.js compat shim → Postgres, or legacy index.js → SQLite)
+        → utils/aiClient → OpenAI / Anthropic APIs        (ai.js, testSuites.js, autoHealer.js)
+        → utils/testRunner → JMeter/K6 binaries or Docker  (execution.js, pipelines.js, ciPipeline.js)
+        → utils/ruleEvaluator                              (testRunner.js, autoHealer.js, ciPipeline.js)
+        → utils/emailUtils → nodemailer → SMTP             (alerts.js, invites.js, passwordReset.js, autoHealer.js callback)
+        → utils/generateAnalyticsPdf → puppeteer + pdfkit  (execution.js PDF export, emailUtils attachments)
+        → simple-git / @octokit/rest / raw HTTP            (git.js, ciPipeline.js)
+        → utils/parseCollection                            (collections.js)
+        → utils/configWriter                               (rules.js, config.js, projectConfig.js, envConfig.js, collections.js)
+```
+
+---
+
+## Developer Notes
+
+- Product is branded **"Peako"** in the frontend UI/HTML title (`<title>Peako | Quarks</title>`) but the codebase, Docker images, and docs all use **"PerfStudio"** — same product, two names in use; don't be thrown by the mismatch.
+- Default seeded credentials per README: `admin@perfstudio.com` / `Admin@123` (super admin) — presumably created on first boot; verify where that seeding happens if it's not obvious (not confirmed by this pass — check `migrate.js` or an init script if you need to reproduce a clean environment).
+- Built by Quarks Technosoft PVT. LTD. (QTSolv) — proprietary, not open source, despite the public GitHub repo used for the Docker Hub CI badge in README.
+- End-to-end user workflow (org setup → API source import → pre-run → rules → env config → test plan → script generation → CI pipeline → analytics → PDF export → git commit/PR) is documented step-by-step in [docs/USER_WORKFLOW.md](docs/USER_WORKFLOW.md) — read that before touching any single feature in isolation, since most features exist to serve this one linear flow.

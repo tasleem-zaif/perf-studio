@@ -23,61 +23,61 @@ const TEST_TYPE_LABELS = { load: 'Load Test', stress: 'Stress Test', spike: 'Spi
 
 router.use(auth);
 
-router.get('/', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+router.get('/', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
   const { collection_id, env } = req.query;
   let suites;
   if (collection_id && env) {
     // Strict env isolation: only return suites explicitly tagged to this collection+env
-    suites = db.prepare(
+    suites = await db.prepare(
       "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
     ).all(req.params.projectId, collection_id, env);
   } else if (collection_id) {
-    suites = db.prepare(
+    suites = await db.prepare(
       "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
     ).all(req.params.projectId, collection_id);
   } else {
-    suites = db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+    suites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
   }
   res.json({ suites });
 });
 
-router.post('/', (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+router.post('/', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
   const { name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config, vusers, rampup, iter_mode, loops, duration } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids ? JSON.parse(test_data_ids) : []);
   const primaryId = idsArr.length ? idsArr[0] : (test_data_id || null);
-  const result = db.prepare(
+  const result = await db.prepare(
     `INSERT INTO test_suites (project_id, name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config_json, vusers, rampup, iter_mode, loops, duration)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(req.params.projectId, name, test_type || 'load', collection_id || null, env || null, primaryId,
     JSON.stringify(idsArr), engine || 'jmeter', JSON.stringify(config || {}), vusers||50, rampup||30, iter_mode||'duration', loops||1, duration||300);
   if (collection_id) {
     const _uid = req.userId, _pid = req.params.projectId;
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
-        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
-        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        updateCollectionConfigs(collection_id, getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(collection_id, await getUserProjectPath(_uid, c?.role, p?.name || ''));
       } catch (_) {}
     });
   }
-  res.json({ suite: db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
+  res.json({ suite: await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
 });
 
-router.put('/:id', (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+router.put('/:id', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted in another session.' });
   const { name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config, vusers, rampup, iter_mode, loops, duration } = req.body;
   const normalId = v => (v === '' || v === undefined) ? null : v;
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids !== undefined ? JSON.parse(test_data_ids || '[]') : null);
   const primaryId = idsArr ? (idsArr.length ? idsArr[0] : null) : (test_data_id !== undefined ? normalId(test_data_id) : suite.test_data_id);
-  db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=?`)
+  await db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=?`)
     .run(name || suite.name, test_type || suite.test_type,
       collection_id !== undefined ? normalId(collection_id) : suite.collection_id,
       env !== undefined ? (env || null) : suite.env,
@@ -91,35 +91,35 @@ router.put('/:id', (req, res) => {
       loops !== undefined ? loops : suite.loops,
       duration !== undefined ? duration : suite.duration,
       req.params.id);
-  const updatedSuite = db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
+  const updatedSuite = await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
   if (updatedSuite?.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = updatedSuite.collection_id;
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
-        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
-        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
       } catch (_) {}
     });
   }
   res.json({ suite: updatedSuite });
 });
 
-router.delete('/:id', (req, res) => {
-  if (!ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+router.delete('/:id', async (req, res) => {
+  if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have already been deleted.' });
-  db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
   resetSequence('test_suites');
   if (suite.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = suite.collection_id;
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
-        const p = db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
-        const c = db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
+        const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
+        const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        updateCollectionConfigs(_cid, getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
       } catch (_) {}
     });
   }
@@ -127,27 +127,27 @@ router.delete('/:id', (req, res) => {
 });
 
 router.post('/:id/generate', async (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Suite not found' });
 
   // Gather context
   const collection = suite.collection_id
-    ? db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+    ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
     : null;
   // Load multiple test data files
   let dataIds = [];
   try { dataIds = JSON.parse(suite.test_data_ids || '[]'); } catch {}
   if (!dataIds.length && suite.test_data_id) dataIds = [suite.test_data_id];
-  const testDataFiles = dataIds
-    .map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(id))
-    .filter(Boolean);
-  const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(req.params.projectId);
+  const testDataFiles = (await Promise.all(
+    dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(id))
+  )).filter(Boolean);
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(req.params.projectId);
 
-  const globalRow = db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
-  const projRow   = db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
+  const globalRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
+  const projRow   = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
   const globalCfg = globalRow ? JSON.parse(globalRow.config_json) : {};
   const projCfg   = projRow   ? JSON.parse(projRow.config_json)   : {};
   const suiteCfg  = JSON.parse(suite.config_json || '{}');
@@ -155,14 +155,42 @@ router.post('/:id/generate', async (req, res) => {
   // Load env-specific config (highest priority) — overrides global + project
   const suiteEnv = suite.env || '';
   const envCfgRow = suiteEnv && suite.collection_id
-    ? db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suiteEnv)
+    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suiteEnv)
     : null;
   const envCfg = envCfgRow ? JSON.parse(envCfgRow.config_json || '{}') : {};
 
+  // urls/protocol/url/port are per-collection-per-env data by design (strict isolation —
+  // see PROJECT_MAP.md). global_config/project_config's copies are project-wide "reference
+  // only" defaults (collections.js's autoPopulateProjectConfig seeds project_config from
+  // whichever collection happens to have literal hostnames, and NEVER writes
+  // collection_env_config for a collection whose endpoints are all {{var}} templates —
+  // e.g. Binance). Letting those leak in here meant a collection with no env URL configured
+  // yet would silently inherit ANOTHER collection's server instead of failing loudly.
+  // For a collection-scoped suite, target-URL fields must come only from envCfg/suiteCfg.
+  let scopedGlobalCfg = globalCfg, scopedProjCfg = projCfg;
+  if (suite.collection_id) {
+    const strip = ({ urls, protocol, url, port, ...rest }) => rest;
+    scopedGlobalCfg = strip(globalCfg);
+    scopedProjCfg   = strip(projCfg);
+  }
+
   // Merge order: DEFAULT → global → project → env-specific → suite overrides
-  const cfg = { ...DEFAULT_CONFIG, ...globalCfg, ...projCfg, ...envCfg, ...suiteCfg };
+  const cfg = { ...DEFAULT_CONFIG, ...scopedGlobalCfg, ...scopedProjCfg, ...envCfg, ...suiteCfg };
 
   const endpoints = collection ? (() => { try { return JSON.parse(collection.json_content); } catch { return []; } })() : [];
+
+  // Fail loudly instead of generating a script that silently targets an empty/wrong host —
+  // this is the gap left once the cross-collection URL fallback above was removed. A saved
+  // env-config URL isn't the only way to have one: endpoints whose {{var}} host resolves
+  // via cfg.variables (multi-host collections, or one re-imported after the {{var}}
+  // auto-populate fix) count too, even if collection_env_config.urls hasn't caught up yet.
+  const hasResolvableHost = (cfg.urls?.[0]?.url || cfg.url) ||
+    endpoints.some(ep => resolveEndpointHost(ep.url || ep.path || '', cfg.variables || {}));
+  if (suite.collection_id && !hasResolvableHost) {
+    return res.status(400).json({
+      error: `No target URL configured for this collection's "${suiteEnv || 'default'}" environment. Set one under Config > Environment Config before generating a script.`,
+    });
+  }
   // Use pre-run data from request body (legacy) or from collection row (new flow)
   const preRunData = req.body.preRunData || (() => {
     if (!collection?.pre_run_data) return null;
@@ -188,8 +216,9 @@ router.post('/:id/generate', async (req, res) => {
 
     let scriptBaseDir = null;
     const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
-    const callerRole = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId)?.role;
-    const userProjPath = getUserProjectPath(req.userId, callerRole, proj.name);
+    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const callerRole = callerUser?.role;
+    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name);
 
     // Admin workspace holds only empty folders — skip script generation for admin
     if (isAdminWorkspace(userProjPath)) {
@@ -214,19 +243,19 @@ router.post('/:id/generate', async (req, res) => {
 
     // Update DB
     const updateField = engine === 'jmeter' ? 'jmx_path' : 'js_path';
-    db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, req.params.id);
+    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, req.params.id);
 
-    if (suite.collection_id) setImmediate(() => updateCollectionConfigs(suite.collection_id));
+    if (suite.collection_id) setImmediate(async () => { await updateCollectionConfigs(suite.collection_id); });
     res.json({ ok: true, filename, path: filePath });
   } catch (e) {
     res.status(500).json({ error: `Script generation failed: ${e.message}. Check your AI API key in Settings and that the collection has valid endpoints.` });
   }
 });
 
-router.get('/:id/download/:type', (req, res) => {
-  const proj = ownsProject(req.userId, req.params.projectId);
+router.get('/:id/download/:type', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted. Try regenerating the script.' });
 
   const filePath = req.params.type === 'jmx' ? suite.jmx_path : suite.js_path;
@@ -361,6 +390,30 @@ function toJmeterVar(v) {
   return String(v ?? '').replace(/\{\{(\w+)\}\}/g, '$${$1}');
 }
 
+// Resolves the literal {protocol,url,port} an endpoint's raw URL targets, substituting
+// a single leading {{var}} token against the collection's resolved variables map.
+// Multi-host collections (e.g. Binance's Spot/Futures/Options/Wallet APIs) define one
+// base-URL variable per API family instead of sharing a single host — this lets each
+// endpoint be mapped back to the specific host its own {{var}} pointed to.
+function resolveEndpointHost(rawUrl, variables) {
+  if (!rawUrl) return null;
+  let urlForParse = rawUrl;
+  const m = rawUrl.match(/^\{\{(\w+)\}\}/);
+  if (m) {
+    const val = variables?.[m[1]];
+    if (!val) return null; // variable has no known value — can't resolve
+    urlForParse = val + rawUrl.slice(m[0].length);
+  } else if (rawUrl.startsWith('/') && !rawUrl.includes('://')) {
+    return null; // relative path with no host token — falls back to the collection default
+  }
+  try {
+    const raw = urlForParse.startsWith('http') ? urlForParse : `https://${urlForParse}`;
+    const u = new URL(raw);
+    if (!u.hostname || u.hostname.includes('{{')) return null;
+    return { protocol: u.protocol.replace(':', ''), url: u.hostname, port: u.port || '' };
+  } catch { return null; }
+}
+
 function normalizeEp(ep) {
   let epPath = ep.path || '';
   let urlQueryParams = {};
@@ -373,7 +426,7 @@ function normalizeEp(ep) {
     try {
       const parsed = new URL(rawUrl.startsWith('http') ? rawUrl : 'https://x' + rawUrl);
       if (!epPath) epPath = parsed.pathname;           // only set path from URL if not already set
-      parsed.searchParams.forEach((v, k) => { urlQueryParams[k] = v; });
+      parsed.searchParams.forEach(async (v, k) => { urlQueryParams[k] = v; });
     } catch {
       if (!epPath) epPath = rawUrl;                    // fallback: use raw string as path
     }
@@ -383,17 +436,17 @@ function normalizeEp(ep) {
   const qIdx = epPath.indexOf('?');
   let queryParams = { ...urlQueryParams, ...(ep.params || ep.queryParams || {}) };
   if (qIdx !== -1) {
-    new URLSearchParams(epPath.slice(qIdx + 1)).forEach((v, k) => { queryParams[k] = v; });
+    new URLSearchParams(epPath.slice(qIdx + 1)).forEach(async (v, k) => { queryParams[k] = v; });
     epPath = epPath.slice(0, qIdx);
   }
   // Postman v2.1: request.url.query = [{ key, value, disabled }]
   const postmanQuery = ep.request?.url?.query || ep.url?.query;
   if (Array.isArray(postmanQuery)) {
-    postmanQuery.forEach(q => { if (q.key && !q.disabled) queryParams[q.key] = q.value ?? ''; });
+    postmanQuery.forEach(async q => { if (q.key && !q.disabled) queryParams[q.key] = q.value ?? ''; });
   }
   // OpenAPI/Swagger: parameters = [{ in: 'query', name, example, default, schema }]
   if (Array.isArray(ep.parameters)) {
-    ep.parameters.forEach(p => {
+    ep.parameters.forEach(async p => {
       if (p.in === 'query' && p.name) {
         queryParams[p.name] = p.example ?? p.default ?? p.schema?.example ?? p.schema?.default ?? '';
       }
@@ -403,7 +456,7 @@ function normalizeEp(ep) {
   for (const k of Object.keys(queryParams)) queryParams[k] = toJmeterVar(queryParams[k]);
   const rawHeaders = ep.headers || ep.request?.header || [];
   const headers = {};
-  if (Array.isArray(rawHeaders)) rawHeaders.forEach(h => { const k = h.key || h.name; if (k) headers[k] = h.value; });
+  if (Array.isArray(rawHeaders)) rawHeaders.forEach(async h => { const k = h.key || h.name; if (k) headers[k] = h.value; });
   else if (typeof rawHeaders === 'object') Object.assign(headers, rawHeaders);
 
   let body = ep.body ?? ep.requestBody ?? ep.request?.body?.raw ?? null;
@@ -464,15 +517,16 @@ function substituteCSVVars(body, csvCols) {
   return result;
 }
 
-function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap) {
+function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars) {
   const { name, method, path: epPath, headers, body, queryParams } = normalizeEp(ep);
+  const { protocol: protoVar = 'PROTOCOL', server: serverVar = 'SERVER', port: portVar = 'PORT' } = hostVars || {};
   const lines = [];
   const isBody = ['POST', 'PUT', 'PATCH'].includes(method) && body;
 
   lines.push(`        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${xmlEsc(name)}" enabled="true">`);
-  lines.push(`          <stringProp name="HTTPSampler.domain">\${SERVER}</stringProp>`);
-  lines.push(`          <stringProp name="HTTPSampler.port">\${PORT}</stringProp>`);
-  lines.push(`          <stringProp name="HTTPSampler.protocol">\${PROTOCOL}</stringProp>`);
+  lines.push(`          <stringProp name="HTTPSampler.domain">\${${serverVar}}</stringProp>`);
+  lines.push(`          <stringProp name="HTTPSampler.port">\${${portVar}}</stringProp>`);
+  lines.push(`          <stringProp name="HTTPSampler.protocol">\${${protoVar}}</stringProp>`);
   // Build query string with CSV value substitution (used only for POST/PUT/PATCH inline path)
   const queryString = Object.entries(queryParams)
     .map(([k, v]) => {
@@ -590,6 +644,32 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   const urls = cfg.urls || [{ protocol: cfg.protocol || 'https', url: cfg.url || '', port: cfg.port || '443' }];
   const { protocol = 'https', url: server = '', port = '443' } = urls[0] || {};
 
+  // Multi-host support: a single collection can span several API families with different
+  // base hosts (e.g. Binance's Spot/Futures/Options/Wallet APIs, each via its own {{var}}).
+  // Resolve every endpoint's own host and, when more than one distinct host is actually
+  // used, emit indexed PROTOCOL_N/SERVER_N/PORT_N instead of forcing every sampler onto
+  // the single default host from `urls[0]`.
+  const variables = cfg.variables || {};
+  const hostKey = h => `${h.protocol}|${h.url}|${h.port}`;
+  const hostList = [];
+  const hostIndexByKey = new Map();
+  const epHostIndex = new Map();
+  for (const ep of endpoints) {
+    const resolved = resolveEndpointHost(ep.url || ep.path || '', variables);
+    if (!resolved) continue;
+    const key = hostKey(resolved);
+    if (!hostIndexByKey.has(key)) { hostIndexByKey.set(key, hostList.length); hostList.push(resolved); }
+    epHostIndex.set(ep, hostIndexByKey.get(key));
+  }
+  const multiHost = hostList.length > 1;
+  // Endpoints whose host couldn't be resolved (relative path, missing variable value)
+  // default to host #1 — same as the single-host fallback below.
+  function hostVarsFor(ep) {
+    if (!multiHost) return null; // null → buildSamplerXml uses plain PROTOCOL/SERVER/PORT
+    const n = (epHostIndex.get(ep) ?? 0) + 1;
+    return { protocol: `PROTOCOL_${n}`, server: `SERVER_${n}`, port: `PORT_${n}` };
+  }
+
   // Parse CSV metadata for each file
   const csvMeta = testDataFiles.map((f, i) => {
     const dir  = path.dirname(f.path).replace(/\\/g, '/');
@@ -616,10 +696,23 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
 
   // User Defined Variables — rt:true vars use ${__P(NAME,default)} so they can be
   // overridden at run time: jmeter -n -t script.jmx -JTHREADS=100 -JDURATION=600 -JRAMP_UP=60
+  //
+  // Single-host collections keep the plain PROTOCOL/SERVER/PORT names (unchanged from
+  // before). Multi-host collections get PROTOCOL_N/SERVER_N/PORT_N per distinct host
+  // instead — no plain/unindexed set, since it would just be a confusing duplicate of
+  // whichever host happened to be first.
   const udv = [
-    { n: 'PROTOCOL',   v: protocol,        rt: true },
-    { n: 'SERVER',     v: server,          rt: true },
-    { n: 'PORT',       v: String(port),    rt: true },
+    ...(multiHost
+      ? hostList.flatMap((h, i) => [
+          { n: `PROTOCOL_${i + 1}`, v: h.protocol,          rt: true },
+          { n: `SERVER_${i + 1}`,   v: h.url,               rt: true },
+          { n: `PORT_${i + 1}`,     v: String(h.port || ''), rt: true },
+        ])
+      : [
+          { n: 'PROTOCOL', v: protocol,        rt: true },
+          { n: 'SERVER',   v: server,          rt: true },
+          { n: 'PORT',     v: String(port),    rt: true },
+        ]),
     { n: 'THREADS',    v: String(vusers),  rt: true },
     { n: 'RAMP_UP',    v: String(rampup),  rt: true },
     ...(iterMode === 'loops'
@@ -628,11 +721,16 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     ...csvMeta.flatMap(m => [{ n: m.pathVar, v: m.dir }, { n: m.fileVar, v: m.file }]),
   ];
 
+  // Runtime override comment — all UPPERCASE vars accept -J flags. Multi-host collections
+  // expose one -JSERVER_N/-JPROTOCOL_N/-JPORT_N triplet per distinct host instead of a
+  // single -JSERVER.
+  const hostOverrideFlags = multiHost
+    ? hostList.map((_, i) => `-JPROTOCOL_${i + 1}=https -JSERVER_${i + 1}=api.example.com -JPORT_${i + 1}=443`).join(' ')
+    : '-JPROTOCOL=https -JSERVER=api.example.com -JPORT=443';
+
   const L = []; // output lines
   L.push(`<?xml version="1.0" encoding="UTF-8"?>`);
-  // Runtime override comment — all UPPERCASE vars accept -J flags:
-  // jmeter -n -t script.jmx -JTHREADS=100 -JRAMP_UP=60 -JDURATION=600 -JPROTOCOL=https -JSERVER=api.example.com -JPORT=443
-  L.push(`<!-- Runtime override: jmeter -n -t script.jmx -JTHREADS=100 -JRAMP_UP=60 -JDURATION=600 -JPROTOCOL=https -JSERVER=api.example.com -JPORT=443 -->`);
+  L.push(`<!-- Runtime override: jmeter -n -t script.jmx -JTHREADS=100 -JRAMP_UP=60 -JDURATION=600 ${hostOverrideFlags} -->`);
   L.push(`<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">`);
   L.push(`  <hashTree>`);
   L.push(`    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="${xmlEsc(name)}" enabled="true">`);
@@ -683,11 +781,13 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   L.push(`      </ThreadGroup>`);
   L.push(`      <hashTree>`);
 
-  // HTTP Request Defaults
+  // HTTP Request Defaults — every sampler sets its own domain/port/protocol explicitly
+  // (see buildSamplerXml), so this is only a fallback; point it at host #1 when multi-host.
+  const defaultHostVars = multiHost ? { server: 'SERVER_1', port: 'PORT_1', protocol: 'PROTOCOL_1' } : { server: 'SERVER', port: 'PORT', protocol: 'PROTOCOL' };
   L.push(`        <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP Request Defaults">`);
-  L.push(`          <stringProp name="HTTPSampler.domain">\${SERVER}</stringProp>`);
-  L.push(`          <stringProp name="HTTPSampler.port">\${PORT}</stringProp>`);
-  L.push(`          <stringProp name="HTTPSampler.protocol">\${PROTOCOL}</stringProp>`);
+  L.push(`          <stringProp name="HTTPSampler.domain">\${${defaultHostVars.server}}</stringProp>`);
+  L.push(`          <stringProp name="HTTPSampler.port">\${${defaultHostVars.port}}</stringProp>`);
+  L.push(`          <stringProp name="HTTPSampler.protocol">\${${defaultHostVars.protocol}}</stringProp>`);
   L.push(`          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">`);
   L.push(`            <collectionProp name="Arguments.arguments"/>`);
   L.push(`          </elementProp>`);
@@ -726,7 +826,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     for (const ep of ordered) {
       const isLogin = ep === loginEp;
       const activeToken = tokenExtracted ? tokenVar : null;
-      L.push(buildSamplerXml(ep, isLogin, activeToken, allCsvCols, csvValueMap));
+      L.push(buildSamplerXml(ep, isLogin, activeToken, allCsvCols, csvValueMap, hostVarsFor(ep)));
       if (isLogin) tokenExtracted = true;
     }
   } else {
@@ -745,7 +845,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
         // Ungrouped endpoints — emit directly (no Simple Controller wrapper)
         for (const ep of eps) {
           const isLogin = ep === loginEp;
-          L.push(buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap));
+          L.push(buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep)));
           if (isLogin) tokenExtracted = true;
         }
       } else {
@@ -757,7 +857,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
         for (const ep of eps) {
           const isLogin = ep === loginEp;
           // Indent samplers one level deeper inside the Simple Controller
-          const samplerXml = buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap)
+          const samplerXml = buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep))
             .split('\n').map(line => '  ' + line).join('\n');
           L.push(samplerXml);
           if (isLogin) tokenExtracted = true;

@@ -14,13 +14,16 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [depsChecked, setDepsChecked] = useState(false);
   const [checkingDeps, setCheckingDeps] = useState(false);
   const [installingDep, setInstallingDep] = useState(null);
+  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/Peako:latest');
+  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/Peako:latest');
+  const [pullingImage, setPullingImage] = useState(null); // 'jmeter' | 'k6' | null
   const [runParams, setRunParams] = useState({ vusers: 50, rampup: 30, iter_mode: 'duration', loops: 1, duration: 300 });
   const [running, setRunning] = useState(false);
   const [autoHeal, setAutoHeal] = useState(true);
   const [healState, setHealState] = useState(null);
   const healPollRef = useRef(null);
   const [logs, setLogs] = useState([
-    { type: 'info', message: 'Performance Studio Execution Engine ready.' },
+    { type: 'info', message: 'Peako Execution Engine ready.' },
     { type: 'info', message: 'Select a project and test suite, then check Docker before running.' },
   ]);
   const [runs, setRuns] = useState([]);
@@ -28,6 +31,14 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   const selectedProject = activeProject;
   const selectedProjectId = activeProject?.id || '';
+
+  // Load the configured Docker image names (used for both CI YAML and local pulls)
+  useEffect(() => {
+    api.get('/config').then(({ data }) => {
+      if (data.config?.jmeter_docker_image) setJmeterDockerImage(data.config.jmeter_docker_image);
+      if (data.config?.k6_docker_image) setK6DockerImage(data.config.k6_docker_image);
+    }).catch(() => {});
+  }, []);
 
   // Load all generated suites when active project changes
   useEffect(() => {
@@ -218,6 +229,55 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     setLogs(prev => [...prev, { type, message }]);
   }
 
+  async function saveDockerImages() {
+    try {
+      const { data } = await api.get('/config');
+      await api.put('/config', { config: { ...(data.config || {}), jmeter_docker_image: jmeterDockerImage, k6_docker_image: k6DockerImage } });
+      toast('Docker images saved.', 'ok');
+    } catch { toast('Failed to save.', 'err'); }
+  }
+
+  async function pullImage(tool) {
+    const image = tool === 'k6' ? k6DockerImage : jmeterDockerImage;
+    setPullingImage(tool);
+    addLog('info', `━━━ Pulling ${image} ━━━`);
+    try {
+      const token = localStorage.getItem('ps_token');
+      const response = await fetch('/api/execution/jmeter/pull-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ image }),
+      });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop();
+        for (const event of events) {
+          const line = event.trim();
+          if (!line.startsWith('data:')) continue;
+          try {
+            const data = JSON.parse(line.slice(5).trim());
+            if (data.done) {
+              if (data.error) addLog('err', 'Pull failed: ' + data.error);
+              else addLog('ok', `${image} is ready.`);
+            } else {
+              addLog(data.type || 'info', data.message || '');
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      addLog('err', 'Pull error: ' + e.message);
+    } finally {
+      setPullingImage(null);
+    }
+  }
+
   function startHealPolling(runId) {
     setHealState({ status: 'pending', heal_run_id: null, logs: [] });
     if (healPollRef.current) clearInterval(healPollRef.current);
@@ -235,6 +295,26 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         }
       } catch {}
     }, 2000);
+  }
+
+  function startCiHealPolling(runId) {
+    if (ciHealPollRef.current[runId]) clearInterval(ciHealPollRef.current[runId]);
+    setCiHealStates(prev => ({ ...prev, [runId]: { status: 'pending', logs: [] } }));
+    ciHealPollRef.current[runId] = setInterval(async () => {
+      try {
+        const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${runId}/heal-status`);
+        setCiHealStates(prev => ({ ...prev, [runId]: data }));
+        const done = ['healed', 'failed', 'exhausted', 'infra_error'].includes(data.status);
+        if (done) {
+          clearInterval(ciHealPollRef.current[runId]);
+          delete ciHealPollRef.current[runId];
+          api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data: d }) => setCiRuns(d.runs || [])).catch(() => {});
+        }
+      } catch {
+        clearInterval(ciHealPollRef.current[runId]);
+        delete ciHealPollRef.current[runId];
+      }
+    }, 3000);
   }
 
   async function runTest() {
@@ -321,16 +401,36 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
   const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
   const ciStepsPollerRef = useRef(null);
+  // CI Auto Heal state
+  const [ciAutoHeal,    setCiAutoHeal]    = useState(true);  // toggle on trigger form
+  const [ciHealStates,  setCiHealStates]  = useState({});    // runId → { status, logs, heal_ci_run_id }
+  const [ciManualHeal,  setCiManualHeal]  = useState({});    // runId → { showing, text, loading }
+  const ciHealPollRef = useRef({});
+
+  // Auto-poll heal status for any run with an active heal in progress when history loads
+  useEffect(() => {
+    const ACTIVE = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'];
+    ciRuns.forEach(r => {
+      if (r.heal_status && ACTIVE.includes(r.heal_status) && !ciHealPollRef.current[r.id]) {
+        startCiHealPolling(r.id);
+      }
+    });
+  }, [ciRuns]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [runTab, setRunTab] = useState('ci-pipeline'); // 'single' | 'ci-pipeline' — declared here so useEffect below can reference it
 
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
+    // Re-fetch every time the CI Pipeline tab becomes active so freshly-saved configs are picked up
+    if (runTab !== 'ci-pipeline') return;
     api.get(`/projects/${selectedProjectId}/ci/config`).then(({ data }) => {
       setCiConfig(data.config);
-      if (data.config?.github_enabled && !data.config?.gitlab_enabled) setCiProvider('github');
+      if (data.config?.bitbucket_enabled && !data.config?.gitlab_enabled && !data.config?.github_enabled) setCiProvider('bitbucket');
+      else if (data.config?.github_enabled && !data.config?.gitlab_enabled) setCiProvider('github');
       else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
     }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
-  }, [selectedProjectId]);
+  }, [selectedProjectId, runTab]);
 
   // Poll live steps when a terminal is expanded
   useEffect(() => {
@@ -364,8 +464,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         // Pass only the active param; set the other to -1 so JMeter ignores it
         jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
+        auto_heal: ciAutoHeal ? 1 : 0,
       });
-      toast(`Pipeline triggered on ${ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'}`, 'success');
+      const providerLabel = ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines';
+      toast(`Pipeline triggered on ${providerLabel}`, 'success');
       setCiRuns(prev => [{ id: data.run_id, provider: ciProvider, status: data.status, web_url: data.web_url, script_name: ciScriptName, run_name: data.run_name, started_at: new Date().toISOString() }, ...prev]);
       // Start polling
       pollCiStatus(data.run_id);
@@ -383,7 +485,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         if (!DONE.has(data.run?.status)) setTimeout(poll, 5000); // poll every 5s until done
         else {
           setCiPolling(null);
-          // Refresh full run list to pick up any runs triggered outside PerfStudio
+          // Refresh full run list to pick up any runs triggered outside Peako
           api.get(`/projects/${selectedProjectId}/ci/runs`)
             .then(({ data: d }) => setCiRuns(d.runs || []))
             .catch(() => {});
@@ -394,7 +496,6 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   }
 
   // ── Pipeline runner state ─────────────────────────────────────────────────
-  const [runTab,           setRunTab]           = useState('ci-pipeline'); // 'single' | 'ci-pipeline'
   const [pipelines,        setPipelines]        = useState([]);
   const [selectedPipeline, setSelectedPipeline] = useState('');
   const [pipelineRunning,  setPipelineRunning]  = useState(false);
@@ -647,16 +748,17 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 {/* Provider selector */}
                 <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
                   {[
-                    { id: 'gitlab',  icon: 'ti-brand-gitlab',  label: 'GitLab',         enabled: ciConfig?.gitlab_enabled },
-                    { id: 'github',  icon: 'ti-brand-github',  label: 'GitHub Actions', enabled: ciConfig?.github_enabled },
+                    { id: 'gitlab',     icon: 'ti-brand-gitlab',     label: 'GitLab',              enabled: ciConfig?.gitlab_enabled },
+                    { id: 'github',     icon: 'ti-brand-github',     label: 'GitHub Actions',      enabled: ciConfig?.github_enabled },
+                    { id: 'bitbucket',  icon: 'ti-brand-bitbucket',  label: 'Bitbucket Pipelines', enabled: ciConfig?.bitbucket_enabled },
                   ].filter(p => p.enabled).map(p => (
                     <button key={p.id} onClick={() => setCiProvider(p.id)}
                       style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 16px', border: `1.5px solid ${ciProvider === p.id ? 'var(--accent)' : '#e2e8f0'}`, borderRadius: 8, background: ciProvider === p.id ? '#f0fdf4' : '#f8fafc', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13, fontWeight: ciProvider === p.id ? 700 : 500, color: ciProvider === p.id ? '#16a34a' : '#374151', transition: 'all .12s' }}>
                       <i className={`ti ${p.icon}`}/>{p.label}
                     </button>
                   ))}
-                  {!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && (
-                    <div style={{ fontSize: 12, color: '#94a3b8' }}>No providers enabled. Enable GitLab or GitHub in CI/CD settings.</div>
+                  {!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled && (
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>No providers enabled. Enable GitLab, GitHub, or Bitbucket in CI/CD settings.</div>
                   )}
                 </div>
 
@@ -742,11 +844,38 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
-                <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled)}>
-                  {ciTriggering
-                    ? <><span className="spinner"/> Triggering…</>
-                    : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : 'GitHub Actions'} Pipeline</>}
-                </button>
+                {/* ── Auto Heal toggle ── */}
+                <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4,
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                    <i className="ti ti-heart-rate-monitor" style={{ color: 'var(--accent)', fontSize: 16 }}/>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>Auto Heal</div>
+                      <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 1 }}>
+                        {ciAutoHeal
+                          ? 'AI will fix and re-run automatically if the pipeline fails'
+                          : 'Heal button appears in run history to fix manually'}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', userSelect: 'none' }}
+                    onClick={() => setCiAutoHeal(v => !v)}>
+                    <span style={{ fontSize: 12, color: ciAutoHeal ? 'var(--accent)' : 'var(--color-text-tertiary)', fontWeight: 600 }}>
+                      {ciAutoHeal ? 'ON' : 'OFF'}
+                    </span>
+                    <div style={{ width: 38, height: 21, borderRadius: 11, background: ciAutoHeal ? 'var(--accent)' : 'var(--color-border-secondary)', position: 'relative', transition: 'background .2s' }}>
+                      <div style={{ position: 'absolute', top: 3, left: ciAutoHeal ? 19 : 3, width: 15, height: 15, borderRadius: '50%', background: '#fff', transition: 'left .2s', boxShadow: '0 1px 3px rgba(0,0,0,.4)' }}/>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 14 }}>
+                  <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
+                    {ciTriggering
+                      ? <><span className="spinner"/> Triggering…</>
+                      : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket'} Pipeline</>}
+                  </button>
+                </div>
               </div>
 
               {/* Run history */}
@@ -766,7 +895,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                         <div key={r.id} style={{ borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
                           {/* Run row */}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px' }}>
-                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : '#e24329', flexShrink: 0 }}/>
+                            <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : r.provider === 'bitbucket' ? 'ti-brand-bitbucket' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : r.provider === 'bitbucket' ? '#0052cc' : '#e24329', flexShrink: 0 }}/>
                             <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.exec_result_dir ? r.exec_result_dir.replace(/\\/g, '/').split('/').pop() : (r.run_name || r.script_name || '—')}</span>
                             <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
                             <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -805,7 +934,115 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
                               </a>
                             )}
+                            {/* Heal button — shown when run failed and no heal is currently active */}
+                            {['failed','failure'].includes(r.status) && !r.is_heal_run &&
+                              !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
+                              <button className="btn-secondary btn-sm"
+                                style={{ padding: '2px 8px', fontSize: 11, color: '#dc2626', borderColor: '#fca5a5' }}
+                                onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: true, text: '', loading: false } }))}>
+                                <i className="ti ti-heart-rate-monitor" style={{ fontSize: 11 }}/>
+                                {['failed','exhausted'].includes(ciHealStates[r.id]?.status) ? ' Heal Again' : ' Heal'}
+                              </button>
+                            )}
                           </div>
+
+                          {/* Manual Heal inline form */}
+                          {ciManualHeal[r.id]?.showing && !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
+                            <div style={{ padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#fafafa' }}>
+                              <div style={{ fontSize: 11, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                                Describe what to fix — AI will apply it and re-run the pipeline
+                              </div>
+                              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                <textarea
+                                  value={ciManualHeal[r.id]?.text || ''}
+                                  onChange={e => setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], text: e.target.value } }))}
+                                  placeholder="e.g. The login endpoint changed to /api/v2/auth — update all request paths accordingly"
+                                  rows={2}
+                                  style={{ flex: 1, fontSize: 12, padding: '7px 10px', borderRadius: 6,
+                                    border: '1px solid var(--color-border)', background: 'var(--color-background)',
+                                    color: 'var(--color-text)', fontFamily: 'inherit', resize: 'vertical',
+                                    boxSizing: 'border-box', outline: 'none', minHeight: 60 }}
+                                />
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                  <button className="btn-primary btn-sm"
+                                    disabled={!ciManualHeal[r.id]?.text?.trim() || ciManualHeal[r.id]?.loading}
+                                    style={{ padding: '6px 14px', fontSize: 11, whiteSpace: 'nowrap' }}
+                                    onClick={async () => {
+                                      const instruction = ciManualHeal[r.id]?.text?.trim();
+                                      if (!instruction) return;
+                                      setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], loading: true } }));
+                                      try {
+                                        await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/heal`, { instruction });
+                                        setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: false, text: '', loading: false } }));
+                                        startCiHealPolling(r.id);
+                                      } catch (e) {
+                                        toast(e.response?.data?.error || 'Failed to start heal', 'error');
+                                        setCiManualHeal(prev => ({ ...prev, [r.id]: { ...prev[r.id], loading: false } }));
+                                      }
+                                    }}>
+                                    {ciManualHeal[r.id]?.loading ? <><span className="spinner"/> Healing…</> : <><i className="ti ti-heart-rate-monitor"/> Heal</>}
+                                  </button>
+                                  <button className="btn-secondary btn-sm"
+                                    style={{ padding: '4px 14px', fontSize: 11 }}
+                                    onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: false, text: '', loading: false } }))}>
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* CI Heal Status Panel */}
+                          {(ciHealStates[r.id]?.status || r.heal_status) && (() => {
+                            const hs = ciHealStates[r.id] || { status: r.heal_status, heal_ci_run_id: r.heal_ci_run_id, heal_summary: r.heal_summary, logs: [] };
+                            const isActive = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(hs.status);
+                            const accentColor = hs.status === 'healed' ? '#16a34a' : hs.status === 'infra_error' ? '#f59e0b' : isActive ? 'var(--accent)' : '#dc2626';
+                            return (
+                              <div style={{ padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#f0f9ff', borderLeft: `3px solid ${accentColor}` }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: hs.logs?.length ? 10 : 0 }}>
+                                  <i className={`ti ${hs.status === 'healed' ? 'ti-circle-check' : ['failed','exhausted'].includes(hs.status) ? 'ti-circle-x' : 'ti-loader'}`}
+                                    style={{ fontSize: 15, color: accentColor, animation: isActive ? 'spin 1s linear infinite' : 'none' }}/>
+                                  <div style={{ fontSize: 12, fontWeight: 600, color: '#0f172a' }}>
+                                    Auto Heal —{' '}
+                                    {hs.status === 'pending'        && 'Queued…'}
+                                    {hs.status === 'diagnosing'     && 'AI diagnosing failure…'}
+                                    {hs.status === 'applying_fix'   && 'Applying fix to script…'}
+                                    {hs.status === 'rerunning'      && 'Re-running quick verify on Bitbucket…'}
+                                    {hs.status === 'rerunning_full' && 'Quick verify passed — running full test…'}
+                                    {hs.status === 'healed'         && 'Issue fixed and CI test passed!'}
+                                    {hs.status === 'failed'         && 'Could not fix automatically'}
+                                    {hs.status === 'exhausted'      && `Reached ${3} attempts without success`}
+                                    {hs.status === 'infra_error'    && 'Server/infrastructure failure — script changes cannot fix this'}
+                                  </div>
+                                  {hs.heal_ci_run_id && (
+                                    <span style={{ fontSize: 10, color: '#64748b', marginLeft: 'auto' }}>Heal run #{hs.heal_ci_run_id}</span>
+                                  )}
+                                </div>
+                                {hs.logs?.length > 0 && (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                    {hs.logs.map((l, i) => (
+                                      <div key={i} style={{ background: '#fff', borderRadius: 6, padding: '8px 10px', fontSize: 11, border: '1px solid #e2e8f0' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                                          <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: l.result === 'healed' ? '#16a34a' : ['failed','no_fix','still_failing'].includes(l.result) ? '#dc2626' : '#64748b', color: '#fff' }}>
+                                            Attempt {i + 1}
+                                          </span>
+                                          <span style={{ fontSize: 10, color: '#64748b' }}>{l.fix_type === 'script_rewrite' ? 'Script rewrite' : l.fix_type === 'no_fix' ? 'No fix found' : l.fix_type || ''}</span>
+                                        </div>
+                                        {l.diagnosis && <div style={{ marginBottom: 2 }}><span style={{ color: '#b45309', fontWeight: 600 }}>Issue: </span>{l.diagnosis}</div>}
+                                        {l.fix_applied && <div><span style={{ color: '#16a34a', fontWeight: 600 }}>Fix: </span>{l.fix_applied}</div>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                                {hs.status === 'exhausted' && hs.heal_summary && (
+                                  <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', borderRadius: 6, border: '1px solid #fed7aa', fontSize: 11 }}>
+                                    <div style={{ fontWeight: 700, color: '#c2410c', marginBottom: 5 }}>Exhaustion Summary</div>
+                                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: '#374151', lineHeight: 1.5 }}>{hs.heal_summary}</pre>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
 
                           {/* Expandable terminal */}
                           {isExpanded && (() => {
@@ -831,7 +1068,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
                                 {/* Trigger info */}
                                 <div style={{ color: '#8b949e', marginBottom: 6 }}>
-                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : 'GitLab CI'}</span></div>
+                                  <div>{r.started_at?.replace('T',' ').slice(0,19)}  Triggered on <span style={{ color: '#c9d1d9' }}>{r.provider === 'github' ? 'GitHub Actions' : r.provider === 'bitbucket' ? 'Bitbucket Pipelines' : 'GitLab CI'}</span></div>
                                   {r.external_id && <div>Run ID: <span style={{ color: '#58a6ff' }}>#{r.external_id}</span>  {job?.runner_name ? `· Runner: ${job.runner_name}` : ''}</div>}
                                 </div>
 
@@ -863,7 +1100,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 ) : (
                                   <div style={{ color: '#484f58', marginBottom: 8 }}>
                                     {['running','in_progress','queued','pending'].includes(r.status)
-                                      ? '⟳ Fetching live steps from GitHub…'
+                                      ? `⟳ Fetching live steps from ${r.provider === 'gitlab' ? 'GitLab' : r.provider === 'bitbucket' ? 'Bitbucket' : 'GitHub'}…`
                                       : 'No step details available'}
                                   </div>
                                 )}
@@ -878,7 +1115,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 {(r.web_url || job?.html_url) && (
                                   <div style={{ marginTop: 6 }}>
                                     <a href={job?.html_url || r.web_url} target="_blank" rel="noreferrer" style={{ color: '#58a6ff', fontSize: 10 }}>
-                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : 'GitLab'} ↗
+                                      → View full step logs on {r.provider === 'github' ? 'GitHub' : r.provider === 'bitbucket' ? 'Bitbucket' : 'GitLab'} ↗
                                     </a>
                                   </div>
                                 )}
@@ -1125,8 +1362,45 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         )}
         <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
           <i className="ti ti-brand-docker" style={{ marginRight: '4px', color: '#2496ed' }} />
-          All tests run inside Docker containers. Images are configured in{' '}
-          <button onClick={() => onNav('config')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: '11px', padding: 0, fontFamily: 'inherit' }}>Configuration</button>.
+          All tests run inside Docker containers — configure the image below.
+        </div>
+
+        {/* Docker Image — used for both local pulls and generated CI YAML */}
+        <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid var(--color-border-secondary)' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <i className="ti ti-brand-docker" style={{ color: '#0ea5e9', fontSize: '14px' }} />
+            Docker Image
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
+            Contains JMeter, K6, Java and Node.js. The image name here is also embedded in generated CI YAML files — update it before generating YAML if you use a custom image. Pull is only needed for local execution; cloud CI pulls automatically on the runner.
+          </div>
+          <div style={{ display: 'flex', gap: '6px', maxWidth: 520, marginBottom: '10px' }}>
+            <input
+              type="text"
+              value={jmeterDockerImage}
+              onChange={e => setJmeterDockerImage(e.target.value)}
+              placeholder="tasleemzaif/Peako:latest"
+              style={{ flex: 1, minWidth: 0 }}
+            />
+            <button
+              className="btn-primary btn-sm"
+              onClick={() => pullImage('jmeter')}
+              disabled={!!pullingImage || !jmeterDockerImage.trim() || (depsChecked && deps[0]?.status !== 'ok')}
+              style={{ whiteSpace: 'nowrap' }}
+              title={depsChecked && deps[0]?.status !== 'ok' ? 'Start Docker Desktop first to pull locally' : 'docker pull'}
+            >
+              {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
+            </button>
+          </div>
+          <button className="btn-secondary btn-sm" onClick={saveDockerImages}>
+            <i className="ti ti-device-floppy" /> Save Image
+          </button>
+          {depsChecked && deps[0]?.status !== 'ok' && (
+            <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--warn)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <i className="ti ti-alert-triangle" />
+              Docker Desktop is not running — Pull is disabled. Check Docker above first, or use cloud CI which pulls automatically.
+            </div>
+          )}
         </div>
       </div>
 
@@ -1257,7 +1531,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                   'var(--color-border-secondary)',
                       color: '#fff',
                     }}>
-                      Attempt {l.attempt}
+                      Attempt {i + 1}
                     </span>
                     <span style={{ fontSize: '10px', color: 'var(--color-text-tertiary)' }}>
                       {l.fix_type === 'script_rewrite' ? 'Script rewrite' : l.fix_type === 'no_fix' ? 'No fix found' : l.fix_type}
@@ -1277,6 +1551,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
               ))}
+            </div>
+          )}
+          {healState?.status === 'exhausted' && healState?.heal_summary && (
+            <div style={{ marginTop: '10px', padding: '10px 12px', background: 'var(--color-background-secondary)', borderRadius: '6px', border: '1px solid var(--warn)', fontSize: '12px' }}>
+              <div style={{ fontWeight: 700, color: 'var(--warn)', marginBottom: '6px' }}>Exhaustion Summary</div>
+              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: 'var(--color-text-primary)', lineHeight: 1.55 }}>{healState.heal_summary}</pre>
             </div>
           )}
         </div>

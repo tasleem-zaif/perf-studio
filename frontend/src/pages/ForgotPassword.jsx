@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import api from '../api';
+import Logo from '../components/Logo';
 
 export default function ForgotPassword() {
   const [email, setEmail]     = useState('');
@@ -23,12 +24,8 @@ export default function ForgotPassword() {
       <div className="auth-card" style={{ width: 400, maxWidth: '90vw' }}>
 
         {/* Logo */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 28 }}>
-          <img src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-            alt="Quarks" style={{ height: 32, width: 'auto' }} />
-          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            Performance Studio
-          </span>
+        <div style={{ marginBottom: 28 }}>
+          <Logo size="sm" theme="light" />
         </div>
 
         {done ? (

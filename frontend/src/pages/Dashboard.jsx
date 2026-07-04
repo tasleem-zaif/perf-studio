@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import api from '../api';
 import { projectDirName } from '../utils/displayName';
 
-export default function Dashboard({ projects: propProjects, user, onSelectProject, onDeleteProject, onNewProject, onEditProject, onProjectsLoaded }) {
+export default function Dashboard({ projects: propProjects, user, onSelectProject, onDeleteProject, onNewProject, onEditProject, onProjectsLoaded, onNav }) {
   const isSuperAdmin = user?.role === 'super_admin';
   const isOrgAdmin   = user?.role === 'org_admin';
 
@@ -170,6 +170,19 @@ export default function Dashboard({ projects: propProjects, user, onSelectProjec
 
   return (
     <div className="page fade-in">
+      {isOrgAdmin && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginBottom: '16px' }}>
+          {onNav && (
+            <button className="btn-secondary" onClick={() => onNav('settings-org')}>
+              <i className="ti ti-building-bank" /> Organization Administration
+            </button>
+          )}
+          {onNewProject && (
+            <button className="btn-primary" onClick={onNewProject}><i className="ti ti-plus" /> New Project</button>
+          )}
+        </div>
+      )}
+
       {/* Top stats — all from a single API call */}
       <div className="stats-row">
         {isSuperAdmin && (

@@ -16,9 +16,9 @@ router.use(auth);
  *   org_admin   → projects in their org
  *   user        → projects explicitly assigned to them
  */
-router.get('/stats', (req, res) => {
+router.get('/stats', async (req, res) => {
   try {
-    const caller = db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(req.userId);
+    const caller = await db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(req.userId);
 
     // ── Build WHERE clause per role ──────────────────────────────────────────
     let projectFilter;    // for the aggregate query
@@ -110,13 +110,13 @@ router.get('/stats', (req, res) => {
       LEFT JOIN test_data_files tdf ON tdf.project_id = p.id
       WHERE ${projectFilter}
     `;
-    const totals = db.prepare(aggSQL).get(...params);
+    const totals = await db.prepare(aggSQL).get(...params);
 
     // ── Query 2: project list with per-project counts ────────────────────────
-    const projects = db.prepare(projectListSQL).all(...params);
+    const projects = await db.prepare(projectListSQL).all(...params);
 
     // Attach empty arrays so ProjectWorkspace doesn't crash before lazy-load
-    projects.forEach(p => {
+    projects.forEach(async p => {
       p.collections = [];
       p.rules = [];
     });

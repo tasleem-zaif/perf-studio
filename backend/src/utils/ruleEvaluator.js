@@ -103,8 +103,8 @@ function compare(actual, op, threshold, thresholdMin, thresholdMax) {
  * @param {string}        jtlPath   – absolute path to results.jtl
  * @returns {{ passed: boolean, violations: Array, metrics: object|null, noRules: boolean }}
  */
-function evaluateRules(projectId, jtlPath) {
-  const rules = db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
+async function evaluateRules(projectId, jtlPath) {
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
 
   if (!rules || rules.length === 0) {
     // No rules defined — pass/fail determined by raw JTL fail count only

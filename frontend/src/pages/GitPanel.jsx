@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
@@ -118,7 +118,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── Identity ──────────────────────────────────────────────────────────────
   const [identity,       setIdentity]       = useState(null);
-  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '', auth_method: 'pat', ssh_key: '' });
+  const [idForm,         setIdForm]         = useState({ branch_name: '', author_name: user?.name || '', author_email: user?.email || '', auth_token: '', auth_method: 'pat', ssh_key: '', git_username: '' });
   const [savingId,       setSavingId]       = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [autoIniting,    setAutoIniting]    = useState(false);
@@ -178,30 +178,34 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
   const loadAll = useCallback(async () => {
     if (!pid) return;
     try {
-      const [cfgRes, idRes, prsRes, statusRes] = await Promise.all([
+      // Phase 1: load cheap DB-only data immediately — renders the page
+      const [cfgRes, idRes, prsRes] = await Promise.all([
         api.get(`/projects/${pid}/git/config`).catch(() => ({ data: { config: null } })),
         api.get(`/projects/${pid}/git/identity`).catch(() => ({ data: { identity: null } })),
         api.get(`/projects/${pid}/git/prs`).catch(() => ({ data: { prs: [] } })),
-        api.get(`/projects/${pid}/git/status`).catch(() => ({ data: { initialized: false } })),
       ]);
       const c = cfgRes.data.config;
       setCfg(c);
       if (c) {
         setCfgForm({ provider: c.provider||'github', remote_url: c.remote_url||'', base_branch: c.base_branch||'main', username: c.username||'', email: c.email||'', auth_token: '', auth_method: c.auth_method||'pat' });
-        setCfgEditMode(!c.remote_url); // start in edit mode only if not yet configured
+        setCfgEditMode(!c.remote_url);
       }
       const id = idRes.data.identity;
       setIdentity(id);
-      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '', auth_method: id.auth_method||'pat', ssh_key: '' }));
+      if (id) setIdForm(f => ({ ...f, branch_name: id.branch_name||'', author_name: id.author_name||f.author_name, author_email: id.author_email||f.author_email, auth_token: '', auth_method: id.auth_method||'pat', ssh_key: '', git_username: id.git_username||'' }));
       setPrs(prsRes.data.prs || []);
-      setStatus(statusRes.data);
-      if (statusRes.data?.initialized) {
-        const [logRes, branchRes] = await Promise.all([
+
+      // Phase 2: load git workspace data in background (runs git commands — slower)
+      if (c?.is_initialized) {
+        Promise.all([
+          api.get(`/projects/${pid}/git/status`).catch(() => ({ data: { initialized: false } })),
           api.get(`/projects/${pid}/git/log`).catch(() => ({ data: { commits: [] } })),
           api.get(`/projects/${pid}/git/branches`).catch(() => ({ data: { branches: [] } })),
-        ]);
-        setLog(logRes.data.commits || []);
-        setBranches(branchRes.data.branches || []);
+        ]).then(([statusRes, logRes, branchRes]) => {
+          setStatus(statusRes.data);
+          setLog(logRes.data.commits || []);
+          setBranches(branchRes.data.branches || []);
+        });
       }
     } catch (e) { console.error('Git load error:', e.message); }
   }, [pid]);
@@ -298,7 +302,8 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
       toast('Git identity saved', 'success');
       loadAll();
       // Auto-init branch if all fields are set and repo is initialized
-      if (initialized && idForm.branch_name && idForm.author_name && idForm.author_email && (idForm.auth_token || identity?.auth_token)) {
+      const bbUsernameOk = cfg?.provider !== 'bitbucket' || idForm.auth_method === 'ssh' || !!(idForm.git_username || identity?.git_username);
+      if (initialized && idForm.branch_name && idForm.author_name && idForm.author_email && (idForm.auth_token || identity?.auth_token) && bbUsernameOk) {
         setAutoIniting(true);
         addLog(`Setting up branch "${idForm.branch_name}"…`);
         try {
@@ -790,8 +795,21 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                 </div>
               </Field>
 
+              {cfg?.provider === 'bitbucket' && idForm.auth_method !== 'ssh' && (
+                <Field label="Bitbucket Username" required hint="Your Bitbucket account username (e.g. tasleema85) — required to authenticate with your API token.">
+                  <input
+                    type="text"
+                    value={idForm.git_username}
+                    onChange={e => setIdForm(f => ({ ...f, git_username: e.target.value }))}
+                    placeholder="your-bitbucket-username"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Field>
+              )}
+
               {idForm.auth_method === 'ssh' ? (
-                <Field label="SSH Private Key" required hint="Paste your private key (-----BEGIN ... PRIVATE KEY-----). The public key must be added to your GitHub/GitLab account.">
+                <Field label="SSH Private Key" required hint={`Paste your private key (-----BEGIN ... PRIVATE KEY-----). The public key must be added to your ${cfg?.provider === 'bitbucket' ? 'Bitbucket' : cfg?.provider === 'gitlab' ? 'GitLab' : 'GitHub'} account.`}>
                   <textarea
                     value={idForm.ssh_key}
                     onChange={e => setIdForm(f => ({ ...f, ssh_key: e.target.value }))}
@@ -810,25 +828,33 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
                     </ol>
                   </div>
                 </Field>
-              ) : (
-                <Field label="Personal access token" required hint="GitHub PAT starting with ghp_ or github_pat_ — never your login password.">
-                  <input
-                    type="text"
-                    value={idForm.auth_token}
-                    onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
-                    placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : 'ghp_xxxxxxxxxxxxxxxxxxxx'}
-                    autoComplete="off"
-                    spellCheck={false}
-                    style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
-                  />
-                  {idForm.auth_token && !idForm.auth_token.startsWith('ghp_') && !idForm.auth_token.startsWith('github_pat_') && (
-                    <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
-                      <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
-                      This doesn't look like a GitHub PAT. It should start with <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>ghp_</code> or <code style={{ background: '#fef3c7', padding: '1px 4px', borderRadius: 3 }}>github_pat_</code>
-                    </div>
-                  )}
-                </Field>
-              )}
+              ) : (() => {
+                const provider = cfg?.provider || 'github';
+                const tokenMeta = {
+                  github:    { label: 'Personal Access Token', hint: 'GitHub PAT starting with ghp_ or github_pat_ — never your login password.', placeholder: 'ghp_xxxxxxxxxxxxxxxxxxxx', valid: t => t.startsWith('ghp_') || t.startsWith('github_pat_'), warn: 'This doesn\'t look like a GitHub PAT. It should start with ghp_ or github_pat_.' },
+                  gitlab:    { label: 'Personal Access Token', hint: 'GitLab PAT starting with glpat- — never your login password.', placeholder: 'glpat-xxxxxxxxxxxxxxxxxxxx', valid: t => t.startsWith('glpat-'), warn: 'This doesn\'t look like a GitLab PAT. It should start with glpat-.' },
+                  bitbucket: { label: 'API Token', hint: 'Bitbucket API token starting with ATATT — created in Bitbucket → Personal settings → API tokens.', placeholder: 'ATATTxxxxxxxxxxxxxxxxx', valid: t => t.startsWith('ATATT') || t.startsWith('ATBB'), warn: null },
+                }[provider] || { label: 'Personal Access Token', hint: '', placeholder: '••••••••', valid: () => true, warn: null };
+                return (
+                  <Field label={tokenMeta.label} required hint={tokenMeta.hint}>
+                    <input
+                      type="text"
+                      value={idForm.auth_token}
+                      onChange={e => setIdForm(f => ({ ...f, auth_token: e.target.value }))}
+                      placeholder={identity?.auth_token ? `(saved — ${cfg?.token_preview || '••••••••'})` : tokenMeta.placeholder}
+                      autoComplete="off"
+                      spellCheck={false}
+                      style={{ fontFamily: idForm.auth_token ? 'monospace' : 'inherit', letterSpacing: idForm.auth_token ? '0.5px' : 'normal' }}
+                    />
+                    {idForm.auth_token && tokenMeta.warn && !tokenMeta.valid(idForm.auth_token) && (
+                      <div style={{ marginTop: 6, fontSize: 12, color: '#b45309', display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <i className="ti ti-alert-triangle" style={{ fontSize: 12 }} />
+                        {tokenMeta.warn}
+                      </div>
+                    )}
+                  </Field>
+                );
+              })()}
               <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
                 <button type="submit" className="btn-primary" disabled={savingId || branchConflict}>
                   {(savingId || autoIniting) && <span className="spinner"/>}

@@ -1,57 +1,32 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
-import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
-import EnvBar from '../components/EnvBar';
 
 const BLANK_URL = { protocol: 'https', url: '', port: '443' };
 function normalizeConfig(raw) {
-  if (!raw) return { urls: [{ ...BLANK_URL }] };
+  if (!raw) return { urls: [] };
   // Strip deprecated fields — Docker handles paths, test plans handle load params
   const { urls, url, protocol, port, jmeter_path, k6_path, java_home, threads, rampup, duration, loops, ...rest } = raw;
   let normalizedUrls;
-  if (urls && Array.isArray(urls)) {
+  if (Array.isArray(urls)) {
+    // Missing key and explicit empty array both mean "no URLs configured" — treat them
+    // identically. Previously a missing key alone would synthesize one blank template
+    // row, which contradicted the "0 URL(s)" badge shown right next to it.
     normalizedUrls = urls;
   } else if (url !== undefined) {
     normalizedUrls = [{ protocol: protocol || 'https', url: url || '', port: port || '443' }];
   } else {
-    normalizedUrls = [{ ...BLANK_URL }];
+    normalizedUrls = [];
   }
   return { urls: normalizedUrls, ...rest };
 }
 
-function LoadParamsEditor({ cfg, setCfg }) {
-  function set(k, v) { setCfg(c => ({ ...c, [k]: v })); }
-  return (
-    <div>
-      <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '10px', marginTop: '16px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-        <i className="ti ti-settings-2" style={{ color: 'var(--accent)' }} /> Default Load Parameters
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px' }}>
-        {[
-          { key: 'threads',  label: 'Virtual Users',   placeholder: 'e.g. 50',  hint: 'threads' },
-          { key: 'rampup',   label: 'Ramp-up (s)',     placeholder: 'e.g. 30',  hint: 'seconds' },
-          { key: 'duration', label: 'Duration (s)',     placeholder: 'e.g. 300', hint: 'seconds' },
-          { key: 'loops',    label: 'Iterations',       placeholder: 'e.g. 1',   hint: 'loop count' },
-        ].map(({ key, label, placeholder, hint }) => (
-          <div className="form-group" key={key} style={{ marginBottom: 0 }}>
-            <label className="form-label">{label}</label>
-            <input
-              type="number" min="1"
-              value={cfg[key] ?? ''}
-              onChange={e => set(key, e.target.value)}
-              placeholder={placeholder}
-            />
-            <div style={{ fontSize: '10px', color: 'var(--color-text-tertiary)', marginTop: '3px' }}>{hint}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '8px' }}>
-        <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-        Used as defaults when creating test suites. Individual suites can override these values.
-      </div>
-    </div>
-  );
+function getCollectionEnvs(col) {
+  if (!col) return [];
+  let envs = [];
+  try { envs = JSON.parse(col.environments || '[]'); } catch {}
+  if (!envs.length && col.environment) envs = [col.environment];
+  return envs;
 }
 
 function UrlRow({ entry, idx, onChange, onRemove, canRemove }) {
@@ -145,6 +120,53 @@ function UrlsEditor({ cfg, setCfg }) {
   );
 }
 
+function VariablesEditor({ cfg, setCfg }) {
+  const varsObj = cfg.variables || {};
+  const rows = Object.keys(varsObj).length ? Object.entries(varsObj).map(([key, value]) => ({ key, value })) : [{ key: '', value: '' }];
+
+  function commit(newRows) {
+    const obj = {};
+    for (const r of newRows) if (r.key.trim()) obj[r.key.trim()] = r.value;
+    setCfg(c => ({ ...c, variables: obj }));
+  }
+
+  function updateRow(idx, field, value) {
+    commit(rows.map((r, i) => i === idx ? { ...r, [field]: value } : r));
+  }
+
+  function addRow() {
+    commit([...rows, { key: '', value: '' }]);
+  }
+
+  function removeRow(idx) {
+    const next = rows.filter((_, i) => i !== idx);
+    commit(next.length ? next : [{ key: '', value: '' }]);
+  }
+
+  return (
+    <div style={{ marginTop: '18px', paddingTop: '16px', borderTop: '1px solid var(--color-border-secondary)' }}>
+      <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <i className="ti ti-variable" style={{ color: 'var(--accent)' }} /> Variables (<code>{'{{var}}'}</code>)
+      </div>
+      <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: '10px' }}>
+        Values for any <code>{'{{var}}'}</code> placeholders used in this collection's endpoints (URL, headers, body) — required for Pre-Run to resolve them. Auto-filled from an uploaded Postman environment file or the collection's own defaults where possible; add or correct any that couldn't be auto-derived (e.g. a value a Postman pre-request script computes dynamically, which Peako does not execute).
+      </div>
+      {rows.map((r, idx) => (
+        <div key={idx} style={{ display: 'flex', gap: '10px', marginBottom: '8px', alignItems: 'center' }}>
+          <input type="text" value={r.key} onChange={e => updateRow(idx, 'key', e.target.value)} placeholder="url" style={{ flex: '0 0 160px' }} />
+          <input type="text" value={r.value} onChange={e => updateRow(idx, 'value', e.target.value)} placeholder="https://api.example.com" style={{ flex: 1 }} />
+          <button className="btn-icon" onClick={() => removeRow(idx)} title="Remove variable" style={{ color: 'var(--danger)' }}>
+            <i className="ti ti-trash" />
+          </button>
+        </div>
+      ))}
+      <button className="btn-secondary btn-sm" onClick={addRow}>
+        <i className="ti ti-plus" /> Add Variable
+      </button>
+    </div>
+  );
+}
+
 function CollapsibleSection({ title, icon, iconColor, open, onToggle, children, badge }) {
   return (
     <div className="collapsible-card">
@@ -161,104 +183,60 @@ function CollapsibleSection({ title, icon, iconColor, open, onToggle, children, 
   );
 }
 
-export default function Config({ project, collection, env, envs, onEnvChange }) {
-  const { toast } = useToast();
+export default function Config({ project }) {
   const [globalCfg, setGlobalCfg]   = useState({ urls: [{ ...BLANK_URL }] });
   const [projectCfg, setProjectCfg] = useState({ urls: [{ ...BLANK_URL }] });
   const [envCfg, setEnvCfg]         = useState({ urls: [{ ...BLANK_URL }] }); // env-specific config
-  const [envReadiness, setEnvReadiness] = useState(null); // env health status
   const [saving, setSaving] = useState(null);
   const [saved, setSaved] = useState(null);
-  const [open, setOpen] = useState({ sysCheck: true, docker: false, global: false, project: false, effective: false, envReady: true });
-  const [sysChecks, setSysChecks] = useState([]);
-  const [sysOverall, setSysOverall] = useState(null); // null | 'ok' | 'warn' | 'fail'
-  const [sysRunning, setSysRunning] = useState(false);
-  const [dockerStatus, setDockerStatus] = useState(null); // null | 'ok' | 'installed' | 'missing'
-  const [dockerVersion, setDockerVersion] = useState('');
-  const [checkingDocker, setCheckingDocker] = useState(false);
-  const [installingDocker, setInstallingDocker] = useState(false);
-  const [startingDocker, setStartingDocker] = useState(false);
-  const [sysDockerMsg, setSysDockerMsg] = useState(''); // inline status inside System Requirements
-  const [enablingVirt, setEnablingVirt] = useState(false);
-  const [virtMsg, setVirtMsg] = useState('');
-  const [dockerLogs, setDockerLogs] = useState([]);
-  const [jmeterDockerImage, setJmeterDockerImage] = useState('tasleemzaif/perfstudio:latest');
-  const [k6DockerImage, setK6DockerImage] = useState('tasleemzaif/perfstudio:latest');
-  const [pullingImage, setPullingImage] = useState(null); // 'jmeter' | 'k6' | null
+  const [open, setOpen] = useState({ project: false, envConfig: true });
+
+  const collections = project?.collections || [];
+  // Collection/environment selection is local to this tab — a project can have multiple
+  // collections, each with its own independent set of {{var}} values and URLs per env.
+  const [selectedCollectionId, setSelectedCollectionId] = useState('');
+  const [selectedEnv, setSelectedEnv] = useState('');
+  const selectedCollection = collections.find(c => String(c.id) === String(selectedCollectionId)) || null;
+  const selectedCollectionEnvs = getCollectionEnvs(selectedCollection);
+
+  // Default to the first collection once the list is available (and keep it valid if
+  // collections are added/removed) — same idea as picking a sensible default, but the
+  // user can change it via the dropdown below at any time.
+  useEffect(() => {
+    if (!collections.length) { setSelectedCollectionId(''); return; }
+    if (!collections.some(c => String(c.id) === String(selectedCollectionId))) {
+      setSelectedCollectionId(collections[0].id);
+    }
+  }, [collections.map(c => c.id).join(','), selectedCollectionId]);
+
+  // Keep the selected env valid for whichever collection is currently selected.
+  useEffect(() => {
+    if (!selectedCollectionEnvs.length) { setSelectedEnv(''); return; }
+    if (!selectedCollectionEnvs.includes(selectedEnv)) setSelectedEnv(selectedCollectionEnvs[0]);
+  }, [selectedCollection?.id]);
 
   useEffect(() => {
     api.get('/config').then(({ data }) => {
       setGlobalCfg(normalizeConfig(data.config));
-      if (data.config?.jmeter_docker_image) setJmeterDockerImage(data.config.jmeter_docker_image);
-      if (data.config?.k6_docker_image) setK6DockerImage(data.config.k6_docker_image);
     }).catch(() => {});
     if (project) {
       api.get(`/projects/${project.id}/config`).then(({ data }) => {
         setProjectCfg(normalizeConfig(data.project));
       }).catch(() => {});
     }
-    runSystemCheck();
-  }, [project?.id, project?.collections?.length]);
+  }, [project?.id]);
 
-  // When env context changes: reset check state + reload env config
+  // Load env-specific config whenever the locally-selected collection/env changes
   useEffect(() => {
-    if (!project) return;
-
-    // Reset system check and docker state so each env gets a fresh check
-    if (collection?.id && env) {
-      setSysChecks([]);
-      setSysOverall(null);
-      setDockerStatus(null);
-      setDockerLogs([]);
-    }
-
-    if (collection?.id && env) {
-      api.get(`/projects/${project.id}/collections/${collection.id}/env-config/${encodeURIComponent(env)}`)
-        .then(({ data }) => {
-          setEnvCfg(normalizeConfig(data.env || { urls: [{ ...BLANK_URL }] }));
-        }).catch(() => setEnvCfg({ urls: [{ ...BLANK_URL }] }));
-
-      // Load env readiness summary
-      Promise.all([
-        api.get(`/projects/${project.id}/test-data?collection_id=${collection.id}&env=${encodeURIComponent(env)}`),
-        api.get(`/projects/${project.id}/test-suites`),
-        api.get(`/projects/${project.id}/collections/${collection.id}/env-config/${encodeURIComponent(env)}`),
-      ]).then(([tdRes, tsRes, cfgRes]) => {
-        // Only count files actually in THIS env's folder — no cross-env sharing
-        const testData = tdRes.data.files || [];
-        const allSuites = tsRes.data.suites || [];
-        const envSuites = allSuites.filter(s => String(s.collection_id) === String(collection.id) && s.env === env);
-        const generated = envSuites.filter(s => s.jmx_path || s.js_path);
-        const envUrls   = (cfgRes.data.env?.urls || []).filter(u => u.url);
-        setEnvReadiness({
-          configuredUrls:  envUrls.length,
-          testDataFiles:   testData.length,
-          testPlans:       envSuites.length,
-          generatedScripts: generated.length,
-          isReady: envUrls.length > 0 && generated.length > 0,
-        });
-      }).catch(() => setEnvReadiness(null));
-    }
-  }, [project?.id, collection?.id, env]);
-
-  async function runSystemCheck() {
-    setSysRunning(true);
-    setSysChecks([]);
-    setSysOverall(null);
-    try {
-      const { data } = await api.get('/execution/system-check');
-      setSysChecks(data.checks || []);
-      setSysOverall(data.overall || 'ok');
-    } catch {
-      setSysChecks([{ id: 'error', name: 'System Check', status: 'fail', detail: 'Could not reach backend — is the server running?' }]);
-      setSysOverall('fail');
-    } finally {
-      setSysRunning(false);
-    }
-  }
+    if (!project || !selectedCollection?.id || !selectedEnv) return;
+    api.get(`/projects/${project.id}/collections/${selectedCollection.id}/env-config/${encodeURIComponent(selectedEnv)}`)
+      .then(({ data }) => {
+        setEnvCfg(normalizeConfig(data.env || { urls: [{ ...BLANK_URL }] }));
+      }).catch(() => setEnvCfg({ urls: [{ ...BLANK_URL }] }));
+  }, [project?.id, selectedCollection?.id, selectedEnv]);
 
   function autoPopulateFromCollection() {
-    if (!project?.collections?.length) return toast('No collections found on this project. Import a collection first.', 'warn');
+    if (!project?.collections?.length) return;
     const urlSets = [];
     const seen = new Set();
     for (const col of project.collections) {
@@ -270,7 +248,10 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
           const u = new URL(ep.url.startsWith('http') ? ep.url : `https://${ep.url}`);
           const protocol = u.protocol.replace(':', '');
           const hostname = u.hostname;
-          const port = u.port || (protocol === 'https' ? '443' : '80');
+          // Skip unresolved Postman {{var}} templates — not a real hostname.
+          if (!hostname || hostname.includes('{{')) continue;
+          // Only use the port if the URL actually specified one — don't assume 443/80.
+          const port = u.port || '';
           const key = `${protocol}|${hostname}|${port}`;
           if (!seen.has(key)) {
             seen.add(key);
@@ -279,188 +260,14 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         } catch { continue; }
       }
     }
-    if (!urlSets.length) return toast('No valid URLs found in collection endpoints.', 'warn');
+    if (!urlSets.length) return;
     setProjectCfg({ urls: urlSets });
     setOpen(o => ({ ...o, project: true }));
-  }
-
-  async function checkDocker() {
-    setCheckingDocker(true);
-    try {
-      const { data } = await api.get('/execution/check-docker');
-      setDockerStatus(data.status);
-      setDockerVersion(data.version || '');
-    } catch {
-      setDockerStatus('missing');
-    } finally {
-      setCheckingDocker(false);
-    }
-  }
-
-  async function startDocker() {
-    setStartingDocker(true);
-    setSysDockerMsg('Launching Docker Desktop…');
-    setDockerLogs([{ type: 'info', message: 'Launching Docker Desktop, please wait...' }]);
-    try {
-      // Fire the start request — backend polls up to 30s internally
-      await api.post('/execution/start-docker').catch(() => {});
-
-      // Frontend-side: poll system-check every 5s for up to 90s until daemon is OK
-      setSysDockerMsg('Waiting for Docker daemon to start…');
-      const deadline = Date.now() + 90000;
-      let ready = false;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 5000));
-        try {
-          const { data } = await api.get('/execution/system-check');
-          const daemonCheck = (data.checks || []).find(c => c.id === 'docker_daemon');
-          if (daemonCheck && daemonCheck.status === 'ok') {
-            setSysChecks(data.checks);
-            setSysOverall(data.overall || 'ok');
-            setSysDockerMsg('');
-            setDockerLogs(prev => [...prev, { type: 'ok', message: 'Docker is running.' }]);
-            await checkDocker();
-            ready = true;
-            break;
-          }
-          // Update the checks so the user sees live state
-          setSysChecks(data.checks || []);
-          setSysOverall(data.overall || 'fail');
-        } catch (_) {}
-      }
-      if (!ready) {
-        setSysDockerMsg('Docker is taking longer than usual — click Run Check once Docker Desktop finishes loading.');
-        setDockerLogs(prev => [...prev, { type: 'warn', message: 'Docker daemon not ready after 90s. Start Docker Desktop manually and click Run Check.' }]);
-      }
-    } catch (e) {
-      setSysDockerMsg('');
-      setDockerLogs(prev => [...prev, { type: 'err', message: 'Failed to start Docker: ' + (e.response?.data?.message || e.message) }]);
-    } finally {
-      setStartingDocker(false);
-    }
-  }
-
-  async function enableVirtualization() {
-    setEnablingVirt(true);
-    setVirtMsg('Launching UAC prompt — accept it to enable the features…');
-    try {
-      const { data } = await api.post('/execution/enable-virtualization');
-      if (data.ok) {
-        setVirtMsg('Features are being enabled. ⚠️ A system restart is required once the window closes.');
-      } else {
-        setVirtMsg(data.message || 'Failed to launch. Please run the commands manually as Administrator.');
-      }
-    } catch (e) {
-      setVirtMsg('Error: ' + (e.response?.data?.message || e.message));
-    } finally {
-      setEnablingVirt(false);
-    }
-  }
-
-  async function installDocker() {
-    setInstallingDocker(true);
-    setDockerLogs([]);
-    try {
-      const token = localStorage.getItem('ps_token');
-      const response = await fetch('/api/execution/install-deps', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ tool: 'docker' }),
-      });
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop();
-        for (const event of events) {
-          const line = event.trim();
-          if (!line.startsWith('data:')) continue;
-          try {
-            const data = JSON.parse(line.slice(5).trim());
-            if (data.done) {
-              if (data.error) {
-                setDockerLogs(prev => [...prev, { type: 'err', message: 'Installation failed: ' + data.error }]);
-              } else {
-                setDockerLogs(prev => [...prev, { type: 'ok', message: 'Docker installation complete.' }]);
-                await checkDocker();
-              }
-            } else {
-              setDockerLogs(prev => [...prev, { type: data.type || 'info', message: data.message || '' }]);
-            }
-          } catch {}
-        }
-      }
-    } catch (e) {
-      setDockerLogs(prev => [...prev, { type: 'err', message: 'Installation error: ' + e.message }]);
-    } finally {
-      setInstallingDocker(false);
-    }
-  }
-
-  async function saveDockerImages() {
-    try {
-      await api.put('/config', { config: { ...globalCfg, jmeter_docker_image: jmeterDockerImage, k6_docker_image: k6DockerImage } });
-      setGlobalCfg(c => ({ ...c, jmeter_docker_image: jmeterDockerImage, k6_docker_image: k6DockerImage }));
-      toast('Docker images saved.', 'ok');
-    } catch { toast('Failed to save.', 'err'); }
-  }
-
-  async function pullImage(tool) {
-    const image = tool === 'k6' ? k6DockerImage : jmeterDockerImage;
-    setPullingImage(tool);
-    setDockerLogs([]);
-    try {
-      const token = localStorage.getItem('ps_token');
-      const response = await fetch('/api/execution/jmeter/pull-image', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ image }),
-      });
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop();
-        for (const event of events) {
-          const line = event.trim();
-          if (!line.startsWith('data:')) continue;
-          try {
-            const data = JSON.parse(line.slice(5).trim());
-            if (data.done) {
-              if (data.error) setDockerLogs(prev => [...prev, { type: 'err', message: 'Pull failed: ' + data.error }]);
-              else setDockerLogs(prev => [...prev, { type: 'ok', message: `${image} is ready.` }]);
-            } else {
-              setDockerLogs(prev => [...prev, { type: data.type || 'info', message: data.message || '' }]);
-            }
-          } catch {}
-        }
-      }
-    } catch (e) {
-      setDockerLogs(prev => [...prev, { type: 'err', message: 'Pull error: ' + e.message }]);
-    } finally {
-      setPullingImage(null);
-    }
   }
 
   function stripDeprecated(cfg) {
     const { jmeter_path, k6_path, java_home, threads, rampup, duration, loops, ...clean } = cfg || {};
     return clean;
-  }
-
-  async function saveGlobal() {
-    setSaving('global');
-    try {
-      await api.put('/config', { config: stripDeprecated(globalCfg) });
-      setSaved('global'); setTimeout(() => setSaved(null), 3000);
-    } finally { setSaving(null); }
   }
 
   async function saveProject() {
@@ -473,24 +280,17 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
   }
 
   async function saveEnv() {
-    if (!project || !collection?.id || !env) return;
+    if (!project || !selectedCollection?.id || !selectedEnv) return;
     setSaving('env');
     try {
-      await api.put(`/projects/${project.id}/collections/${collection.id}/env-config/${encodeURIComponent(env)}`,
+      await api.put(`/projects/${project.id}/collections/${selectedCollection.id}/env-config/${encodeURIComponent(selectedEnv)}`,
         { config: stripDeprecated(envCfg) });
       setSaved('env'); setTimeout(() => setSaved(null), 3000);
     } finally { setSaving(null); }
   }
 
-  function getMergedUrls() {
-    const base = (globalCfg.urls || []).length ? globalCfg.urls : [{ ...BLANK_URL }];
-    const proj = (projectCfg.urls || []).filter(u => u.url);
-    return proj.length ? proj : base;
-  }
-
   return (
     <div className="page fade-in">
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to configure server settings" />
       <div className="section-hdr" style={{ marginBottom: '4px' }}>
         <div className="section-title"><i className="ti ti-settings-2" style={{ marginRight: '8px', color: 'var(--accent)' }} />Configuration</div>
       </div>
@@ -498,245 +298,8 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         Base URLs are auto-populated from your API source collections and stored as JMeter User Defined Variables.
       </div>
 
-      {/* System Requirements removed — use Docker Engine section below */}
-      {null && <CollapsibleSection title="" open={false} onToggle={() => {}}>
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Verifies all dependencies, permissions, and configuration needed to run PerfStudio and execute tests.
-        </div>
-
-        <button
-          className="btn-secondary btn-sm"
-          onClick={runSystemCheck}
-          disabled={sysRunning}
-          style={{ marginBottom: '14px' }}
-        >
-          {sysRunning ? <><span className="spinner" />Running check…</> : <><i className="ti ti-refresh" />Run Check</>}
-        </button>
-
-        {sysChecks.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {/* Overall banner */}
-            {sysOverall && (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '10px 14px', borderRadius: '8px', marginBottom: '6px',
-                background: sysOverall === 'ok' ? 'rgba(34,197,94,0.1)' : sysOverall === 'fail' ? 'rgba(247,84,100,0.1)' : 'rgba(240,167,50,0.1)',
-                border: `1px solid ${sysOverall === 'ok' ? '#22c55e' : sysOverall === 'fail' ? 'var(--danger)' : 'var(--warn)'}`,
-              }}>
-                <i className={`ti ${sysOverall === 'ok' ? 'ti-circle-check' : sysOverall === 'fail' ? 'ti-circle-x' : 'ti-alert-triangle'}`}
-                   style={{ fontSize: '18px', color: sysOverall === 'ok' ? '#22c55e' : sysOverall === 'fail' ? 'var(--danger)' : 'var(--warn)' }} />
-                <div style={{ fontWeight: 600, fontSize: '13px', color: sysOverall === 'ok' ? '#22c55e' : sysOverall === 'fail' ? 'var(--danger)' : 'var(--warn)' }}>
-                  {sysOverall === 'ok' ? 'All requirements met — ready to run tests.' :
-                   sysOverall === 'fail' ? `${sysChecks.filter(c => c.status === 'fail').length} requirement(s) failed — fix before running tests.` :
-                   `${sysChecks.filter(c => c.status === 'warn').length} warning(s) — tests may still run but review items below.`}
-                </div>
-              </div>
-            )}
-
-            {/* Check rows */}
-            {sysChecks.map(c => {
-              const icon = c.status === 'ok' ? 'ti-circle-check' : c.status === 'fail' ? 'ti-circle-x' : 'ti-alert-triangle';
-              const color = c.status === 'ok' ? '#22c55e' : c.status === 'fail' ? 'var(--danger)' : 'var(--warn)';
-              const isDaemonNotRunning = c.id === 'docker_daemon' && c.status === 'fail' && c.detail && c.detail.includes('daemon not running');
-              const isVirtFail = c.id === 'virtualization' && c.status === 'fail';
-              return (
-                <div key={c.id} style={{
-                  display: 'flex', alignItems: 'flex-start', gap: '10px',
-                  padding: '9px 12px',
-                  background: c.status === 'ok' ? 'rgba(34,197,94,0.06)' : 'var(--color-background-primary)',
-                  border: `1px solid ${c.status === 'ok' ? 'rgba(34,197,94,0.25)' : 'var(--color-border-secondary)'}`,
-                  borderRadius: '7px',
-                }}>
-                  <i className={`ti ${icon}`} style={{ fontSize: '16px', color, marginTop: '1px', flexShrink: 0 }} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 600, fontSize: '12px', color: 'var(--color-text-primary)' }}>{c.name}</div>
-                    <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '2px', wordBreak: 'break-word', fontFamily: c.status !== 'ok' ? 'var(--font-mono)' : undefined }}>
-                      {c.detail}
-                    </div>
-                    {isDaemonNotRunning && (
-                      <div style={{ marginTop: '7px', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                        <button
-                          className="btn-primary btn-sm"
-                          onClick={startDocker}
-                          disabled={startingDocker || checkingDocker}
-                        >
-                          {startingDocker
-                            ? <><span className="spinner" />Starting…</>
-                            : <><i className="ti ti-player-play" />Start Docker</>}
-                        </button>
-                        {sysDockerMsg && (
-                          <span style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', fontStyle: 'italic' }}>
-                            {sysDockerMsg}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    {isVirtFail && (
-                      <div style={{ marginTop: '8px' }}>
-                        <div style={{
-                          fontSize: '11px', color: 'var(--color-text-tertiary)',
-                          marginBottom: '7px', lineHeight: '1.5',
-                          padding: '7px 10px',
-                          background: 'rgba(240,167,50,0.08)',
-                          border: '1px solid rgba(240,167,50,0.25)',
-                          borderRadius: '6px',
-                        }}>
-                          <i className="ti ti-info-circle" style={{ marginRight: '5px', color: 'var(--warn)' }} />
-                          This will open an elevated PowerShell window (UAC prompt). Accept it to enable the features.
-                          A <strong>system restart</strong> is required after completion.
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                          <button
-                            className="btn-primary btn-sm"
-                            onClick={enableVirtualization}
-                            disabled={enablingVirt}
-                          >
-                            {enablingVirt
-                              ? <><span className="spinner" />Launching…</>
-                              : <><i className="ti ti-cpu" />Enable Hyper-V &amp; WSL2</>}
-                          </button>
-                          {virtMsg && (
-                            <span style={{ fontSize: '11px', color: virtMsg.includes('restart') ? 'var(--warn)' : 'var(--color-text-tertiary)', fontStyle: 'italic', maxWidth: '380px' }}>
-                              {virtMsg}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  <span style={{
-                    flexShrink: 0, fontSize: '10px', fontWeight: 700, letterSpacing: '.4px',
-                    padding: '2px 8px', borderRadius: '20px', textTransform: 'uppercase',
-                    background: c.status === 'ok' ? 'rgba(34,197,94,0.15)' : c.status === 'fail' ? 'rgba(247,84,100,0.15)' : 'rgba(240,167,50,0.15)',
-                    color,
-                    border: `1px solid ${color}`,
-                  }}>
-                    {c.status === 'ok' ? 'OK' : c.status === 'fail' ? 'FAIL' : 'WARN'}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </CollapsibleSection>}
-
-      {/* Docker Engine */}
-      <CollapsibleSection
-        title="Docker Engine"
-        icon="ti-brand-docker"
-        iconColor="#2496ed"
-        open={open.docker}
-        onToggle={() => setOpen(o => ({ ...o, docker: !o.docker }))}
-        badge={dockerStatus === 'ok' ? 'Running' : dockerStatus === 'installed' ? 'Installed' : dockerStatus === 'missing' ? 'Missing' : undefined}
-      >
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-          Checks whether Docker is installed and running on your local machine. Required for pulling the CI pipeline image locally.
-        </div>
-
-        {/* Status display */}
-        {dockerStatus && (
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px', borderRadius: '8px', marginBottom: '14px',
-            background: dockerStatus === 'ok' ? 'rgba(34,197,94,0.08)' : dockerStatus === 'installed' ? 'rgba(255,165,0,0.1)' : 'rgba(255,77,77,0.1)',
-            border: `1px solid ${dockerStatus === 'ok' ? '#22c55e' : dockerStatus === 'installed' ? 'var(--warn)' : 'var(--danger)'}`
-          }}>
-            <i className={`ti ${dockerStatus === 'ok' ? 'ti-circle-check' : dockerStatus === 'installed' ? 'ti-circle-dot' : 'ti-circle-x'}`}
-              style={{ fontSize: '18px', color: dockerStatus === 'ok' ? '#22c55e' : dockerStatus === 'installed' ? 'var(--warn)' : 'var(--danger)' }} />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600, fontSize: '13px', color: dockerStatus === 'ok' ? '#22c55e' : dockerStatus === 'installed' ? 'var(--warn)' : 'var(--danger)' }}>
-                {dockerStatus === 'ok' ? '✔ Docker is installed and running locally' : dockerStatus === 'installed' ? 'Docker is installed but daemon is not running' : 'Docker is not installed on this machine'}
-              </div>
-              {dockerVersion && <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>{dockerVersion}</div>}
-            </div>
-            {dockerStatus === 'installed' && (
-              <button className="btn-primary btn-sm" onClick={startDocker} disabled={startingDocker || checkingDocker}>
-                {startingDocker ? <><span className="spinner" />Starting...</> : <><i className="ti ti-player-play" />Start Docker</>}
-              </button>
-            )}
-          </div>
-        )}
-
-        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: dockerLogs.length ? '14px' : 0 }}>
-          <button className="btn-secondary btn-sm" onClick={checkDocker} disabled={checkingDocker || installingDocker || startingDocker}>
-            {checkingDocker ? <><span className="spinner" />Checking...</> : <><i className="ti ti-refresh" />Check Docker</>}
-          </button>
-          {dockerStatus === 'missing' && (
-            <button className="btn-primary btn-sm" onClick={installDocker} disabled={installingDocker || checkingDocker}>
-              {installingDocker ? <><span className="spinner" />Installing...</> : <><i className="ti ti-download" />Install Docker</>}
-            </button>
-          )}
-          {dockerStatus === null && (
-            <span style={{ fontSize: '12px', color: 'var(--color-text-tertiary)' }}>Click "Check Docker" to verify installation.</span>
-          )}
-        </div>
-
-        {dockerLogs.length > 0 && (
-          <div style={{ background: 'var(--color-background-primary)', border: '1px solid var(--color-border-secondary)', borderRadius: '6px', padding: '10px 12px', maxHeight: '200px', overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
-            {dockerLogs.map((l, i) => (
-              <div key={i} className={`run-line run-${l.type}`}>{l.message}</div>
-            ))}
-          </div>
-        )}
-
-        {dockerStatus === 'ok' && (
-          <div style={{ marginTop: '10px', fontSize: '11px', color: '#22c55e' }}>
-            <i className="ti ti-circle-check" style={{ marginRight: '4px', color: '#22c55e' }} />
-            Docker is ready. You can now run tests.
-          </div>
-        )}
-        {dockerStatus === 'installed' && !startingDocker && (
-          <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-            <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-            Docker Desktop is installed but the daemon is not running. Click <strong>Start Docker</strong> to launch it automatically.
-          </div>
-        )}
-        {dockerStatus === 'missing' && !installingDocker && (
-          <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-            <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-            Docker Desktop is not installed. Click <strong>Install Docker</strong> to download and install it.
-          </div>
-        )}
-
-        {/* CI Docker Image */}
-        <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--color-border-secondary)' }}>
-          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <i className="ti ti-brand-docker" style={{ color: '#0ea5e9', fontSize: '14px' }} />
-            CI Pipeline Docker Image
-          </div>
-          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '14px' }}>
-            Custom Docker image used in GitHub Actions / GitLab CI pipelines. Contains JMeter, K6, Java and Node.js.
-          </div>
-          <div style={{ display: 'flex', gap: '6px', maxWidth: 520, marginBottom: '12px' }}>
-            <input
-              type="text"
-              value={jmeterDockerImage}
-              onChange={e => setJmeterDockerImage(e.target.value)}
-              placeholder="tasleemzaif/perfstudio:latest"
-              style={{ flex: 1, minWidth: 0 }}
-            />
-            <button
-              className="btn-primary btn-sm"
-              onClick={() => pullImage('jmeter')}
-              disabled={!!pullingImage || !jmeterDockerImage.trim()}
-              style={{ whiteSpace: 'nowrap' }}
-              title="docker pull"
-            >
-              {pullingImage === 'jmeter' ? <><span className="spinner" />Pulling...</> : <><i className="ti ti-download" />Pull</>}
-            </button>
-          </div>
-          <button className="btn-secondary btn-sm" onClick={saveDockerImages}>
-            <i className="ti ti-device-floppy" /> Save Image
-          </button>
-          <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-            <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />
-            Pull caches the image locally. This is also the image referenced in generated CI YAML files.
-          </div>
-        </div>
-      </CollapsibleSection>
-
-
       {/* Endpoint Details — only shown when NOT in a specific env context */}
-      {(!collection || !env) && (
+      {(!selectedCollection || !selectedEnv) && (
       <CollapsibleSection
         title={`Endpoint Details${project ? ` — ${project.name}` : ''}`}
         icon="ti-folder"
@@ -760,53 +323,30 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
       </CollapsibleSection>
       )}
 
-      {/* ── Env Readiness Dashboard — shown when in collection+env context ── */}
-      {collection && env && envReadiness && (
-        <CollapsibleSection
-          title={`${env} Environment Readiness`}
-          icon="ti-checklist"
-          iconColor={envReadiness.isReady ? '#22c55e' : 'var(--warn)'}
-          open={open.envReady}
-          onToggle={() => setOpen(o => ({ ...o, envReady: !o.envReady }))}
-          badge={envReadiness.isReady ? 'Ready' : 'Setup Needed'}
-        >
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px', marginBottom: '14px' }}>
-            {[
-              { label: 'Target URLs',      val: envReadiness.configuredUrls,   icon: 'ti-world',      ok: envReadiness.configuredUrls > 0,    hint: 'Set in Environment Config below' },
-              { label: 'Test Data Files',  val: envReadiness.testDataFiles,    icon: 'ti-table',      ok: envReadiness.testDataFiles >= 0,    hint: 'Upload via Test Data' },
-              { label: 'Test Plans',       val: envReadiness.testPlans,        icon: 'ti-test-pipe',  ok: envReadiness.testPlans > 0,         hint: 'Create via Test Plans' },
-              { label: 'Generated Scripts',val: envReadiness.generatedScripts, icon: 'ti-code',       ok: envReadiness.generatedScripts > 0,  hint: 'Generate from Test Plans' },
-            ].map(({ label, val, icon, ok, hint }) => (
-              <div key={label} style={{
-                padding: '12px 14px',
-                background: ok ? 'rgba(34,197,94,0.07)' : 'rgba(245,158,11,0.07)',
-                border: `1px solid ${ok ? 'rgba(34,197,94,0.25)' : 'rgba(245,158,11,0.25)'}`,
-                borderRadius: '8px',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '6px' }}>
-                  <i className={`ti ${icon}`} style={{ fontSize: '14px', color: ok ? '#22c55e' : 'var(--warn)' }} />
-                  <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--color-text-tertiary)', textTransform: 'uppercase', letterSpacing: '.4px' }}>{label}</span>
-                </div>
-                <div style={{ fontSize: '22px', fontWeight: 700, color: ok ? '#22c55e' : 'var(--warn)', fontFamily: 'var(--font-mono)' }}>{val}</div>
-                {!ok && <div style={{ fontSize: '10px', color: 'var(--color-text-tertiary)', marginTop: '3px' }}>{hint}</div>}
-              </div>
-            ))}
+      {/* Collection + Environment selector — variables/URLs are stored per collection, per env */}
+      {collections.length > 0 && (
+        <div className="collapsible-card" style={{ padding: '14px 18px' }}>
+          <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <div className="form-group" style={{ marginBottom: 0, minWidth: '260px' }}>
+              <label className="form-label">API Source Collection</label>
+              <CustomSelect value={selectedCollectionId} onChange={e => setSelectedCollectionId(e.target.value)}>
+                {collections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </CustomSelect>
+            </div>
+            <div className="form-group" style={{ marginBottom: 0, minWidth: '200px' }}>
+              <label className="form-label">Environment</label>
+              <CustomSelect value={selectedEnv} onChange={e => setSelectedEnv(e.target.value)}>
+                {selectedCollectionEnvs.map(e => <option key={e} value={e}>{e}</option>)}
+              </CustomSelect>
+            </div>
           </div>
-          {envReadiness.isReady
-            ? <div style={{ fontSize: '13px', color: '#22c55e', display: 'flex', alignItems: 'center', gap: '7px' }}>
-                <i className="ti ti-circle-check" /> This environment is fully configured and ready to run tests.
-              </div>
-            : <div style={{ fontSize: '13px', color: 'var(--warn)', display: 'flex', alignItems: 'center', gap: '7px' }}>
-                <i className="ti ti-alert-triangle" /> Complete the setup steps above before running tests in this environment.
-              </div>
-          }
-        </CollapsibleSection>
+        </div>
       )}
 
       {/* Environment-Specific Config — shown only when inside a collection+env context */}
-      {collection && env && (
+      {selectedCollection && selectedEnv && (
         <CollapsibleSection
-          title={`Environment Config — ${collection.name} / ${env}`}
+          title={`Environment Config — ${selectedCollection.name} / ${selectedEnv}`}
           icon="ti-server"
           iconColor="var(--accent)"
           open={open.envConfig !== false}
@@ -815,18 +355,19 @@ export default function Config({ project, collection, env, envs, onEnvChange }) 
         >
           <div style={{ padding: '10px 14px', background: 'rgba(73,204,61,0.07)', border: '1px solid rgba(73,204,61,0.2)', borderRadius: '8px', marginBottom: '14px', fontSize: '12px', color: 'var(--color-text-secondary)' }}>
             <i className="ti ti-shield-check" style={{ color: 'var(--accent)', marginRight: '6px' }} />
-            <strong>Enter the target server URL for {env}.</strong> Each environment must have its own server URL
+            <strong>Enter the target server URL for {selectedEnv}.</strong> Each environment must have its own server URL
             (e.g. QA → <code>qa-api.company.com</code>, Staging → <code>staging-api.company.com</code>).
             <strong style={{ color: 'var(--danger)', marginLeft: '4px' }}>This is not shared with any other environment.</strong>
             <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
-              Priority: <strong style={{ color: 'var(--accent)' }}>{env} URL</strong> (used in JMX) → Project → Global (fallback)
+              Priority: <strong style={{ color: 'var(--accent)' }}>{selectedEnv} URL</strong> (used in JMX) → Project → Global (fallback)
             </div>
           </div>
           {saved === 'env' && <div style={{ marginBottom: '12px', padding: '8px 12px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px', fontSize: '12px', color: '#22c55e' }}>Environment config saved.</div>}
           <UrlsEditor cfg={envCfg} setCfg={setEnvCfg} />
+          <VariablesEditor cfg={envCfg} setCfg={setEnvCfg} />
           <div style={{ marginTop: '16px', display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
             <button className="btn-primary" onClick={saveEnv} disabled={saving === 'env'}>
-              {saving === 'env' && <span className="spinner" />}Save {env} Config
+              {saving === 'env' && <span className="spinner" />}Save {selectedEnv} Config
             </button>
             <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>
               <i className="ti ti-info-circle" style={{ marginRight: '4px' }} />

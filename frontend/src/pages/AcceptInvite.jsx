@@ -15,16 +15,14 @@ function LeftPanel() {
   return (
     <div className="auth-left">
       {/* Logo */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 }}>
-        <img
-          src="https://www.qtsolv.com/wp-content/themes/qtsolvtheme/assets/images/svg/logo.svg"
-          alt="Quarks"
-          style={{ height: 36, width: 'auto' }}
-        />
-        <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.15)' }} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 28 }}>
+        <img src="/favicon.svg" alt="Peako" style={{ height: 52, width: 'auto' }} />
         <div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Performance Studio</div>
-          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>by Quarks Technosoft</div>
+          <div style={{ lineHeight: 1.3 }}>
+            <span style={{ fontSize: 22, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px' }}>Peako</span>
+            <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.65)', marginLeft: 4 }}>- Next Gen Performance Testing</span>
+          </div>
+          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>by Quarks Technosoft</div>
         </div>
       </div>
 

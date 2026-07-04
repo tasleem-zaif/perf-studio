@@ -8,8 +8,8 @@ on:
     branches: [main]
 
 env:
-  BACKEND_IMAGE: tasleemzaif/perf-studio-backend
-  FRONTEND_IMAGE: tasleemzaif/perf-studio-frontend
+  BACKEND_IMAGE: tasleemzaif/PerfStudio-backend
+  FRONTEND_IMAGE: tasleemzaif/PerfStudio-frontend
 
 jobs:
   build-and-push:

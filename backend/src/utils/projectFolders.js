@@ -34,9 +34,9 @@ function userNameSlug(name) {
 }
 
 /** Resolve the folder name for a given user: their display-name slug, falling back to user-{id} */
-function resolveUserFolder(userId) {
+async function resolveUserFolder(userId) {
   try {
-    const row = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+    const row = await db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
     const slug = userNameSlug(row?.name);
     return slug || `user-${userId}`;
   } catch {
@@ -83,6 +83,23 @@ function ensureProjectFolders(projectName) {
 /** Get path to a specific collection + env folder */
 function getCollectionPath(projectFolderPath, collectionName, env) {
   return path.join(projectFolderPath, cleanName(collectionName), cleanName(env || 'Default'));
+}
+
+/**
+ * Resolves the env a collection-scoped test suite's results/scripts should live under,
+ * even when `suite.env` itself is blank — falls back to the collection's own default
+ * env instead of leaving the caller to fall back all the way to a bare project-level
+ * folder. A suite with a collection should always land under <Collection>/<Env>/...;
+ * the project-level fallback is only legitimate for a suite with NO collection at all.
+ */
+function resolveSuiteEnv(collection, suite) {
+  if (suite?.env) return suite.env;
+  if (!collection) return null;
+  try {
+    const envs = JSON.parse(collection.environments || '[]');
+    if (envs.length) return envs[0];
+  } catch (_) {}
+  return collection.environment || 'Default';
 }
 
 /**
@@ -156,8 +173,8 @@ function backupAndDeleteProjectFolder(folderPath, projectName, projectId) {
  * The outer <ProjectName> is the workspace bucket; <userName> is the git repo root;
  * the inner <ProjectName> is the content subfolder where collections/scripts live.
  */
-function getUserProjectPath(userId, userRole, projectName) {
-  const userFolder = resolveUserFolder(userId);
+async function getUserProjectPath(userId, userRole, projectName) {
+  const userFolder = await resolveUserFolder(userId);
   return path.join(GIT_WORKSPACES_ROOT, cleanName(projectName), userFolder, cleanName(projectName));
 }
 
@@ -176,6 +193,7 @@ module.exports = {
   getProjectPath,
   ensureProjectFolders,
   getCollectionPath,
+  resolveSuiteEnv,
   ensureCollectionFolders,
   ensureAllEnvFolders,
   getUserProjectPath,
