@@ -1,0 +1,42 @@
+sequenceDiagram
+    actor User
+    participant FE as Frontend
+    participant TS as testSuites.js Route
+    participant DB as Database (Postgres)
+    participant AC as aiClient.js
+    participant LLM as LLM Provider
+    participant FS as File System
+
+    User->>FE: Click "Generate Script"
+    FE->>TS: POST /api/projects/:id/test-suites/:suiteId/generate
+    TS->>DB: Fetch test suite (engine, test_type, vusers, rampup, duration, env)
+    TS->>DB: Fetch linked collection (json_content, pre_run_data)
+    TS->>DB: Fetch test data files (CSV paths + column names)
+    TS->>DB: Fetch performance rules (metric, operator, value, severity)
+    TS->>DB: Fetch global_config, project_config, collection_env_config
+    TS->>TS: Merge config (DEFAULT, global, project, env, suite)
+    Note over TS: Pre-run data read from collection.pre_run_data<br/>(no longer passed from frontend)
+
+    alt engine = jmeter
+        TS->>TS: buildJmxTemplate() - deterministic builder, no LLM needed
+        TS->>TS: Login endpoint detected? add JSONPostProcessor extractor
+        TS->>TS: CSV columns to CSVDataSet + variable substitution
+        TS->>TS: Folders from Postman? SimpleController grouping
+        TS->>TS: cleanScript() - strip markdown fences + fixJmxHashTrees()
+    else engine = k6
+        TS->>AC: callAi(userId, systemPrompt, userPrompt)
+        AC->>DB: Read ai_settings (provider, api_key encrypted)
+        AC->>AC: decrypt(api_key)
+        AC->>LLM: generateText(k6 prompt + endpoints + CSV + correlation + thresholds)
+        LLM-->>AC: Raw K6 JavaScript
+        AC-->>TS: Script content
+        TS->>TS: cleanScript() - strip markdown fences
+    end
+
+    TS->>TS: getUserProjectPath(userId, role, projectName)
+    TS->>TS: isAdminWorkspace()? reject if admin workspace
+    TS->>FS: mkdirSync(collection/ENV/script/)
+    TS->>FS: writeFileSync(suiteName_testType.jmx)
+    TS->>DB: UPDATE test_suites SET jmx_path, status = 'generated'
+    TS-->>FE: ok, filename, path
+    FE->>FE: Show download button + Re-generate option

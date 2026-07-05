@@ -140,6 +140,7 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     if (!ok) return;
     await api.delete(`/projects/${project.id}/test-suites/${id}`);
     loadSuites();
+    if (onAfterSave) onAfterSave();
   }
 
   async function generate(suite) {
@@ -148,6 +149,10 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     try {
       await api.post(`/projects/${project.id}/test-suites/${suite.id}/generate`, {});
       await loadSuites();
+      // Tell Runner.jsx (kept permanently mounted elsewhere in the workspace) that its
+      // own test-suites list is now stale — otherwise a freshly generated script only
+      // shows up in the "Run Test" dropdown after a hard browser refresh.
+      if (onAfterSave) onAfterSave();
       const ext = suite.engine === 'jmeter' ? '.jmx' : '.js';
       toast(`Script ${wasGenerated ? 're-generated' : 'generated'} successfully — ${suite.name}${ext} is ready to download`, 'success');
     } catch (e) {

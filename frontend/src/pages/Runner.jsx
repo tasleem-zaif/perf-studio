@@ -3,7 +3,7 @@ import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
 
-export default function Runner({ projects, activeProject, activeCollection, activeEnv, onNav }) {
+export default function Runner({ projects, activeProject, activeCollection, activeEnv, onNav, suitesVersion }) {
   const { toast } = useToast();
   const [suites, setSuites] = useState([]);           // all generated suites for project
   const [selectedCollectionId, setSelectedCollectionId] = useState('');
@@ -40,7 +40,11 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     }).catch(() => {});
   }, []);
 
-  // Load all generated suites when active project changes
+  // Load all generated suites when active project changes, or when suitesVersion is bumped
+  // (Runner is kept permanently mounted — display:none toggle, not unmount — when the user
+  // navigates elsewhere and back, so a project-id-only dependency would never re-fetch after
+  // a script is generated on the Test Plans page; suitesVersion is ProjectWorkspace's signal
+  // that something about this project's test suites changed).
   useEffect(() => {
     if (!activeProject?.id) { setSuites([]); setSelectedCollectionId(''); setSelectedEnv(''); setSelectedSuiteId(''); return; }
     api.get(`/projects/${activeProject.id}/test-suites`)
@@ -55,10 +59,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
           setSelectedCollectionId('');
           setSelectedEnv('');
         }
-        setSelectedSuiteId('');
+        // Keep the current suite selection if it's still in the refreshed list (a
+        // suitesVersion bump can be for a totally unrelated suite) — only clear it if
+        // it's genuinely gone.
+        setSelectedSuiteId(prev => (prev && generated.some(s => String(s.id) === String(prev))) ? prev : '');
       })
       .catch(() => { setSuites([]); });
-  }, [activeProject?.id]);
+  }, [activeProject?.id, suitesVersion]);
 
   // Sync when user navigates to runner from sidebar — always override with sidebar context
   useEffect(() => {
@@ -400,6 +407,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
   const [ciExpandedRun,  setCiExpandedRun]  = useState(null); // runId with expanded terminal
   const [ciSteps,        setCiSteps]        = useState({});   // runId → { steps, job }
+  const [ciExpandedHealChain, setCiExpandedHealChain] = useState({}); // rootRunId → bool
+  const [ciHealPanelCollapsed, setCiHealPanelCollapsed] = useState({}); // runId → bool (attempt logs + exhaustion summary)
   const ciStepsPollerRef = useRef(null);
   // CI Auto Heal state
   const [ciAutoHeal,    setCiAutoHeal]    = useState(true);  // toggle on trigger form
@@ -430,6 +439,27 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
     }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
+  }, [selectedProjectId, runTab]);
+
+  // Background refresh for the CI Run History list. pollCiStatus()/startCiHealPolling()
+  // only run while a status-changing action (trigger/heal/manual refresh) happened in THIS
+  // browser session — reloading the page (or just having left it open since before a run
+  // finished) leaves nothing polling, so a run completing or auto-heal progressing server-side
+  // never reaches the UI until the user manually refreshes. This interval re-fetches the run
+  // list on its own whenever anything shown is still in flight, so those changes show up live.
+  const ciRunsRef = useRef([]);
+  useEffect(() => { ciRunsRef.current = ciRuns; }, [ciRuns]);
+  useEffect(() => {
+    if (!selectedProjectId || runTab !== 'ci-pipeline') return;
+    const IN_FLIGHT_RUN  = new Set(['pending','queued','running','in_progress']);
+    const IN_FLIGHT_HEAL = new Set(['pending','diagnosing','applying_fix','rerunning','rerunning_full']);
+    const tick = setInterval(() => {
+      const hasInFlight = ciRunsRef.current.some(r =>
+        IN_FLIGHT_RUN.has(r.status) || IN_FLIGHT_HEAL.has(r.heal_status));
+      if (!hasInFlight) return;
+      api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
+    }, 6000);
+    return () => clearInterval(tick);
   }, [selectedProjectId, runTab]);
 
   // Poll live steps when a terminal is expanded
@@ -485,6 +515,14 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         if (!DONE.has(data.run?.status)) setTimeout(poll, 5000); // poll every 5s until done
         else {
           setCiPolling(null);
+          // The backend kicks off auto-sync (and, if auto_heal is on and the run failed,
+          // auto-heal) via setImmediate right after this same status response — start
+          // heal-status polling now instead of waiting for the next full ciRuns refresh to
+          // notice, otherwise the heal cycle can start and finish entirely invisibly (this
+          // polling loop already stopped, and nothing else re-fetches ciRuns in between).
+          if (data.run?.status === 'failed' && data.run?.auto_heal && !ciHealPollRef.current[runId]) {
+            startCiHealPolling(runId);
+          }
           // Refresh full run list to pick up any runs triggered outside Peako
           api.get(`/projects/${selectedProjectId}/ci/runs`)
             .then(({ data: d }) => setCiRuns(d.runs || []))
@@ -885,12 +923,35 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                     <i className="ti ti-history" style={{ color: 'var(--accent)' }}/> CI Run History
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {ciRuns.map(r => {
+                    {(() => {
+                      // Heal-run children (is_heal_run=1) are quick/full-verify re-runs spawned
+                      // by auto-heal — they're steps of an existing attempt, not new pipeline
+                      // triggers a user asked for, so they collapse under their root run instead
+                      // of appearing as their own top-level history entries.
+                      const runsById = new Map(ciRuns.map(x => [x.id, x]));
+                      const rootRuns = ciRuns.filter(x => !x.is_heal_run);
+                      const healChainFor = root => {
+                        const chain = [];
+                        const seen = new Set([root.id]);
+                        let cur = root;
+                        while (cur.heal_ci_run_id && runsById.has(cur.heal_ci_run_id) && !seen.has(cur.heal_ci_run_id)) {
+                          cur = runsById.get(cur.heal_ci_run_id);
+                          seen.add(cur.id);
+                          chain.push(cur);
+                        }
+                        return chain;
+                      };
                       const statusMap = { pending: ['#dbeafe','#1d4ed8'], queued: ['#dbeafe','#1d4ed8'], running: ['#fef9c3','#b45309'], in_progress: ['#fef9c3','#b45309'], completed: ['#dcfce7','#16a34a'], success: ['#dcfce7','#16a34a'], failed: ['#fee2e2','#dc2626'], failure: ['#fee2e2','#dc2626'], cancelled: ['#f1f5f9','#64748b'] };
-                      const [bg, color] = statusMap[r.status] || statusMap.pending;
-                      const isPolling  = ciPolling === r.id;
+                      return rootRuns.map(r => {
+                      const healChain    = healChainFor(r);
+                      const latestInChain = healChain[healChain.length - 1] || r;
+                      const [bg, color] = statusMap[latestInChain.status] || statusMap.pending;
+                      const isPolling  = ciPolling === r.id || ciPolling === latestInChain.id;
                       const isExpanded = ciExpandedRun === r.id;
+                      const isChainExpanded = !!ciExpandedHealChain[r.id];
                       const vars = (() => { try { return JSON.parse(r.variables || '{}'); } catch { return {}; } })();
+                      const healStatus = ciHealStates[r.id]?.status || r.heal_status;
+                      const healActive = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(healStatus);
                       return (
                         <div key={r.id} style={{ borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
                           {/* Run row */}
@@ -898,25 +959,34 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                             <i className={`ti ${r.provider === 'github' ? 'ti-brand-github' : r.provider === 'bitbucket' ? 'ti-brand-bitbucket' : 'ti-brand-gitlab'}`} style={{ fontSize: 14, color: r.provider === 'github' ? '#24292f' : r.provider === 'bitbucket' ? '#0052cc' : '#e24329', flexShrink: 0 }}/>
                             <span style={{ flex: 1, fontSize: 12, color: '#374151', fontWeight: 500 }}>{r.exec_result_dir ? r.exec_result_dir.replace(/\\/g, '/').split('/').pop() : (r.run_name || r.script_name || '—')}</span>
                             <span style={{ fontSize: 11, color: '#94a3b8' }}>{r.started_at?.slice(0, 16).replace('T', ' ')}</span>
-                            <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}>
-                              {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{r.status}
+                            <span style={{ padding: '2px 8px', borderRadius: 20, fontSize: 10, fontWeight: 700, background: bg, color, display: 'flex', alignItems: 'center', gap: 4 }}
+                              title={healChain.length ? `Latest of ${healChain.length} auto-heal attempt(s)` : undefined}>
+                              {isPolling && <span className="spinner" style={{ width: 8, height: 8 }}/>}{latestInChain.status}
                             </span>
+                            {/* Heal-attempts chain toggle */}
+                            {healChain.length > 0 && (
+                              <button className="btn-secondary btn-sm"
+                                onClick={() => setCiExpandedHealChain(prev => ({ ...prev, [r.id]: !prev[r.id] }))}
+                                style={{ padding: '2px 8px', fontSize: 11 }} title="Show/hide auto-heal attempts">
+                                <i className={`ti ${isChainExpanded ? 'ti-chevron-up' : 'ti-git-branch'}`} style={{ fontSize: 11 }}/> {healChain.length}
+                              </button>
+                            )}
                             {/* Terminal toggle */}
                             <button className="btn-secondary btn-sm" onClick={() => setCiExpandedRun(isExpanded ? null : r.id)}
                               style={{ padding: '2px 8px', fontSize: 11 }} title="Show/hide execution log">
                               <i className={`ti ${isExpanded ? 'ti-chevron-up' : 'ti-terminal-2'}`} style={{ fontSize: 11 }}/>
                             </button>
-                            {!isPolling && ['pending','queued','running','in_progress'].includes(r.status) && (
-                              <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(r.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
+                            {!isPolling && ['pending','queued','running','in_progress'].includes(latestInChain.status) && (
+                              <button className="btn-secondary btn-sm" onClick={() => pollCiStatus(latestInChain.id)} style={{ padding: '2px 8px', fontSize: 11 }}>
                                 <i className="ti ti-refresh"/>
                               </button>
                             )}
-                            {['completed','success'].includes(r.status) && (
+                            {['completed','success'].includes(latestInChain.status) && (
                               <button className="btn-secondary btn-sm"
                                 style={{ padding: '2px 8px', fontSize: 11, color: '#16a34a', borderColor: '#86efac' }}
                                 onClick={async () => {
                                   try {
-                                    const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${r.id}/sync-results`);
+                                    const { data } = await api.post(`/projects/${selectedProjectId}/ci/runs/${latestInChain.id}/sync-results`);
                                     if (data.already_synced) {
                                       toast('Already synced — results available in Analytics', 'info');
                                     } else {
@@ -928,23 +998,49 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 <i className="ti ti-download" style={{ fontSize: 11 }}/> Sync Results
                               </button>
                             )}
-                            {r.web_url && (
-                              <a href={r.web_url} target="_blank" rel="noreferrer"
+                            {latestInChain.web_url && (
+                              <a href={latestInChain.web_url} target="_blank" rel="noreferrer"
                                 style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
                                 <i className="ti ti-external-link" style={{ fontSize: 11 }}/> View
                               </a>
                             )}
-                            {/* Heal button — shown when run failed and no heal is currently active */}
-                            {['failed','failure'].includes(r.status) && !r.is_heal_run &&
-                              !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
+                            {/* Heal button — shown when the run failed, or its heal chain gave up
+                                (exhausted/failed/infra_error), regardless of whether this particular
+                                row is itself a heal-run — a run's own heal attempts exhausting is
+                                exactly when a manual "Heal Again" retry needs to be offered. */}
+                            {(['failed','failure'].includes(r.status) || ['exhausted','failed','infra_error'].includes(healStatus)) &&
+                              !healActive && (
                               <button className="btn-secondary btn-sm"
                                 style={{ padding: '2px 8px', fontSize: 11, color: '#dc2626', borderColor: '#fca5a5' }}
                                 onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: true, text: '', loading: false } }))}>
                                 <i className="ti ti-heart-rate-monitor" style={{ fontSize: 11 }}/>
-                                {['failed','exhausted'].includes(ciHealStates[r.id]?.status) ? ' Heal Again' : ' Heal'}
+                                {['failed','exhausted','infra_error'].includes(healStatus) ? ' Heal Again' : ' Heal'}
                               </button>
                             )}
                           </div>
+
+                          {/* Auto-heal attempt chain — collapsed by default, one compact row
+                              per quick/full-verify re-run spawned while healing this run. */}
+                          {isChainExpanded && healChain.length > 0 && (
+                            <div style={{ padding: '6px 12px 8px 34px', borderTop: '1px solid #e2e8f0', background: '#fbfdff', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              {healChain.map((h, i) => {
+                                const [hbg, hcolor] = statusMap[h.status] || statusMap.pending;
+                                return (
+                                  <div key={h.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+                                    <i className="ti ti-corner-down-right" style={{ fontSize: 11, color: '#94a3b8' }}/>
+                                    <span style={{ color: '#64748b' }}>Attempt {i + 1} — {h.run_name || h.script_name || `Run #${h.id}`}</span>
+                                    <span style={{ color: '#94a3b8' }}>{h.started_at?.slice(0, 16).replace('T', ' ')}</span>
+                                    <span style={{ padding: '1px 7px', borderRadius: 20, fontSize: 9, fontWeight: 700, background: hbg, color: hcolor }}>{h.status}</span>
+                                    {h.web_url && (
+                                      <a href={h.web_url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 3 }}>
+                                        <i className="ti ti-external-link" style={{ fontSize: 10 }}/> View
+                                      </a>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
 
                           {/* Manual Heal inline form */}
                           {ciManualHeal[r.id]?.showing && !['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(ciHealStates[r.id]?.status) && (
@@ -997,12 +1093,17 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                             const hs = ciHealStates[r.id] || { status: r.heal_status, heal_ci_run_id: r.heal_ci_run_id, heal_summary: r.heal_summary, logs: [] };
                             const isActive = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(hs.status);
                             const accentColor = hs.status === 'healed' ? '#16a34a' : hs.status === 'infra_error' ? '#f59e0b' : isActive ? 'var(--accent)' : '#dc2626';
+                            const hasDetails = hs.logs?.length > 0 || (hs.status === 'exhausted' && hs.heal_summary);
+                            // Defaults to expanded (undefined !== true) so a heal in progress or a
+                            // freshly-loaded exhausted run still shows details right away — collapsing
+                            // is an explicit user action, not the default state.
+                            const isPanelCollapsed = hasDetails && ciHealPanelCollapsed[r.id] === true;
                             return (
                               <div style={{ padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#f0f9ff', borderLeft: `3px solid ${accentColor}` }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: hs.logs?.length ? 10 : 0 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: (hasDetails && !isPanelCollapsed) ? 10 : 0 }}>
                                   <i className={`ti ${hs.status === 'healed' ? 'ti-circle-check' : ['failed','exhausted'].includes(hs.status) ? 'ti-circle-x' : 'ti-loader'}`}
                                     style={{ fontSize: 15, color: accentColor, animation: isActive ? 'spin 1s linear infinite' : 'none' }}/>
-                                  <div style={{ fontSize: 12, fontWeight: 600, color: '#0f172a' }}>
+                                  <div style={{ fontSize: 12, fontWeight: 600, color: '#0f172a', flex: 1 }}>
                                     Auto Heal —{' '}
                                     {hs.status === 'pending'        && 'Queued…'}
                                     {hs.status === 'diagnosing'     && 'AI diagnosing failure…'}
@@ -1011,14 +1112,19 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                     {hs.status === 'rerunning_full' && 'Quick verify passed — running full test…'}
                                     {hs.status === 'healed'         && 'Issue fixed and CI test passed!'}
                                     {hs.status === 'failed'         && 'Could not fix automatically'}
-                                    {hs.status === 'exhausted'      && `Reached ${3} attempts without success`}
+                                    {hs.status === 'exhausted'      && 'Auto-heal attempt unsuccessful — use "Heal Again" below for a targeted retry'}
                                     {hs.status === 'infra_error'    && 'Server/infrastructure failure — script changes cannot fix this'}
                                   </div>
-                                  {hs.heal_ci_run_id && (
-                                    <span style={{ fontSize: 10, color: '#64748b', marginLeft: 'auto' }}>Heal run #{hs.heal_ci_run_id}</span>
+                                  {hasDetails && (
+                                    <button className="btn-secondary btn-sm"
+                                      onClick={() => setCiHealPanelCollapsed(prev => ({ ...prev, [r.id]: !isPanelCollapsed }))}
+                                      style={{ padding: '2px 8px', fontSize: 11 }}
+                                      title={isPanelCollapsed ? 'Show auto-heal details' : 'Hide auto-heal details'}>
+                                      <i className={`ti ${isPanelCollapsed ? 'ti-chevron-down' : 'ti-chevron-up'}`} style={{ fontSize: 11 }}/>
+                                    </button>
                                   )}
                                 </div>
-                                {hs.logs?.length > 0 && (
+                                {!isPanelCollapsed && hs.logs?.length > 0 && (
                                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                                     {hs.logs.map((l, i) => (
                                       <div key={i} style={{ background: '#fff', borderRadius: 6, padding: '8px 10px', fontSize: 11, border: '1px solid #e2e8f0' }}>
@@ -1034,7 +1140,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                     ))}
                                   </div>
                                 )}
-                                {hs.status === 'exhausted' && hs.heal_summary && (
+                                {!isPanelCollapsed && hs.status === 'exhausted' && hs.heal_summary && (
                                   <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', borderRadius: 6, border: '1px solid #fed7aa', fontSize: 11 }}>
                                     <div style={{ fontWeight: 700, color: '#c2410c', marginBottom: 5 }}>Exhaustion Summary</div>
                                     <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit', color: '#374151', lineHeight: 1.5 }}>{hs.heal_summary}</pre>
@@ -1105,9 +1211,11 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                   </div>
                                 )}
 
-                                {/* Status + finish time */}
+                                {/* Status + finish time — this panel is the ROOT run's own log,
+                                    so its status line reflects r's own outcome, not the heal
+                                    chain's latest (which the header badge above shows instead). */}
                                 <div style={{ color: '#8b949e', borderTop: '1px solid #21262d', paddingTop: 6 }}>
-                                  <span>Status: </span><span style={{ color }}>{r.status.toUpperCase()}</span>
+                                  <span>Status: </span><span style={{ color: (statusMap[r.status] || statusMap.pending)[1] }}>{r.status.toUpperCase()}</span>
                                   {r.finished_at && <span style={{ color: '#484f58' }}>  · Finished: {r.finished_at?.replace('T',' ').slice(0,19)}</span>}
                                 </div>
 
@@ -1124,7 +1232,8 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           })()}
                         </div>
                       );
-                    })}
+                      });
+                    })()}
                   </div>
                 </div>
               )}
@@ -1502,7 +1611,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 {healState.status === 'rerunning'     && 'Re-running the fixed test...'}
                 {healState.status === 'healed'        && 'Issue fixed and test passed!'}
                 {healState.status === 'failed'        && 'Could not automatically fix the issue'}
-                {healState.status === 'exhausted'     && `Reached max ${3} attempts without success`}
+                {healState.status === 'exhausted'     && 'Auto-heal attempt unsuccessful — re-run the test to try again'}
                 {healState.status === 'no_errors'     && 'No errors detected — healing not needed'}
                 {healState.status === 'infra_error'   && 'Server/infrastructure failure — script changes cannot fix this'}
               </div>

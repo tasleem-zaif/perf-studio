@@ -1,0 +1,49 @@
+flowchart TB
+    Browser["Your Browser<br/>Performance Studio Web App<br/>React · Vite"]
+    RH["Request Handler<br/>Processes all user actions"]
+
+    subgraph Server["Performance Studio Server"]
+        RH
+        AI["AI Engine<br/>Generates test scripts"]
+        EA["Email Alerts<br/>Sends reports after each run"]
+        VC["Version Control<br/>Tracks scripts via Git"]
+        TE["Test Executor<br/>Runs JMeter and K6"]
+        AH["Auto-Healer<br/>Fixes scripts after a failed run"]
+    end
+
+    subgraph ExtSvc["External Services"]
+        AIP["AI Provider<br/>OpenAI GPT-4o or<br/>Anthropic Claude"]
+        ES["Email Server<br/>Gmail · Outlook · SMTP"]
+        GP["Git Platform<br/>GitHub · GitLab · Bitbucket"]
+    end
+
+    subgraph ExecEnv["Test Execution Environment"]
+        TC["Test Container<br/>JMeter · K6 · Java · Node.js"]
+    end
+
+    subgraph Storage["Data Storage"]
+        DB[("Database<br/>PostgreSQL")]
+        FS["File Storage<br/>Scripts · Test data · Reports"]
+    end
+
+    Browser -->|User actions| RH
+    RH --> AI
+    RH --> EA
+    RH --> VC
+    RH --> TE
+
+    AI -->|Generate script| AIP
+    EA -->|Send report| ES
+    VC -->|Push / pull| GP
+    TE -->|Launch container| TC
+    TC -->|Save results| FS
+
+    TE ==>|Run fails rules| AH
+    AH ==>|Ask AI to fix| AI
+    AH ==>|Overwrite script| FS
+    AH ==>|Rerun| TE
+
+    RH -.-> DB
+    TE -.-> DB
+    AH -.-> DB
+    VC -.-> DB

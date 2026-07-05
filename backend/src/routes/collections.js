@@ -10,6 +10,7 @@ const ownsProject = require('../utils/ownsProject');
 const { parseCurl } = require('../utils/parseCurl');
 const { parseCollection, parsePostmanEnvironment, extractCollectionVariables } = require('../utils/parseCollection');
 const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
+const { resolveUrlSet } = require('../utils/preRunEngine');
 
 /**
  * Auto-populate project config URLs from a collection's parsed endpoints.
@@ -18,9 +19,11 @@ const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = req
  *
  * `variables` (the collection's own `variable` defaults, overridden by an uploaded
  * Postman environment file — same map seedEnvVariables() stores) is used to resolve
- * {{var}}-templated base URLs (e.g. {{alpha_url}}) into a real hostname before the
- * {{-skip check, so collections that only ever reference their host via a variable
- * (never a literal URL) still get a usable env config instead of none at all.
+ * {{var}}-templated base URLs (e.g. {{alpha_url}}, or one whose own value is itself a
+ * template like baseUrl = "{{protocol}}://{{host}}") into a real hostname/port via the
+ * single shared resolveUrlSet() (preRunEngine.js — also used by script generation), so
+ * collections that only ever reference their host/port via variables still get a usable
+ * env config instead of none at all.
  */
 async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables = {}) {
   try {
@@ -31,26 +34,12 @@ async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, v
     const seen = new Set();
 
     for (const ep of endpoints) {
-      let rawUrl = ep.url || ep.path || '';
+      const rawUrl = ep.url || ep.path || '';
       if (!rawUrl) continue;
-      // Resolve {{var}} tokens using the collection/environment-file variables —
-      // same substitution pre-run (ai.js) applies — before checking for a real hostname.
-      rawUrl = rawUrl.replace(/\{\{(\w+)\}\}/g, (m, key) =>
-        Object.prototype.hasOwnProperty.call(variables, key) ? variables[key] : m);
-      try {
-        if (rawUrl.startsWith('/') && !rawUrl.includes('://')) continue;
-        const raw = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`;
-        const u = new URL(raw);
-        const protocol = u.protocol.replace(':', '');
-        const hostname  = u.hostname;
-        // Skip still-unresolved {{var}} templates (no matching value found) — not a real
-        // hostname, would only pollute this list with garbage entries.
-        if (!hostname || hostname.includes('{{')) continue;
-        // Only use the port if the URL actually specified one — don't assume 443/80.
-        const port = u.port || '';
-        const key  = `${protocol}|${hostname}|${port}`;
-        if (!seen.has(key)) { seen.add(key); urlSets.push({ protocol, url: hostname, port }); }
-      } catch { continue; }
+      const resolved = resolveUrlSet(rawUrl, variables);
+      if (!resolved) continue;
+      const key = `${resolved.protocol}|${resolved.url}|${resolved.port}`;
+      if (!seen.has(key)) { seen.add(key); urlSets.push(resolved); }
     }
 
     if (!urlSets.length) return;

@@ -9,6 +9,7 @@ const { callAi } = require('../utils/aiClient');
 const { readCsv } = require('../utils/csvUtils');
 const resetSequence = require('../utils/resetSequence');
 const { updateCollectionConfigs, updateProjectCollectionConfigs } = require('../utils/configWriter');
+const { TOKEN_KEYS, fingerprintMatches, resolveUrlSet, resolveForScript } = require('../utils/preRunEngine');
 
 const DEFAULT_CONFIG = { protocol: 'https', url: '', port: '443', threads: 50, rampup: 30, loop: 1, duration: 300 };
 
@@ -126,12 +127,19 @@ router.delete('/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/:id/generate', async (req, res) => {
-  const proj = await ownsProject(req.userId, req.params.projectId);
-  if (!proj) return res.status(404).json({ error: 'Project not found' });
+// Extracted from POST /:id/generate so auto-heal can trigger the exact same deterministic
+// regeneration pipeline after persisting new endpointOverrides (see ai.js's "Fix with AI"
+// for the shape) — a targeted per-endpoint override + regeneration costs zero extra AI
+// tokens for JMeter (generateJmx is deterministic), unlike asking the AI to rewrite the
+// whole script, which fails outright once a script is too large for the model's output
+// limit. Returns { ok, filename, path } on success or { error, status } on failure — the
+// route below is now a thin wrapper that translates the latter into an HTTP response.
+async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData) {
+  const proj = await ownsProject(userId, projectId);
+  if (!proj) return { error: 'Project not found', status: 404 };
 
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
-  if (!suite) return res.status(404).json({ error: 'Suite not found' });
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
+  if (!suite) return { error: 'Suite not found', status: 404 };
 
   // Gather context
   const collection = suite.collection_id
@@ -144,10 +152,10 @@ router.post('/:id/generate', async (req, res) => {
   const testDataFiles = (await Promise.all(
     dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(id))
   )).filter(Boolean);
-  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(req.params.projectId);
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
 
-  const globalRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
-  const projRow   = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(req.params.projectId);
+  const globalRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
+  const projRow   = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(projectId);
   const globalCfg = globalRow ? JSON.parse(globalRow.config_json) : {};
   const projCfg   = projRow   ? JSON.parse(projRow.config_json)   : {};
   const suiteCfg  = JSON.parse(suite.config_json || '{}');
@@ -187,12 +195,13 @@ router.post('/:id/generate', async (req, res) => {
   const hasResolvableHost = (cfg.urls?.[0]?.url || cfg.url) ||
     endpoints.some(ep => resolveEndpointHost(ep.url || ep.path || '', cfg.variables || {}));
   if (suite.collection_id && !hasResolvableHost) {
-    return res.status(400).json({
+    return {
       error: `No target URL configured for this collection's "${suiteEnv || 'default'}" environment. Set one under Config > Environment Config before generating a script.`,
-    });
+      status: 400,
+    };
   }
-  // Use pre-run data from request body (legacy) or from collection row (new flow)
-  const preRunData = req.body.preRunData || (() => {
+  // Use pre-run data from the caller's request body (legacy) or from collection row (new flow)
+  const preRunData = reqPreRunData || (() => {
     if (!collection?.pre_run_data) return null;
     try { return JSON.parse(collection.pre_run_data); } catch { return null; }
   })();
@@ -204,9 +213,9 @@ router.post('/:id/generate', async (req, res) => {
   try {
     let scriptContent;
     if (engine === 'jmeter') {
-      scriptContent = cleanScript(await generateJmx(req.userId, suite, collection, testDataFiles, cfg, endpoints, rules, preRunData, testType), 'jmeter');
+      scriptContent = cleanScript(await generateJmx(userId, suite, collection, testDataFiles, cfg, endpoints, rules, preRunData, testType), 'jmeter');
     } else {
-      scriptContent = cleanScript(await generateK6(req.userId, suite, collection, testDataFiles[0] || null, cfg, endpoints, rules, preRunData, testType), 'k6');
+      scriptContent = cleanScript(await generateK6(userId, suite, collection, testDataFiles[0] || null, cfg, endpoints, rules, preRunData, testType), 'k6');
     }
 
     // Write script to collection/env/script/ — use suite.env or derive from collection
@@ -216,13 +225,13 @@ router.post('/:id/generate', async (req, res) => {
 
     let scriptBaseDir = null;
     const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
-    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
     const callerRole = callerUser?.role;
-    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name);
+    const userProjPath = await getUserProjectPath(userId, callerRole, proj.name);
 
     // Admin workspace holds only empty folders — skip script generation for admin
     if (isAdminWorkspace(userProjPath)) {
-      return res.status(400).json({ error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.' });
+      return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
     }
     if (collection && userProjPath) {
       let targetEnv = suite.env;
@@ -243,13 +252,19 @@ router.post('/:id/generate', async (req, res) => {
 
     // Update DB
     const updateField = engine === 'jmeter' ? 'jmx_path' : 'js_path';
-    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, req.params.id);
+    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, suiteId);
 
     if (suite.collection_id) setImmediate(async () => { await updateCollectionConfigs(suite.collection_id); });
-    res.json({ ok: true, filename, path: filePath });
+    return { ok: true, filename, path: filePath };
   } catch (e) {
-    res.status(500).json({ error: `Script generation failed: ${e.message}. Check your AI API key in Settings and that the collection has valid endpoints.` });
+    return { error: `Script generation failed: ${e.message}. Check your AI API key in Settings and that the collection has valid endpoints.`, status: 500 };
   }
+}
+
+router.post('/:id/generate', async (req, res) => {
+  const result = await generateScriptForSuite(req.userId, req.params.projectId, req.params.id, req.body.preRunData);
+  if (result.error) return res.status(result.status || 500).json({ error: result.error });
+  res.json(result);
 });
 
 router.get('/:id/download/:type', async (req, res) => {
@@ -365,24 +380,59 @@ function isLoginEp(ep) {
   return /login|signin|sign-in|authenticate/.test(n) || /\/login|\/auth\/login|\/signin/.test(p);
 }
 
-function detectTokenKey(preRunData, loginEp) {
-  if (!preRunData || !Array.isArray(preRunData)) return null;
+// Detects every token-like field in the login response (reusing the same field-name list
+// pre-run's live extraction uses — utils/preRunEngine.js — so a field pre-run captures at
+// runtime, e.g. refreshToken, is also available here as its own JMeter variable). This lets
+// a per-endpoint override (endpointOverrides, set via pre-run's "Fix with AI" action) request
+// a *different* captured field than the default for its own Authorization header/body.
+function detectCapturedFields(preRunData, loginEp) {
+  if (!preRunData || !Array.isArray(preRunData)) return {};
+  const loginName = (loginEp?.name || '').toLowerCase();
   const loginPath = (loginEp?.path || loginEp?.url || '').toLowerCase();
+  // Match against the pre-run row's endpoint label AND its actual fired URL — a collection
+  // whose login endpoint is simply named "Login" (no URL text in `r.endpoint`, per
+  // ai.js's `endpoint: ep.name || ep.url`) previously matched nothing at all.
   const match = preRunData.find(r => {
-    const ep = (r.endpoint || '').toLowerCase();
-    return ep.includes('/login') || ep.includes('/auth') || ep.includes(loginPath);
+    const label = (r.endpoint || '').toLowerCase();
+    const url = (r.url || '').toLowerCase();
+    return (loginName && label.includes(loginName)) ||
+      (loginPath && (label.includes(loginPath) || url.includes(loginPath))) ||
+      /login|signin|sign-in|authenticate/.test(label) ||
+      url.includes('/login') || url.includes('/auth');
   });
-  if (!match?.body) return null;
+  if (!match?.body) return {};
   let body;
-  try { body = typeof match.body === 'string' ? JSON.parse(match.body) : match.body; } catch { return null; }
-  const priorities = ['accessToken','access_token','token','jwt','bearerToken','bearer_token','authToken','id_token'];
-  for (const k of priorities) {
-    if (body[k] !== undefined) return { varName: k.replace(/[^a-zA-Z0-9]/g, '_'), jsonPath: `$.${k}` };
+  try { body = typeof match.body === 'string' ? JSON.parse(match.body) : match.body; } catch { return {}; }
+  const fields = {};
+  for (const k of TOKEN_KEYS) {
+    if (typeof body[k] === 'string' && body[k].length > 8) fields[k] = { varName: k.replace(/[^a-zA-Z0-9]/g, '_'), jsonPath: `$.${k}` };
   }
-  for (const [k] of Object.entries(body)) {
-    if (/token|jwt|bearer/i.test(k)) return { varName: k.replace(/[^a-zA-Z0-9]/g, '_'), jsonPath: `$.${k}` };
+  if (!Object.keys(fields).length) {
+    for (const [k] of Object.entries(body)) {
+      if (/token|jwt|bearer/i.test(k)) { fields[k] = { varName: k.replace(/[^a-zA-Z0-9]/g, '_'), jsonPath: `$.${k}` }; break; }
+    }
   }
-  return null;
+  return fields;
+}
+
+// Which captured field is used as the *default* Authorization value (no per-endpoint
+// override) — same priority order pre-run's blanket 401-retry uses, deliberately
+// excluding refresh-type fields (a refresh token should only be used where an explicit
+// override says so, never as the generic default — that's the bug this whole feature fixes).
+const DEFAULT_FIELD_PRIORITY = ['accessToken','access_token','token','jwt','bearerToken','bearer_token','authToken','id_token'];
+function pickDefaultField(fields) {
+  for (const k of DEFAULT_FIELD_PRIORITY) if (fields[k]) return fields[k];
+  const anyKey = Object.keys(fields)[0];
+  return anyKey ? fields[anyKey] : null;
+}
+
+// Translates the {{captured:KEY}} placeholders used in an endpointOverride's headers/body
+// (same syntax the pre-run heal AI prompt is instructed to use) into a JMeter variable
+// reference for whichever field KEY was actually detected — {{var}} for a plain collection
+// variable is already handled by the existing toJmeterVar() and runs after this.
+function applyOverridePlaceholders(str, capturedFields) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/\{\{captured:(\w+)\}\}/g, (m, key) => capturedFields[key] ? `\${${capturedFields[key].varName}}` : m);
 }
 
 function toJmeterVar(v) {
@@ -390,31 +440,21 @@ function toJmeterVar(v) {
   return String(v ?? '').replace(/\{\{(\w+)\}\}/g, '$${$1}');
 }
 
-// Resolves the literal {protocol,url,port} an endpoint's raw URL targets, substituting
-// a single leading {{var}} token against the collection's resolved variables map.
-// Multi-host collections (e.g. Binance's Spot/Futures/Options/Wallet APIs) define one
+// Resolves {{var}} tokens in a request body/header/query-param value against the
+// collection's known variable map — delegates to the shared resolveForScript()
+// (preRunEngine.js), the same rule autoHealer.js's mechanical {{var}} fix applies, so a
+// script that's regenerated behaves identically to one auto-heal fixed in place.
+const resolveTemplateVars = resolveForScript;
+
+// Resolves the {protocol,url,port} an endpoint's raw URL targets — delegates to the single
+// shared resolveUrlSet() (preRunEngine.js) that handles both nested {{var}} resolution and
+// the port-variable fallback, so this file doesn't carry its own independent copy of that
+// logic. Multi-host collections (e.g. Binance's Spot/Futures/Options/Wallet APIs) define one
 // base-URL variable per API family instead of sharing a single host — this lets each
 // endpoint be mapped back to the specific host its own {{var}} pointed to.
-function resolveEndpointHost(rawUrl, variables) {
-  if (!rawUrl) return null;
-  let urlForParse = rawUrl;
-  const m = rawUrl.match(/^\{\{(\w+)\}\}/);
-  if (m) {
-    const val = variables?.[m[1]];
-    if (!val) return null; // variable has no known value — can't resolve
-    urlForParse = val + rawUrl.slice(m[0].length);
-  } else if (rawUrl.startsWith('/') && !rawUrl.includes('://')) {
-    return null; // relative path with no host token — falls back to the collection default
-  }
-  try {
-    const raw = urlForParse.startsWith('http') ? urlForParse : `https://${urlForParse}`;
-    const u = new URL(raw);
-    if (!u.hostname || u.hostname.includes('{{')) return null;
-    return { protocol: u.protocol.replace(':', ''), url: u.hostname, port: u.port || '' };
-  } catch { return null; }
-}
+const resolveEndpointHost = resolveUrlSet;
 
-function normalizeEp(ep) {
+function normalizeEp(ep, variables) {
   let epPath = ep.path || '';
   let urlQueryParams = {};
 
@@ -425,7 +465,13 @@ function normalizeEp(ep) {
   if (rawUrl) {
     try {
       const parsed = new URL(rawUrl.startsWith('http') ? rawUrl : 'https://x' + rawUrl);
-      if (!epPath) epPath = parsed.pathname;           // only set path from URL if not already set
+      // `.pathname` percent-encodes characters that aren't valid URL code points — including
+      // { and } — so an unresolved Postman {{var}} path segment (e.g. /products/{{productId}})
+      // comes back as /products/%7B%7BproductId%7D%7D, permanently destroying the template
+      // before resolveTemplateVars() below ever gets a chance to convert it to ${var}. Decode
+      // it back to plain text first; `.searchParams` (used just below) doesn't have this
+      // problem since reading it already decodes.
+      if (!epPath) { try { epPath = decodeURIComponent(parsed.pathname); } catch { epPath = parsed.pathname; } }
       parsed.searchParams.forEach(async (v, k) => { urlQueryParams[k] = v; });
     } catch {
       if (!epPath) epPath = rawUrl;                    // fallback: use raw string as path
@@ -452,15 +498,28 @@ function normalizeEp(ep) {
       }
     });
   }
-  // Normalise all query param values: Postman {{var}} → JMeter ${var}
-  for (const k of Object.keys(queryParams)) queryParams[k] = toJmeterVar(queryParams[k]);
+  // Resolve {{var}} in query param values: known collection variables become their real
+  // value, unresolved ones fall back to JMeter's ${var} syntax.
+  for (const k of Object.keys(queryParams)) queryParams[k] = resolveTemplateVars(queryParams[k], variables);
+  // Same resolution for the path itself — Postman path variables (e.g. /products/{{productId}})
+  // were previously left as literal "{{productId}}" text, which JMeter doesn't recognize as a
+  // variable reference at all; it just percent-encodes the unsafe { } characters when building
+  // the request, producing /products/%7B%7BproductId%7D%7D instead of a working ${productId}.
+  epPath = resolveTemplateVars(epPath, variables);
   const rawHeaders = ep.headers || ep.request?.header || [];
   const headers = {};
   if (Array.isArray(rawHeaders)) rawHeaders.forEach(async h => { const k = h.key || h.name; if (k) headers[k] = h.value; });
   else if (typeof rawHeaders === 'object') Object.assign(headers, rawHeaders);
+  // Same {{var}} resolution for header values (e.g. {{apiKey}} in a custom auth header).
+  for (const k of Object.keys(headers)) headers[k] = resolveTemplateVars(headers[k], variables);
 
   let body = ep.body ?? ep.requestBody ?? ep.request?.body?.raw ?? null;
   if (body && typeof body === 'object') body = JSON.stringify(body, null, 2);
+  // Same {{var}} resolution for the JSON/raw body — e.g. {"username": "{{username}}"}.
+  // Must run before substituteCSVVars() so a variable that's ALSO a CSV column still
+  // gets the ${col} treatment (substituteCSVVars matches by key name regardless of the
+  // value it finds there).
+  if (typeof body === 'string') body = resolveTemplateVars(body, variables);
 
   const method = (ep.method || ep.request?.method || 'GET').toUpperCase();
   return { name: ep.name || ep.testname || epPath || 'HTTP Request', method, path: epPath, headers, body, queryParams };
@@ -517,10 +576,18 @@ function substituteCSVVars(body, csvCols) {
   return result;
 }
 
-function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars) {
-  const { name, method, path: epPath, headers, body, queryParams } = normalizeEp(ep);
+function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, override, capturedFields, variables) {
+  const { name, method, path: epPath, headers, body: rawBody, queryParams } = normalizeEp(ep, variables);
   const { protocol: protoVar = 'PROTOCOL', server: serverVar = 'SERVER', port: portVar = 'PORT' } = hostVars || {};
   const lines = [];
+  // A saved per-endpoint fix (endpointOverrides, from pre-run's "Fix with AI" action)
+  // always wins over the endpoint's own stored body — it's the known-correct request now.
+  // The AI sometimes returns "body" as a JSON object rather than a pre-stringified string
+  // (same ambiguity normalizeEp() handles for ep.body above) — String() on an object would
+  // silently produce the literal text "[object Object]" instead of the intended JSON.
+  let overrideBody = override?.body;
+  if (overrideBody !== undefined && typeof overrideBody !== 'string') overrideBody = JSON.stringify(overrideBody, null, 2);
+  const body = overrideBody !== undefined ? toJmeterVar(applyOverridePlaceholders(overrideBody, capturedFields || {})) : rawBody;
   const isBody = ['POST', 'PUT', 'PATCH'].includes(method) && body;
 
   lines.push(`        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${xmlEsc(name)}" enabled="true">`);
@@ -602,6 +669,16 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars) 
     if (!headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase()))
       headerEntries.push({ name: k, value: String(v) });
   }
+  // A saved per-endpoint fix always wins — add or replace by header name (e.g. swap the
+  // default accessToken Authorization value for {{captured:refreshToken}}'s JMeter var).
+  if (override?.headers) {
+    for (const [k, v] of Object.entries(override.headers)) {
+      const translated = toJmeterVar(applyOverridePlaceholders(String(v), capturedFields || {}));
+      const existing = headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase());
+      if (existing) existing.value = translated;
+      else headerEntries.push({ name: k, value: translated });
+    }
+  }
   lines.push(`          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">`);
   lines.push(`            <collectionProp name="HeaderManager.headers">`);
   for (const h of headerEntries) {
@@ -615,15 +692,21 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars) 
   lines.push(`          <hashTree/>`);
 
   if (isLogin) {
-    const tVar = tokenVar || 'accessToken';
-    const tPath = tokenVar ? `$.${tokenVar.replace(/_/g, '')}` : '$.accessToken';
-    lines.push(`          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="JSON Extractor - Token" enabled="true">`);
-    lines.push(`            <stringProp name="JSONPostProcessor.referenceNames">${xmlEsc(tVar)}</stringProp>`);
-    lines.push(`            <stringProp name="JSONPostProcessor.jsonPathExprs">${xmlEsc(tPath)}</stringProp>`);
-    lines.push(`            <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>`);
-    lines.push(`            <stringProp name="JSONPostProcessor.defaultValues">NOT_FOUND</stringProp>`);
-    lines.push(`          </JSONPostProcessor>`);
-    lines.push(`          <hashTree/>`);
+    // One extractor per captured field (not just the default) — a per-endpoint override
+    // elsewhere in the script may reference a different field (e.g. refreshToken) than
+    // the default Authorization value, so its JMeter variable must exist too.
+    const fieldsToExtract = capturedFields && Object.keys(capturedFields).length
+      ? Object.values(capturedFields)
+      : [{ varName: tokenVar || 'accessToken', jsonPath: tokenVar ? `$.${tokenVar.replace(/_/g, '')}` : '$.accessToken' }];
+    for (const { varName, jsonPath } of fieldsToExtract) {
+      lines.push(`          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="JSON Extractor - ${xmlEsc(varName)}" enabled="true">`);
+      lines.push(`            <stringProp name="JSONPostProcessor.referenceNames">${xmlEsc(varName)}</stringProp>`);
+      lines.push(`            <stringProp name="JSONPostProcessor.jsonPathExprs">${xmlEsc(jsonPath)}</stringProp>`);
+      lines.push(`            <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>`);
+      lines.push(`            <stringProp name="JSONPostProcessor.defaultValues">NOT_FOUND</stringProp>`);
+      lines.push(`          </JSONPostProcessor>`);
+      lines.push(`          <hashTree/>`);
+    }
   }
   lines.push(`        </hashTree>`);
   return lines.join('\n');
@@ -641,14 +724,13 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   const duration = suite.duration || 300;
 
   // Resolve server/protocol/port from config
-  const urls = cfg.urls || [{ protocol: cfg.protocol || 'https', url: cfg.url || '', port: cfg.port || '443' }];
-  const { protocol = 'https', url: server = '', port = '443' } = urls[0] || {};
-
   // Multi-host support: a single collection can span several API families with different
   // base hosts (e.g. Binance's Spot/Futures/Options/Wallet APIs, each via its own {{var}}).
-  // Resolve every endpoint's own host and, when more than one distinct host is actually
-  // used, emit indexed PROTOCOL_N/SERVER_N/PORT_N instead of forcing every sampler onto
-  // the single default host from `urls[0]`.
+  // Resolve every endpoint's own host first — needed both for the multi-host indexed UDVs
+  // below AND as a fallback for the single-host default (right after) when
+  // collection_env_config.urls hasn't been populated yet, e.g. a collection whose base URL
+  // is itself a template (baseUrl = "{{protocol}}://{{host}}") that hasn't been re-saved
+  // since {{var}} auto-populate was fixed to resolve that kind of indirection.
   const variables = cfg.variables || {};
   const hostKey = h => `${h.protocol}|${h.url}|${h.port}`;
   const hostList = [];
@@ -662,6 +744,14 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     epHostIndex.set(ep, hostIndexByKey.get(key));
   }
   const multiHost = hostList.length > 1;
+
+  // Resolve server/protocol/port for the single-host default: a real `collection_env_config`
+  // URL wins if present, otherwise fall back to whatever host the endpoints themselves
+  // resolve to via {{var}} — so this never silently generates a script with an empty host
+  // just because the env config's `urls` array hasn't caught up yet.
+  const configuredUrl = (cfg.urls || []).find(u => u?.url);
+  const fallbackHost = !multiHost ? hostList[0] : null;
+  const { protocol = 'https', url: server = '', port = '443' } = configuredUrl || fallbackHost || { protocol: cfg.protocol, url: cfg.url, port: cfg.port };
   // Endpoints whose host couldn't be resolved (relative path, missing variable value)
   // default to host #1 — same as the single-host fallback below.
   function hostVarsFor(ep) {
@@ -689,10 +779,24 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   // Value-based CSV map: lowercaseValue → columnName (for smart query-param detection)
   const csvValueMap = buildCsvValueMap(testDataFiles);
 
-  // Login & token detection
-  const loginEp   = endpoints.find(isLoginEp) || null;
-  const tokenInfo = loginEp ? (detectTokenKey(preRunData, loginEp) || { varName: 'accessToken', jsonPath: '$.accessToken' }) : null;
-  const tokenVar  = tokenInfo?.varName || null;
+  // Login & token detection — captures every token-like field (not just the default one),
+  // so a per-endpoint override can reference a specific field (e.g. refreshToken).
+  const loginEp        = endpoints.find(isLoginEp) || null;
+  const capturedFields = loginEp ? detectCapturedFields(preRunData, loginEp) : {};
+  const tokenInfo       = loginEp ? (pickDefaultField(capturedFields) || { varName: 'accessToken', jsonPath: '$.accessToken' }) : null;
+  const tokenVar        = tokenInfo?.varName || null;
+
+  // Per-endpoint fixes applied via pre-run's "Fix with AI" heal action (cfg.endpointOverrides,
+  // stored on collection_env_config — same row this suite's envCfg was already merged from).
+  // Keyed by the endpoint's position in the original `endpoints` array (same indexing
+  // routes/ai.js's pre-run uses), validated against a method+name fingerprint so a stale
+  // override left over from before a collection re-import isn't silently misapplied.
+  const endpointOverrides = cfg.endpointOverrides || {};
+  const epIndexOf = new Map(endpoints.map((e, i) => [e, i]));
+  function overrideFor(ep) {
+    const saved = endpointOverrides[epIndexOf.get(ep)];
+    return fingerprintMatches(ep, saved) ? saved : null;
+  }
 
   // User Defined Variables — rt:true vars use ${__P(NAME,default)} so they can be
   // overridden at run time: jmeter -n -t script.jmx -JTHREADS=100 -JDURATION=600 -JRAMP_UP=60
@@ -701,6 +805,28 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   // before). Multi-host collections get PROTOCOL_N/SERVER_N/PORT_N per distinct host
   // instead — no plain/unindexed set, since it would just be a confusing duplicate of
   // whichever host happened to be first.
+  const RESERVED_UDV_NAMES = new Set([
+    'PROTOCOL', 'SERVER', 'PORT', 'THREADS', 'RAMP_UP', 'DURATION', 'LOOP_COUNT',
+    ...csvMeta.flatMap(m => [m.pathVar, m.fileVar]),
+    ...(multiHost ? hostList.flatMap((_, i) => [`PROTOCOL_${i + 1}`, `SERVER_${i + 1}`, `PORT_${i + 1}`]) : []),
+  ]);
+  // Collection environment variables (e.g. username/password from an imported Postman
+  // env file). normalizeEp() already inlines any {{var}} whose value it can resolve
+  // directly into the request text — but whenever it can't (resolveForScript's fallback
+  // to a bare ${var} reference), nothing ever defined that variable anywhere in the
+  // script, so JMeter sent the literal, un-substituted "${var}" text instead of a real
+  // value. Declare every collection variable as a User Defined Variable — same treatment
+  // PROTOCOL/SERVER/PORT/THREADS already get — so any ${var} left in the script resolves.
+  // A collection variable's own value can itself be a template referencing other variables
+  // (e.g. baseUrl = "{{protocol}}://{{host}}") — resolve those against the full variables
+  // map before declaring the UDV, otherwise the literal "{{protocol}}"/"{{host}}" text ends
+  // up baked into the script even though every *request* in it already resolved correctly.
+  // Auto-heal's mechanical {{var}} scan can't tell "unused declarative UDV" apart from "a
+  // template a live request actually sends", so a leftover unresolved one here gets reported
+  // as a guaranteed failure cause on every heal cycle even though it never affected any request.
+  const collectionVarUdv = Object.entries(variables)
+    .filter(([k, v]) => k && !RESERVED_UDV_NAMES.has(k.toUpperCase()) && v !== null && typeof v !== 'object')
+    .map(([k, v]) => ({ n: k, v: resolveTemplateVars(String(v ?? ''), variables) }));
   const udv = [
     ...(multiHost
       ? hostList.flatMap((h, i) => [
@@ -719,6 +845,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
       ? [{ n: 'LOOP_COUNT', v: String(loops),    rt: true }]
       : [{ n: 'DURATION',   v: String(duration), rt: true }, { n: 'LOOP_COUNT', v: '-1' }]),
     ...csvMeta.flatMap(m => [{ n: m.pathVar, v: m.dir }, { n: m.fileVar, v: m.file }]),
+    ...collectionVarUdv,
   ];
 
   // Runtime override comment — all UPPERCASE vars accept -J flags. Multi-host collections
@@ -826,7 +953,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     for (const ep of ordered) {
       const isLogin = ep === loginEp;
       const activeToken = tokenExtracted ? tokenVar : null;
-      L.push(buildSamplerXml(ep, isLogin, activeToken, allCsvCols, csvValueMap, hostVarsFor(ep)));
+      L.push(buildSamplerXml(ep, isLogin, activeToken, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables));
       if (isLogin) tokenExtracted = true;
     }
   } else {
@@ -845,7 +972,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
         // Ungrouped endpoints — emit directly (no Simple Controller wrapper)
         for (const ep of eps) {
           const isLogin = ep === loginEp;
-          L.push(buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep)));
+          L.push(buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables));
           if (isLogin) tokenExtracted = true;
         }
       } else {
@@ -857,7 +984,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
         for (const ep of eps) {
           const isLogin = ep === loginEp;
           // Indent samplers one level deeper inside the Simple Controller
-          const samplerXml = buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep))
+          const samplerXml = buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables)
             .split('\n').map(line => '  ' + line).join('\n');
           L.push(samplerXml);
           if (isLogin) tokenExtracted = true;
@@ -934,6 +1061,17 @@ Pass extracted values to subsequent requests.
 ${JSON.stringify(preRunData, null, 2).slice(0, 2000)}
 ` : '';
 
+  // Fixes previously verified via pre-run's "Fix with AI" heal action (cfg.endpointOverrides,
+  // stored on collection_env_config) — tell the AI exactly which endpoints needed a
+  // non-default value (e.g. a refresh token instead of the access token) so the generated
+  // script doesn't fail the same way pre-run originally did before that fix was applied.
+  const overrideEntries = Object.values(cfg.endpointOverrides || {});
+  const overrideSection = overrideEntries.length ? `
+PREVIOUSLY VERIFIED FIXES (apply the same approach to the matching endpoint below):
+${overrideEntries.map(o => `- ${o.method} "${o.name}": ${o.fix || 'requires a specific header/body override'}${o.headers ? ` — headers: ${JSON.stringify(o.headers)}` : ''}${o.body !== undefined ? ` — body: ${JSON.stringify(o.body)}` : ''}`).join('\n')}
+A value written as {{captured:KEY}} means: extract KEY from the response of whichever earlier request returns it (usually login) and use that captured value here, NOT a hardcoded string.
+` : '';
+
   const systemPrompt = `You are an expert k6 v0.50 JavaScript performance test script generator.
 Output ONLY raw valid JavaScript. No markdown fences, no explanation.`;
 
@@ -974,6 +1112,7 @@ Add k6 check() calls to verify HTTP 200/201 status codes.
 Add sleep(1) between requests.
 ${csvSection}
 ${correlationSection}
+${overrideSection}
 
 Output the complete k6 JavaScript file only.`;
 
@@ -981,3 +1120,4 @@ Output the complete k6 JavaScript file only.`;
 }
 
 module.exports = router;
+module.exports.generateScriptForSuite = generateScriptForSuite;

@@ -26,14 +26,17 @@ Install the following before proceeding.
 | **Node.js** | 20+ (22 recommended) | https://nodejs.org |
 | **npm** | 9+ (comes with Node.js) | — |
 | **Git** | Any recent version | https://git-scm.com |
-| **Docker Desktop** *(Method A only)* | Latest | https://www.docker.com/products/docker-desktop |
+| **Docker Desktop** *(Method A only, or to run Postgres in Method B)* | Latest | https://www.docker.com/products/docker-desktop |
+| **PostgreSQL 16** *(Method B only, if not running it via Docker)* | 16+ | https://www.postgresql.org/download/ |
+
+The app requires a running PostgreSQL database (`DATABASE_URL`) — there is no SQLite/file-based fallback. Method A's Docker Compose stack provisions Postgres for you; Method B needs either a local Postgres install or a Postgres container you run separately.
 
 **Verify your installation:**
 ```bash
 node --version    # should print v20.x or higher
 npm --version     # should print 9.x or higher
 git --version
-docker --version  # only needed for Method A
+docker --version  # only needed for Method A, or to run Postgres via Docker in Method B
 ```
 
 ---
@@ -72,6 +75,9 @@ Create a file named `.env` in the **project root** (`PerfStudio/.env`) with the 
 JWT_SECRET=PASTE_YOUR_JWT_SECRET_HERE
 ENCRYPTION_KEY=PASTE_YOUR_ENCRYPTION_KEY_HERE
 
+# PostgreSQL connection string — see Method A/B below for how to get one running
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/perf_studio
+
 # ── Server ────────────────────────────────────────────────
 PORT=3001
 NODE_ENV=development
@@ -88,20 +94,25 @@ HOST_PROJECTS_ROOT=C:/Users/YourName/PerfStudio/projects
 HOST_BACKUPS_ROOT=C:/Users/YourName/PerfStudio/backups
 ```
 
-> **Important:** `HOST_PROJECTS_ROOT` and `HOST_BACKUPS_ROOT` must be absolute paths using forward slashes. Only needed for Method A (Docker).
+> **Important:** `HOST_PROJECTS_ROOT` and `HOST_BACKUPS_ROOT` must be absolute paths using forward slashes. Only needed for Method A (Docker). For Method A, `DATABASE_URL` should instead point at the `postgres` service hostname (`postgresql://postgres:postgres@postgres:5432/perf_studio`) since the app and database run as sibling containers — see below.
 
 ---
 
 ## 4. Method A — Docker (Recommended)
 
-This runs the entire application (backend + frontend served as static files) in a single container. No Node.js setup required after the prerequisites.
+This runs the entire application (backend + frontend served as static files) plus a PostgreSQL container, in one Compose stack. No Node.js or Postgres setup required after the prerequisites.
 
 ```bash
 # From the project root
 docker compose up -d
 ```
 
-Docker will build the image on the first run (takes 2–5 minutes). Subsequent starts are instant.
+Docker will build the image and pull Postgres on the first run (takes 2–5 minutes). Subsequent starts are instant.
+
+**First run only — apply the database schema** (not done automatically):
+```bash
+docker compose exec PerfStudio node backend/src/db/migrate.js
+```
 
 **Access the application:** http://localhost:3001
 
@@ -119,13 +130,24 @@ docker compose down
 
 ## 5. Method B — Manual (Node.js)
 
-This runs the backend and frontend as separate dev servers with hot-reload. Requires two terminal windows.
+This runs the backend and frontend as separate dev servers with hot-reload. Requires two terminal windows, plus a running Postgres instance.
+
+### Terminal 0 — Postgres (if you don't already have one)
+
+```bash
+docker run -d --name perf_studio_pg \
+  -e POSTGRES_DB=perf_studio -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -p 5432:5432 postgres:16-alpine
+```
+
+Make sure `.env`'s `DATABASE_URL` points at it (`postgresql://postgres:postgres@localhost:5432/perf_studio` for the command above).
 
 ### Terminal 1 — Backend
 
 ```bash
 cd PerfStudio/backend
 npm install
+node src/db/migrate.js   # applies schema.sql — first run only, safe to re-run anytime
 npm run dev
 ```
 
@@ -156,7 +178,7 @@ VITE ready in 500ms
 
 ## 6. First Login
 
-On first startup the database is created automatically and a Super Admin account is seeded.
+On first backend startup, a Super Admin account is seeded into the database automatically (as long as `migrate.js` has already applied the schema — see above).
 
 | Field | Value |
 |---|---|
@@ -179,10 +201,10 @@ On first startup the database is created automatically and a Super Admin account
 
 The application creates the following folders automatically — do not delete them while the app is running.
 
+The database itself (users, orgs, licenses, projects, run history, etc.) lives in PostgreSQL, not on disk here — see `DATABASE_URL`.
+
 ```
 PerfStudio/
-├── data/
-│   └── PerfStudio.db          ← SQLite database (all app data)
 ├── projects/                   ← Legacy admin project files
 ├── backups/                    ← Project ZIP backups (on delete)
 └── git-workspaces/
@@ -225,15 +247,17 @@ taskkill /PID <PID> /F
 
 ### Cannot log in / JWT errors
 
-The `JWT_SECRET` in `.env` was likely changed after accounts were created. Run:
+The `JWT_SECRET` in `.env` was likely changed after accounts were created — existing tokens/sessions no longer validate. This doesn't require wiping data; users just need to log in again. If you genuinely want a clean slate:
 ```bash
-# Delete the database and restart (all data will be lost)
-# Windows
-del data\PerfStudio.db
-# Mac/Linux
-rm data/PerfStudio.db
+# Drop and recreate the database, then re-apply the schema (all data will be lost)
+psql "$DATABASE_URL" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+cd backend && node src/db/migrate.js
 ```
-Then restart the server — the database and default admin account will be re-created.
+Restart the backend afterward — the default super admin account will be re-seeded automatically.
+
+### "relation does not exist" errors on login/register
+
+The schema was never applied to this Postgres instance. Run `node src/db/migrate.js` from `backend/` (or `docker compose exec PerfStudio node backend/src/db/migrate.js` for Method A) — this is a required one-time step, not automatic.
 
 ### npm install fails
 

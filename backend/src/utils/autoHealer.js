@@ -3,19 +3,24 @@ const path = require('path');
 const dns = require('dns').promises;
 const { spawn, execSync } = require('child_process');
 const db = require('../db');
-const { callAi } = require('./aiClient');
+const { callAi, getMaxOutputTokens } = require('./aiClient');
 const { getProjectPath } = require('./projectFolders');
 const { evaluateRules } = require('./ruleEvaluator');
 const { patchJmxForParams } = require('./patchJmx');
+const { resolveForScript, extractAllTokens } = require('./preRunEngine');
 
-const MAX_ATTEMPTS   = 3;
+// Auto-heal gets exactly 1 automatic attempt — if it doesn't fix the run, the "Custom Heal"
+// button (which lets the user supply a targeted instruction) is the intended next step
+// rather than more unguided automatic retries burning AI calls on the same failure.
+const MAX_ATTEMPTS   = 1;
 const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
 // Phase-1 quick-verify params — just enough to confirm the script fix is valid.
-// Runs in ~20 seconds regardless of original test duration.
-const HEAL_VUSERS   = 3;
-const HEAL_DURATION = 20;   // seconds
-const HEAL_RAMPUP   = 2;    // seconds
+// Single user, single loop: the cheapest possible smoke test before spending real load
+// on the full-params re-run in Phase 2.
+const HEAL_VUSERS = 1;
+const HEAL_RAMPUP = 1;    // seconds
+const HEAL_LOOPS  = 1;
 
 // ── Binary discovery ──────────────────────────────────────────────────────────
 function getJMeterBin(customPath) {
@@ -130,7 +135,7 @@ function classifyErrors(jtlPath) {
 }
 
 // ── Core run spawner ──────────────────────────────────────────────────────────
-// mode = 'quick'  → HEAL_VUSERS / HEAL_DURATION (no report generation)
+// mode = 'quick'  → HEAL_VUSERS / HEAL_LOOPS (no report generation)
 // mode = 'full'   → exact runtime params from the original failed run
 async function spawnRun(userId, originalRun, suite, project, mode) {
   const cfgRow   = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
@@ -152,7 +157,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
   const addLog  = (type, message) => allLogs.push({ type, message });
 
   const modeLabel = mode === 'quick'
-    ? `Quick-verify: ${HEAL_VUSERS} VUsers × ${HEAL_DURATION}s`
+    ? `Quick-verify: ${HEAL_VUSERS} VUser × ${HEAL_LOOPS} loop`
     : `Full run with original params`;
 
   addLog('info', `[Auto Healer] Run #${runNumber} — ${modeLabel}`);
@@ -160,7 +165,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
   // Resolve params based on mode
   const orig = resolveRunParams(originalRun, suite);
   const p = mode === 'quick'
-    ? { vusers: HEAL_VUSERS, rampup: HEAL_RAMPUP, iter_mode: 'duration', duration: HEAL_DURATION, loops: 1 }
+    ? { vusers: HEAL_VUSERS, rampup: HEAL_RAMPUP, iter_mode: 'loops', duration: 0, loops: HEAL_LOOPS }
     : orig;
 
   const newRunId = (await db.prepare(`
@@ -264,7 +269,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     // Determine pass/fail via Rule Engine → raw fail count fallback
     let finalStatus = 'completed';
     if (jtlPath && fs.existsSync(jtlPath)) {
-      const ruleResult = evaluateRules(originalRun.project_id, jtlPath);
+      const ruleResult = await evaluateRules(originalRun.project_id, jtlPath);
       if (!ruleResult.noRules) {
         if (ruleResult.passed === false) {
           finalStatus = 'failed';
@@ -461,7 +466,7 @@ async function buildContext(run, suite) {
     .map(l => `[${l.type}] ${l.message}`).slice(-80).join('\n');
 
   // ── JTL analysis ────────────────────────────────────────────────────────────
-  const jtl = parseJtlComprehensive(jtlPath);
+  const jtl = await parseJtlComprehensive(jtlPath);
 
   // Label sets
   const allLabels = new Set(), failingLabels = new Set();
@@ -492,7 +497,7 @@ async function buildContext(run, suite) {
   }
 
   // ── Rule + overall hasErrors ──────────────────────────────────────────────
-  const ruleResult = evaluateRules(run.project_id, jtlPath);
+  const ruleResult = await evaluateRules(run.project_id, jtlPath);
   let hasErrors;
   if (!ruleResult.noRules) {
     hasErrors = ruleResult.passed === false || run.status === 'failed';
@@ -534,8 +539,408 @@ function sanitizeJsonControlChars(s) {
   return out;
 }
 
+// Detects literal Postman-style {{var}} tokens still baked into a generated script.
+// Unlike every other failure category this needs no AI diagnosis: JMeter/K6 do not
+// support {{var}} syntax at all, so the server receives that literal text instead of a
+// real value — guaranteed to fail every request that uses it, with no ambiguity about
+// the cause. Fixed deterministically: a variable with a known value in the collection's
+// env config is baked in as that real value (same rule testSuites.js's
+// resolveTemplateVars applies at generation time); anything unresolved falls back to a
+// JMeter ${var} reference so it can still be supplied by a CSV Data Set / User Defined
+// Variable instead of being sent to the server as broken literal text.
+async function tryFixTemplateVars(suite, ctx) {
+  const scriptContent = ctx.scriptContent || '';
+  const templateVars = [...new Set([...scriptContent.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]))];
+  if (!templateVars.length) return null;
+
+  let variables = {};
+  if (suite.collection_id) {
+    try {
+      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?')
+        .get(suite.collection_id, suite.env || 'Default');
+      variables = JSON.parse(row?.config_json || '{}')?.variables || {};
+    } catch (_) {}
+  }
+
+  const fixedScript = resolveForScript(scriptContent, variables);
+  const resolved   = templateVars.filter(k => Object.prototype.hasOwnProperty.call(variables, k));
+  const unresolved = templateVars.filter(k => !resolved.includes(k));
+
+  return {
+    issue: `Script contains ${templateVars.length} literal Postman-style {{var}} token(s) — {{${templateVars.join('}}, {{')}}}}. ` +
+      `JMeter/K6 do not support {{var}} syntax; the server was receiving that literal text instead of a real value, which fails every request using it.`,
+    fix: [
+      resolved.length
+        ? `Replaced ${resolved.length} variable(s) (${resolved.join(', ')}) with the real value from the collection's environment config.`
+        : null,
+      unresolved.length
+        ? `Converted ${unresolved.length} variable(s) (${unresolved.join(', ')}) to a JMeter \${var} reference — no matching value was found in the collection's environment config, so add a User Defined Variable or CSV Data Set column for it if requests using it still fail.`
+        : null,
+    ].filter(Boolean).join(' '),
+    fix_type: 'script_rewrite',
+    fixed_script: fixedScript,
+  };
+}
+
+// Detects the single most common, zero-ambiguity cause of ZERO_SAMPLES (JMeter produced no
+// requests at all): a ThreadGroup/Sampler/Controller left with enabled="false" — e.g. from a
+// manual edit, or a prior heal attempt that disabled an element while isolating a failing
+// endpoint and never re-enabled it. Fixed deterministically (a plain attribute flip) rather
+// than via AI: this is the case where a full-script AI rewrite is both unnecessary (the fix
+// is one attribute) and, for a large script, impossible to even attempt without truncating —
+// see the token-budget guard in diagnoseWithAi below.
+function tryFixDisabledElements(ctx) {
+  if (ctx.allLabels.length > 0) return null; // samples exist — not a disabled-element issue
+  const content = ctx.scriptContent || '';
+  if (!content) return null;
+  const DISABLED_TAGS = ['ThreadGroup', 'HTTPSamplerProxy', 'GenericController', 'TransactionController', 'LoopController'];
+  const pattern = new RegExp(`<(${DISABLED_TAGS.join('|')})([^>]*?)\\benabled="false"([^>]*)>`, 'g');
+  const matches = [...content.matchAll(pattern)];
+  if (!matches.length) return null;
+
+  const fixedScript = content.replace(pattern, (m, tag, pre, post) => `<${tag}${pre}enabled="true"${post}>`);
+  const kinds = [...new Set(matches.map(m => m[1]))].join(', ');
+  return {
+    issue: `${matches.length} element(s) (${kinds}) had enabled="false" — JMeter skips disabled elements entirely, so this test plan executed zero requests.`,
+    fix: `Re-enabled ${matches.length} disabled element(s) (enabled="false" → "true") so the test plan actually runs.`,
+    fix_type: 'script_rewrite',
+    fixed_script: fixedScript,
+  };
+}
+
+// For JMeter runs backed by a real collection, endpoint-scoped failures (bad body/headers/
+// auth — NOT structural issues like ZERO_SAMPLES/DNS) can be fixed with a small per-endpoint
+// patch instead of asking the AI to reproduce the entire script. This is the difference
+// between success and a guaranteed truncation failure once a script is too large for the
+// model's output limit (e.g. a 247KB JMX with 100+ endpoints, ~60K+ tokens on its own).
+// The patch is stored in the exact same `endpointOverrides` shape pre-run's "Fix with AI"
+// already writes (routes/ai.js), then applied by regenerating the script — testSuites.js's
+// deterministic JMX builder already knows how to honor an override, so the actual rewrite
+// costs zero extra AI tokens; the AI only ever has to describe the fix, never the file.
+async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customInstruction) {
+  if (run.engine !== 'jmeter' || !suite.collection_id) return null;
+  // Deliberately excludes CORRELATION_PARAMETERIZATION: that category usually needs a
+  // token/session value captured from an earlier response, and this lightweight prompt
+  // doesn't carry captured-field context the way the full-rewrite prompt below does — safer
+  // to let those fall through to full diagnosis (where there's still headroom) than to
+  // have the AI either guess wrong or reliably burn every attempt on "no_fix".
+  const ENDPOINT_SCOPED = ['VARIABLE_REFERENCE', 'REQUEST_MALFUNCTION'];
+  if (!cats.some(c => ENDPOINT_SCOPED.includes(c))) return null;
+  if (!ctx.failingLabels.length) return null;
+
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+  let endpoints = [];
+  try { endpoints = JSON.parse(collection?.json_content || '[]'); } catch {}
+  if (!endpoints.length) return null;
+
+  // Only endpoints we can actually locate by name in the collection. Cap the count — a run
+  // with dozens of distinct failing endpoints at once is unusual and more likely a
+  // structural problem the full-rewrite path (or a human) should look at instead.
+  const targets = ctx.failingLabels
+    .map(label => endpoints.find(ep => (ep.name || '') === label))
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!targets.length) return null;
+
+  const envRow = suite.env
+    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suite.env)
+    : null;
+  let variables = {};
+  try { variables = JSON.parse(envRow?.config_json || '{}')?.variables || {}; } catch {}
+
+  // Same captured-token detection pre-run's "Fix with AI" uses (routes/ai.js) — without this,
+  // the AI's only visible option for an Authorization/token fix was a static collection
+  // variable, which is how a blank leftover env placeholder (e.g. "bearerToken") ended up
+  // hard-wired into a header instead of the token actually returned by login.
+  const capturedTokens = {};
+  try {
+    for (const r of JSON.parse(collection?.pre_run_data || '[]')) {
+      if (!r) continue;
+      for (const [k, v] of Object.entries(extractAllTokens(r.body, r.responseHeaders))) {
+        if (!capturedTokens[k]) capturedTokens[k] = v;
+      }
+    }
+  } catch {}
+
+  const endpointBlocks = targets.map(ep => {
+    const stat = ctx.jtl.byLabel?.[ep.name];
+    const errLines = (stat?.samples || []).slice(0, 3)
+      .map(s => `    ${s.code} — ${s.failMsg || s.msg}`).join('\n') || '    (no specific JTL error captured)';
+    return [
+      `### ${ep.name}`,
+      `Method: ${ep.method || 'GET'}`,
+      `Current headers: ${JSON.stringify(ep.headers || {}, null, 2)}`,
+      `Current body: ${typeof ep.body === 'string' ? ep.body : JSON.stringify(ep.body || {}, null, 2)}`,
+      `Errors seen (${stat?.count || 0} total):`,
+      errLines,
+    ].join('\n');
+  }).join('\n\n');
+
+  const systemPrompt =
+    `You are an expert JMeter performance test auto-healer. Fix ONLY the specific failing endpoints ` +
+    `listed below by proposing corrected headers/body/url for each — do NOT rewrite the whole script, ` +
+    `and do NOT reference or reproduce any endpoint not listed.\n\n` +
+    `Output ONLY a single valid JSON object, no markdown fences:\n` +
+    `{\n` +
+    `  "issue": "root cause in 1-3 sentences covering all endpoints listed",\n` +
+    `  "fix": "what you changed and why",\n` +
+    `  "fix_type": "endpoint_overrides" | "no_fix",\n` +
+    `  "overrides": [{ "name": "<exact endpoint name from the list below>", "method": "GET|POST|...", "headers": {}, "body": "", "url": "" }]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- "name" MUST exactly match one of the endpoint names given below, verbatim.\n` +
+    `- In each override, only include "headers"/"body"/"url" for fields you're actually changing — omit the rest.\n` +
+    `- A value that should come from another response captured earlier (e.g. a login's access token) MUST use the placeholder {{captured:KEY}}, where KEY is one of the "Captured token fields" listed below — never invent a KEY that is not listed.\n` +
+    `- A value that should come from the collection's own configured variables MUST use {{key}}, where key is one of the Collection variables listed below.\n` +
+    `- For an Authorization header or any other token/session value, ALWAYS prefer {{captured:KEY}} over a collection variable — a token is normally produced dynamically by a login/auth response, not configured statically. Only fall back to a collection variable if no matching captured field exists.\n` +
+    `- If you cannot determine a confident fix from the information given (e.g. it needs a token captured from another endpoint's response, which isn't available here), return fix_type "no_fix" and explain why — do not guess.`;
+
+  const userPrompt = [
+    customInstruction ? `=== USER INSTRUCTION (HIGHEST PRIORITY) ===\n${customInstruction}\n` : '',
+    `=== Failing Endpoints (fix ONLY these — ${targets.length} of them) ===`,
+    endpointBlocks,
+    ``,
+    `=== Captured token fields available (from this suite's last pre-run) ===`,
+    Object.keys(capturedTokens).join(', ') || '(none captured yet)',
+    ``,
+    `=== Collection variables available ===`,
+    // Blank values (e.g. a leftover placeholder from an imported Postman environment) are
+    // excluded — listing them just invites the AI to "fix" a 401 by wiring in an empty
+    // credential, which is how a static "bearerToken": "" ended up in an Authorization header.
+    Object.keys(variables).filter(k => variables[k] !== '' && variables[k] != null).join(', ') || '(none)',
+    ``,
+    `=== JMeter Log (last 4 KB) ===`,
+    (ctx.jmeterLog || '').slice(-4000) || '(empty)',
+  ].filter(Boolean).join('\n');
+
+  const raw = await callAi(userId, systemPrompt, userPrompt, 'heal');
+  const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
+  const jsonStr = match ? (match[1] || match[0]) : raw;
+  if (!jsonStr.trim().startsWith('{')) return { fix_type: 'no_fix', issue: raw.slice(0, 300), fix: 'Could not parse AI response' };
+  try { return JSON.parse(jsonStr.trim()); }
+  catch {
+    try { return JSON.parse(sanitizeJsonControlChars(jsonStr.trim())); }
+    catch (e2) { return { fix_type: 'no_fix', issue: `JSON parse error: ${e2.message}`, fix: '' }; }
+  }
+}
+
+// Persists AI-proposed per-endpoint overrides into collection_env_config (same shape/table
+// pre-run's "Fix with AI" already uses — see routes/ai.js) and regenerates the script via
+// testSuites.js's deterministic generator so the override actually takes effect. Returns the
+// number of overrides successfully matched to a real endpoint and applied.
+async function applyEndpointOverrides(userId, projectId, suite, overrides) {
+  if (!suite.collection_id || !overrides?.length) return 0;
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+  let endpoints = [];
+  try { endpoints = JSON.parse(collection?.json_content || '[]'); } catch {}
+  if (!endpoints.length) return 0;
+
+  const env = suite.env || 'Default';
+  const envRow = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?')
+    .get(suite.collection_id, env);
+  const envCfg = envRow ? JSON.parse(envRow.config_json || '{}') : {};
+  const existing = envCfg.endpointOverrides || {};
+
+  let applied = 0;
+  for (const o of overrides) {
+    const idx = endpoints.findIndex(ep => (ep.name || '') === o.name &&
+      (!o.method || (ep.method || 'GET').toUpperCase() === String(o.method).toUpperCase()));
+    if (idx === -1) continue; // couldn't confidently match — skip rather than guess wrong
+    // Store the endpoint's own method/name verbatim (not upper-cased) — testSuites.js's
+    // fingerprintMatches() does an exact-case comparison against the raw endpoint object,
+    // the same convention routes/ai.js's "Fix with AI" override already follows.
+    existing[idx] = {
+      method: endpoints[idx].method || 'GET',
+      name: endpoints[idx].name || '',
+      ...(o.headers ? { headers: o.headers } : {}),
+      ...(o.body !== undefined ? { body: o.body } : {}),
+      ...(o.url ? { url: o.url } : {}),
+      issue: o.issue || '', fix: o.fix || '',
+      updatedAt: new Date().toISOString(),
+    };
+    applied++;
+  }
+  if (!applied) return 0;
+
+  envCfg.endpointOverrides = existing;
+  if (envRow) {
+    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?')
+      .run(JSON.stringify(envCfg), suite.collection_id, env);
+  } else {
+    await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
+      .run(suite.collection_id, env, JSON.stringify(envCfg));
+  }
+
+  // Regenerate — deterministic for JMeter, so this costs no extra AI tokens and can't
+  // suffer the same truncation failure as asking the AI to output the file itself.
+  const { generateScriptForSuite } = require('../routes/testSuites');
+  const genResult = await generateScriptForSuite(userId, projectId, suite.id, null);
+  if (genResult.error) throw new Error(`Regeneration after endpoint patch failed: ${genResult.error}`);
+  return applied;
+}
+
+// Applies a set of surgical find/replace edits to a script. Each `find` must match the
+// script's current content EXACTLY ONCE — anything ambiguous (0 or 2+ matches) is skipped
+// rather than guessed at, since applying a replace against the wrong occurrence (or none)
+// would silently corrupt or no-op the fix. Returns which edits actually landed so the caller
+// can decide whether the patch as a whole succeeded.
+function applyDiffPatch(content, edits) {
+  let result = content;
+  const applied = [], skipped = [];
+  for (const e of edits || []) {
+    const find = e?.find;
+    if (typeof find !== 'string' || !find) { skipped.push('(missing "find")'); continue; }
+    const count = result.split(find).length - 1;
+    if (count !== 1) {
+      skipped.push(`"${find.slice(0, 60)}${find.length > 60 ? '…' : ''}" matched ${count} time(s) (need exactly 1)`);
+      continue;
+    }
+    result = result.replace(find, e.replace ?? '');
+    applied.push(find.slice(0, 60));
+  }
+  return { result, applied, skipped };
+}
+
+// Lightweight structural check — this codebase has no XML parser dependency (patchJmx.js
+// does all its own JMX editing via regex too), so this isn't a full validator, just enough
+// to catch the failure mode a find/replace patch can introduce that a full-file rewrite
+// mostly can't: an edit that leaves a tag unclosed or mismatched (e.g. "replace" text with
+// a subtly different tag name than "find" had). Strips comments/CDATA/PIs, then walks every
+// remaining tag with a stack requiring strict open/close nesting.
+function isWellFormedXmlish(content) {
+  const stripped = content
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
+    .replace(/<\?[\s\S]*?\?>/g, '');
+  const tagRe = /<(\/?)([A-Za-z_][\w.-]*)\b[^>]*?(\/?)>/g;
+  const stack = [];
+  let m;
+  while ((m = tagRe.exec(stripped))) {
+    const [, closing, name, selfClose] = m;
+    if (selfClose === '/') continue; // self-closing — no stack effect either way
+    if (closing === '/') {
+      if (stack.length === 0 || stack[stack.length - 1] !== name) return false;
+      stack.pop();
+    } else {
+      stack.push(name);
+    }
+  }
+  return stack.length === 0;
+}
+
+// Same idea for k6 (plain JS) scripts — not a real parser, just a brace/paren balance check
+// to catch a patch that dropped or duplicated a closing token.
+function hasBalancedBrackets(content) {
+  const pairs = { ')': '(', ']': '[', '}': '{' };
+  const stack = [];
+  for (const ch of content) {
+    if (ch === '(' || ch === '[' || ch === '{') stack.push(ch);
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (stack.pop() !== pairs[ch]) return false;
+    }
+  }
+  return stack.length === 0;
+}
+
+// The token-efficient middle path between a zero-AI mechanical fix and a full-script
+// rewrite: instead of asking the AI to reproduce the whole file (output size = file size,
+// the exact thing that guarantees truncation on a large script), ask it for a small list of
+// surgical find/replace edits (output size = size of the CHANGE, independent of file size).
+// Unlike tryEndpointOverridePatch this isn't restricted to endpoint-scoped categories or
+// JMeter-with-a-collection — it's a general repair mechanism for any engine/category, since
+// it's just exact-text substitution against the script the AI was already shown. Falls
+// through (returns null) whenever the AI can't express the fix this way (e.g. it genuinely
+// needs to restructure large portions of the file) so the full-rewrite path remains the
+// backstop for those rarer cases.
+async function tryDiffPatch(userId, run, suite, ctx, cats, customInstruction) {
+  const scriptContent = ctx.scriptContent || '';
+  if (!scriptContent) return null;
+
+  const isJmeter = run.engine === 'jmeter';
+  const systemPrompt =
+    `You are an expert ${isJmeter ? 'JMeter 5.6' : 'k6 v0.50'} performance test auto-healer. Fix the failure described ` +
+    `below by proposing a SMALL number of surgical text edits to the script — do NOT reproduce the whole file.\n\n` +
+    `Output ONLY a single valid JSON object, no markdown fences:\n` +
+    `{\n` +
+    `  "issue": "root cause in 1-3 sentences",\n` +
+    `  "fix": "what you changed and why",\n` +
+    `  "fix_type": "diff_patch" | "no_fix",\n` +
+    `  "edits": [{ "find": "<exact text copied verbatim from the script below>", "replace": "<replacement text>" }]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Each "find" MUST be an exact, verbatim substring of the script below (identical whitespace/quoting) that appears EXACTLY ONCE — include enough surrounding text (e.g. the full element tag, or a nearby unique attribute) to make it unique. An edit whose "find" doesn't match exactly once will be rejected and discarded.\n` +
+    `- Keep each edit minimal — change only what's broken, don't reformat or rewrite unrelated lines.\n` +
+    `- Prefer few, larger, unambiguous edits over many tiny fragile ones.\n` +
+    `- If the fix genuinely requires restructuring large portions of the file (not expressible as a handful of surgical edits), return fix_type "no_fix" and explain why — do not force it.`;
+
+  const userPrompt = [
+    customInstruction ? `=== USER INSTRUCTION (HIGHEST PRIORITY) ===\n${customInstruction}\n` : '',
+    `Failure categories detected: ${cats.join(', ')}`,
+    ``,
+    `=== JTL Error Summary ===`,
+    ctx.jtl.errorSummaryText || '(no errors in JTL — see log below)',
+    ``,
+    `=== Endpoint DNS Status ===`,
+    Object.entries(ctx.endpointStatus).map(([h, r]) => `  ${h}: ${r.ok ? 'OK' : 'UNREACHABLE — ' + r.error}`).join('\n') || '  (not checked)',
+    ``,
+    `=== JMeter/k6 Log (last 8 KB) ===`,
+    (ctx.jmeterLog || '').slice(-8000) || '(empty)',
+    ``,
+    `=== Current Script (copy "find" text from here verbatim) ===`,
+    scriptContent,
+  ].filter(Boolean).join('\n');
+
+  const raw = await callAi(userId, systemPrompt, userPrompt, 'heal');
+  const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
+  const jsonStr = match ? (match[1] || match[0]) : raw;
+  if (!jsonStr.trim().startsWith('{')) return null;
+
+  let parsed;
+  try { parsed = JSON.parse(jsonStr.trim()); }
+  catch { try { parsed = JSON.parse(sanitizeJsonControlChars(jsonStr.trim())); } catch { return null; } }
+
+  if (parsed.fix_type !== 'diff_patch' || !parsed.edits?.length) return null;
+
+  const { result, applied, skipped } = applyDiffPatch(scriptContent, parsed.edits);
+  if (!applied.length) return null; // every edit was ambiguous/missing — nothing actually changed, fall through
+
+  // Same non-negotiable guard as the full-rewrite path: never let a patch silently drop a
+  // sampler that was passing before.
+  if (ctx.allLabels.length > 0) {
+    const missing = ctx.allLabels.filter(lbl => !result.includes(lbl));
+    if (missing.length > 0) return null; // let the full-rewrite path handle it instead of risking data loss
+  }
+
+  // A patch that leaves the file structurally broken (unclosed tag, unbalanced braces) is
+  // worse than no fix at all — it would burn the one heal attempt on a script JMeter/k6
+  // can't even parse. Reject and fall through to the full-rewrite path instead, which at
+  // least produces the AI's own self-consistent version of the whole file.
+  const stillWellFormed = isJmeter ? isWellFormedXmlish(result) : hasBalancedBrackets(result);
+  if (!stillWellFormed) return null;
+
+  return {
+    issue: parsed.issue || 'Unknown issue',
+    fix: (parsed.fix || '') + (skipped.length ? ` (${skipped.length} proposed edit(s) skipped — ambiguous or not found, did not apply.)` : ''),
+    fix_type: 'script_rewrite',
+    fixed_script: result,
+  };
+}
+
 // ── AI diagnosis with category-specific guidance ──────────────────────────────
 async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruction = null) {
+  // Literal {{var}} tokens are always broken and don't need AI diagnosis — fix them
+  // deterministically first. If the run still fails afterward, the {{var}} tokens will
+  // be gone by the next attempt and it'll fall through to full AI diagnosis for
+  // whatever's left (these were never the only possible cause, just a guaranteed one).
+  const mechanicalFix = await tryFixTemplateVars(suite, ctx);
+  if (mechanicalFix) return mechanicalFix;
+
+  // Same reasoning as above — a disabled ThreadGroup/sampler is a guaranteed, unambiguous
+  // cause of zero samples and needs no AI call to fix (and, on a large script, a full
+  // rewrite couldn't even attempt it — see the token-budget guard further below).
+  const disabledFix = tryFixDisabledElements(ctx);
+  if (disabledFix) return disabledFix;
+
   const isJmeter    = run.engine === 'jmeter';
   const engineLabel = isJmeter ? 'JMeter 5.6' : 'k6 v0.50';
   const allCount    = ctx.allLabels.length;
@@ -552,6 +957,51 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruc
   if (!zeroSamples && (jtl.variableErrors.length || ctx.missingVars.length)) cats.push('VARIABLE_REFERENCE');
   if (!zeroSamples && jtl.requestErrors.length)            cats.push('REQUEST_MALFUNCTION');
   if (!cats.length)                                         cats.push('UNKNOWN');
+
+  // For endpoint-scoped categories, try a small targeted patch before ever building the
+  // (potentially huge) full-script-rewrite prompt below — this is what makes healing work
+  // at all on a script too large for the model to reproduce whole. Only returns non-null
+  // when it actually found endpoints to target; falls through to full diagnosis otherwise
+  // (e.g. no collection, k6 engine, or a structural category like ZERO_SAMPLES/DNS).
+  const patchResp = await tryEndpointOverridePatch(userId, run, suite, ctx, cats, customInstruction);
+  if (patchResp) return patchResp;
+
+  // Before ever asking the AI to reproduce the whole file, try expressing the fix as a
+  // small set of surgical find/replace edits instead — output size scales with the size of
+  // the CHANGE, not the file, so this works regardless of how large the script is. Covers
+  // every category the endpoint-override patch doesn't (ZERO_SAMPLES, DNS, correlation,
+  // assertions, unknown) without ever risking the truncation the full rewrite below can hit.
+  let diffResp = null;
+  try { diffResp = await tryDiffPatch(userId, run, suite, ctx, cats, customInstruction); }
+  catch (e) { console.warn('[Auto Heal] diff-patch attempt failed, falling back:', e.message); }
+  if (diffResp) return diffResp;
+
+  // Nothing deterministic, endpoint-scoped, or diff-patchable applied, so the only path left
+  // is the full-script rewrite below — which asks the AI to reproduce the ENTIRE script
+  // verbatim inside one JSON string field. That output is capped at the provider's hard
+  // ceiling (16000 tokens for GPT-4o, 8192 for Claude — a real model limit, not a config knob
+  // that can be raised). A script whose own size already approaches that ceiling is
+  // mathematically guaranteed to truncate — confirmed live on a 247KB JMX, which truncated
+  // identically on every one of 3 attempts across multiple heal sessions, each attempt
+  // costing a real AI call for a result already known before sending it. Check that BEFORE
+  // calling, not after, so this returns one honest no_fix immediately instead of burning
+  // the whole attempt budget on guaranteed-identical failures.
+  const maxOutputTokens = await getMaxOutputTokens();
+  if (maxOutputTokens) {
+    const approxScriptTokens = Math.ceil((ctx.scriptContent || '').length / 3.5); // XML/code averages under 4 chars/token
+    const reserveForMetadata = 600; // issue/fix text + JSON wrapper overhead
+    if (approxScriptTokens > maxOutputTokens - reserveForMetadata) {
+      return {
+        fix_type: 'no_fix',
+        issue: `This script is ~${Math.round((ctx.scriptContent || '').length / 1024)} KB (~${approxScriptTokens} tokens), too large for a full-script rewrite — every AI provider caps a single response at ${maxOutputTokens} tokens, a hard model limit that no retry can exceed. ` +
+          (zeroSamples
+            ? `This run produced zero samples/no results at all, which on a script this size usually means the CI job itself failed before JMeter could run (build step, missing dependency, unreachable runner) rather than a fixable script bug — check the raw CI pipeline logs for the actual failure, since auto-heal has no way to inspect those directly.`
+            : `Auto-heal can only fix a script this size via small, endpoint-scoped patches (already attempted above for the applicable categories) — a structural fix at this size needs manual review.`),
+        fix: '',
+        fixed_script: '',
+      };
+    }
+  }
 
   // ── Category-specific fix instructions ──────────────────────────────────────
   const catGuidance = [];
@@ -744,6 +1194,19 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruc
       };
     }
   }
+  // Guard: reject a structurally broken rewrite (unclosed/mismatched tag, unbalanced
+  // brackets) — same reasoning as tryDiffPatch's check, applied here too since a full
+  // rewrite can make this mistake just as easily as a surgical edit can.
+  if (parsed.fix_type === 'script_rewrite' && parsed.fixed_script) {
+    const stillWellFormed = isJmeter ? isWellFormedXmlish(parsed.fixed_script) : hasBalancedBrackets(parsed.fixed_script);
+    if (!stillWellFormed) {
+      return {
+        fix_type: 'no_fix',
+        issue: `AI's rewritten script is structurally broken (${isJmeter ? 'unclosed/mismatched XML tag' : 'unbalanced brackets'}) — rejected rather than writing a file that would fail to even parse.`,
+        fix: '', fixed_script: '',
+      };
+    }
+  }
   return parsed;
 }
 
@@ -791,7 +1254,13 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     aiResp.fix_type || 'no_fix'
   );
 
-  if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
+  const isEndpointPatch = aiResp.fix_type === 'endpoint_overrides' && aiResp.overrides?.length;
+  if (aiResp.fix_type !== 'script_rewrite' && !isEndpointPatch) {
+    await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
+    await setHealStatus(targetRunId, 'failed');
+    return;
+  }
+  if (aiResp.fix_type === 'script_rewrite' && !aiResp.fixed_script) {
     await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('no_fix', logId);
     await setHealStatus(targetRunId, 'failed');
     return;
@@ -800,7 +1269,11 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
   // Apply fix (keep .bak of original)
   await setHealStatus(targetRunId, 'applying_fix');
   try {
-    if (ctx.scriptPath) {
+    if (isEndpointPatch) {
+      if (ctx.scriptPath && fs.existsSync(ctx.scriptPath)) fs.copyFileSync(ctx.scriptPath, ctx.scriptPath + '.bak');
+      const applied = await applyEndpointOverrides(userId, run.project_id, suite, aiResp.overrides);
+      if (!applied) throw new Error('None of the proposed overrides matched a real endpoint by name.');
+    } else if (ctx.scriptPath) {
       if (fs.existsSync(ctx.scriptPath)) fs.copyFileSync(ctx.scriptPath, ctx.scriptPath + '.bak');
       fs.writeFileSync(ctx.scriptPath, aiResp.fixed_script, 'utf8');
     }
@@ -834,7 +1307,7 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     return;
   }
 
-  const quickRuleCheck  = evaluateRules(quickRun.project_id, quickJtlPath);
+  const quickRuleCheck  = await evaluateRules(quickRun.project_id, quickJtlPath);
   const quickPassed = quickRun.status === 'completed' &&
     (quickRuleCheck.noRules ? true : quickRuleCheck.passed !== false);
 
@@ -876,7 +1349,7 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     return;
   }
 
-  const fullRuleCheck = evaluateRules(fullRun.project_id, fullJtlPath);
+  const fullRuleCheck = await evaluateRules(fullRun.project_id, fullJtlPath);
   const fullPassed = fullRun.status === 'completed' &&
     (fullRuleCheck.noRules ? true : fullRuleCheck.passed !== false);
 
@@ -954,4 +1427,4 @@ async function getHealStatus(runId) {
   return { status: run.heal_status, heal_run_id: run.heal_run_id, logs };
 }
 
-module.exports = { startAutoHeal, getHealStatus, buildContext, diagnoseWithAi, classifyErrors };
+module.exports = { startAutoHeal, getHealStatus, buildContext, diagnoseWithAi, classifyErrors, applyEndpointOverrides };
