@@ -1214,9 +1214,9 @@ router.post('/run', auth, async (req, res) => {
 
     // ── Email alert logic ──────────────────────────────────────────────────────
     // • Passed run              → send immediately for this run
-    // • Failed + auto-heal ON   → defer until healer finishes (up to 3 attempts);
+    // • Failed + auto-heal ON   → defer until healer finishes (1 attempt);
     //                             send for the healed run if successful,
-    //                             or the final failed run if all 3 attempts exhausted
+    //                             or the final failed run if the attempt is exhausted
     // • Failed + auto-heal OFF  → send immediately with failed status
     const sendEmailForRun = async (targetRunId) => {
       console.log(`[Alerts] sendEmailForRun started for run #${targetRunId}`);

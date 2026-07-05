@@ -232,7 +232,14 @@ export default function PipelineConfig({ project, envs, user }) {
     try {
       await api.put(`/projects/${project.id}/ci/config`, ciForm);
       const { data } = await api.post(`/projects/${project.id}/ci/generate-yaml`, { providers: [provider] });
-      toast(data.message || `Generated: ${data.created?.join(', ')}`, 'success');
+      // The route returns ok:true even when the file was generated but the git push
+      // failed (errors is populated) — a blanket success toast would hide exactly that,
+      // which is how a workflow fix once "succeeded" in the UI while never reaching main.
+      if (data.errors?.length) {
+        toast(data.errors.join(' '), 'error');
+      } else {
+        toast(data.message || `Generated: ${data.created?.join(', ')}`, 'success');
+      }
     } catch (e) { toast(e.response?.data?.error || 'Generation failed', 'error'); }
     finally { setCiGenerating(null); }
   }

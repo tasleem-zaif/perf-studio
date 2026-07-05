@@ -19,6 +19,7 @@
 const fs   = require('fs');
 const path = require('path');
 const db   = require('../db');
+const { resolveUrlSet } = require('./preRunEngine');
 
 function writeJson(filePath, data) {
   try {
@@ -189,28 +190,30 @@ async function writeProjectSnapshot(project, userId) {
 
 async function autoPopulateFromCollections(projectId) {
   try {
-    const cols = await db.prepare('SELECT json_content FROM collections WHERE project_id = ?').all(projectId);
+    const cols = await db.prepare('SELECT id, environment, json_content FROM collections WHERE project_id = ?').all(projectId);
     const seen    = new Set();
     const urlSets = [];
 
     for (const col of cols) {
       let endpoints = [];
       try { endpoints = JSON.parse(col.json_content || '[]'); } catch { continue; }
+      // A collection's endpoints commonly reference {{var}} templates (including ones
+      // whose own value is itself a template, e.g. baseUrl = "{{protocol}}://{{host}}") —
+      // resolve against this collection's own default-env variables via the same shared
+      // resolveUrlSet() script generation and collection import use, so this project-wide
+      // reference value doesn't silently stay empty for a {{var}}-only collection.
+      let variables = {};
+      if (col.environment) {
+        const envRow = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(col.id, col.environment);
+        try { variables = JSON.parse(envRow?.config_json || '{}').variables || {}; } catch {}
+      }
       for (const ep of endpoints) {
         const rawUrl = ep.url || ep.path || '';
-        if (!rawUrl || (rawUrl.startsWith('/') && !rawUrl.includes('://'))) continue;
-        try {
-          const raw = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`;
-          const u   = new URL(raw);
-          const protocol = u.protocol.replace(':', '');
-          const hostname  = u.hostname;
-          // Skip unresolved Postman {{var}} templates — not a real hostname.
-          if (!hostname || hostname.includes('{{')) continue;
-          // Only use the port if the URL actually specified one — don't assume 443/80.
-          const port = u.port || '';
-          const key  = `${protocol}|${hostname}|${port}`;
-          if (!seen.has(key)) { seen.add(key); urlSets.push({ protocol, url: hostname, port }); }
-        } catch { continue; }
+        if (!rawUrl) continue;
+        const resolved = resolveUrlSet(rawUrl, variables);
+        if (!resolved) continue;
+        const key = `${resolved.protocol}|${resolved.url}|${resolved.port}`;
+        if (!seen.has(key)) { seen.add(key); urlSets.push(resolved); }
       }
     }
 

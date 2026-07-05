@@ -170,6 +170,13 @@ CREATE TABLE IF NOT EXISTS execution_runs (
   archived     INTEGER DEFAULT 0
 );
 
+-- Concurrent status-poll requests for the same CI run could each pass the
+-- "not yet synced" check before either INSERT committed, producing two
+-- execution_runs rows for one ci_pipeline_runs row — which then LEFT JOINs into
+-- duplicate "runs" in CI Run History. One execution_run per CI run, full stop.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_runs_ci_run_id_unique
+  ON execution_runs(ci_run_id) WHERE ci_run_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS auto_heal_logs (
   id          SERIAL PRIMARY KEY,
   run_id      INTEGER NOT NULL,

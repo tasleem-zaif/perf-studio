@@ -151,16 +151,18 @@ function VariablesEditor({ cfg, setCfg }) {
       <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: '10px' }}>
         Values for any <code>{'{{var}}'}</code> placeholders used in this collection's endpoints (URL, headers, body) — required for Pre-Run to resolve them. Auto-filled from an uploaded Postman environment file or the collection's own defaults where possible; add or correct any that couldn't be auto-derived (e.g. a value a Postman pre-request script computes dynamically, which Peako does not execute).
       </div>
-      {rows.map((r, idx) => (
-        <div key={idx} style={{ display: 'flex', gap: '10px', marginBottom: '8px', alignItems: 'center' }}>
-          <input type="text" value={r.key} onChange={e => updateRow(idx, 'key', e.target.value)} placeholder="url" style={{ flex: '0 0 160px' }} />
-          <input type="text" value={r.value} onChange={e => updateRow(idx, 'value', e.target.value)} placeholder="https://api.example.com" style={{ flex: 1 }} />
-          <button className="btn-icon" onClick={() => removeRow(idx)} title="Remove variable" style={{ color: 'var(--danger)' }}>
-            <i className="ti ti-trash" />
-          </button>
-        </div>
-      ))}
-      <button className="btn-secondary btn-sm" onClick={addRow}>
+      <div style={{ maxHeight: '400px', overflowY: 'auto', paddingRight: '6px' }}>
+        {rows.map((r, idx) => (
+          <div key={idx} style={{ display: 'flex', gap: '10px', marginBottom: '8px', alignItems: 'center' }}>
+            <input type="text" value={r.key} onChange={e => updateRow(idx, 'key', e.target.value)} placeholder="url" style={{ flex: '0 0 160px' }} />
+            <input type="text" value={r.value} onChange={e => updateRow(idx, 'value', e.target.value)} placeholder="https://api.example.com" style={{ flex: 1 }} />
+            <button className="btn-icon" onClick={() => removeRow(idx)} title="Remove variable" style={{ color: 'var(--danger)' }}>
+              <i className="ti ti-trash" />
+            </button>
+          </div>
+        ))}
+      </div>
+      <button className="btn-secondary btn-sm" onClick={addRow} style={{ marginTop: '4px' }}>
         <i className="ti ti-plus" /> Add Variable
       </button>
     </div>

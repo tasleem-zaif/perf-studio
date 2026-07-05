@@ -25,6 +25,14 @@ const os      = require('os');
 const { randomBytes } = require('crypto');
 const { spawnSync } = require('child_process');
 
+// Guards against overlapping status-poll requests for the same CI run both passing the
+// "not yet synced" check before either INSERT commits — without this, two concurrent
+// polls (e.g. a backgrounded browser tab's throttled timers firing in a burst) can each
+// create their own execution_runs row for the same ci_run_id, which then LEFT JOINs into
+// duplicate-looking rows in CI Run History. Backed by a DB-level unique index too
+// (schema.sql) as a second line of defense across process restarts/multiple workers.
+const ciSyncInProgress = new Set();
+
 // ── Shared patcher script content ─────────────────────────────────────────────
 // Written to .PerfStudio/patch_jmx.py in every Bitbucket workspace before push.
 // Uses double-quoted raw strings to avoid character-class escaping issues in re.
@@ -738,10 +746,38 @@ run_jmeter:
         -Jduration="\${JMETER_DURATION}" \\
         -l /output/results.jtl \\
         -e -o /output/html
+    - |
+      JTL="\$CI_PROJECT_DIR/reports/results.jtl"
+      if [ ! -f "\$JTL" ]; then
+        echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+        exit 1
+      fi
+      TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
+      echo "Total requests: \$TOTAL"
+      if [ "\$TOTAL" -le 0 ]; then
+        echo "ERROR: 0 requests executed - check thread group config"
+        exit 1
+      fi
+      # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+      # results sync to notice. Header-based column lookup since JMeter's CSV field
+      # order isn't guaranteed fixed.
+      SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+      if [ -n "\$SUCCESS_COL" ]; then
+        FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
+        echo "Failed requests: \$FAILED / \$TOTAL"
+        if [ "\$FAILED" -eq "\$TOTAL" ]; then
+          echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
+          exit 1
+        fi
+      else
+        echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
+      fi
+      echo "Validation passed: \$TOTAL requests"
   artifacts:
     paths:
       - reports/
     expire_in: 7 days
+    when: always
   rules:
     - when: manual
 `;
@@ -898,6 +934,20 @@ jobs:
           TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
           echo "Total requests: \$TOTAL"
           [ "\$TOTAL" -le 0 ] && echo "ERROR: 0 requests executed - check thread group config" && exit 1
+          # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+          # results sync to notice. Header-based column lookup since JMeter's CSV field
+          # order isn't guaranteed fixed.
+          SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+          if [ -n "\$SUCCESS_COL" ]; then
+            FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
+            echo "Failed requests: \$FAILED / \$TOTAL"
+            if [ "\$FAILED" -eq "\$TOTAL" ]; then
+              echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
+              exit 1
+            fi
+          else
+            echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
+          fi
           echo "Validation passed: \$TOTAL requests"
 
       - name: Upload report
@@ -1100,6 +1150,20 @@ pipelines:
                 echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
                 exit 1
               fi
+              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+              # results sync to notice. Header-based column lookup since JMeter's CSV field
+              # order isn't guaranteed fixed.
+              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+              if [ -n "$SUCCESS_COL" ]; then
+                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                echo "Failed requests: $FAILED / $TOTAL"
+                if [ "$FAILED" -eq "$TOTAL" ]; then
+                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                  exit 1
+                fi
+              else
+                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+              fi
               echo "Validation passed: $TOTAL requests executed."
 `;
     try {
@@ -1201,8 +1265,35 @@ pipelines:
         // Configure identity
         gitRun(['config', 'user.name',  callerRow.name  || 'PerfStudio']);
         gitRun(['config', 'user.email', callerRow.email || 'noreply@perfstudio.com']);
-        gitRun(['remote', 'set-url', 'origin', remoteUrl]);
-        try { gitRun(['checkout', autoCommitBranch]); } catch {}
+        // Keep 'origin' on the CLEAN url — the actual fetch/push below pass remoteUrl
+        // (authenticated) directly as the command's URL argument, so the token never
+        // needs to sit in .git/config at rest (readable via `git remote -v` indefinitely).
+        gitRun(['remote', 'set-url', 'origin', gitCfg.remote_url]);
+
+        // Never silently proceed on whatever branch happens to already be checked out —
+        // that's exactly how a generated file once ended up committed to a stale personal
+        // branch instead of main with zero indication anything went wrong. Try a plain
+        // checkout (existing local branch), then a remote-tracking checkout (branch exists
+        // on origin but was never fetched locally), then finally create it fresh.
+        try {
+          gitRun(['checkout', autoCommitBranch]);
+        } catch {
+          try {
+            // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like
+            // a by-name `fetch origin` would — a bare URL fetch with no refspec only sets
+            // FETCH_HEAD, which the checkout below wouldn't find.
+            gitRun(['fetch', remoteUrl, `+${autoCommitBranch}:refs/remotes/origin/${autoCommitBranch}`]);
+            gitRun(['checkout', '-b', autoCommitBranch, `origin/${autoCommitBranch}`]);
+          } catch {
+            gitRun(['checkout', '-b', autoCommitBranch]);
+          }
+        }
+        // Defensive: a checkout that "succeeds" onto the wrong ref must never silently
+        // result in a commit landing in the wrong place — verify before committing anything.
+        const actualBranch = gitRun(['rev-parse', '--abbrev-ref', 'HEAD']);
+        if (actualBranch !== autoCommitBranch) {
+          throw new Error(`Expected to be on branch "${autoCommitBranch}" before committing the generated CI config, but git reports "${actualBranch}" — aborting instead of committing to the wrong branch.`);
+        }
 
         // Stage only the generated CI files
         gitRun(['add', ...created.map(f => path.join(gitRoot, f))]);
@@ -1354,7 +1445,7 @@ router.post('/trigger', async (req, res) => {
     const suiteFile = suiteRow?.jmx_path || suiteRow?.js_path || '';
     resolvedScriptName = suiteFile.replace(/\\/g, '/').split('/').pop() || '';
   }
-  const canonicalPaths = buildCanonicalRepoPaths(req.params.projectId, resolvedScriptName || script_name);
+  const canonicalPaths = await buildCanonicalRepoPaths(req.params.projectId, resolvedScriptName || script_name);
   const variables = {
     script_name: resolvedScriptName || script_name,
     script_path:   canonicalPaths.scriptRepoPath,
@@ -1592,6 +1683,20 @@ pipelines:
               if [ "$TOTAL" -le 0 ]; then
                 echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
                 exit 1
+              fi
+              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+              # results sync to notice. Header-based column lookup since JMeter's CSV field
+              # order isn't guaranteed fixed.
+              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+              if [ -n "$SUCCESS_COL" ]; then
+                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                echo "Failed requests: $FAILED / $TOTAL"
+                if [ "$FAILED" -eq "$TOTAL" ]; then
+                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                  exit 1
+                fi
+              else
+                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
               fi
               echo "Validation passed: $TOTAL requests executed."
 `;
@@ -2594,9 +2699,16 @@ router.get('/runs/:runId/status', async (req, res) => {
     const wasFinished = ['completed','failed','cancelled','skipped'].includes(run.status);
     if (['completed','failed'].includes(mappedStatus)) {
       const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
-      if (!alreadySynced) {
+      // ciSyncInProgress.add() happens synchronously (same event-loop turn as the check),
+      // so two overlapping polls for the same run can't both pass this gate — the second
+      // sees the id already in the set and skips, closing the race that used to produce
+      // two execution_runs rows for one ci_pipeline_runs row.
+      if (!alreadySynced && !ciSyncInProgress.has(run.id)) {
+        ciSyncInProgress.add(run.id);
         const runSnapshot = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(run.id);
-        setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId).catch(e => console.error('[Auto-sync] failed for run', runSnapshot.id, ':', e.message)));
+        setImmediate(() => autoSyncCiRun(runSnapshot, cfg, req.params.projectId, req.userId)
+          .catch(e => console.error('[Auto-sync] failed for run', runSnapshot.id, ':', e.message))
+          .finally(() => ciSyncInProgress.delete(run.id)));
       }
     }
 
@@ -3178,26 +3290,42 @@ router.get('/runs/:runId/steps', async (req, res) => {
 // CI AUTO HEAL
 // ══════════════════════════════════════════════════════════════════════════════
 
-const HEAL_CI_MAX_ATTEMPTS = 3;
-const HEAL_CI_VUSERS       = 3;
-const HEAL_CI_DURATION     = 20;
-const HEAL_CI_RAMPUP       = 2;
+// Auto-heal gets exactly 1 automatic attempt per session — same reasoning as autoHealer.js's
+// local MAX_ATTEMPTS. After that, the "Heal Again" button (Runner.jsx's instruction textarea
+// → POST /runs/:runId/heal's auto_heal_instruction) is the intended path for a targeted
+// retry rather than more unguided automatic attempts.
+const HEAL_CI_MAX_ATTEMPTS = 1;
+const HEAL_CI_VUSERS       = 1;
+const HEAL_CI_RAMPUP       = 1;
+const HEAL_CI_LOOPS        = 1;
+// patch_jmx.py treats duration <= 0 (or "-1") as "loop-mode" — anything else forces
+// scheduler/duration mode instead, which hardcodes LoopController.loops to -1 and ignores
+// jmeter_loops entirely. Must stay "-1" for a true single-user/single-loop quick verify.
+const HEAL_CI_DURATION     = '-1';
 
 async function generateHealSummary(ciRunId) {
+  // `attempt` on each log row is a GLOBAL counter carried across heal sessions/chained
+  // runs (so logs read "Attempt 1, 2, 3…" across separate "Heal Again" clicks) — but this
+  // summary only ever sees the rows logged against THIS SPECIFIC ci_run_id, which can be
+  // a small slice of that global sequence (e.g. rows numbered 1 and 11). Display a plain
+  // local index here instead of the raw global number, since "Attempt 11" right after
+  // "Attempt 1" with nothing in between reads as a bug, not as cross-session continuity.
   const logs = await db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(ciRunId);
   if (!logs.length) return 'Auto-heal exhausted — no attempt logs found.';
+  const run = await db.prepare('SELECT provider FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+  const providerLabel = { github: 'GitHub Actions', gitlab: 'GitLab CI', bitbucket: 'Bitbucket Pipelines' }[run?.provider] || 'CI';
   const lines = [`Auto-heal exhausted after ${logs.length} attempt(s). The script could not be automatically fixed.\n`];
-  for (const log of logs) {
-    lines.push(`Attempt ${log.attempt}:`);
+  logs.forEach((log, i) => {
+    lines.push(`Attempt ${i + 1}:`);
     if (log.diagnosis)   lines.push(`  Issue:       ${log.diagnosis}`);
     if (log.fix_applied) lines.push(`  Fix applied: ${log.fix_applied}`);
     lines.push(`  Result:      ${log.result || 'unknown'}`);
     lines.push('');
-  }
+  });
   const last = logs[logs.length - 1];
   if (last?.diagnosis) {
     lines.push(`Remaining issue: ${last.diagnosis}`);
-    lines.push('\nRecommendation: Review the script manually. Check that Bitbucket YAML variables (jmeter_users, jmeter_rampup, jmeter_duration) are injected, all ThreadGroup elements have enabled="true", and the target host is reachable from the CI runner.');
+    lines.push(`\nRecommendation: Review the script manually. Check that ${providerLabel} pipeline variables (jmeter_users, jmeter_rampup, jmeter_duration) are injected, all ThreadGroup elements have enabled="true", and the target host is reachable from the CI runner.`);
   }
   return lines.join('\n');
 }
@@ -3280,7 +3408,7 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   // Locate the fixed JMX on disk and build canonical repo paths
   const scriptName   = originalCiRun.script_name || '';
   const scriptFile   = scriptName.replace(/\\/g, '/').split('/').pop() || scriptName || 'test';
-  const healCanonical = buildCanonicalRepoPaths(projectId, scriptName);
+  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
   const jmxDiskPath  = healCanonical.jmxDiskPath;
 
   // Build multipart file push
@@ -3417,7 +3545,7 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
 
   const scriptName    = originalCiRun.script_name || '';
   const scriptFile    = scriptName.replace(/\\/g, '/').split('/').pop() || 'test.jmx';
-  const healCanonical = buildCanonicalRepoPaths(projectId, scriptName);
+  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
   const jmxDiskPath   = healCanonical.jmxDiskPath;
 
   // Push fixed JMX to GitHub via Contents API
@@ -3554,7 +3682,7 @@ async function pollCiUntilDone(provider, triggerResult, maxWaitMs) {
 }
 
 async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sessionStart) {
-  const { buildContext, diagnoseWithAi, classifyErrors } = require('../utils/autoHealer');
+  const { buildContext, diagnoseWithAi, classifyErrors, applyEndpointOverrides } = require('../utils/autoHealer');
   // sessionStart is the first attemptNum of this session; limit retries per session not globally
   if (sessionStart === undefined) sessionStart = attemptNum;
   if (attemptNum > sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
@@ -3568,6 +3696,9 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   const execRun = await db.prepare('SELECT * FROM execution_runs WHERE ci_run_id = ? ORDER BY id DESC LIMIT 1').get(ciRunId);
   if (!execRun || !execRun.result_dir) {
     console.warn(`[CI Heal] No execution_run for CI run #${ciRunId}`);
+    const lid = await logCiHealAttempt(ciRunId, attemptNum,
+      `Could not start diagnosis — no synced results found for this CI run. Try "Sync Results" first, then Heal again.`, '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
@@ -3579,13 +3710,22 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     : null;
   if (!suite) {
     console.warn(`[CI Heal] No test suite for script "${ciRun?.script_name}"`);
+    const lid = await logCiHealAttempt(ciRunId, attemptNum,
+      `Could not find the test plan for script "${ciRun?.script_name || '(unknown)'}" — it may have been deleted or renamed since this CI run was triggered.`, '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
 
   let ctx;
   try { ctx = await buildContext(execRun, suite); }
-  catch (e) { console.error('[CI Heal] buildContext error:', e.message); setCiHealStatus(ciRunId, 'failed'); return; }
+  catch (e) {
+    console.error('[CI Heal] buildContext error:', e.message);
+    const lid = await logCiHealAttempt(ciRunId, attemptNum, `Failed to analyze the run: ${e.message}`, '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
+    setCiHealStatus(ciRunId, 'failed');
+    return;
+  }
 
   if (!ctx.hasErrors) { setCiHealStatus(ciRunId, null); return; }
 
@@ -3596,37 +3736,56 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     return;
   }
 
+  // A transient AI failure (network blip, truncated response, malformed JSON) shouldn't
+  // burn the whole heal session on attempt 1 — retry like any other "still_failing" case,
+  // up to the same attempt budget, instead of giving up immediately.
+  const retryOrGiveUp = async (giveUpStatus) => {
+    if (attemptNum < sessionStart + HEAL_CI_MAX_ATTEMPTS - 1) {
+      return healCycleCI(userId, ciRunId, projectId, options, attemptNum + 1, sessionStart);
+    }
+    await setCiHealStatus(ciRunId, giveUpStatus);
+  };
+
   let aiResp;
   try {
     aiResp = await diagnoseWithAi(userId, execRun, suite, ctx, attemptNum, options.customInstruction || null);
   } catch (e) {
     const lid = await logCiHealAttempt(ciRunId, attemptNum, `AI error: ${e.message}`, '', 'no_fix');
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
-    setCiHealStatus(ciRunId, 'failed');
-    return;
+    return retryOrGiveUp('exhausted');
   }
 
   const lid = await logCiHealAttempt(ciRunId, attemptNum, aiResp.issue || 'Unknown issue', aiResp.fix || '', aiResp.fix_type || 'no_fix');
 
-  if (aiResp.fix_type !== 'script_rewrite' || !aiResp.fixed_script) {
+  const isEndpointPatch = aiResp.fix_type === 'endpoint_overrides' && aiResp.overrides?.length;
+  if (aiResp.fix_type !== 'script_rewrite' && !isEndpointPatch) {
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('no_fix', lid);
-    setCiHealStatus(ciRunId, 'failed');
-    return;
+    return retryOrGiveUp('exhausted');
+  }
+  if (aiResp.fix_type === 'script_rewrite' && !aiResp.fixed_script) {
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('no_fix', lid);
+    return retryOrGiveUp('exhausted');
   }
 
   // Apply fix to the local JMX file
   setCiHealStatus(ciRunId, 'applying_fix');
   const jmxPath = suite.jmx_path || suite.js_path;
   try {
-    if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
-    if (jmxPath) fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
+    if (isEndpointPatch) {
+      if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
+      const applied = await applyEndpointOverrides(userId, projectId, suite, aiResp.overrides);
+      if (!applied) throw new Error('None of the proposed overrides matched a real endpoint by name.');
+    } else {
+      if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
+      if (jmxPath) fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
+    }
   } catch (e) {
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
     setCiHealStatus(ciRunId, 'failed');
     return;
   }
 
-  // ── Phase 1: Quick verify (3 VUsers × 20s) ────────────────────────────────
+  // ── Phase 1: Quick verify (1 VUser × 1 loop) ──────────────────────────────
   setCiHealStatus(ciRunId, 'rerunning');
   let quickResult;
   try {
@@ -3634,7 +3793,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
       jmeter_users:    String(HEAL_CI_VUSERS),
       jmeter_rampup:   String(HEAL_CI_RAMPUP),
       jmeter_duration: String(HEAL_CI_DURATION),
-      jmeter_loops:    '-1',
+      jmeter_loops:    String(HEAL_CI_LOOPS),
     });
   } catch (e) {
     console.error('[CI Heal] Phase 1 trigger error:', e.message);
@@ -3652,12 +3811,14 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     quickPoll.done ? (quickPoll.success ? 'completed' : 'failed') : 'failed', quickCiRunId
   );
 
-  if (quickPoll.done) {
+  if (quickPoll.done && !ciSyncInProgress.has(quickCiRunId)) {
+    ciSyncInProgress.add(quickCiRunId);
     try {
       const quickCiRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
       const quickCfg   = decryptConfig(await getConfig(projectId, userId));
       await autoSyncCiRun(quickCiRow, quickCfg, projectId, userId);
     } catch (e) { console.warn('[CI Heal] quick sync error:', e.message); }
+    finally { ciSyncInProgress.delete(quickCiRunId); }
   }
 
   // Guarantee execution_runs exists for quickCiRunId so the next attempt can read context.
@@ -3721,12 +3882,14 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     fullPoll.done ? (fullPoll.success ? 'completed' : 'failed') : 'failed', fullCiRunId
   );
 
-  if (fullPoll.done) {
+  if (fullPoll.done && !ciSyncInProgress.has(fullCiRunId)) {
+    ciSyncInProgress.add(fullCiRunId);
     try {
       const fullCiRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
       const fullCfg   = decryptConfig(await getConfig(projectId, userId));
       await autoSyncCiRun(fullCiRow, fullCfg, projectId, userId);
     } catch (e) { console.warn('[CI Heal] full sync error:', e.message); }
+    finally { ciSyncInProgress.delete(fullCiRunId); }
   }
 
   // Guarantee execution_runs for fullCiRunId before any retry
