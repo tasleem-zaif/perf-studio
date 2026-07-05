@@ -59,6 +59,11 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
   const [activeEnv,             setActiveEnv]             = useState(null);
   const [hasJmeterPlan,         setHasJmeterPlan]         = useState(false);
   const [testPlanCount,         setTestPlanCount]         = useState(project?.test_plan_count || 0);
+  // Bumped whenever test suites change (created/edited/generated) — Runner.jsx is kept
+  // permanently mounted (display:none toggle, not unmount/remount) so its own
+  // "load suites on activeProject change" effect never re-runs on SPA navigation alone;
+  // this gives it an explicit signal to refetch instead of only updating on a hard reload.
+  const [suitesVersion,         setSuitesVersion]         = useState(0);
   const [testDataCount,         setTestDataCount]         = useState(project?.test_data_count || 0);
   const [collectionsModalTrig,  setCollectionsModalTrig]  = useState(0);
   const [rulesModalTrig,        setRulesModalTrig]        = useState(0);
@@ -160,6 +165,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         setTestPlanCount(suites.length);
       })
       .catch(() => {});
+    setSuitesVersion(v => v + 1);
   }
 
   const shared = { project, collection: activeCollection, env: activeEnv, envs: collectionEnvs, onEnvChange: setActiveEnv, onNav: navigate, onProjectUpdated };
@@ -551,7 +557,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
             {/* Runner rendered persistently so logs survive navigation away and back */}
             {project && (
               <div style={{ display: activePage === 'runner' ? 'block' : 'none' }}>
-                <Runner projects={projects || [project]} activeProject={project} activeCollection={activeCollection} activeEnv={activeEnv} onNav={navigate} />
+                <Runner projects={projects || [project]} activeProject={project} activeCollection={activeCollection} activeEnv={activeEnv} onNav={navigate} suitesVersion={suitesVersion} />
               </div>
             )}
           </div>

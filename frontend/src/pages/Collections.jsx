@@ -212,8 +212,36 @@ export default function Collections({ project, collection: activeCollection, onN
         setOwnCollections(d.collections || []);
       }).catch(() => {});
     } catch (e) {
-      toast(e.response?.data?.error || 'Pre-run failed', 'error');
+      toast(e.response?.data?.error || e.message || 'Pre-run failed', 'error');
     } finally { setPreRunning(null); }
+  }
+
+  // Per-endpoint "Fix with AI" heal state, keyed by the same `modal_<collectionId>_<idx>`
+  // key used for the row's expand/collapse state.
+  const [healState, setHealState] = useState({});
+
+  async function healEndpoint(collection, idx) {
+    const key = `modal_${collection.id}_${idx}`;
+    const instruction = healState[key]?.text?.trim();
+    if (!instruction) return;
+    setHealState(prev => ({ ...prev, [key]: { ...prev[key], loading: true } }));
+    try {
+      const { data } = await api.post('/ai/pre-run/heal', {
+        project_id: project.id, collection_id: collection.id, index: idx, instruction,
+      });
+      setPreRunData(prev => {
+        const rows = [...(prev[collection.id] || [])];
+        if (data.result) rows[idx] = data.result;
+        return { ...prev, [collection.id]: rows };
+      });
+      setHealState(prev => ({ ...prev, [key]: { showing: false, text: '', loading: false, diagnosis: data.diagnosis } }));
+      if (data.diagnosis?.fix_type === 'no_fix') toast(data.diagnosis.issue || 'AI could not determine a fix', 'warn');
+      else if (data.result?.success) toast('Fix applied — endpoint now passes', 'success');
+      else toast('Fix applied, but the endpoint still fails — see details', 'warn');
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Heal failed', 'error');
+      setHealState(prev => ({ ...prev, [key]: { ...prev[key], loading: false } }));
+    }
   }
 
   function isPreRunFresh(c) {
@@ -565,12 +593,57 @@ export default function Collections({ project, collection: activeCollection, onN
                         <span style={{ fontSize: '12px', flex: 1, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.url || r.endpoint}</span>
                         {r.tokenExtracted && <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(0,200,150,0.15)', color: '#00c896', flexShrink: 0 }}>TOKEN EXTRACTED</span>}
                         {r.tokenInjected && <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(78,158,255,0.15)', color: 'var(--accent)', flexShrink: 0 }}>AUTH INJECTED</span>}
+                        {r.aiFixed && <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(168,85,247,0.15)', color: '#a855f7', flexShrink: 0 }}>AI FIXED</span>}
                         {r.status ? (
                           <span style={{ fontSize: '11px', fontWeight: 700, color: statusColor, flexShrink: 0 }}>{r.status} {r.statusText}</span>
                         ) : isErr ? (
                           <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--danger)', flexShrink: 0 }}>{r.skipped ? 'SKIPPED' : 'ERROR'}</span>
                         ) : null}
+                        {!r.success && (
+                          <button className="btn-secondary btn-sm" style={{ fontSize: '10px', padding: '3px 8px', flexShrink: 0 }}
+                            onClick={e => { e.stopPropagation(); setHealState(prev => ({ ...prev, [key]: { ...prev[key], showing: !prev[key]?.showing } })); }}>
+                            <i className="ti ti-wand" /> Fix with AI
+                          </button>
+                        )}
                       </div>
+                      {healState[key]?.showing && !healState[key]?.loading && (
+                        <div style={{ padding: '0 20px 12px 44px' }}>
+                          <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '6px' }}>
+                            Describe what this endpoint needs — AI will apply it and re-check
+                          </div>
+                          <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                            <textarea
+                              value={healState[key]?.text || ''}
+                              onChange={e => setHealState(prev => ({ ...prev, [key]: { ...prev[key], text: e.target.value } }))}
+                              placeholder="e.g. Use the refreshToken from the login response, not the accessToken"
+                              rows={2}
+                              style={{ flex: 1, fontSize: '12px', padding: '7px 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-background)', color: 'var(--color-text)', fontFamily: 'inherit', resize: 'vertical', boxSizing: 'border-box', outline: 'none', minHeight: '52px' }}
+                            />
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                              <button className="btn-primary btn-sm" style={{ padding: '6px 14px', fontSize: '11px', whiteSpace: 'nowrap' }}
+                                disabled={!healState[key]?.text?.trim()}
+                                onClick={() => healEndpoint(logModalCollection, idx)}>
+                                <i className="ti ti-wand" /> Heal
+                              </button>
+                              <button className="btn-secondary btn-sm" style={{ padding: '4px 14px', fontSize: '11px' }}
+                                onClick={() => setHealState(prev => ({ ...prev, [key]: { showing: false, text: '' } }))}>
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {healState[key]?.loading && (
+                        <div style={{ padding: '0 20px 12px 44px', fontSize: '12px', color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span className="spinner" /> AI is analyzing this endpoint…
+                        </div>
+                      )}
+                      {healState[key]?.diagnosis && (
+                        <div style={{ margin: '0 20px 10px 44px', padding: '8px 12px', borderRadius: '6px', fontSize: '11px', background: healState[key].diagnosis.fix_type === 'no_fix' ? 'rgba(240,167,50,0.08)' : 'rgba(168,85,247,0.08)', color: healState[key].diagnosis.fix_type === 'no_fix' ? 'var(--warn)' : '#a855f7' }}>
+                          <div><strong>Issue:</strong> {healState[key].diagnosis.issue}</div>
+                          {healState[key].diagnosis.fix_type !== 'no_fix' && <div><strong>Fix:</strong> {healState[key].diagnosis.fix}</div>}
+                        </div>
+                      )}
                       {expanded && (
                         <div style={{ padding: '0 20px 12px 44px', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
                           {isErr ? (

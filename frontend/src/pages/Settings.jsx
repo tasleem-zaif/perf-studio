@@ -13,6 +13,11 @@ const PROVIDERS = [
   { value: 'claude', label: 'Anthropic (Claude)' },
 ];
 
+// This list is a manually curated snapshot, not a live fetch from OpenAI/Anthropic — it will
+// always drift out of date as providers ship new models (confirmed: the Claude entries below
+// were stale until this pass). The backend (settings.js) never validates the model string
+// against this list — it stores whatever is saved verbatim — so "Custom" exists specifically
+// so a newer model never has to wait on someone editing this file to be usable.
 const MODELS = {
   openai: [
     { value: 'gpt-4o',          label: 'GPT-4o',            desc: 'Most capable, best quality — recommended' },
@@ -22,18 +27,24 @@ const MODELS = {
     { value: 'gpt-3.5-turbo',   label: 'GPT-3.5 Turbo',    desc: 'Fastest & cheapest — basic use only' },
     { value: 'o1-mini',         label: 'o1 Mini',           desc: 'Reasoning model — slower but thorough' },
     { value: 'o3-mini',         label: 'o3 Mini',           desc: 'Latest reasoning model — best for complex fixes' },
+    { value: '__custom__',      label: 'Custom (enter model ID)…', desc: 'Type any model ID your OpenAI account has access to — including anything released after this list was last updated.' },
   ],
   claude: [
-    { value: 'claude-opus-4-5',   label: 'Claude Opus 4.5',   desc: 'Most powerful Claude — best quality' },
-    { value: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5', desc: 'Balanced quality & speed — recommended' },
-    { value: 'claude-sonnet-4',   label: 'Claude Sonnet 4',   desc: 'Previous generation Sonnet' },
-    { value: 'claude-haiku-4-5',  label: 'Claude Haiku 4.5',  desc: 'Fastest & cheapest Claude model' },
-    { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', desc: 'Stable production model' },
-    { value: 'claude-3-opus-20240229',     label: 'Claude 3 Opus',     desc: 'Previous generation Opus' },
+    { value: 'claude-sonnet-5',              label: 'Claude Sonnet 5',        desc: 'Latest Sonnet — balanced quality & speed, recommended' },
+    { value: 'claude-opus-4-8',              label: 'Claude Opus 4.8',       desc: 'Latest Opus — most powerful Claude' },
+    { value: 'claude-haiku-4-5-20251001',    label: 'Claude Haiku 4.5',      desc: 'Fastest & cheapest current Claude model' },
+    { value: 'claude-fable-5',               label: 'Claude Fable 5',        desc: 'Latest small/fast Claude model' },
+    { value: 'claude-opus-4-5',              label: 'Claude Opus 4.5',       desc: 'Previous-generation Opus' },
+    { value: 'claude-sonnet-4-5',            label: 'Claude Sonnet 4.5',     desc: 'Previous-generation Sonnet' },
+    { value: 'claude-sonnet-4',              label: 'Claude Sonnet 4',       desc: 'Older Sonnet generation' },
+    { value: 'claude-haiku-4-5',             label: 'Claude Haiku 4.5 (legacy ID)', desc: 'Older Haiku 4.5 model ID — kept for existing configs' },
+    { value: 'claude-3-5-sonnet-20241022',   label: 'Claude 3.5 Sonnet',     desc: 'Older stable production model' },
+    { value: 'claude-3-opus-20240229',       label: 'Claude 3 Opus',         desc: 'Older Opus generation' },
+    { value: '__custom__',                   label: 'Custom (enter model ID)…', desc: 'Type any model ID your Anthropic account has access to — including anything released after this list was last updated.' },
   ],
 };
 
-const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-4-5' };
+const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-5' };
 
 
 const ROLE_LABELS = { super_admin: 'Super Admin', org_admin: 'Org Admin', user: 'User' };
@@ -568,8 +579,25 @@ function UserManagementPanel({ user, projects = [] }) {
 }
 
 
-function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor, disabled = false }) {
-  const selected = models.find(m => m.value === value);
+function ModelRow({ icon, title, subtitle, value, rawValue, onChange, models, iconColor, disabled = false }) {
+  // `value` is the effective (fallback-applied) model — used for the dropdown's own
+  // selection/description so it shows the real default when nothing's been chosen yet.
+  // `rawValue` is the parent's actual unfallback-ed state — used to pre-fill the custom text
+  // input, so a fallback default's name never appears as if the admin had typed it in.
+  const knownMatch = models.find(m => m.value === rawValue && m.value !== '__custom__');
+  // Local "custom mode" flag. Driven by rawValue (below) for external changes — a fresh
+  // load delivering a legacy/unlisted saved model, or a provider switch resetting rawValue
+  // to '' — but the dropdown's own "Custom" click sets it directly WITHOUT touching
+  // rawValue, so the effect (keyed only on rawValue) doesn't immediately fire and revert it.
+  const [customMode, setCustomMode] = useState(rawValue !== '' && !knownMatch);
+  useEffect(() => {
+    if (rawValue === '' || knownMatch) setCustomMode(false);
+    else setCustomMode(true);
+  }, [rawValue]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selectValue = customMode ? '__custom__' : value;
+  const selected     = models.find(m => m.value === selectValue);
+
   return (
     <div style={{
       padding: '14px 16px', marginBottom: '10px',
@@ -585,10 +613,33 @@ function ModelRow({ icon, title, subtitle, value, onChange, models, iconColor, d
           <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '1px' }}>{subtitle}</div>
         </div>
       </div>
-      <CustomSelect value={value} onChange={e => !disabled && onChange(e.target.value)} disabled={disabled}>
+      <CustomSelect
+        value={selectValue}
+        onChange={e => {
+          if (disabled) return;
+          const v = e.target.value;
+          // Selecting "Custom" is purely a view toggle — it deliberately does NOT clear the
+          // underlying value, so whatever model was previously selected stays pre-filled in
+          // the text input below for editing rather than being wiped out.
+          if (v === '__custom__') setCustomMode(true);
+          else { setCustomMode(false); onChange(v); }
+        }}
+        disabled={disabled}
+      >
         {models.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
       </CustomSelect>
-      {selected && (
+      {customMode && (
+        <input
+          type="text"
+          className="form-input"
+          style={{ marginTop: '8px', width: '100%', boxSizing: 'border-box' }}
+          placeholder="e.g. gpt-4.1, o4-mini, claude-opus-5 — exact model ID as your provider names it"
+          value={rawValue}
+          disabled={disabled}
+          onChange={e => !disabled && onChange(e.target.value)}
+        />
+      )}
+      {selected && selected.value !== '__custom__' && (
         <div style={{ marginTop: '7px', fontSize: '11px', color: 'var(--color-text-tertiary)', display: 'flex', alignItems: 'center', gap: '5px' }}>
           <i className="ti ti-info-circle" style={{ fontSize: '11px' }} />
           {selected.desc}
@@ -699,6 +750,7 @@ function AIConfigPanel({ user }) {
         title="Script Generation Model"
         subtitle="Used when generating JMX / K6 scripts from your API collections"
         value={effectiveModel}
+        rawValue={model}
         onChange={isRegularUser ? () => {} : setModel}
         models={providerModels}
         disabled={isRegularUser}
@@ -711,6 +763,7 @@ function AIConfigPanel({ user }) {
         title="Auto Healer Model"
         subtitle="Used when diagnosing and fixing failed test runs (reasoning-heavy — use a smarter model)"
         value={effectiveHeal}
+        rawValue={healModel}
         onChange={isRegularUser ? () => {} : setHealModel}
         models={providerModels}
         disabled={isRegularUser}

@@ -324,9 +324,16 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   await git.addConfig('user.email', authorEmail);
   await git.addConfig('core.longpaths', 'true');
 
+  // 'origin' is left pointing at the CLEAN url (no embedded token) — every actual network
+  // operation elsewhere in this file passes the authenticated URL directly as a command
+  // argument to fetch/push/ls-remote rather than relying on 'origin' being authenticated,
+  // so there's no need for the token to sit in .git/config (readable via `git remote -v`)
+  // between requests. SSH mode is unaffected — the SSH URL itself carries no secret; the
+  // key lives in a temp file (sshEnv/sshCleanup), not in the remote URL.
+  const cleanRemote = isSSHMode ? remoteForOps : cfg.remote_url;
   const remotes = await git.getRemotes();
   if (remotes.find(r => r.name === 'origin')) {
-    await git.remote(['set-url', 'origin', remoteForOps]);
+    await git.remote(['set-url', 'origin', cleanRemote]);
   }
 
   // Rebuild collection folder structure from DB — the remote may not have these
@@ -765,12 +772,14 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
     // Apply to the full workspace tree (covers collections, envs, and all subfolders)
     ensureGitkeepAll(gitRoot);
 
-    // Set or update remote
+    // Set or update remote — kept on the CLEAN url (no embedded token). The actual
+    // push/fetch below pass remoteWithAuth directly as the command's URL argument, so
+    // 'origin' never needs to carry auth and the token never sits in .git/config at rest.
     const remotes = await git.getRemotes();
     if (remotes.find(r => r.name === 'origin')) {
-      await git.remote(['set-url', 'origin', remoteWithAuth]);
+      await git.remote(['set-url', 'origin', cfg.remote_url]);
     } else {
-      await git.addRemote('origin', remoteWithAuth);
+      await git.addRemote('origin', cfg.remote_url);
     }
 
     // ── Clean up nested .git dirs and stale _workspace folders ───────────────
@@ -949,8 +958,13 @@ router.post('/commit', async (req, res) => {
     const branch = identity?.branch_name || getBranchForUser(caller, cfg);
 
     const baseBranch = getBaseBranch(cfg);
-    // Pull latest base branch then switch to user's branch
-    try { await git.fetch('origin', baseBranch); } catch {}
+    // Pull latest base branch then switch to user's branch. Uses gitExec with the
+    // authenticated URL passed explicitly (like every other network op in this file) —
+    // 'origin' itself now intentionally carries no token (see ensureUserWorkspace).
+    // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like a
+    // by-name `fetch origin` would — a bare URL fetch with no refspec only sets
+    // FETCH_HEAD, which the checkout below wouldn't find.
+    try { gitExec(['fetch', result.remoteWithAuth, `+${baseBranch}:refs/remotes/origin/${baseBranch}`], gitDir, result.sshEnv || {}); } catch {}
     const branches = await git.branchLocal();
     if (branches.all.includes(branch)) {
       await git.checkout(branch);
@@ -1008,8 +1022,9 @@ router.post('/push', async (req, res) => {
       await git.checkout(['-b', branch, baseBranch]).catch(() => git.checkout(['-b', branch]));
     });
 
-    // Update remote URL
-    await git.remote(['set-url', 'origin', remoteUrl]);
+    // Keep 'origin' on the CLEAN url — fetch/push below pass remoteUrl (authenticated)
+    // directly as the command's URL argument, so origin never needs to carry the token.
+    await git.remote(['set-url', 'origin', cfg.remote_url]);
 
     await disableGcm(git, gitDir);
 
@@ -1060,7 +1075,9 @@ router.post('/pull', async (req, res) => {
     const git = gitInstance(gitDir, sshEnv);
     const branch = getBranchForUser(caller, cfg);
 
-    await git.remote(['set-url', 'origin', remoteUrl]);
+    // Keep 'origin' on the CLEAN url — ls-remote/fetch/pull/push below all pass remoteUrl
+    // (authenticated) directly as the command's URL argument.
+    await git.remote(['set-url', 'origin', cfg.remote_url]);
 
     // Check if the user's branch exists on the remote
     let remoteBranches = [];
@@ -1254,7 +1271,9 @@ router.put('/prs/:prId/merge', async (req, res) => {
 
     await git.addConfig('user.name', cfg.username || caller.name);
     await git.addConfig('user.email', cfg.email || caller.email || 'noreply@perfstudio.com');
-    await git.remote(['set-url', 'origin', mergeRemoteUrl]);
+    // Keep 'origin' on the CLEAN url — fetch/pull/push below all pass mergeRemoteUrl
+    // (authenticated) directly as the command's URL argument.
+    await git.remote(['set-url', 'origin', cfg.remote_url]);
 
     // Fetch the feature branch
     gitExec(['fetch', mergeRemoteUrl, pr.from_branch], gitDir, mergeSshEnv);
@@ -1695,7 +1714,11 @@ router.post('/fetch', async (req, res) => {
     const gitDir = getUserWorkspace(proj, caller);
     const r = await ensureUserWorkspace(gitDir, { ...cfg, project_id: req.params.projectId }, caller);
     sshCleanup = r.sshCleanup || (() => {});
-    gitExec(['fetch', '--all'], gitDir, r.sshEnv || {});
+    // 'origin' intentionally carries no token (see ensureUserWorkspace), so `fetch --all`
+    // (which resolves to 'origin' — the only remote this app ever configures) would fail
+    // to authenticate. Pass the authenticated URL explicitly with origin's own standard
+    // refspec instead, replicating exactly what `fetch --all` did for this single remote.
+    gitExec(['fetch', r.remoteWithAuth, '+refs/heads/*:refs/remotes/origin/*'], gitDir, r.sshEnv || {});
     res.json({ ok: true, message: 'Fetched latest from remote successfully.' });
   } catch (e) {
     res.status(500).json({ error: `Fetch failed: ${e.message}. Verify your access token and network connectivity.` });
