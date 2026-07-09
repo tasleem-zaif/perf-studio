@@ -7,6 +7,8 @@ const resetSequence = require('../utils/resetSequence');
 const { writeProjectSnapshot } = require('../utils/configWriter');
 const { ensureProjectFolders, deleteProjectFolder, backupAndDeleteProjectFolder, BACKUPS_ROOT } = require('../utils/projectFolders');
 const { getOrgLicenseStatus } = require('../utils/license');
+const { decrypt } = require('../utils/encryption');
+const ownsProject = require('../utils/ownsProject');
 
 const COLORS = ['#1a6bff','#00c896','#ef9f27','#e24b4a','#8b5cf6','#06b6d4'];
 const BKGS   = ['#e8f0ff','#e0faf3','#faeeda','#fcebeb','#ede9fe','#e0f2fe'];
@@ -254,6 +256,26 @@ router.get('/backups/:filename', async (req, res) => {
   const filePath = path.join(BACKUPS_ROOT, safe);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Backup not found' });
   res.download(filePath, safe);
+});
+
+// GET /projects/:id/registry-token — org's npm registry token, for local/CI use
+router.get('/:id/registry-token', async (req, res) => {
+  try {
+    const project = await ownsProject(req.userId, req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const caller = await getCaller(req.userId);
+    const org = caller.org_id
+      ? await db.prepare('SELECT registry_token_enc FROM organizations WHERE id = ?').get(caller.org_id)
+      : null;
+
+    res.json({
+      token: org?.registry_token_enc ? decrypt(org.registry_token_enc) : null,
+      registryUrl: `${process.env.ARTIFACT_KEEPER_URL || 'https://artifact-keeper.qtsolvdev.com'}/npm/@peako/`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load registry token' });
+  }
 });
 
 module.exports = router;

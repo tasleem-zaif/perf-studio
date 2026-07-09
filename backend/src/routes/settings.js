@@ -6,24 +6,26 @@ const { encrypt } = require('../utils/encryption');
 router.use(auth);
 
 router.get('/ai', async (req, res) => {
-  const row = await db.prepare('SELECT provider, model, heal_model, api_key FROM ai_settings WHERE user_id = ?').get(req.userId);
+  const row = await db.prepare('SELECT provider, model, heal_model, api_key, azure_endpoint, azure_api_version FROM ai_settings WHERE user_id = ?').get(req.userId);
   res.json({
-    provider:    row?.provider    || 'openai',
-    model:       row?.model       || '',
-    heal_model:  row?.heal_model  || '',
+    provider:          row?.provider          || 'openai',
+    model:              row?.model              || '',
+    heal_model:         row?.heal_model         || '',
+    azure_endpoint:     row?.azure_endpoint     || '',
+    azure_api_version:  row?.azure_api_version  || '',
     api_key_set: !!(row?.api_key),
     // Never return the raw/encrypted key to the frontend
   });
 });
 
 router.put('/ai', async (req, res) => {
-  const { provider, model, heal_model, api_key } = req.body;
+  const { provider, model, heal_model, api_key, azure_endpoint, azure_api_version } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required' });
 
   const existing = await db.prepare('SELECT id FROM ai_settings WHERE user_id = ?').get(req.userId);
   if (existing) {
-    const updates = ['provider = ?', 'model = ?', 'heal_model = ?'];
-    const values  = [provider, model || '', heal_model || ''];
+    const updates = ['provider = ?', 'model = ?', 'heal_model = ?', 'azure_endpoint = ?', 'azure_api_version = ?'];
+    const values  = [provider, model || '', heal_model || '', azure_endpoint || '', azure_api_version || ''];
     if (api_key) {
       updates.push('api_key = ?');
       values.push(encrypt(api_key)); // store encrypted
@@ -31,8 +33,8 @@ router.put('/ai', async (req, res) => {
     values.push(req.userId);
     await db.prepare(`UPDATE ai_settings SET ${updates.join(', ')} WHERE user_id = ?`).run(...values);
   } else {
-    await db.prepare('INSERT INTO ai_settings (user_id, provider, model, heal_model, api_key) VALUES (?, ?, ?, ?, ?)')
-      .run(req.userId, provider, model || '', heal_model || '', api_key ? encrypt(api_key) : '');
+    await db.prepare('INSERT INTO ai_settings (user_id, provider, model, heal_model, api_key, azure_endpoint, azure_api_version) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(req.userId, provider, model || '', heal_model || '', api_key ? encrypt(api_key) : '', azure_endpoint || '', azure_api_version || '');
   }
   res.json({ ok: true });
 });
