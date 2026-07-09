@@ -10,6 +10,8 @@
  */
 
 const db = require('../db');
+const { provisionOrgToken, revokeOrgToken } = require('./registry');
+const { encrypt } = require('./encryption');
 
 const PLAN_DEFAULTS = {
   trial:      { maxUsers: 2,    maxProjects: 1,    trialDays: 7   },
@@ -138,6 +140,33 @@ async function setOrgStatus(orgId, status) {
   if (!['active', 'disabled'].includes(status)) throw new Error(`Invalid status: ${status}`);
   await getOrCreateOrgLicense(orgId);
   await db.prepare('UPDATE org_licenses SET status = ?, updated_at = NOW() WHERE org_id = ?').run(status, orgId);
+
+  // Registry token follows org status — non-fatal if Artifact Keeper is unreachable.
+  const org = await db.prepare('SELECT id, name, registry_token_key FROM organizations WHERE id = ?').get(orgId);
+  if (org) {
+    try {
+      if (status === 'disabled' && org.registry_token_key) {
+        await revokeOrgToken(org.registry_token_key);
+        await db.prepare(`
+          UPDATE organizations
+          SET registry_token_enc = NULL, registry_token_key = NULL, registry_token_prefix = NULL,
+              registry_token_created_at = NULL, registry_token_expires_at = NULL
+          WHERE id = ?
+        `).run(orgId);
+      } else if (status === 'active' && !org.registry_token_key) {
+        const license = await getOrgLicenseStatus(orgId);
+        const { token, key } = await provisionOrgToken(org.name, license.expiresAt);
+        await db.prepare(`
+          UPDATE organizations
+          SET registry_token_enc = ?, registry_token_key = ?, registry_token_prefix = ?, registry_token_created_at = NOW()
+          WHERE id = ?
+        `).run(encrypt(token), key, token.slice(0, 12), orgId);
+      }
+    } catch (e) {
+      console.warn(`[org-${status} registry]`, e.message);
+    }
+  }
+
   return getOrgLicenseStatus(orgId);
 }
 

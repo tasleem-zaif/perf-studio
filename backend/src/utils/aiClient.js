@@ -1,12 +1,14 @@
-const { OpenAI } = require('openai');
+const { OpenAI, AzureOpenAI } = require('openai');
 const db = require('../db');
 const { decrypt } = require('./encryption');
 
 // Default models per provider — used when no model is explicitly saved. Kept in sync with
 // Settings.jsx's DEFAULT_MODEL — both were pointing at a stale Claude model ID until this pass.
+// No entry for 'azure' — a deployment name is account-specific, there's no sane fallback.
 const DEFAULT_MODELS = {
   openai: 'gpt-4o',
   claude: 'claude-sonnet-5',
+  gemini: 'gemini-2.0-flash',
 };
 
 // Each provider's hard output-token ceiling — not a config knob, the actual model limit.
@@ -17,6 +19,8 @@ const DEFAULT_MODELS = {
 const MAX_OUTPUT_TOKENS = {
   openai: 16384, // gpt-4o's actual hard ceiling — max_tokens above this is rejected/clamped by OpenAI itself
   claude: 8192,  // Claude's default ceiling without the extended-output beta header (untested here — see note in getMaxOutputTokens callers)
+  gemini: 8192,  // conservative ceiling shared by current Gemini 2.x models
+  azure: 16384,  // Azure OpenAI deployments are typically GPT-4o-class — same ceiling as openai
 };
 
 async function getSettings() {
@@ -55,6 +59,9 @@ async function callAi(userId, systemPrompt, userPrompt, purpose = 'script') {
   const rawModel = purpose === 'heal'
     ? (settings.heal_model && settings.heal_model.trim()) || (settings.model && settings.model.trim())
     : (settings.model && settings.model.trim());
+  if (settings.provider === 'azure' && !rawModel) {
+    throw new Error('Azure OpenAI deployment name not configured. Go to Settings → AI Configuration and enter your deployment name.');
+  }
   const model = rawModel || DEFAULT_MODELS[settings.provider] || 'gpt-4o';
 
   // Decrypt the stored API key before use
@@ -99,6 +106,46 @@ async function callAi(userId, systemPrompt, userPrompt, purpose = 'script') {
       baseURL: 'https://api.anthropic.com/v1/',
       defaultHeaders: { 'anthropic-version': '2023-06-01' },
     });
+    const resp = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+      temperature: 0.2,
+      max_tokens: maxTokens,
+    });
+    return checkTruncated(resp);
+  }
+
+  if (settings.provider === 'gemini') {
+    // Uses Google's OpenAI-compatible endpoint
+    const client = new OpenAI({
+      apiKey,
+      baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    });
+    const resp = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+      temperature: 0.2,
+      max_tokens: maxTokens,
+    });
+    return checkTruncated(resp);
+  }
+
+  if (settings.provider === 'azure') {
+    if (!settings.azure_endpoint) {
+      throw new Error('Azure OpenAI endpoint not configured. Go to Settings → AI Configuration and enter your resource endpoint.');
+    }
+    const client = new AzureOpenAI({
+      apiKey,
+      endpoint: settings.azure_endpoint,
+      apiVersion: (settings.azure_api_version && settings.azure_api_version.trim()) || '2024-10-21',
+    });
+    // model here is the deployment name, not a base model ID — Azure routes by deployment
     const resp = await client.chat.completions.create({
       model,
       messages: [

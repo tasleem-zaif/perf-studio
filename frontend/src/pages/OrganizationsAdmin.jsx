@@ -389,6 +389,112 @@ function OrgAdminsTab({ org, user, onInviteSent }) {
   );
 }
 
+/* ── Registry Token tab ──────────────────────────────────────────────────── */
+function OrgRegistryTokenTab({ org }) {
+  const { toast } = useToast();
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
+  const [meta, setMeta] = useState(null);
+  const [expiry, setExpiry] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [revoking, setRevoking] = useState(false);
+  const [revealed, setRevealed] = useState(null);
+
+  function load() {
+    api.get(`/orgs/${org.id}/npm-token`).then(r => setMeta(r.data)).catch(() => setMeta(null));
+  }
+  useEffect(() => { setRevealed(null); load(); }, [org.id]);
+
+  async function generate() {
+    setGenerating(true);
+    try {
+      const body = {};
+      if (expiry) body.expiresAt = new Date(expiry).toISOString();
+      const { data } = await api.post(`/orgs/${org.id}/npm-token`, body);
+      setRevealed(data.token);
+      setMeta({ hasToken: true, prefix: data.prefix, createdAt: data.createdAt, expiresAt: data.expiresAt });
+      toast('Registry token generated', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to generate registry token', 'error');
+    } finally { setGenerating(false); }
+  }
+
+  async function revoke() {
+    const ok = await confirm(`Revoke the registry token for "${org.name}"? All members lose access to @peako packages until a new one is generated.`, 'Revoke Registry Token');
+    if (!ok) return;
+    setRevoking(true);
+    try {
+      await api.delete(`/orgs/${org.id}/npm-token`);
+      setMeta({ hasToken: false, prefix: null, createdAt: null, expiresAt: null });
+      setRevealed(null);
+      toast('Registry token revoked', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to revoke registry token', 'error');
+    } finally { setRevoking(false); }
+  }
+
+  if (meta === null) return <div style={{ color: 'var(--color-text-tertiary)', fontSize: '12px' }}>Loading…</div>;
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '16px' }}>
+        Org members use this npm token to install private <code>@peako</code> packages. Generating a new token immediately revokes the existing one.
+      </div>
+
+      <div style={{ padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <div style={{ fontWeight: 600, fontSize: '14px' }}>Current token</div>
+          {meta.hasToken && (
+            <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={revoke} disabled={revoking}>
+              {revoking ? <span className="spinner" /> : <i className="ti ti-trash" />} Revoke
+            </button>
+          )}
+        </div>
+        {meta.hasToken ? (
+          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>
+            <div><code>{meta.prefix}…</code></div>
+            <div style={{ marginTop: 4 }}>Created {new Date(meta.createdAt).toLocaleDateString()}</div>
+            <div>{meta.expiresAt ? `Expires ${new Date(meta.expiresAt).toLocaleDateString()}` : 'No expiry'}</div>
+          </div>
+        ) : (
+          <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)' }}>No registry token provisioned yet.</div>
+        )}
+      </div>
+
+      {revealed && (
+        <div style={{ padding: '16px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '8px', marginBottom: '16px' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px' }}>
+            <i className="ti ti-alert-circle" style={{ marginRight: 6, color: '#16a34a' }} />
+            Copy this token now — it won't be shown again here
+          </div>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: '10px' }}>
+            <input readOnly value={revealed} onClick={e => e.target.select()}
+              style={{ flex: 1, padding: '6px 8px', fontSize: '11px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '6px' }} />
+            <button className="btn-secondary btn-sm" onClick={() => { navigator.clipboard.writeText(revealed); toast('Token copied', 'success'); }}>
+              <i className="ti ti-copy" /> Copy
+            </button>
+          </div>
+          <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: 4 }}>.npmrc:</div>
+          <code style={{ display: 'block', fontSize: '11px', padding: '8px 10px', background: 'var(--color-background)', borderRadius: '6px', overflowX: 'auto' }}>
+            @peako:registry=https://artifact-keeper.qtsolvdev.com/npm/@peako/{'\n'}//artifact-keeper.qtsolvdev.com/npm/@peako/:_authToken={revealed}
+          </code>
+        </div>
+      )}
+
+      <div style={{ padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px' }}>
+        <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '10px' }}>{meta.hasToken ? 'Regenerate token' : 'Generate token'}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+          <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)} style={{ maxWidth: '180px' }} />
+          <span style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>Leave blank for the default 180-day expiry</span>
+        </div>
+        <button className="btn-primary" onClick={generate} disabled={generating} style={{ marginTop: '14px' }}>
+          {generating ? <span className="spinner" /> : <i className="ti ti-key" />} {meta.hasToken ? 'Regenerate' : 'Generate'} Token
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ── All Users tab (platform-wide, super_admin only) ────────────────────── */
 const th = { textAlign: 'left', padding: '8px 12px', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '.04em', color: 'var(--color-text-tertiary)', fontWeight: 600 };
 const td = { padding: '8px 12px', fontSize: '13px' };
@@ -627,6 +733,7 @@ export default function OrganizationsAdmin({ user }) {
                     { id: 'edit', label: 'Edit Details' },
                     { id: 'license', label: 'License & Limits' },
                     { id: 'admins', label: 'Org Admins' },
+                    { id: 'registry', label: 'Registry Token' },
                   ].map(t => (
                     <button key={t.id} onClick={() => setSubTab(t.id)} style={tabBtnStyle(subTab === t.id)}>{t.label}</button>
                   ))}
@@ -641,6 +748,7 @@ export default function OrganizationsAdmin({ user }) {
                     onChanged={lic => setLicenses(prev => ({ ...prev, [selectedOrg.id]: lic }))} />
                 )}
                 {subTab === 'admins' && <OrgAdminsTab org={selectedOrg} user={user} onInviteSent={loadAll} />}
+                {subTab === 'registry' && <OrgRegistryTokenTab org={selectedOrg} />}
               </>
             )}
           </div>

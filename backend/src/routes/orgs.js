@@ -3,6 +3,8 @@ const db     = require('../db');
 const auth   = require('../middleware/auth');
 const { createInviteCore } = require('./invites');
 const { setOrgPlan } = require('../utils/license');
+const { provisionOrgToken, revokeOrgToken } = require('../utils/registry');
+const { encrypt } = require('../utils/encryption');
 
 function slugify(name) {
   return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -67,7 +69,20 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Organization name already exists' });
   }
 
-  await setOrgPlan(org.id, plan || 'trial');
+  const license = await setOrgPlan(org.id, plan || 'trial');
+
+  // Provision the org's npm registry token — non-fatal, org creation still
+  // succeeds if Artifact Keeper is unreachable (retry later from the admin UI).
+  try {
+    const { token, key } = await provisionOrgToken(org.name, license.expiresAt);
+    await db.prepare(`
+      UPDATE organizations
+      SET registry_token_enc = ?, registry_token_key = ?, registry_token_prefix = ?, registry_token_created_at = NOW()
+      WHERE id = ?
+    `).run(encrypt(token), key, token.slice(0, 12), org.id);
+  } catch (e) {
+    console.warn('[org-create registry]', e.message);
+  }
 
   let invite = null;
   if (admin_email?.trim()) {
@@ -114,6 +129,82 @@ router.get('/:id/admins', async (req, res) => {
     ORDER BY created_at ASC
   `).all(req.params.id);
   res.json({ admins });
+});
+
+// ── Super Admin — npm registry token (metadata only, never the raw token) ─────
+router.get('/:id/npm-token', async (req, res) => {
+  try {
+    const caller = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    if (caller?.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
+
+    const org = await db.prepare(
+      'SELECT registry_token_prefix, registry_token_created_at, registry_token_expires_at FROM organizations WHERE id = ?'
+    ).get(req.params.id);
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    res.json({
+      hasToken: !!org.registry_token_prefix,
+      prefix: org.registry_token_prefix,
+      createdAt: org.registry_token_created_at,
+      expiresAt: org.registry_token_expires_at,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load registry token status' });
+  }
+});
+
+// ── Super Admin — regenerate (revokes old token first, if any) ────────────────
+router.post('/:id/npm-token', async (req, res) => {
+  const caller = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  if (caller?.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
+
+  const org = await db.prepare('SELECT id, name, registry_token_key FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+  try {
+    if (org.registry_token_key) {
+      try { await revokeOrgToken(org.registry_token_key); } catch (e) { /* best-effort */ }
+    }
+
+    const { expiresAt } = req.body;
+    const { token, key } = await provisionOrgToken(org.name, expiresAt || null);
+    const prefix = token.slice(0, 12);
+
+    await db.prepare(`
+      UPDATE organizations
+      SET registry_token_enc = ?, registry_token_key = ?, registry_token_prefix = ?,
+          registry_token_created_at = NOW(), registry_token_expires_at = ?
+      WHERE id = ?
+    `).run(encrypt(token), key, prefix, expiresAt || null, org.id);
+
+    res.json({ token, prefix, createdAt: new Date().toISOString(), expiresAt: expiresAt || null });
+  } catch (e) {
+    res.status(502).json({ error: e.message || 'Failed to generate registry token' });
+  }
+});
+
+// ── Super Admin — revoke ───────────────────────────────────────────────────────
+router.delete('/:id/npm-token', async (req, res) => {
+  const caller = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  if (caller?.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
+
+  const org = await db.prepare('SELECT id, registry_token_key FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+  try {
+    if (org.registry_token_key) await revokeOrgToken(org.registry_token_key);
+  } catch (e) {
+    return res.status(502).json({ error: e.message || 'Failed to revoke registry token' });
+  }
+
+  await db.prepare(`
+    UPDATE organizations
+    SET registry_token_enc = NULL, registry_token_key = NULL, registry_token_prefix = NULL,
+        registry_token_created_at = NULL, registry_token_expires_at = NULL
+    WHERE id = ?
+  `).run(org.id);
+
+  res.json({ ok: true });
 });
 
 // Delete organization (only if no active members)
