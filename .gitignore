@@ -5,7 +5,7 @@ node_modules/
 # Build output
 frontend/dist/
 frontend/.vite/
-
+package-lock.json
 # Environment & secrets
 .env
 .env.local
