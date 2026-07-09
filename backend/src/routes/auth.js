@@ -192,7 +192,7 @@ router.get('/me/registry-token', auth, async (req, res) => {
     res.json({
       orgName: org?.name || null,
       token: org?.registry_token_enc ? decrypt(org.registry_token_enc) : null,
-      registryUrl: `${process.env.ARTIFACT_KEEPER_URL || 'https://artifact-keeper.qtsolvdev.com'}/npm/@peako/`,
+      registryUrl: `${process.env.ARTIFACT_KEEPER_URL || 'https://artifact-keeper.qtsolvdev.com'}/npm/qa-automation-libraries/`,
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load registry token' });

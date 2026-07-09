@@ -1,26 +1,8 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
+import CopyCommandBlock from '../components/CopyCommandBlock';
 
 /* ── Registry Token card — org's npm token for @peako packages ────────────── */
-function CopyCommandBlock({ command, copyText }) {
-  const [copied, setCopied] = useState(false);
-  function copy() {
-    navigator.clipboard.writeText(copyText ?? command);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  }
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#0f172a', borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
-      <code style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, color: '#4ade80', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-        {command}
-      </code>
-      <button className="btn-secondary btn-sm" onClick={copy} style={{ flexShrink: 0, background: 'rgba(255,255,255,0.1)', color: '#fff', border: 'none' }}>
-        {copied ? 'Copied!' : 'Copy'}
-      </button>
-    </div>
-  );
-}
-
 function RegistryTokenCard() {
   const [data, setData] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -31,7 +13,10 @@ function RegistryTokenCard() {
 
   if (data === null) return null; // still loading / request failed
 
-  const host = data.token ? data.registryUrl.replace(/^https?:\/\//, '') : '';
+  // npm's per-registry auth key requires the leading "//" (protocol-relative form) —
+  // stripping just the scheme name, not the slashes, or npm silently won't match this
+  // auth entry to the registry and requests go out unauthenticated.
+  const host = data.token ? '//' + data.registryUrl.replace(/^https?:\/\//, '') : '';
 
   function copyToken() {
     navigator.clipboard.writeText(data.token);
@@ -142,7 +127,7 @@ export default function Profile({ user, onUserUpdated, onBack }) {
               padding: '4px 0', fontFamily: 'inherit',
             }}>
             <i className="ti ti-arrow-left" style={{ fontSize: 14 }} />
-            Back to Dashboard
+            {user?.role === 'super_admin' ? 'Back to Organization Administration' : 'Back to Dashboard'}
           </button>
         </div>
       )}

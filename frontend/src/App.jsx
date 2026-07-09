@@ -494,6 +494,7 @@ function AppInner() {
         onProjectUpdated={refreshProject}
         theme={theme}
         onThemeChange={setTheme}
+        onAppNav={nav}
       />
       </>
     );
@@ -545,7 +546,7 @@ function AppInner() {
              are now handled inside ProjectWorkspace which renders as a full-screen root.
              Only dashboard, settings, profile remain here. */}
         <KeepAlive active={page === 'profile'} everVisited={everVisited.has('profile')}>
-          <Profile user={user} onUserUpdated={u => { setUser(u); localStorage.setItem('ps_user', JSON.stringify(u)); }} onBack={() => nav('dashboard')} />
+          <Profile user={user} onUserUpdated={u => { setUser(u); localStorage.setItem('ps_user', JSON.stringify(u)); }} onBack={() => nav(user?.role === 'super_admin' ? 'settings-orgs' : 'dashboard')} />
         </KeepAlive>
 
       </div>

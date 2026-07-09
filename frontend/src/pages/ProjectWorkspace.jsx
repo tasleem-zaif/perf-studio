@@ -12,11 +12,13 @@ import Runner      from './Runner';
 import Analytics      from './Analytics';
 import Reports        from './Reports';
 import PipelineConfig from './PipelineConfig';
+import Recorder from './Recorder';
 import Logo from '../components/Logo';
 
 const NAV_ITEMS = [
   { id: 'overview',    icon: 'ti-layout-dashboard',       label: 'Overview',       sub: 'Project summary',              color: '#22c55e', bg: '#dcfce7' },
   { id: 'config',      icon: 'ti-settings-2',             label: 'Configuration',  sub: 'Environment, AI & Pipeline',   color: '#475569', bg: '#f1f5f9' },
+  { id: 'recorder',    icon: 'ti-video',                  label: 'Recorder',       sub: 'Capture network traffic',      color: '#0891b2', bg: '#cffafe' },
   { id: 'collections', icon: 'ti-braces',                 label: 'API Sources',    sub: 'Import API endpoints',         color: '#0d9488', bg: '#f0fdfa' },
   { id: 'test-data',   icon: 'ti-table',                  label: 'Test Data',      sub: 'CSV datasets per env',         color: '#7c3aed', bg: '#ede9fe' },
   { id: 'rules',       icon: 'ti-adjustments-horizontal', label: 'Rule Engine',    sub: 'Performance thresholds',       color: '#ea580c', bg: '#ffedd5' },
@@ -49,7 +51,7 @@ const PAGE_ACTIONS = {
   'test-suites':[ { label: 'Add Test Plan', icon: 'ti-plus',   color: '#22c55e' }],
 };
 
-export default function ProjectWorkspace({ project, user, projects, onBack, onProjectUpdated, theme, onThemeChange }) {
+export default function ProjectWorkspace({ project, user, projects, onBack, onProjectUpdated, theme, onThemeChange, onAppNav }) {
   const [activePage,            setActivePage]            = useState(() => {
     // Restore section from URL e.g. /projects/5/test-suites → 'test-suites'
     const m = window.location.pathname.match(/^\/projects\/\d+\/(.+)$/);
@@ -259,6 +261,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         case 'runner':      return null; // rendered persistently below to preserve logs state
         case 'analytics':   return <Analytics project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
         case 'reports':     return <Reports project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
+        case 'recorder':    return <Recorder onAppNav={onAppNav} />;
         default: return null;
       }
     }
