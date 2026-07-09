@@ -1,5 +1,85 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import api from '../api';
+
+/* ── Registry Token card — org's npm token for @peako packages ────────────── */
+function CopyCommandBlock({ command, copyText }) {
+  const [copied, setCopied] = useState(false);
+  function copy() {
+    navigator.clipboard.writeText(copyText ?? command);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#0f172a', borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
+      <code style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, color: '#4ade80', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+        {command}
+      </code>
+      <button className="btn-secondary btn-sm" onClick={copy} style={{ flexShrink: 0, background: 'rgba(255,255,255,0.1)', color: '#fff', border: 'none' }}>
+        {copied ? 'Copied!' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
+function RegistryTokenCard() {
+  const [data, setData] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    api.get('/auth/me/registry-token').then(r => setData(r.data)).catch(() => setData(null));
+  }, []);
+
+  if (data === null) return null; // still loading / request failed
+
+  const host = data.token ? data.registryUrl.replace(/^https?:\/\//, '') : '';
+
+  function copyToken() {
+    navigator.clipboard.writeText(data.token);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  return (
+    <div className="card">
+      <div style={{ fontWeight: 600, fontSize: 15, display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <i className="ti ti-key" style={{ color: 'var(--accent)' }} /> Registry Token
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 18 }}>
+        Use this token to install private <code>@peako</code> packages from the registry on your local machine.
+      </div>
+
+      {!data.token ? (
+        <div style={{ padding: '12px 14px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 8, fontSize: 12, color: 'var(--color-text-secondary)' }}>
+          <i className="ti ti-info-circle" style={{ marginRight: 6, color: '#f59e0b' }} />
+          No registry token has been generated for your organization yet. Contact your Super Admin.
+        </div>
+      ) : (
+        <>
+      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Your token</div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
+        <input readOnly value={'•'.repeat(40)} disabled
+          style={{ flex: 1, padding: '8px 10px', fontSize: 13, background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: 6, letterSpacing: 2, color: 'var(--color-text-tertiary)' }} />
+        <button className="btn-primary btn-sm" onClick={copyToken} style={{ flexShrink: 0 }}>
+          {copied ? 'Copied!' : 'Copy Token'}
+        </button>
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 18 }}>
+        Token is never displayed — click Copy to use it.
+      </div>
+
+      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>
+        Setup commands <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(run once per machine)</span>
+      </div>
+      <CopyCommandBlock command={`npm config set @peako:registry ${data.registryUrl}`} />
+      <CopyCommandBlock
+        command={`npm config set ${host}:_authToken ${'•'.repeat(20)}`}
+        copyText={`npm config set ${host}:_authToken ${data.token}`}
+      />
+        </>
+      )}
+    </div>
+  );
+}
 
 export default function Profile({ user, onUserUpdated, onBack }) {
   const [editMode, setEditMode] = useState(false);
@@ -203,6 +283,8 @@ export default function Profile({ user, onUserUpdated, onBack }) {
               </>
             )}
           </div>
+
+          <RegistryTokenCard />
 
         </div>
       </div>

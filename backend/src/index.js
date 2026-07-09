@@ -3,6 +3,16 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 
+// Express 4 doesn't catch rejections thrown by async route handlers — without
+// this, any unhandled DB/network error in a route (e.g. a stale schema
+// assumption) crashes the whole process instead of just failing that request.
+process.on('unhandledRejection', (err) => {
+  console.error('[UnhandledRejection]', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err?.message || err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
