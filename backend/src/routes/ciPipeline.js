@@ -102,6 +102,61 @@ print("Patch complete")
 // shell-quoting hazards of inlining raw Python source into a `run:` block.
 const PATCHER_PY_B64 = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8').toString('base64');
 
+// Mirrors git.js's safeCheckout/parseCheckoutConflictPaths (duplicated rather than
+// shared across route files, consistent with this codebase's existing convention —
+// see cleanName/getCleanProjectName duplicated between git.js and projectFolders.js).
+// A plain `checkout(branch)` here can fail with "Your local changes... would be
+// overwritten by checkout" if the shared admin workspace was left dirty by a prior
+// request; falling straight to `checkout -b` in that case fails a second time with
+// "A branch named 'x' already exists.", masking the real cause instead of fixing it.
+function parseCheckoutConflictPaths(gitErrorMessage) {
+  const paths = [];
+  let inList = false;
+  for (const rawLine of (gitErrorMessage || '').split('\n')) {
+    const line = rawLine.trim();
+    if (/^error: (Your local changes to the following files would be overwritten by checkout|The following untracked working tree files would be overwritten by checkout)/.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    if (line === '' || /^(Please |Aborting)/.test(line)) { inList = false; continue; }
+    paths.push(line);
+  }
+  return paths;
+}
+
+async function safeCheckoutSimpleGit(git, gitRoot, branch) {
+  try {
+    await git.checkout(branch);
+    return;
+  } catch (err) {
+    const conflictPaths = parseCheckoutConflictPaths(err.message || '');
+    if (!conflictPaths.length) throw err;
+
+    const asideDir = path.join(os.tmpdir(), `peako-ci-checkout-aside-${process.pid}-${Date.now()}`);
+    const saved = [];
+    for (const rel of conflictPaths) {
+      const src = path.join(gitRoot, rel);
+      if (fs.existsSync(src)) {
+        const dest = path.join(asideDir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+        saved.push(rel);
+      }
+    }
+    try {
+      await git.checkout(branch);
+    } finally {
+      for (const rel of saved) {
+        const dest = path.join(gitRoot, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(asideDir, rel), dest);
+      }
+      try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
 router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1597,9 +1652,10 @@ router.post('/trigger', async (req, res) => {
       await git2.addConfig('user.email', callerRow2?.email || 'noreply@perfstudio.com');
       await git2.remote(['set-url', 'origin', authUrl]);
       await git2.fetch(['origin']).catch(() => {});
-      try {
-        await git2.checkout(targetRef);
-      } catch {
+      const localBranchesForTrigger = await git2.branchLocal();
+      if (localBranchesForTrigger.all.includes(targetRef)) {
+        await safeCheckoutSimpleGit(git2, wsRoot, targetRef);
+      } else {
         // Branch may exist on remote but not locally — try to track it
         try { await git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]); }
         catch { await git2.checkoutLocalBranch(targetRef); }
