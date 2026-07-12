@@ -1702,17 +1702,26 @@ pipelines:
 `;
           fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
           console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template');
-          // Ensure .PerfStudio/patch_jmx.py is present (may already be there from git checkout)
-          const _patcherDir = path.join(wsRoot, '.PerfStudio');
-          const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
-          if (!fs.existsSync(_patcherPath)) {
-            fs.mkdirSync(_patcherDir, { recursive: true });
-            fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
-            console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
-          }
         } catch (e) {
           console.warn('[CI trigger] YAML regen failed:', e.message);
         }
+      }
+
+      // Ensure .PerfStudio/patch_jmx.py is present on the branch being pushed/dispatched —
+      // for EVERY provider, not just Bitbucket. It's normally committed to main via
+      // /generate-yaml, but a user's branch may have been created before that, or may
+      // never have merged it in, leaving GitHub Actions unable to find it at checkout
+      // ("python3: can't open file '.../.PerfStudio/patch_jmx.py'").
+      try {
+        const _patcherDir = path.join(wsRoot, '.PerfStudio');
+        const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
+        if (!fs.existsSync(_patcherPath)) {
+          fs.mkdirSync(_patcherDir, { recursive: true });
+          fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+          console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
+        }
+      } catch (e) {
+        console.warn('[CI trigger] patch_jmx.py ensure failed:', e.message);
       }
 
       // Copy the JMX/JS file into the workspace if it only exists in admin workspace.
