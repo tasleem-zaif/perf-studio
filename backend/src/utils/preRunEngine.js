@@ -172,6 +172,18 @@ function extractCookies(responseHeaders) {
   return cookies.map(c => c.split(';')[0]).join('; ');
 }
 
+// Reads one specific cookie's value out of a live response's Set-Cookie header(s) — the
+// live-firing counterpart to testSuites.js's cookieRegexExtractorXml/k6CookieAccessor.
+// Reuses extractCookies' "name=value" flattening (same lenient join used for the
+// blanket cookie-jar re-injection elsewhere in this file) rather than a separate parser.
+function getCookieValue(responseHeaders, cookieName) {
+  const flat = extractCookies(responseHeaders); // "name1=value1; name2=value2" or null
+  if (!flat) return undefined;
+  const re = new RegExp(`(?:^|;\\s*)${cookieName}=([^;]+)`, 'i');
+  const m = flat.match(re);
+  return m ? m[1] : undefined;
+}
+
 // A saved per-endpoint override only applies if the endpoint at that array index still
 // looks like the one it was created for — guards against a stale override silently
 // misapplying to the wrong endpoint after a collection re-import reorders things.
@@ -235,8 +247,164 @@ async function fireEndpoint(ep, { variables = {}, capturedTokens = {}, override 
   }
 }
 
+// Reads the value at a jsonPath ("$.a.b[0]") out of a real parsed response body — the
+// live-firing counterpart to scriptCorrelation.jsonPathToOptionalChain (which instead
+// emits accessor CODE for a generated script to run later; here we need the actual value
+// right now, to fire the NEXT request in this same pre-run pass).
+function getValueAtJsonPath(obj, jsonPath) {
+  const body = String(jsonPath || '').replace(/^\$\.?/, '');
+  if (!body) return obj;
+  const parts = body.match(/[^.[\]]+/g) || [];
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[/^\d+$/.test(p) ? Number(p) : p];
+  }
+  return cur;
+}
+
+// Live-firing counterpart to scriptCorrelation.substituteCorrelatedLiterals: instead of
+// replacing a recorded literal with a `${var}` reference for an ENGINE to resolve later,
+// this replaces it with the REAL value captured earlier in this same pre-run pass, since
+// pre-run makes the actual request right now rather than generating code for later.
+function applyLiveCorrelatedValues(ep, targetRules, capturedValues) {
+  if (!targetRules || !targetRules.length) return ep;
+  const { replaceBodyLiteral } = require('./scriptCorrelation');
+  const { rawFieldNameOf } = require('./correlationEngine');
+  let url = ep.url;
+  const headers = { ...(ep.headers || {}) };
+  const queryParams = { ...(ep.queryParams || {}) };
+  let body = ep.body;
+
+  for (const rule of targetRules) {
+    let liveValue = capturedValues[rule.varName];
+    // The source endpoint's response didn't actually contain this field this run (a
+    // different server response shape, or the source request itself failed) — leave the
+    // recorded literal in place rather than guessing; the request will fail naturally and
+    // visibly, same as it would have before this feature existed.
+    if (liveValue === undefined) continue;
+    if (rule.transform) {
+      const { transformLiveValue } = require('./transforms');
+      liveValue = transformLiveValue(rule.transform, liveValue);
+    }
+
+    if (rule.targetLocation === 'urlPath') {
+      if (url.includes(rule.value)) url = url.split(rule.value).join(liveValue);
+    } else if (rule.targetLocation === 'query') {
+      if (String(queryParams[rule.targetKey]) === rule.value) queryParams[rule.targetKey] = liveValue;
+    } else if (rule.targetLocation === 'header') {
+      const k = Object.keys(headers).find(h => h.toLowerCase() === String(rule.targetKey).toLowerCase());
+      if (rule.value == null) {
+        // "Inject" mode (see scriptCorrelation.js's matching branch) — always ensure this
+        // header carries the live value, whether or not this endpoint was ever recorded
+        // with it, so pre-run can actually prove the injection works before generation.
+        // A real HTTP `Cookie` request header is a "name=value" pair per RFC 6265, not a
+        // bare value — a cookie-sourced value injected straight into a literal "cookie"
+        // header target (no pre-existing literal to preserve the "name=" prefix from,
+        // since this IS inject mode) must be re-wrapped in that shape, or no server-side
+        // cookie parser will ever recognize it and the request 401s regardless of how
+        // fresh the captured value is.
+        const needsCookiePair = rule.sourceLocation === 'cookie' && String(rule.targetKey).toLowerCase() === 'cookie';
+        headers[k || rule.targetKey] = needsCookiePair ? `${rule.sourceJsonPath}=${liveValue}` : liveValue;
+      } else if (k && typeof headers[k] === 'string' && headers[k].includes(rule.value)) {
+        headers[k] = headers[k].split(rule.value).join(liveValue);
+      }
+    } else if (rule.targetLocation === 'body' && typeof body === 'string') {
+      body = replaceBodyLiteral(body, rawFieldNameOf(rule.targetKey), rule.value, liveValue);
+    }
+  }
+  return { ...ep, url, headers, body, queryParams };
+}
+
+// Fires every endpoint SEQUENTIALLY (unlike the default parallel-chunk pre-run), applying
+// confirmed correlation rules with values actually captured from earlier responses in this
+// same pass — so a pre-run can prove the full chain (login -> create -> fetch-by-id, etc.)
+// really works before a script is ever generated from it. Only used when a collection has
+// applicable correlation rules (routes/ai.js decides); collections without any keep using
+// the faster parallel-chunk path unchanged, since sequential-only-when-needed avoids
+// regressing pre-run's speed on the common case (no correlation involved).
+// Computes a firing order where every rule's source endpoint runs before its target
+// (Kahn's algorithm) — the raw collection order is NOT guaranteed to already satisfy this.
+// A collection recorded by clicking around a real app (many endpoints, several unrelated
+// flows) very commonly has its "Login" request recorded well after some endpoint that
+// actually depends on it; firing strictly in recorded order then means the dependent
+// endpoint runs before its source ever captured a live value, silently falling back to the
+// stale recorded literal and failing. Always prefers the lowest original index among
+// endpoints that are ready to fire, so a collection that's ALREADY in a valid order fires
+// in that same order, unchanged. A cycle (shouldn't occur — detectCorrelations never
+// proposes a backward reference, but a manual rule theoretically could) leaves some
+// endpoints permanently non-ready; those are appended in their original order rather than
+// silently dropped from execution.
+function topologicalFireOrder(endpointCount, correlationRules) {
+  const indegree = new Array(endpointCount).fill(0);
+  const edgesFrom = new Map(); // sourceIndex -> Set(targetIndex)
+  for (const rule of (correlationRules || [])) {
+    const s = rule.sourceEndpointIndex, t = rule.targetEndpointIndex;
+    if (s == null || t == null || s === t || s < 0 || t < 0 || s >= endpointCount || t >= endpointCount) continue;
+    if (!edgesFrom.has(s)) edgesFrom.set(s, new Set());
+    if (!edgesFrom.get(s).has(t)) { edgesFrom.get(s).add(t); indegree[t]++; }
+  }
+  const ready = [];
+  for (let i = 0; i < endpointCount; i++) if (indegree[i] === 0) ready.push(i);
+  const order = [];
+  while (ready.length) {
+    ready.sort((a, b) => a - b);
+    const i = ready.shift();
+    order.push(i);
+    for (const t of (edgesFrom.get(i) || [])) {
+      indegree[t]--;
+      if (indegree[t] === 0) ready.push(t);
+    }
+  }
+  if (order.length < endpointCount) {
+    const seen = new Set(order);
+    for (let i = 0; i < endpointCount; i++) if (!seen.has(i)) order.push(i);
+  }
+  return order;
+}
+
+async function fireEndpointsWithCorrelation(endpoints, correlationRules, { variables = {} } = {}) {
+  const { groupRulesBySource, groupRulesByTarget } = require('./scriptCorrelation');
+  const rulesBySource = groupRulesBySource(correlationRules);
+  const rulesByTarget = groupRulesByTarget(correlationRules);
+  const capturedValues = {};
+  const results = new Array(endpoints.length);
+
+  for (const i of topologicalFireOrder(endpoints.length, correlationRules)) {
+    const targetRules = rulesByTarget.get(i) || [];
+    const liveEp = applyLiveCorrelatedValues(endpoints[i], targetRules, capturedValues);
+    const result = await fireEndpoint(liveEp, { variables });
+    results[i] = result;
+
+    const sourceFields = rulesBySource.get(i) || [];
+    if (sourceFields.length) {
+      let parsedBody = result.body;
+      if (typeof parsedBody === 'string') { try { parsedBody = JSON.parse(parsedBody); } catch { parsedBody = null; } }
+      for (const { varName, jsonPath, sourceLocation } of sourceFields) {
+        if (sourceLocation === 'header') {
+          // result.responseHeaders keys are already lowercase (fireEndpoint builds them
+          // from the Fetch API's Headers.entries(), which the spec normalizes) — same
+          // casing correlationEngine.js detected the header name under, so a direct
+          // lookup is safe here (unlike the generated-script side, which must handle a
+          // REAL target server's original casing at its own future runtime).
+          const v = result.responseHeaders?.[jsonPath];
+          if (v !== undefined) capturedValues[varName] = String(v);
+        } else if (sourceLocation === 'cookie') {
+          const v = getCookieValue(result.responseHeaders, jsonPath);
+          if (v !== undefined) capturedValues[varName] = v;
+        } else if (parsedBody && typeof parsedBody === 'object') {
+          const v = getValueAtJsonPath(parsedBody, jsonPath);
+          if (v !== undefined) capturedValues[varName] = String(v);
+        }
+      }
+    }
+  }
+  return results;
+}
+
 module.exports = {
   isSafeUrl, substituteVars, findMissingVars, appendQueryParams,
-  TOKEN_KEYS, extractAllTokens, pickDefaultToken, extractCookies,
+  getValueAtJsonPath, applyLiveCorrelatedValues, fireEndpointsWithCorrelation,
+  TOKEN_KEYS, extractAllTokens, pickDefaultToken, extractCookies, getCookieValue,
   fingerprintMatches, fireEndpoint, resolveUrlSet, findPortVariable, resolveForScript,
 };
