@@ -125,9 +125,13 @@ function parseCheckoutConflictPaths(gitErrorMessage) {
   return paths;
 }
 
-async function safeCheckoutSimpleGit(git, gitRoot, branch) {
+// Generic retry wrapper (mirrors git.js's withCheckoutConflictRetry) — not specific to
+// plain `checkout(branch)`. `checkout -b <new> <start>` / `checkoutLocalBranch` hit the
+// identical conflict since they also have to update the working tree to match <start>,
+// so every checkout-shaped git2 call in this file needs to go through this.
+async function withCheckoutConflictRetrySimpleGit(gitRoot, fn) {
   try {
-    await git.checkout(branch);
+    await fn();
     return;
   } catch (err) {
     const conflictPaths = parseCheckoutConflictPaths(err.message || '');
@@ -141,11 +145,15 @@ async function safeCheckoutSimpleGit(git, gitRoot, branch) {
         const dest = path.join(asideDir, rel);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         fs.copyFileSync(src, dest);
+        // Must actually remove it here, not just copy — the retry below hits the exact
+        // same "would be overwritten" conflict otherwise, since the file is still sitting
+        // in gitRoot blocking it. (Verified against real git.)
+        fs.rmSync(src, { force: true });
         saved.push(rel);
       }
     }
     try {
-      await git.checkout(branch);
+      await fn();
     } finally {
       for (const rel of saved) {
         const dest = path.join(gitRoot, rel);
@@ -155,6 +163,10 @@ async function safeCheckoutSimpleGit(git, gitRoot, branch) {
       try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
     }
   }
+}
+
+async function safeCheckoutSimpleGit(git, gitRoot, branch) {
+  return withCheckoutConflictRetrySimpleGit(gitRoot, () => git.checkout(branch));
 }
 
 router.use(auth);
@@ -1367,6 +1379,10 @@ pipelines:
               const dest = path.join(asideDir, f);
               fs.mkdirSync(path.dirname(dest), { recursive: true });
               fs.copyFileSync(src, dest);
+              // Must actually remove it here, not just copy — the checkout retry below
+              // hits the exact same "would be overwritten" conflict otherwise, since the
+              // file is still sitting in gitRoot blocking it. (Verified against real git.)
+              fs.rmSync(src, { force: true });
               savedFiles.push(f);
             }
           }
@@ -1657,8 +1673,11 @@ router.post('/trigger', async (req, res) => {
         await safeCheckoutSimpleGit(git2, wsRoot, targetRef);
       } else {
         // Branch may exist on remote but not locally — try to track it
-        try { await git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]); }
-        catch { await git2.checkoutLocalBranch(targetRef); }
+        try {
+          await withCheckoutConflictRetrySimpleGit(wsRoot, () => git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]));
+        } catch {
+          await withCheckoutConflictRetrySimpleGit(wsRoot, () => git2.checkoutLocalBranch(targetRef));
+        }
       }
       // Sync with remote BEFORE committing new files so the push is fast-forward.
       // Without this, if origin/main has new commits (workflow file updates, CI artifacts, etc.)

@@ -284,9 +284,16 @@ function parseCheckoutConflictPaths(gitErrorMessage) {
   return paths;
 }
 
-async function safeCheckout(git, gitRoot, branch) {
+// Generic retry wrapper: runs any git operation (plain checkout, `checkout -b`, etc.),
+// and if it fails with the "would be overwritten by checkout" conflict, copies the exact
+// conflicting paths (as reported by git itself) aside, retries the SAME operation, then
+// restores them. Not specific to `checkout <branch>` — `checkout -b <new> <start>` triggers
+// the identical conflict (it still has to update the working tree to match <start>), so
+// every checkout-shaped git call in this file needs to go through this, not just the ones
+// that switch to an already-existing local branch.
+async function withCheckoutConflictRetry(gitRoot, fn) {
   try {
-    await git.checkout(branch);
+    await fn();
     return;
   } catch (err) {
     const conflictPaths = parseCheckoutConflictPaths(err.message || '');
@@ -300,11 +307,16 @@ async function safeCheckout(git, gitRoot, branch) {
         const dest = path.join(asideDir, rel);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         fs.copyFileSync(src, dest);
+        // Must actually remove it here, not just copy — the retry below hits the exact
+        // same "would be overwritten" conflict otherwise, since the file is still sitting
+        // in gitRoot blocking it. (Verified against real git: a plain copy-without-remove
+        // does not unblock the checkout.)
+        fs.rmSync(src, { force: true });
         saved.push(rel);
       }
     }
     try {
-      await git.checkout(branch);
+      await fn();
     } finally {
       for (const rel of saved) {
         const dest = path.join(gitRoot, rel);
@@ -314,6 +326,10 @@ async function safeCheckout(git, gitRoot, branch) {
       try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
     }
   }
+}
+
+async function safeCheckout(git, gitRoot, branch) {
+  return withCheckoutConflictRetry(gitRoot, () => git.checkout(branch));
 }
 
 // Clone or pull-update a user's workspace from the remote
@@ -1064,7 +1080,11 @@ router.post('/commit', async (req, res) => {
     if (branches.all.includes(branch)) {
       await safeCheckout(git, gitDir, branch);
     } else {
-      await git.checkout(['-b', branch, `origin/${baseBranch}`]).catch(() => git.checkout(['-b', branch]));
+      try {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${baseBranch}`]));
+      } catch {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch]));
+      }
     }
 
     // Stage all changes
@@ -1117,7 +1137,11 @@ router.post('/push', async (req, res) => {
     if (localBranches.all.includes(branch)) {
       await safeCheckout(git, gitDir, branch);
     } else {
-      await git.checkout(['-b', branch, baseBranch]).catch(() => git.checkout(['-b', branch]));
+      try {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, baseBranch]));
+      } catch {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch]));
+      }
     }
 
     // Keep 'origin' on the CLEAN url — fetch/push below pass remoteUrl (authenticated)
@@ -1194,7 +1218,7 @@ router.post('/pull', async (req, res) => {
       if (localBranchesForPull.all.includes(branch)) {
         await safeCheckout(git, gitDir, branch);
       } else {
-        await git.checkout(['-b', branch, `origin/${branch}`]);
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${branch}`]));
       }
       gitExec(['pull', remoteUrl, branch, '--no-rebase'], gitDir, sshEnv);
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
@@ -1208,7 +1232,7 @@ router.post('/pull', async (req, res) => {
 
       const localBranches = await git.branchLocal();
       if (!localBranches.all.includes(branch)) {
-        await git.checkout(['-b', branch, `origin/${baseBranch}`]);
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${baseBranch}`]));
       } else {
         await safeCheckout(git, gitDir, branch);
         await git.merge([`origin/${baseBranch}`, '--no-edit']).catch(() => {});
@@ -1591,8 +1615,8 @@ router.post('/branch', async (req, res) => {
     const baseBranch = getBaseBranch(cfg);
     // Create from latest base branch
     try { gitExec(['fetch', branchRemoteUrl, baseBranch], gitRoot, r.sshEnv || {}); } catch {}
-    try { await git.checkout(baseBranch); } catch {}
-    await git.checkoutLocalBranch(branchName);
+    try { await safeCheckout(git, gitRoot, baseBranch); } catch {}
+    await withCheckoutConflictRetry(gitRoot, () => git.checkoutLocalBranch(branchName));
 
     // Push branch to remote and apply protection
     await disableGcm(git, gitRoot);
