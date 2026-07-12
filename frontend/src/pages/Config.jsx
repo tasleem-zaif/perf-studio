@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import api from '../api';
 import CustomSelect from '../components/CustomSelect';
 
@@ -120,13 +120,27 @@ function UrlsEditor({ cfg, setCfg }) {
   );
 }
 
+function rowsFromVars(varsObj) {
+  const entries = Object.entries(varsObj || {});
+  return entries.length ? entries.map(([key, value]) => ({ key, value })) : [{ key: '', value: '' }];
+}
+
 function VariablesEditor({ cfg, setCfg }) {
-  const varsObj = cfg.variables || {};
-  const rows = Object.keys(varsObj).length ? Object.entries(varsObj).map(([key, value]) => ({ key, value })) : [{ key: '', value: '' }];
+  const lastCommitted = useRef(null);
+  const [rows, setRows] = useState(() => rowsFromVars(cfg.variables));
+
+  // Resync from parent only when the change came from outside this editor (e.g. switching
+  // environments loads a different saved config) — not on our own commits, which would
+  // otherwise immediately strip the blank row a user just added via "Add Variable".
+  useEffect(() => {
+    if (cfg.variables !== lastCommitted.current) setRows(rowsFromVars(cfg.variables));
+  }, [cfg.variables]);
 
   function commit(newRows) {
+    setRows(newRows);
     const obj = {};
     for (const r of newRows) if (r.key.trim()) obj[r.key.trim()] = r.value;
+    lastCommitted.current = obj;
     setCfg(c => ({ ...c, variables: obj }));
   }
 
@@ -154,8 +168,8 @@ function VariablesEditor({ cfg, setCfg }) {
       <div style={{ maxHeight: '400px', overflowY: 'auto', paddingRight: '6px' }}>
         {rows.map((r, idx) => (
           <div key={idx} style={{ display: 'flex', gap: '10px', marginBottom: '8px', alignItems: 'center' }}>
-            <input type="text" value={r.key} onChange={e => updateRow(idx, 'key', e.target.value)} placeholder="url" style={{ flex: '0 0 160px' }} />
-            <input type="text" value={r.value} onChange={e => updateRow(idx, 'value', e.target.value)} placeholder="https://api.example.com" style={{ flex: 1 }} />
+            <input type="text" value={r.key} onChange={e => updateRow(idx, 'key', e.target.value)} placeholder="Key" autoComplete="off" style={{ flex: '0 0 160px' }} />
+            <input type="text" value={r.value} onChange={e => updateRow(idx, 'value', e.target.value)} placeholder="Value" autoComplete="off" style={{ flex: 1 }} />
             <button className="btn-icon" onClick={() => removeRow(idx)} title="Remove variable" style={{ color: 'var(--danger)' }}>
               <i className="ti ti-trash" />
             </button>
