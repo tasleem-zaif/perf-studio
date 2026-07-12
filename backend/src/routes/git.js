@@ -340,19 +340,36 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   // folders if they were created after the last push, or this is a fresh clone.
   try {
     const { ensureAllEnvFolders, cleanName: cn } = require('../utils/projectFolders');
-    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
-    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
+    // Content lives one level under the workspace root, inside a folder named after
+    // the project — this MUST match getUserProjectPath() (used by testSuites.js /
+    // collections.js / testData.js to actually write scripts/config/testData) and
+    // buildCanonicalRepoPaths() in ciPipeline.js (used to compute the script_path the
+    // CI workflow patches). Scaffolding folders at gitRoot directly — as this used to
+    // do — created a second, empty, out-of-sync tree alongside the real one and left
+    // the CI "Patch JMX" step looking for a script_path that didn't exist there.
+    // Standard: <workspace>/<ProjectName>/<CollectionName>/<Env>/script|testData|config|results/
+    const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(cfg.project_id);
+    const projectContentDir = path.join(gitRoot, cn(projRow?.name || ''));
     const collections = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
     for (const col of collections) {
+      // Remove the stale duplicate this function used to scaffold directly at the
+      // workspace root (gitRoot/<CollectionName>) before content moved under
+      // gitRoot/<ProjectName>/<CollectionName> — otherwise it keeps getting
+      // re-created/re-committed on every commit even after the code fix.
+      const staleFlatDir = path.join(gitRoot, cn(col.name || 'Default'));
+      if (staleFlatDir !== projectContentDir && fs.existsSync(staleFlatDir)) {
+        fs.rmSync(staleFlatDir, { recursive: true, force: true });
+      }
+
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitRoot, col.name, envs);
+      ensureAllEnvFolders(projectContentDir, col.name, envs);
     }
 
     // Copy JMX/JS scripts into this workspace if they don't exist here yet.
-    // Destination is always: gitRoot/<CollectionName>/<Env>/script/<filename>
+    // Destination is always: gitRoot/<ProjectName>/<CollectionName>/<Env>/script/<filename>
     const suites = await db.prepare(`
       SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
       FROM test_suites ts
@@ -363,7 +380,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
       const srcAbs = suite.jmx_path || suite.js_path;
       if (!srcAbs || !fs.existsSync(srcAbs)) continue;
       const destAbs = path.join(
-        gitRoot,
+        projectContentDir,
         cn(suite.col_name || 'Default'),
         cn(suite.env || 'Default'),
         'script',
@@ -600,23 +617,31 @@ router.post('/init', async (req, res) => {
     // Project files go DIRECTLY at the workspace root — no projects/ subdirectory.
     // This means pushing to GitHub only includes THIS project's files.
     //
-    // GitHub structure:
+    // GitHub structure (must match getUserProjectPath() in projectFolders.js — used by
+    // testSuites.js/collections.js/testData.js to actually write scripts/config/testData —
+    // and buildCanonicalRepoPaths() in ciPipeline.js, which computes the script_path the
+    // CI "Patch JMX" step opens):
     //   <repo_root>/
-    //   ├── <CollectionName>/
-    //   │   └── <Env>/
-    //   │       ├── config/
-    //   │       ├── script/
-    //   │       ├── testData/
-    //   │       └── results/  (gitignored)
+    //   ├── <ProjectName>/
+    //   │   └── <CollectionName>/
+    //   │       └── <Env>/
+    //   │           ├── config/
+    //   │           ├── script/
+    //   │           ├── testData/
+    //   │           └── results/  (gitignored)
     //   ├── .gitignore
     //   └── README.md
     const gitRoot = getUserWorkspace(proj, caller);  // git-workspaces/<ProjectName>/admin/
 
-    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
-    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
+    // Collections live under a <ProjectName> content folder inside the workspace root —
+    // scaffolding them directly at gitRoot (as this used to do) produced a second, empty
+    // folder tree alongside the real one and left the CI patch step looking for a
+    // script_path that didn't exist there.
+    // Standard: <workspace>/<ProjectName>/<CollectionName>/<Env>/script|testData|config|results/
     fs.mkdirSync(gitRoot, { recursive: true });
 
     const { ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
+    const contentRoot = path.join(gitRoot, cleanName(proj.name));
 
     // Create collection subfolders for all existing collections
     const existingCols = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
@@ -625,7 +650,7 @@ router.post('/init', async (req, res) => {
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitRoot, col.name, envs);
+      ensureAllEnvFolders(contentRoot, col.name, envs);
     }
 
     // Update folder_path in DB to the workspace root
@@ -669,16 +694,17 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
 
 \`\`\`
 <repo_root>/
-├── <CollectionName>/         # One folder per API Source
-│   ├── QA/
-│   │   ├── testData/         # CSV files for QA environment
-│   │   ├── script/           # Generated JMeter (.jmx) / K6 (.js) scripts
-│   │   ├── results/          # Test run output & reports
-│   │   └── config/           # Environment-specific config (URLs, ports)
-│   ├── Staging/
-│   │   └── ...               # Same structure as QA
-│   └── UAT/
-│       └── ...               # Same structure as QA
+├── <ProjectName>/
+│   └── <CollectionName>/     # One folder per API Source
+│       ├── QA/
+│       │   ├── testData/     # CSV files for QA environment
+│       │   ├── script/       # Generated JMeter (.jmx) / K6 (.js) scripts
+│       │   ├── results/      # Test run output & reports
+│       │   └── config/       # Environment-specific config (URLs, ports)
+│       ├── Staging/
+│       │   └── ...           # Same structure as QA
+│       └── UAT/
+│           └── ...           # Same structure as QA
 ├── .github/workflows/        # CI pipeline definition
 └── README.md
 \`\`\`
@@ -731,7 +757,16 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
       for (const col of collections) {
         // Clean name only — no ID suffix (IDs are stored in DB, not needed in folder names)
         const colFolderName = col.name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-        const colDir = path.join(gitRoot, colFolderName);
+        const colDir = path.join(contentRoot, colFolderName);
+
+        // Remove the stale duplicate this endpoint used to scaffold directly at the
+        // workspace root (gitRoot/<CollectionName>) before content moved under
+        // gitRoot/<ProjectName>/<CollectionName> — otherwise it keeps getting
+        // re-created/re-committed on every init even after the code fix.
+        const staleFlatDir = path.join(gitRoot, colFolderName);
+        if (staleFlatDir !== contentRoot && fs.existsSync(staleFlatDir)) {
+          fs.rmSync(staleFlatDir, { recursive: true, force: true });
+        }
 
         // .gitkeep directly in collection folder so GitHub shows it as its own folder
         // (without this, GitHub collapses colFolder/env into a single path)
