@@ -256,6 +256,66 @@ function getUserWorkspace(proj, user) {
   return path.join(GIT_WORKSPACES_ROOT, cleanProjectName, userFolder);
 }
 
+// `ensureUserWorkspace` (below) rebuilds collection/env folders and copies scripts from
+// the DB straight into gitRoot's working tree — onto whatever branch happens to be
+// checked out at that moment. If a later `git.checkout(<otherBranch>)` in the same
+// request needs to switch off of that branch, git refuses when the freshly-written
+// files (tracked-and-modified, or brand new untracked scaffolding like .gitkeep) would
+// be overwritten by the target branch's version: "Your local changes to the following
+// files would be overwritten by checkout" / "The following untracked working tree files
+// would be overwritten by checkout". Git's own error message conveniently lists the
+// exact conflicting paths — copy just those aside (not `git stash`, which can fail to
+// pop on a conflict and silently swallow the very content we're trying to preserve, per
+// the identical bug fixed in ciPipeline.js's /generate-yaml), checkout, then restore them
+// so they land on the new branch instead of being discarded.
+function parseCheckoutConflictPaths(gitErrorMessage) {
+  const paths = [];
+  let inList = false;
+  for (const rawLine of (gitErrorMessage || '').split('\n')) {
+    const line = rawLine.trim();
+    if (/^error: (Your local changes to the following files would be overwritten by checkout|The following untracked working tree files would be overwritten by checkout)/.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    if (line === '' || /^(Please |Aborting)/.test(line)) { inList = false; continue; }
+    paths.push(line);
+  }
+  return paths;
+}
+
+async function safeCheckout(git, gitRoot, branch) {
+  try {
+    await git.checkout(branch);
+    return;
+  } catch (err) {
+    const conflictPaths = parseCheckoutConflictPaths(err.message || '');
+    if (!conflictPaths.length) throw err;
+
+    const asideDir = path.join(os.tmpdir(), `peako-checkout-aside-${process.pid}-${Date.now()}`);
+    const saved = [];
+    for (const rel of conflictPaths) {
+      const src = path.join(gitRoot, rel);
+      if (fs.existsSync(src)) {
+        const dest = path.join(asideDir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+        saved.push(rel);
+      }
+    }
+    try {
+      await git.checkout(branch);
+    } finally {
+      for (const rel of saved) {
+        const dest = path.join(gitRoot, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(asideDir, rel), dest);
+      }
+      try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
 // Clone or pull-update a user's workspace from the remote
 async function ensureUserWorkspace(gitRoot, cfg, user) {
   const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
@@ -1002,7 +1062,7 @@ router.post('/commit', async (req, res) => {
     try { gitExec(['fetch', result.remoteWithAuth, `+${baseBranch}:refs/remotes/origin/${baseBranch}`], gitDir, result.sshEnv || {}); } catch {}
     const branches = await git.branchLocal();
     if (branches.all.includes(branch)) {
-      await git.checkout(branch);
+      await safeCheckout(git, gitDir, branch);
     } else {
       await git.checkout(['-b', branch, `origin/${baseBranch}`]).catch(() => git.checkout(['-b', branch]));
     }
@@ -1053,9 +1113,12 @@ router.post('/push', async (req, res) => {
 
     const baseBranch = getBaseBranch(cfg);
     // Ensure on correct branch
-    await git.checkout(branch).catch(async () => {
+    const localBranches = await git.branchLocal();
+    if (localBranches.all.includes(branch)) {
+      await safeCheckout(git, gitDir, branch);
+    } else {
       await git.checkout(['-b', branch, baseBranch]).catch(() => git.checkout(['-b', branch]));
-    });
+    }
 
     // Keep 'origin' on the CLEAN url — fetch/push below pass remoteUrl (authenticated)
     // directly as the command's URL argument, so origin never needs to carry the token.
@@ -1127,7 +1190,12 @@ router.post('/pull', async (req, res) => {
 
     if (branchExistsOnRemote) {
       // Branch exists on remote — pull directly from it
-      await git.checkout(branch).catch(() => git.checkout(['-b', branch, `origin/${branch}`]));
+      const localBranchesForPull = await git.branchLocal();
+      if (localBranchesForPull.all.includes(branch)) {
+        await safeCheckout(git, gitDir, branch);
+      } else {
+        await git.checkout(['-b', branch, `origin/${branch}`]);
+      }
       gitExec(['pull', remoteUrl, branch, '--no-rebase'], gitDir, sshEnv);
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
     } else {
@@ -1142,7 +1210,7 @@ router.post('/pull', async (req, res) => {
       if (!localBranches.all.includes(branch)) {
         await git.checkout(['-b', branch, `origin/${baseBranch}`]);
       } else {
-        await git.checkout(branch);
+        await safeCheckout(git, gitDir, branch);
         await git.merge([`origin/${baseBranch}`, '--no-edit']).catch(() => {});
       }
 
@@ -1315,7 +1383,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
 
     const baseBranch = getBaseBranch(cfg);
     // Switch to base branch
-    await git.checkout(baseBranch);
+    await safeCheckout(git, gitDir, baseBranch);
     gitExec(['pull', mergeRemoteUrl, baseBranch, '--no-rebase'], gitDir, mergeSshEnv);
 
     // Merge feature branch
@@ -1506,7 +1574,7 @@ router.post('/branch', async (req, res) => {
 
     const branchSummary = await git.branchLocal();
     if (branchSummary.all.includes(branchName)) {
-      await git.checkout(branchName);
+      await safeCheckout(git, gitRoot, branchName);
       // Branch exists locally — check if it's on the remote too; push if not
       await disableGcm(git, gitRoot);
       const lsResult = spawnSync('git', ['ls-remote', '--heads', branchRemoteUrl, branchName], {
@@ -1827,7 +1895,7 @@ router.post('/sync', async (req, res) => {
     const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
       const branches = await r.git.branchLocal();
-      if (branches.all.includes(branch)) await r.git.checkout(branch);
+      if (branches.all.includes(branch)) await safeCheckout(r.git, gitDir, branch);
     }
     await r.git.merge([`origin/${baseBranch}`, '--no-edit', '--allow-unrelated-histories']);
     res.json({ ok: true, message: `Branch "${branch}" synced with latest ${baseBranch}.` });
