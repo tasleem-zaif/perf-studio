@@ -1,10 +1,10 @@
 import { useToast } from '../hooks/useToast';
 
 const CONFIG = {
-  success: { icon: 'ti-circle-check', color: '#22c55e', bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.35)',  bar: '#22c55e' },
-  error:   { icon: 'ti-circle-x',     color: '#ef4444', bg: 'rgba(239,68,68,0.12)',  border: 'rgba(239,68,68,0.35)',  bar: '#ef4444' },
-  warn:    { icon: 'ti-alert-triangle',color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.35)', bar: '#f59e0b' },
-  info:    { icon: 'ti-info-circle',   color: '#58a6ff', bg: 'rgba(88,166,255,0.10)', border: 'rgba(88,166,255,0.30)', bar: '#58a6ff' },
+  success: { icon: 'ti-circle-check',  bg: '#16a34a', border: '#15803d', fg: '#ffffff' },
+  error:   { icon: 'ti-circle-x',      bg: '#dc2626', border: '#b91c1c', fg: '#ffffff' },
+  warn:    { icon: 'ti-alert-triangle',bg: '#d97706', border: '#b45309', fg: '#ffffff' },
+  info:    { icon: 'ti-info-circle',   bg: '#2563eb', border: '#1d4ed8', fg: '#ffffff' },
 };
 
 // Inject keyframes once
@@ -37,21 +37,20 @@ function ToastItem({ t, onDismiss }) {
         background: cfg.bg,
         border: `1px solid ${cfg.border}`,
         borderRadius: '10px',
-        boxShadow: '0 4px 20px rgba(0,0,0,0.18)',
+        boxShadow: '0 4px 20px rgba(0,0,0,0.25)',
         display: 'flex', alignItems: 'flex-start', gap: '10px',
         animation: 'toast-slide-in 0.22s ease',
-        backdropFilter: 'blur(6px)',
         fontFamily: 'var(--font)',
       }}
     >
       {/* Icon */}
       <i
         className={`ti ${cfg.icon}`}
-        style={{ fontSize: '17px', color: cfg.color, marginTop: '1px', flexShrink: 0 }}
+        style={{ fontSize: '17px', color: cfg.fg, marginTop: '1px', flexShrink: 0 }}
       />
 
       {/* Message */}
-      <span style={{ flex: 1, fontSize: '13px', color: 'var(--color-text-primary)', lineHeight: 1.5, wordBreak: 'break-word' }}>
+      <span style={{ flex: 1, fontSize: '13px', color: cfg.fg, lineHeight: 1.5, wordBreak: 'break-word' }}>
         {t.message}
       </span>
 
@@ -61,12 +60,12 @@ function ToastItem({ t, onDismiss }) {
         title="Dismiss"
         style={{
           background: 'none', border: 'none', cursor: 'pointer',
-          color: cfg.color, opacity: 0.7, fontSize: '16px',
+          color: cfg.fg, opacity: 0.8, fontSize: '16px',
           padding: '0', lineHeight: 1, flexShrink: 0, marginTop: '1px',
           transition: 'opacity .15s',
         }}
         onMouseEnter={e => e.currentTarget.style.opacity = '1'}
-        onMouseLeave={e => e.currentTarget.style.opacity = '0.7'}
+        onMouseLeave={e => e.currentTarget.style.opacity = '0.8'}
       >
         <i className="ti ti-x" style={{ fontSize: '13px' }} />
       </button>
@@ -75,7 +74,7 @@ function ToastItem({ t, onDismiss }) {
       <div
         style={{
           position: 'absolute', bottom: 0, left: 0, height: '3px',
-          background: cfg.bar, opacity: 0.6,
+          background: cfg.fg, opacity: 0.5,
           animation: `toast-progress ${secs}s linear forwards`,
         }}
       />

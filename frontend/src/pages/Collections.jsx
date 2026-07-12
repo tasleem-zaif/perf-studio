@@ -7,6 +7,19 @@ import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
 import api from '../api';
 
+// Module-scope (not defined inside Collections()) so its component identity is stable
+// across renders — a component redefined inside a parent's render body gets a new
+// identity every render, which makes React remount its subtree (losing input focus on
+// every keystroke) instead of just re-rendering it.
+function FieldLabel({ text, children }) {
+  return (
+    <label style={{ display: 'block' }}>
+      <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--color-text-tertiary)', marginBottom: '3px' }}>{text}</div>
+      {children}
+    </label>
+  );
+}
+
 const SOURCE_TYPES = [
   { value: 'postman', label: 'Postman Collection', icon: 'ti-brand-chrome', desc: 'Import from Postman v2.1 JSON export', accept: '.json' },
   { value: 'swagger', label: 'Swagger / OpenAPI', icon: 'ti-code', desc: 'Import OpenAPI 3 or Swagger 2 (JSON or YAML)', accept: '.json,.yaml,.yml' },
@@ -56,6 +69,11 @@ export default function Collections({ project, collection: activeCollection, onN
   const [logModalCollection, setLogModalCollection] = useState(null);
   const [logModalPos, setLogModalPos] = useState({ x: 0, y: 0 });
   const [expandedLog, setExpandedLog] = useState({});
+  // Correlation rules detected by the last pre-run (utils/correlationEngine.js) — a
+  // human-review layer over the auto-detected/high-confidence rules script generation
+  // will burn into the JMX/k6 output. Keyed by collection id, same as preRunData.
+  const [correlationsByCollection, setCorrelationsByCollection] = useState({});
+  const [correlationsOpen, setCorrelationsOpen] = useState(true);
   const fileRef = useRef(null);
   const envFileRef = useRef(null);
   const firstRender = useRef(true);
@@ -199,11 +217,27 @@ export default function Collections({ project, collection: activeCollection, onN
     onProjectUpdated();
   }
 
+  // "Show Logs" only ever restores modalResponses from the collection's persisted
+  // pre_run_data (see the mount effects above) — correlationsByCollection was never
+  // hydrated from anywhere except preRun()'s own response, so opening the modal without
+  // re-running pre-run first always showed "Correlations 0" even though the rules were
+  // safely persisted server-side all along. Fetch them fresh every time the modal opens.
+  async function openLogModal(collection) {
+    setLogModalCollection(collection);
+    try {
+      const { data } = await api.get(`/ai/correlations?collection_id=${collection.id}&project_id=${project.id}`);
+      setCorrelationsByCollection(prev => ({ ...prev, [collection.id]: data.correlationRules || [] }));
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Failed to load correlation rules', 'error');
+    }
+  }
+
   async function preRun(c) {
     setPreRunning(c.id);
     try {
       const { data } = await api.post('/ai/pre-run', { collection_id: c.id, project_id: project.id });
       setPreRunData(prev => ({ ...prev, [c.id]: data.responses }));
+      setCorrelationsByCollection(prev => ({ ...prev, [c.id]: data.correlationRules || [] }));
       const failed = data.responses.filter(r => r.error || !r.success).length;
       if (failed > 0) toast(`Pre-run complete — ${failed} endpoint(s) failed. Check logs.`, 'warn');
       else toast(`Pre-run complete — all ${data.responses.length} endpoint(s) succeeded`, 'success');
@@ -244,9 +278,147 @@ export default function Collections({ project, collection: activeCollection, onN
     }
   }
 
+  async function setCorrelationStatus(collection, rule, status) {
+    try {
+      const { data } = await api.post('/ai/correlations/status', {
+        collection_id: collection.id, project_id: project.id, id: rule.id, status,
+      });
+      setCorrelationsByCollection(prev => ({ ...prev, [collection.id]: data.correlationRules }));
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Failed to update correlation rule', 'error');
+    }
+  }
+
+  async function deleteCorrelation(collection, rule) {
+    try {
+      const { data } = await api.post('/ai/correlations/delete', {
+        collection_id: collection.id, project_id: project.id, id: rule.id,
+      });
+      setCorrelationsByCollection(prev => ({ ...prev, [collection.id]: data.correlationRules }));
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Failed to remove correlation rule', 'error');
+    }
+  }
+
+  // Removes one recorded endpoint from a collection (e.g. garbage/noise traffic swept up
+  // during recording — a static asset request, a framework prefetch call) — the backend
+  // reindexes every correlation rule/field generator/endpoint override that referenced an
+  // endpoint by array index, so those need refreshing here too, not just the endpoint list.
+  // `label` is passed in by the caller (built from the SAME pre-run response row already
+  // rendered on screen) rather than re-derived from `collection.json_content` here — that
+  // list can lag behind what's actually displayed if the collection was refreshed elsewhere
+  // since the modal opened, which would show the wrong endpoint's name in the confirmation.
+  async function deleteEndpoint(collection, idx, label) {
+    const ok = await confirm(
+      `Remove "${label}" from this collection? Any correlation rules or AI fixes tied to it will be removed too. This cannot be undone.`,
+      'Delete Endpoint'
+    );
+    if (!ok) return;
+    try {
+      const { data } = await api.post(`/projects/${project.id}/collections/${collection.id}/endpoints/delete`, { index: idx });
+      setOwnCollections(prev => prev.map(c => (c.id === collection.id ? data.collection : c)));
+      setLogModalCollection(data.collection);
+      setPreRunData(prev => {
+        const rows = [...(prev[collection.id] || [])];
+        rows.splice(idx, 1);
+        return { ...prev, [collection.id]: rows };
+      });
+      // Rule/generator indices shifted server-side — refetch rather than try to patch them
+      // up locally, since this collection's endpoint list just changed shape.
+      try {
+        const { data: corrData } = await api.get(`/ai/correlations?collection_id=${collection.id}&project_id=${project.id}`);
+        setCorrelationsByCollection(prev => ({ ...prev, [collection.id]: corrData.correlationRules || [] }));
+      } catch {}
+      toast('Endpoint removed', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Failed to remove endpoint', 'error');
+    }
+  }
+
+  // Manual correlation add form — the fallback for anything auto-detection missed (a
+  // transformed value, a source field it couldn't confidently match, etc.). Keyed by
+  // collection id so the form's own open/closed + field state doesn't leak across collections.
+  const [manualRuleForm, setManualRuleForm] = useState({});
+  function manualFormFor(collectionId) {
+    return manualRuleForm[collectionId] || {
+      open: false, sourceEndpointIndex: '', sourceJsonPath: '', sourceLocation: 'body',
+      // targetEndpointIndices: one rule gets created per selected target — e.g. a session
+      // token pulled from Login's cookie, injected as a header into many APIs at once.
+      targetEndpointIndices: [], targetLocation: 'body', targetKey: '', varName: '', value: '', transform: '',
+      injectIfMissing: false,
+    };
+  }
+  function updateManualForm(collectionId, patch) {
+    setManualRuleForm(prev => ({ ...prev, [collectionId]: { ...manualFormFor(collectionId), ...patch } }));
+  }
+  function toggleManualFormTarget(collectionId, index) {
+    const f = manualFormFor(collectionId);
+    const next = f.targetEndpointIndices.includes(index)
+      ? f.targetEndpointIndices.filter(i => i !== index)
+      : [...f.targetEndpointIndices, index];
+    updateManualForm(collectionId, { targetEndpointIndices: next });
+  }
+
+  async function addManualCorrelation(collection) {
+    const f = manualFormFor(collection.id);
+    if (f.sourceEndpointIndex === '' || !f.sourceJsonPath.trim() || !f.targetEndpointIndices.length || !f.targetKey.trim()) {
+      toast('Source endpoint, source field, at least one target endpoint, and target key are required', 'warn');
+      return;
+    }
+    try {
+      const { data } = await api.post('/ai/correlations/manual', {
+        collection_id: collection.id, project_id: project.id,
+        sourceEndpointIndex: Number(f.sourceEndpointIndex), sourceJsonPath: f.sourceJsonPath.trim(), sourceLocation: f.sourceLocation,
+        targetEndpointIndex: f.targetEndpointIndices.map(Number), targetLocation: f.targetLocation,
+        targetKey: f.targetLocation === 'urlPath' ? Number(f.targetKey) : f.targetKey.trim(),
+        varName: f.varName.trim() || undefined,
+        value: f.value.trim() || undefined,
+        transform: f.transform || undefined,
+        injectIfMissing: f.targetLocation === 'header' ? f.injectIfMissing : undefined,
+      });
+      setCorrelationsByCollection(prev => ({ ...prev, [collection.id]: data.correlationRules }));
+      updateManualForm(collection.id, { open: false, sourceJsonPath: '', targetEndpointIndices: [], targetKey: '', varName: '', value: '', transform: '', injectIfMissing: false });
+      if (data.skipped?.length) {
+        toast(`${data.created.length} rule(s) added, ${data.skipped.length} skipped: ${data.skipped.map(s => s.reason).join('; ')}`, 'warn');
+      } else {
+        toast(`${data.created.length} correlation rule(s) added`, 'success');
+      }
+    } catch (e) {
+      toast(e.response?.data?.error || e.message || 'Failed to add correlation rule', 'error');
+    }
+  }
+
   function isPreRunFresh(c) {
     if (!c.pre_run_collection_hash) return false;
     return simpleHash(c.json_content || '') === c.pre_run_collection_hash;
+  }
+
+  // Display label for an endpoint index referenced by a correlation rule — falls back to
+  // the raw index if the collection's own endpoint list can't be parsed for some reason.
+  function epLabel(collection, index) {
+    try {
+      const eps = JSON.parse(collection.json_content || '[]');
+      const ep = eps[index];
+      return ep ? (ep.name || ep.url || `#${index}`) : `#${index}`;
+    } catch { return `#${index}`; }
+  }
+
+  const LOCATION_LABEL = { urlPath: 'URL path', query: 'query param', header: 'header', body: 'body field' };
+
+  // Matches backend/src/utils/transforms.js's TRANSFORMS registry exactly — keep in sync.
+  const TRANSFORM_OPTIONS = [
+    { value: '', label: '(none — copy value as-is)' },
+    { value: 'md5', label: 'MD5 hash (hex)' },
+    { value: 'sha1', label: 'SHA-1 hash (hex)' },
+    { value: 'sha256', label: 'SHA-256 hash (hex)' },
+    { value: 'urlEncode', label: 'URL-encode' },
+    { value: 'urlDecode', label: 'URL-decode' },
+    { value: 'upperCase', label: 'Upper case' },
+    { value: 'lowerCase', label: 'Lower case' },
+  ];
+
+  function getEndpointList(collection) {
+    try { return JSON.parse(collection.json_content || '[]'); } catch { return []; }
   }
 
   function onLogDragStart(e) {
@@ -341,7 +513,7 @@ export default function Collections({ project, collection: activeCollection, onN
                   </div>
                   <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
                     {responses && (
-                      <button className="btn-secondary btn-sm" onClick={() => setLogModalCollection(c)}>
+                      <button className="btn-secondary btn-sm" onClick={() => openLogModal(c)}>
                         <i className="ti ti-list-details" /> Show Logs
                       </button>
                     )}
@@ -361,7 +533,7 @@ export default function Collections({ project, collection: activeCollection, onN
                         <i className="ti ti-circle-x" /> {failCount} failed
                       </span>
                     )}
-                    <button className="btn-secondary btn-sm" onClick={() => setLogModalCollection(c)}>
+                    <button className="btn-secondary btn-sm" onClick={() => openLogModal(c)}>
                       <i className="ti ti-list-details" /> Show Logs
                     </button>
                   </div>
@@ -550,6 +722,7 @@ export default function Collections({ project, collection: activeCollection, onN
       {/* Pre-run Logs Modal */}
       {logModalCollection && (() => {
         const modalResponses = preRunData[logModalCollection.id] || [];
+        const modalCorrelations = correlationsByCollection[logModalCollection.id] || [];
         return (
           <div style={{ position: 'fixed', inset: 0, zIndex: 1000, pointerEvents: 'none' }}>
             <div style={{
@@ -574,6 +747,182 @@ export default function Collections({ project, collection: activeCollection, onN
                 </div>
                 <button className="btn-icon" onClick={() => setLogModalCollection(null)}><i className="ti ti-x" /></button>
               </div>
+              {/* Correlations detected — tokens/params/paths carried from one endpoint's
+                  response into a later one's request. Only 'confirmed' rules (or an
+                  unreviewed 'high' confidence auto-guess) are ever burned into a generated
+                  script — 'low' confidence guesses sit here until a human confirms them. */}
+              {(() => {
+                const manualForm = manualFormFor(logModalCollection.id);
+                const eps = getEndpointList(logModalCollection);
+                return (
+                <div style={{ borderBottom: '1px solid var(--color-border-secondary)', flexShrink: 0 }}>
+                  <div onClick={() => setCorrelationsOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 20px', cursor: 'pointer', userSelect: 'none' }}>
+                    <i className={`ti ti-chevron-${correlationsOpen ? 'down' : 'right'}`} style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }} />
+                    <i className="ti ti-link" style={{ fontSize: '14px', color: 'var(--accent)' }} />
+                    <span style={{ fontSize: '12px', fontWeight: 700 }}>Correlations</span>
+                    <span style={{ fontSize: '11px', padding: '1px 7px', borderRadius: '10px', background: 'var(--color-background-secondary)', fontWeight: 600 }}>{modalCorrelations.length}</span>
+                    {modalCorrelations.some(r => r.status === 'auto' && r.confidence === 'low') && (
+                      <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: 'rgba(240,167,50,0.15)', color: 'var(--warn)' }}>
+                        {modalCorrelations.filter(r => r.status === 'auto' && r.confidence === 'low').length} need review
+                      </span>
+                    )}
+                  </div>
+                  {correlationsOpen && (
+                    // Capped + independently scrollable so this section (rule list + the
+                    // manual-add form, which can get tall once its target-endpoint
+                    // checklist and every field is showing) can never squeeze the endpoint
+                    // response list below down to zero height via flexShrink — without this
+                    // cap, adding more correlations left nothing to scroll to see the
+                    // endpoints that were actually fired in pre-run.
+                    <div style={{ padding: '0 20px 12px 20px', display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '340px', overflowY: 'auto' }}>
+                      {modalCorrelations.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '220px', overflowY: 'auto' }}>
+                          {modalCorrelations.map(rule => {
+                            const badgeColor = rule.status === 'confirmed' ? '#00c896' : rule.status === 'rejected' ? 'var(--danger)' : rule.confidence === 'high' ? 'var(--accent)' : 'var(--warn)';
+                            const badgeLabel = rule.status === 'confirmed' ? 'CONFIRMED' : rule.status === 'rejected' ? 'REJECTED' : rule.confidence === 'high' ? 'AUTO (HIGH)' : 'NEEDS REVIEW';
+                            return (
+                              <div key={rule.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '7px 10px', borderRadius: '6px', background: 'var(--color-background-secondary)', fontSize: '11px' }}>
+                                <span style={{ fontWeight: 700, padding: '2px 6px', borderRadius: '4px', background: `${badgeColor}22`, color: badgeColor, flexShrink: 0 }}>{badgeLabel}</span>
+                                <span style={{ flex: 1, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  <strong>{epLabel(logModalCollection, rule.sourceEndpointIndex)}</strong> ({rule.sourceJsonPath}) &rarr;{' '}
+                                  <strong>{epLabel(logModalCollection, rule.targetEndpointIndex)}</strong> {LOCATION_LABEL[rule.targetLocation] || rule.targetLocation}
+                                  {rule.targetLocation !== 'urlPath' ? ` "${rule.targetKey}"` : ''} as <code>${'{' + rule.varName + '}'}</code>
+                                  {rule.transform ? <> via <code>{rule.transform}</code></> : null}
+                                </span>
+                                {rule.status !== 'confirmed' && (
+                                  <button className="btn-secondary btn-sm" style={{ fontSize: '10px', padding: '2px 8px', color: '#00c896', flexShrink: 0 }}
+                                    onClick={() => setCorrelationStatus(logModalCollection, rule, 'confirmed')}>Confirm</button>
+                                )}
+                                {rule.status !== 'rejected' && (
+                                  <button className="btn-secondary btn-sm" style={{ fontSize: '10px', padding: '2px 8px', color: 'var(--danger)', flexShrink: 0 }}
+                                    onClick={() => setCorrelationStatus(logModalCollection, rule, 'rejected')}>Reject</button>
+                                )}
+                                <button className="btn-icon" style={{ fontSize: '10px', padding: '2px 6px', flexShrink: 0, color: 'var(--danger)' }}
+                                  title="Delete this rule permanently"
+                                  onClick={() => deleteCorrelation(logModalCollection, rule)}><i className="ti ti-trash" /></button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* Manual add — the fallback for anything auto-detection missed: a
+                          transformed value, a source it couldn't confidently match, a
+                          value that only appears in a format detection doesn't scan. */}
+                      {!manualForm.open ? (
+                        <button className="btn-secondary btn-sm" style={{ fontSize: '11px', alignSelf: 'flex-start' }}
+                          onClick={() => updateManualForm(logModalCollection.id, { open: true })}>
+                          <i className="ti ti-plus" /> Add correlation
+                        </button>
+                      ) : (
+                        <div style={{ padding: '12px', borderRadius: '8px', border: '1px dashed var(--color-border-secondary)', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                          <FieldLabel text="Source endpoint">
+                            <select value={manualForm.sourceEndpointIndex} onChange={e => updateManualForm(logModalCollection.id, { sourceEndpointIndex: e.target.value })}
+                              style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }}>
+                              <option value="">Select the endpoint whose response has the value…</option>
+                              {eps.map((ep, i) => <option key={i} value={i}>{i}: {ep.method || 'GET'} {ep.name || ep.url}</option>)}
+                            </select>
+                          </FieldLabel>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            <div style={{ width: '110px', flexShrink: 0 }}>
+                              <FieldLabel text="Source location">
+                                <select value={manualForm.sourceLocation} onChange={e => updateManualForm(logModalCollection.id, { sourceLocation: e.target.value })}
+                                  style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }}>
+                                  <option value="body">body</option>
+                                  <option value="header">header</option>
+                                  <option value="cookie">cookie</option>
+                                </select>
+                              </FieldLabel>
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <FieldLabel text="Field name">
+                                <input value={manualForm.sourceJsonPath} onChange={e => updateManualForm(logModalCollection.id, { sourceJsonPath: e.target.value })}
+                                  placeholder={manualForm.sourceLocation === 'body' ? 'e.g. accessToken (or full path $.data.token)' : 'e.g. sessionId'}
+                                  style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }} />
+                              </FieldLabel>
+                            </div>
+                          </div>
+
+                          <FieldLabel text={`Target endpoint(s) — select one or more${manualForm.targetEndpointIndices.length ? ` (${manualForm.targetEndpointIndices.length} selected)` : ''}`}>
+                            <div style={{
+                              display: 'flex', flexDirection: 'column', gap: '2px', maxHeight: '140px', overflowY: 'auto',
+                              border: '1px solid var(--color-border-secondary)', borderRadius: '6px', padding: '6px', boxSizing: 'border-box',
+                            }}>
+                              {eps.map((ep, i) => (
+                                <label key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', padding: '3px 4px', cursor: 'pointer', borderRadius: '4px' }}>
+                                  <input type="checkbox" checked={manualForm.targetEndpointIndices.includes(i)}
+                                    onChange={() => toggleManualFormTarget(logModalCollection.id, i)} />
+                                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{i}: {ep.method || 'GET'} {ep.name || ep.url}</span>
+                                </label>
+                              ))}
+                            </div>
+                          </FieldLabel>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            <div style={{ width: '140px', flexShrink: 0 }}>
+                              <FieldLabel text="Target location">
+                                <select value={manualForm.targetLocation} onChange={e => updateManualForm(logModalCollection.id, { targetLocation: e.target.value })}
+                                  style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }}>
+                                  <option value="urlPath">URL path segment</option>
+                                  <option value="query">query param</option>
+                                  <option value="header">header</option>
+                                  <option value="body">body field</option>
+                                </select>
+                              </FieldLabel>
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <FieldLabel text="Target key">
+                                <input value={manualForm.targetKey} onChange={e => updateManualForm(logModalCollection.id, { targetKey: e.target.value })}
+                                  placeholder={manualForm.targetLocation === 'urlPath' ? 'segment index, e.g. 2' : manualForm.targetLocation === 'body' ? 'field name, e.g. orderId' : 'name'}
+                                  style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }} />
+                              </FieldLabel>
+                            </div>
+                          </div>
+
+                          {manualForm.targetLocation === 'header' && (
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', cursor: 'pointer' }}>
+                              <input type="checkbox" checked={manualForm.injectIfMissing}
+                                onChange={e => updateManualForm(logModalCollection.id, { injectIfMissing: e.target.checked })} />
+                              Always add this header, even on endpoints that never recorded it
+                            </label>
+                          )}
+
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <FieldLabel text="Variable name (optional)">
+                                <input value={manualForm.varName} onChange={e => updateManualForm(logModalCollection.id, { varName: e.target.value })}
+                                  placeholder="auto-suggested from the field name" style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }} />
+                              </FieldLabel>
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <FieldLabel text="Transform (optional)">
+                                <select value={manualForm.transform} onChange={e => updateManualForm(logModalCollection.id, { transform: e.target.value })}
+                                  style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }}>
+                                  {TRANSFORM_OPTIONS.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                                </select>
+                              </FieldLabel>
+                            </div>
+                          </div>
+
+                          {!manualForm.injectIfMissing && (
+                            <FieldLabel text="Explicit value override (optional — only needed if the target field wraps the value, e.g. a header reading Bearer <token>)">
+                              <input value={manualForm.value} onChange={e => updateManualForm(logModalCollection.id, { value: e.target.value })}
+                                placeholder="the exact substring to replace" style={{ width: '100%', fontSize: '11px', boxSizing: 'border-box' }} />
+                            </FieldLabel>
+                          )}
+
+                          <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                            <button className="btn-secondary btn-sm" style={{ fontSize: '11px' }}
+                              onClick={() => updateManualForm(logModalCollection.id, { open: false })}>Cancel</button>
+                            <button className="btn-primary btn-sm" style={{ fontSize: '11px' }}
+                              onClick={() => addManualCorrelation(logModalCollection)}>Add</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                );
+              })()}
               {/* Body */}
               <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
                 {modalResponses.map((r, idx) => {
@@ -605,6 +954,11 @@ export default function Collections({ project, collection: activeCollection, onN
                             <i className="ti ti-wand" /> Fix with AI
                           </button>
                         )}
+                        <button className="btn-icon" style={{ fontSize: '10px', padding: '3px 6px', flexShrink: 0, color: 'var(--danger)' }}
+                          title="Remove this endpoint from the collection"
+                          onClick={e => { e.stopPropagation(); deleteEndpoint(logModalCollection, idx, `${r.method || 'GET'} ${r.url || r.endpoint}`); }}>
+                          <i className="ti ti-trash" />
+                        </button>
                       </div>
                       {healState[key]?.showing && !healState[key]?.loading && (
                         <div style={{ padding: '0 20px 12px 44px' }}>

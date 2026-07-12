@@ -11,6 +11,7 @@ const { parseCurl } = require('../utils/parseCurl');
 const { parseCollection, parsePostmanEnvironment, extractCollectionVariables } = require('../utils/parseCollection');
 const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
 const { resolveUrlSet } = require('../utils/preRunEngine');
+const { reindexAfterEndpointRemoval } = require('../utils/correlationEngine');
 
 /**
  * Auto-populate project config URLs from a collection's parsed endpoints.
@@ -438,6 +439,59 @@ router.delete('/:id', async (req, res) => {
   resetSequence('test_suites');
   resetSequence('collections');
   res.json({ ok: true });
+});
+
+// Deletes one or more recorded endpoints (by array index into json_content) from a
+// collection — the fallback for pruning garbage/noise traffic (static asset requests,
+// framework prefetch calls, etc.) that got swept up during recording, with no dedicated
+// per-endpoint edit UI otherwise. Every endpoint reference elsewhere (correlationRules,
+// fieldGenerators, endpointOverrides — all in collection_env_config, keyed by array INDEX
+// not a stable id) must be reindexed in lockstep across EVERY env for this collection, or
+// deleting index 5 out of 41 would silently misdirect every rule/generator/override that
+// pointed at index 6+ toward the wrong (shifted) endpoint.
+router.post('/:id/endpoints/delete', async (req, res) => {
+  const proj = await ownsProject(req.userId, req.params.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  if (!col) return res.status(404).json({ error: 'Collection not found — it may have been deleted in another session.' });
+
+  const rawIndices = Array.isArray(req.body.indices) ? req.body.indices : [req.body.index];
+  const indices = rawIndices.map(Number);
+  if (!indices.length || indices.some(i => Number.isNaN(i))) {
+    return res.status(400).json({ error: 'indices (array of endpoint indices) or index (single) is required' });
+  }
+
+  let endpoints = [];
+  try { endpoints = JSON.parse(col.json_content || '[]'); } catch { return res.status(400).json({ error: 'Invalid collection data' }); }
+  const toDelete = [...new Set(indices)].filter(i => i >= 0 && i < endpoints.length);
+  if (!toDelete.length) return res.status(400).json({ error: 'No valid endpoint indices to delete' });
+
+  const remaining = endpoints.filter((_, i) => !toDelete.includes(i));
+  await db.prepare('UPDATE collections SET json_content = ? WHERE id = ?').run(JSON.stringify(remaining), req.params.id);
+
+  const envRows = await db.prepare('SELECT id, config_json FROM collection_env_config WHERE collection_id = ?').all(req.params.id);
+  for (const row of envRows) {
+    let cfg = {};
+    try { cfg = JSON.parse(row.config_json || '{}'); } catch {}
+    const reindexed = reindexAfterEndpointRemoval(cfg, toDelete);
+    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE id = ?').run(JSON.stringify(reindexed), row.id);
+  }
+
+  const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(req.params.id);
+
+  // Sync the workspace's config.json snapshot, same as the PUT route above — otherwise it
+  // keeps listing endpoints that no longer exist until some unrelated edit refreshes it.
+  try {
+    const { getUserProjectPath, isAdminWorkspace } = require('../utils/projectFolders');
+    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, projRow?.name || '');
+    if (userProjPath && !isAdminWorkspace(userProjPath)) writeCollectionConfig(updatedCol, userProjPath);
+  } catch (e) {
+    console.warn('[Collections] Config sync after endpoint delete failed:', e.message);
+  }
+
+  res.json({ collection: updatedCol, deletedCount: toDelete.length });
 });
 
 module.exports = router;
