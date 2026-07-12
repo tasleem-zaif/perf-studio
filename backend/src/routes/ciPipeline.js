@@ -1304,7 +1304,7 @@ pipelines:
           // `workflow_dispatch` entirely) in place. Copy just the generated files aside on
           // disk instead — not through git — so the checkout can proceed, then restore
           // them once we're on the right branch. This can never lose the payload.
-          const asideDir = path.join(os.tmpdir(), `peako-generate-yaml-aside-${process.pid}-${Math.floor(process.hrtime.bigint() % 1000000n)}`);
+          const asideDir = path.join(os.tmpdir(), `peako-generate-yaml-aside-${process.pid}-${Date.now()}`);
           const savedFiles = [];
           for (const f of created) {
             const src = path.join(gitRoot, f);
