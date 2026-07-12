@@ -5,11 +5,16 @@ const { writeFileSync } = require('fs');
 const db = require('../db');
 const auth = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
-const { callAi } = require('../utils/aiClient');
 const { readCsv } = require('../utils/csvUtils');
 const resetSequence = require('../utils/resetSequence');
 const { updateCollectionConfigs, updateProjectCollectionConfigs } = require('../utils/configWriter');
 const { TOKEN_KEYS, fingerprintMatches, resolveUrlSet, resolveForScript } = require('../utils/preRunEngine');
+const {
+  filterApplicableRules, groupRulesBySource, groupRulesByTarget, substituteCorrelatedLiterals,
+  jsonPathToOptionalChain, k6HeaderAccessor, k6CookieAccessor, toK6TemplateLiteral,
+} = require('../utils/scriptCorrelation');
+const { applyFieldGenerators, groupGeneratorsByTarget } = require('../utils/fieldGenerators');
+const { K6_CRYPTO_TRANSFORMS } = require('../utils/transforms');
 
 const DEFAULT_CONFIG = { protocol: 'https', url: '', port: '443', threads: 50, rampup: 30, loop: 1, duration: 300 };
 
@@ -19,8 +24,6 @@ const THREAD_GROUPS = {
   spike:     'kg.apc.jmeter.threads.arrivals.ArrivalsThreadGroup',
   endurance: 'kg.apc.jmeter.threads.ConcurrencyThreadGroup',
 };
-
-const TEST_TYPE_LABELS = { load: 'Load Test', stress: 'Stress Test', spike: 'Spike Test', endurance: 'Endurance Test' };
 
 router.use(auth);
 
@@ -374,6 +377,94 @@ function listenerXml(testname, guiclass) {
       </ResultCollector>`;
 }
 
+// Response status-code assertion (JMeter's equivalent of k6's check() call) — every
+// sampler gets one, matching k6's per-request `status is 2xx/3xx` check, so JMX and k6
+// validate responses to the same standard rather than JMX silently treating a 404/500 as
+// just "a response that happened" (JMeter, unlike k6, doesn't fail a sample on a non-2xx
+// status by default — only a connection error counts as a JMeter failure without this).
+//
+// Property keys/values verified directly against JMeter's own ResponseAssertion.java
+// source (not guessed): the collection-of-patterns property really is spelled
+// "Asserion.test_strings" (missing the second "s") — a typo baked into JMeter itself since
+// early versions and kept for file-format compatibility. Getting this "typo" wrong (i.e.
+// "fixing" it to the correct spelling) would make JMeter silently ignore the assertion.
+function responseAssertionXml(testname) {
+  return [
+    `          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="${xmlEsc(testname)}" enabled="true">`,
+    `            <collectionProp name="Asserion.test_strings">`,
+    `              <stringProp name="0">[23]\\d\\d</stringProp>`,
+    `            </collectionProp>`,
+    `            <stringProp name="Assertion.custom_message"></stringProp>`,
+    `            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>`,
+    `            <boolProp name="Assertion.assume_success">false</boolProp>`,
+    `            <intProp name="Assertion.test_type">1</intProp>`,
+    `          </ResponseAssertion>`,
+    `          <hashTree/>`,
+  ].join('\n');
+}
+
+// Think-time pacing between requests — JMeter's equivalent of k6's `sleep(1)` between
+// every http call. A Timer applies to every sampler within its own scope, so ONE
+// ConstantTimer declared at the Thread Group level (see buildJmxTemplate) paces every
+// sampler in the whole test, rather than needing one copy per sampler.
+function constantTimerXml(delayMs, testname) {
+  return [
+    `        <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="${xmlEsc(testname)}" enabled="true">`,
+    `          <stringProp name="ConstantTimer.delay">${delayMs}</stringProp>`,
+    `        </ConstantTimer>`,
+    `        <hashTree/>`,
+  ].join('\n');
+}
+
+// Extractor for a value sourced from a RESPONSE HEADER rather than the JSON body (e.g. a
+// `Location` header on a 201 Created, or a session token returned via a custom header) —
+// a RegexExtractor with useHeaders=true, searching the raw header block text. Property
+// keys/shape verified against a real captured .jmx (not guessed): RegexExtractor.useHeaders
+// is the stringProp "true"/"false" switch, template uses Perl "$1$" group syntax.
+//
+// The regex's header-name portion is wrapped in the inline case-insensitive flag `(?i)` —
+// preRunEngine.js's response header names come from the Fetch API's Headers.entries(),
+// which the spec always normalizes to lowercase, but the REAL header text JMeter searches
+// at runtime keeps whatever casing the target server actually sends (e.g. "Location", not
+// "location"). Without (?i) a header detected as "location" would never match a live
+// server that sends "Location", silently breaking the exact thing this extractor is for.
+function headerRegexExtractorXml(headerName, varName) {
+  const pattern = `(?i)${headerName}:\\s*(.+)`;
+  return [
+    `          <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Header Extractor - ${xmlEsc(varName)}" enabled="true">`,
+    `            <stringProp name="RegexExtractor.useHeaders">true</stringProp>`,
+    `            <stringProp name="RegexExtractor.refname">${xmlEsc(varName)}</stringProp>`,
+    `            <stringProp name="RegexExtractor.regex">${xmlEsc(pattern)}</stringProp>`,
+    `            <stringProp name="RegexExtractor.template">$1$</stringProp>`,
+    `            <stringProp name="RegexExtractor.default">NOT_FOUND</stringProp>`,
+    `            <stringProp name="RegexExtractor.match_number">1</stringProp>`,
+    `          </RegexExtractor>`,
+    `          <hashTree/>`,
+  ].join('\n');
+}
+
+// Extractor for a value sourced from a COOKIE — cookies arrive as `Set-Cookie` response
+// headers, so this is the same RegexExtractor/useHeaders mechanism as headerRegexExtractorXml
+// above, just with a pattern matching `cookieName=value` (stopping at the next `;` — the
+// rest of a Set-Cookie header is attributes like Path/HttpOnly/Max-Age, not part of the
+// value) instead of `headerName: value`. Case-insensitive on the cookie name for the same
+// reason as headers, even though cookie names are technically case-sensitive per spec —
+// being lenient here costs nothing and matches this app's lowercase-normalized detection.
+function cookieRegexExtractorXml(cookieName, varName) {
+  const pattern = `(?i)${cookieName}=([^;\\r\\n]+)`;
+  return [
+    `          <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Cookie Extractor - ${xmlEsc(varName)}" enabled="true">`,
+    `            <stringProp name="RegexExtractor.useHeaders">true</stringProp>`,
+    `            <stringProp name="RegexExtractor.refname">${xmlEsc(varName)}</stringProp>`,
+    `            <stringProp name="RegexExtractor.regex">${xmlEsc(pattern)}</stringProp>`,
+    `            <stringProp name="RegexExtractor.template">$1$</stringProp>`,
+    `            <stringProp name="RegexExtractor.default">NOT_FOUND</stringProp>`,
+    `            <stringProp name="RegexExtractor.match_number">1</stringProp>`,
+    `          </RegexExtractor>`,
+    `          <hashTree/>`,
+  ].join('\n');
+}
+
 function isLoginEp(ep) {
   const n = (ep.name || ep.testname || '').toLowerCase();
   const p = (ep.path || ep.url || '').toLowerCase();
@@ -438,6 +529,16 @@ function applyOverridePlaceholders(str, capturedFields) {
 function toJmeterVar(v) {
   // Convert Postman {{var}} → JMeter ${var}
   return String(v ?? '').replace(/\{\{(\w+)\}\}/g, '$${$1}');
+}
+
+// True when a query-param value is already a `${...}` reference — a correlation variable,
+// a transform-wrapped expression (which itself nests another `${...}` inside, e.g.
+// `${__digest(MD5,${x},,,)}`), or a CSV/generator placeholder — rather than a literal
+// string that still needs percent-encoding. Anchored to the whole string (not just a
+// prefix) so a literal value that merely happens to CONTAIN "${" text somewhere isn't
+// mistaken for a full placeholder.
+function isPlaceholderRef(v) {
+  return typeof v === 'string' && /^\$\{[\s\S]*\}$/.test(v);
 }
 
 // Resolves {{var}} tokens in a request body/header/query-param value against the
@@ -576,8 +677,79 @@ function substituteCSVVars(body, csvCols) {
   return result;
 }
 
-function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, override, capturedFields, variables) {
-  const { name, method, path: epPath, headers, body: rawBody, queryParams } = normalizeEp(ep, variables);
+// Full nested folder path for an endpoint — parseCollection.js's `folderPath` is the whole
+// ancestor chain ("Auth / Login / Sub"), while `folder` is only the first (top-level)
+// ancestor; prefer folderPath so nested Postman folders become nested Simple Controllers
+// instead of being flattened into one top-level group.
+function folderPathSegments(ep) {
+  if (ep.folderPath) return ep.folderPath.split(' / ').filter(Boolean);
+  if (ep.folder) return [ep.folder];
+  return [];
+}
+
+// Builds a tree mirroring the recorded folder hierarchy: { order, children: Map<name,node>,
+// endpoints } — `order` preserves first-seen folder order (so output order is stable and
+// predictable), `endpoints` holds whatever sits directly at that level (no subfolder).
+function buildFolderTree(endpoints) {
+  const root = { order: [], children: new Map(), endpoints: [] };
+  for (const ep of endpoints) {
+    let node = root;
+    for (const seg of folderPathSegments(ep)) {
+      if (!node.children.has(seg)) {
+        node.children.set(seg, { order: [], children: new Map(), endpoints: [] });
+        node.order.push(seg);
+      }
+      node = node.children.get(seg);
+    }
+    node.endpoints.push(ep);
+  }
+  return root;
+}
+
+function indentBlock(str, spaces) {
+  const pad = ' '.repeat(spaces);
+  return str.split('\n').map(l => pad + l).join('\n');
+}
+
+// Recursively emits a folder tree node: endpoints sitting directly at this level first
+// (no wrapper), then each subfolder as a nested Simple Controller (GenericController) —
+// JMeter allows a controller's hashTree to mix samplers and further controllers as
+// siblings, so a folder with both its own endpoints AND subfolders is naturally supported.
+// `ctx` carries everything a sampler needs (see buildSamplerXml's params) plus the shared
+// login/token-extraction state, threaded by reference so it stays correct across recursion.
+function renderFolderNode(node, ctx) {
+  const parts = [];
+  for (const ep of node.endpoints) {
+    const isLogin = ep === ctx.loginEp;
+    parts.push(buildSamplerXml(
+      ep, isLogin, ctx.tokenState.extracted ? ctx.tokenVar : null,
+      ctx.allCsvCols, ctx.csvValueMap, ctx.hostVarsFor(ep), ctx.overrideFor(ep),
+      ctx.capturedFields, ctx.variables, ctx.sourceFieldsFor(ep), ctx.targetRulesFor(ep), ctx.generatorRulesFor(ep),
+    ));
+    if (isLogin) ctx.tokenState.extracted = true;
+  }
+  for (const name of node.order) {
+    const childXml = renderFolderNode(node.children.get(name), ctx);
+    parts.push([
+      `        <GenericController guiclass="LogicControllerGui" testclass="GenericController" testname="${xmlEsc(name)}" enabled="true">`,
+      `          <stringProp name="TestPlan.comments"></stringProp>`,
+      `        </GenericController>`,
+      `        <hashTree>`,
+      indentBlock(childXml, 2),
+      `        </hashTree>`,
+    ].join('\n'));
+  }
+  return parts.join('\n');
+}
+
+function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, override, capturedFields, variables, sourceFields, targetRules, generatorRules) {
+  // Full correlation (tokens, query params, path segments, body fields) rewrites the
+  // endpoint's own recorded literals to ${var} BEFORE anything else touches them (override
+  // merge, CSV substitution) — those only ever act on values that are still literal. A
+  // user-attached generator (fieldGenerators.js) runs right after — its own stale-value
+  // guard means it silently no-ops on anything correlation already replaced.
+  const preGenerated = substituteCorrelatedLiterals(normalizeEp(ep, variables), targetRules, 'jmeter');
+  const { name, method, path: epPath, headers, body: rawBody, queryParams } = applyFieldGenerators(preGenerated, generatorRules, 'jmeter');
   const { protocol: protoVar = 'PROTOCOL', server: serverVar = 'SERVER', port: portVar = 'PORT' } = hostVars || {};
   const lines = [];
   // A saved per-endpoint fix (endpointOverrides, from pre-run's "Fix with AI" action)
@@ -602,6 +774,13 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
         resolvedVal = `\${${k}}`;
       } else if (csvValueMap && csvValueMap.has(String(v).toLowerCase())) {
         resolvedVal = `\${${csvValueMap.get(String(v).toLowerCase())}}`;
+      } else if (isPlaceholderRef(v)) {
+        // Already a correlation/generator ${...} reference (or a transform-wrapped one) —
+        // percent-encoding it here would corrupt the placeholder text itself (e.g. "${" ->
+        // "%24%7B"), which JMeter would then send to the server literally instead of
+        // resolving. Pass it through untouched; JMeter resolves the reference at runtime,
+        // encoding whatever real value comes out of it via the sampler's own handling.
+        resolvedVal = v;
       } else {
         resolvedVal = encodeURIComponent(String(v));
       }
@@ -663,16 +842,30 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
   // Sampler hashTree: HeaderManager + optional JSONPostProcessor
   lines.push(`        <hashTree>`);
   const headerEntries = [{ name: 'Content-Type', value: 'application/json' }];
-  if (!isLogin && tokenVar) headerEntries.push({ name: 'Authorization', value: `Bearer \${${tokenVar}}` });
-  // Merge any custom headers from endpoint (skip Content-Type already added)
+  // Recorded/correlated headers are added FIRST so a specific correlation rule (e.g. this
+  // endpoint's Authorization needs ${refreshToken}, not the blanket default) wins; the
+  // blanket "any non-login request gets the default token" fallback below only fires when
+  // this endpoint recorded no Authorization header of its own to correlate.
   for (const [k, v] of Object.entries(headers)) {
     if (!headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase()))
       headerEntries.push({ name: k, value: String(v) });
   }
-  // A saved per-endpoint fix always wins — add or replace by header name (e.g. swap the
-  // default accessToken Authorization value for {{captured:refreshToken}}'s JMeter var).
+  if (!isLogin && tokenVar && !headerEntries.find(h => h.name.toLowerCase() === 'authorization')) {
+    headerEntries.push({ name: 'Authorization', value: `Bearer \${${tokenVar}}` });
+  }
+  // A saved per-endpoint fix normally wins — add or replace by header name (e.g. swap the
+  // default accessToken Authorization value for {{captured:refreshToken}}'s JMeter var) —
+  // UNLESS a confirmed correlation rule already targets this exact header, in which case
+  // the rule wins instead. The rule is the newer, more reliable source of truth (it threads
+  // a real live value through detection, not a static AI guess); an override predating that
+  // rule commonly references a field `capturedFields` has no entry for at all (e.g. a
+  // cookie-sourced value — detectCapturedFields below never covers cookies), so applying it
+  // here would silently bake an unresolvable {{captured:X}} placeholder — syntax JMeter has
+  // never supported — directly into the script, clobbering output the rule already got right.
   if (override?.headers) {
+    const correlatedHeaderKeys = new Set((targetRules || []).filter(r => r.targetLocation === 'header').map(r => String(r.targetKey).toLowerCase()));
     for (const [k, v] of Object.entries(override.headers)) {
+      if (correlatedHeaderKeys.has(k.toLowerCase())) continue;
       const translated = toJmeterVar(applyOverridePlaceholders(String(v), capturedFields || {}));
       const existing = headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase());
       if (existing) existing.value = translated;
@@ -690,15 +883,29 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
   lines.push(`            </collectionProp>`);
   lines.push(`          </HeaderManager>`);
   lines.push(`          <hashTree/>`);
+  lines.push(responseAssertionXml(`${name} status is 2xx/3xx`));
 
-  if (isLogin) {
-    // One extractor per captured field (not just the default) — a per-endpoint override
-    // elsewhere in the script may reference a different field (e.g. refreshToken) than
-    // the default Authorization value, so its JMeter variable must exist too.
-    const fieldsToExtract = capturedFields && Object.keys(capturedFields).length
-      ? Object.values(capturedFields)
-      : [{ varName: tokenVar || 'accessToken', jsonPath: tokenVar ? `$.${tokenVar.replace(/_/g, '')}` : '$.accessToken' }];
-    for (const { varName, jsonPath } of fieldsToExtract) {
+  // One extractor per confirmed correlation rule sourced from THIS endpoint's response —
+  // not just the login endpoint's token fields anymore. Falls back to the legacy
+  // login-only token detection only when this collection has no correlationRules at all
+  // yet (e.g. pre-run hasn't been re-run since upgrading), so older scripts keep working.
+  const fieldsToExtract = (sourceFields && sourceFields.length)
+    ? sourceFields
+    : (isLogin
+        ? (capturedFields && Object.keys(capturedFields).length
+            ? Object.values(capturedFields)
+            : [{ varName: tokenVar || 'accessToken', jsonPath: tokenVar ? `$.${tokenVar.replace(/_/g, '')}` : '$.accessToken' }])
+        : []);
+  if (fieldsToExtract.length) {
+    for (const { varName, jsonPath, sourceLocation } of fieldsToExtract) {
+      if (sourceLocation === 'header') {
+        lines.push(headerRegexExtractorXml(jsonPath, varName));
+        continue;
+      }
+      if (sourceLocation === 'cookie') {
+        lines.push(cookieRegexExtractorXml(jsonPath, varName));
+        continue;
+      }
       lines.push(`          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="JSON Extractor - ${xmlEsc(varName)}" enabled="true">`);
       lines.push(`            <stringProp name="JSONPostProcessor.referenceNames">${xmlEsc(varName)}</stringProp>`);
       lines.push(`            <stringProp name="JSONPostProcessor.jsonPathExprs">${xmlEsc(jsonPath)}</stringProp>`);
@@ -797,6 +1004,22 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     const saved = endpointOverrides[epIndexOf.get(ep)];
     return fingerprintMatches(ep, saved) ? saved : null;
   }
+
+  // Full correlation — tokens, query params, path segments, body fields — from
+  // collection_env_config.correlationRules (utils/correlationEngine.js + ai.js's
+  // /pre-run route). Only rules a human confirmed, or detection was confident about,
+  // are ever burned into the script (see scriptCorrelation.filterApplicableRules).
+  const correlationRules = filterApplicableRules(cfg.correlationRules);
+  const rulesBySource = groupRulesBySource(correlationRules);
+  const rulesByTarget = groupRulesByTarget(correlationRules);
+  function sourceFieldsFor(ep) { return rulesBySource.get(epIndexOf.get(ep)) || []; }
+  function targetRulesFor(ep) { return rulesByTarget.get(epIndexOf.get(ep)) || []; }
+
+  // User-attached generators (fieldGenerators.js) for a recorded literal that never came
+  // from any earlier response — a unique email/username/idempotency key. Always
+  // user-authored (see groupGeneratorsByTarget), never auto-detected.
+  const generatorsByTarget = groupGeneratorsByTarget(cfg.fieldGenerators);
+  function generatorRulesFor(ep) { return generatorsByTarget.get(epIndexOf.get(ep)) || []; }
 
   // User Defined Variables — rt:true vars use ${__P(NAME,default)} so they can be
   // overridden at run time: jmeter -n -t script.jmx -JTHREADS=100 -JDURATION=600 -JRAMP_UP=60
@@ -938,61 +1161,32 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
     L.push(`        <hashTree/>`);
   }
 
+  // Think-time pacing — one Timer at Thread Group scope applies to every sampler beneath
+  // it, matching k6's flat `sleep(1)` between every request without needing a copy per
+  // sampler (see constantTimerXml's comment for why scope alone is enough).
+  L.push(constantTimerXml(1000, 'Think Time'));
+
   // HTTP Samplers — grouped by folder using Simple Controllers when folders exist.
-  // Login endpoint always comes first regardless of folder.
-  let tokenExtracted = false;
-  const ordered = loginEp
+  // Login endpoint always comes first regardless of folder — UNLESS it's itself a
+  // correlation target (depends on a value from some other endpoint's response), in which
+  // case moving it to position 0 would emit it before its own source's extractor exists.
+  // Every other correlation source→target pair is already safe: detectCorrelations only
+  // ever points backward in the original endpoints array, and reordering everything else
+  // around login preserves each pair's original relative order.
+  const loginHasInboundCorrelation = loginEp && targetRulesFor(loginEp).length > 0;
+  const ordered = (loginEp && !loginHasInboundCorrelation)
     ? [loginEp, ...endpoints.filter(e => e !== loginEp)]
     : [...endpoints];
 
-  // Check if any endpoint has folder info
-  const hasFolders = ordered.some(e => e.folder);
-
-  if (!hasFolders) {
-    // Flat list — emit samplers directly under ThreadGroup
-    for (const ep of ordered) {
-      const isLogin = ep === loginEp;
-      const activeToken = tokenExtracted ? tokenVar : null;
-      L.push(buildSamplerXml(ep, isLogin, activeToken, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables));
-      if (isLogin) tokenExtracted = true;
-    }
-  } else {
-    // Group by folder — login endpoint (if any) gets its own group or goes into its natural folder
-    // Build ordered list of [folderName, ep[]] preserving first-seen folder order
-    const folderMap = new Map(); // folderName → ep[]
-    const NO_FOLDER = '__no_folder__';
-    for (const ep of ordered) {
-      const key = ep.folder || NO_FOLDER;
-      if (!folderMap.has(key)) folderMap.set(key, []);
-      folderMap.get(key).push(ep);
-    }
-
-    for (const [folderName, eps] of folderMap) {
-      if (folderName === NO_FOLDER) {
-        // Ungrouped endpoints — emit directly (no Simple Controller wrapper)
-        for (const ep of eps) {
-          const isLogin = ep === loginEp;
-          L.push(buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables));
-          if (isLogin) tokenExtracted = true;
-        }
-      } else {
-        // Wrap folder's endpoints in a Simple Controller (GenericController = JMeter Simple Controller)
-        L.push(`        <GenericController guiclass="LogicControllerGui" testclass="GenericController" testname="${xmlEsc(folderName)}" enabled="true">`);
-        L.push(`          <stringProp name="TestPlan.comments"></stringProp>`);
-        L.push(`        </GenericController>`);
-        L.push(`        <hashTree>`);
-        for (const ep of eps) {
-          const isLogin = ep === loginEp;
-          // Indent samplers one level deeper inside the Simple Controller
-          const samplerXml = buildSamplerXml(ep, isLogin, tokenExtracted ? tokenVar : null, allCsvCols, csvValueMap, hostVarsFor(ep), overrideFor(ep), capturedFields, variables)
-            .split('\n').map(line => '  ' + line).join('\n');
-          L.push(samplerXml);
-          if (isLogin) tokenExtracted = true;
-        }
-        L.push(`        </hashTree>`);
-      }
-    }
-  }
+  // Nested Simple Controllers mirroring each endpoint's full recorded folder path (not
+  // just the top-level folder) — an endpoint with no folder info at all just lands at the
+  // tree root and renders flat, with no wrapper, so this naturally covers the old
+  // no-folders case too.
+  const folderTree = buildFolderTree(ordered);
+  L.push(renderFolderNode(folderTree, {
+    loginEp, tokenVar, allCsvCols, csvValueMap, hostVarsFor, overrideFor, capturedFields,
+    variables, sourceFieldsFor, targetRulesFor, generatorRulesFor, tokenState: { extracted: false },
+  }));
 
   L.push(`      </hashTree>`); // ThreadGroup hashTree
   L.push(`    </hashTree>`);   // TestPlan hashTree
@@ -1005,7 +1199,110 @@ function generateJmx(userId, suite, collection, testDataFiles, cfg, endpoints, r
   return buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preRunData);
 }
 
-async function generateK6(userId, suite, collection, testDataFile, cfg, endpoints, rules, preRunData, testType) {
+// Builds one k6 http.*() call + its check() + any correlation extractors, from the same
+// normalizeEp()/substituteCorrelatedLiterals()/substituteCSVVars() pipeline buildSamplerXml
+// uses for JMX — a `${var}` placeholder those produce is valid JMeter property syntax AND
+// valid JS template-literal interpolation, so the exact same substitution output can be
+// embedded directly into a backtick-quoted k6 URL/body/header without any translation step.
+function buildK6Request(ep, index, ctx) {
+  const { isLogin, tokenVar, csvCols, csvValueMap, override, capturedFields, variables, sourceFields, targetRules, generatorRules } = ctx;
+
+  const correlated = substituteCorrelatedLiterals(normalizeEp(ep, variables), targetRules, 'k6');
+  const normalized = applyFieldGenerators(correlated, generatorRules, 'k6');
+  const { name, method, path: epPath, headers, body: rawBody, queryParams } = normalized;
+
+  let overrideBody = override?.body;
+  if (overrideBody !== undefined && typeof overrideBody !== 'string') overrideBody = JSON.stringify(overrideBody, null, 2);
+  let body = overrideBody !== undefined ? toJmeterVar(applyOverridePlaceholders(overrideBody, capturedFields || {})) : rawBody;
+
+  const isBody = ['POST', 'PUT', 'PATCH'].includes(method) && body;
+  if (isBody) body = substituteCSVVars(body, csvCols);
+
+  // Query params always fold into the URL for k6 — its http module has no separate
+  // "arguments" concept the way a JMeter sampler does.
+  const queryString = Object.entries(queryParams).map(([k, v]) => {
+    let val;
+    if (csvCols.includes(k)) val = `\${${k}}`;
+    else if (csvValueMap && csvValueMap.has(String(v).toLowerCase())) val = `\${${csvValueMap.get(String(v).toLowerCase())}}`;
+    // Already a correlation/generator ${...} reference — percent-encoding it here would
+    // corrupt the placeholder text itself and get sent to the server literally instead of
+    // k6 evaluating the real JS expression inside it at runtime.
+    else if (isPlaceholderRef(v)) val = v;
+    else val = encodeURIComponent(String(v));
+    return `${encodeURIComponent(k)}=${val}`;
+  }).join('&');
+  const fullPath = queryString ? `${epPath}${epPath.includes('?') ? '&' : '?'}${queryString}` : epPath;
+
+  // Headers — recorded/correlated headers win over the blanket token default (same
+  // precedence bug-fix as buildSamplerXml, for the same reason: a specific correlation
+  // rule must never be silently clobbered by the generic fallback), override wins last.
+  const headerEntries = { 'Content-Type': 'application/json' };
+  const keyByLower = { 'content-type': 'Content-Type' };
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (!(lower in keyByLower)) { keyByLower[lower] = k; headerEntries[k] = String(v); }
+  }
+  if (!isLogin && tokenVar && !('authorization' in keyByLower)) {
+    headerEntries['Authorization'] = `Bearer \${${tokenVar}}`;
+    keyByLower['authorization'] = 'Authorization';
+  }
+  // Same precedence fix as buildSamplerXml: a confirmed correlation rule targeting this
+  // exact header must win over a saved override, or a stale pre-rule override (often
+  // referencing a cookie-sourced {{captured:X}} that capturedFields never resolves) bakes
+  // invalid, unresolvable placeholder text into the script instead of the rule's correct output.
+  if (override?.headers) {
+    const correlatedHeaderKeys = new Set((targetRules || []).filter(r => r.targetLocation === 'header').map(r => String(r.targetKey).toLowerCase()));
+    for (const [k, v] of Object.entries(override.headers)) {
+      if (correlatedHeaderKeys.has(k.toLowerCase())) continue;
+      const translated = toJmeterVar(applyOverridePlaceholders(String(v), capturedFields || {}));
+      const existingKey = keyByLower[k.toLowerCase()] || k;
+      headerEntries[existingKey] = translated;
+      keyByLower[k.toLowerCase()] = existingKey;
+    }
+  }
+
+  const resVar = `res${index}`;
+  const k6Method = method === 'DELETE' ? 'del' : method.toLowerCase();
+  const urlExpr = '`${BASE_URL}' + toK6TemplateLiteral(fullPath) + '`';
+  const headerLines = Object.entries(headerEntries)
+    .map(([k, v]) => `        '${k.replace(/'/g, "\\'")}': \`${toK6TemplateLiteral(v)}\`,`)
+    .join('\n');
+
+  const lines = [];
+  lines.push(`  // ${name}`);
+  if (isBody) {
+    lines.push(`  let ${resVar} = http.${k6Method}(${urlExpr}, \`${toK6TemplateLiteral(body || '{}')}\`, {`);
+  } else {
+    lines.push(`  let ${resVar} = http.${k6Method}(${urlExpr}, {`);
+  }
+  lines.push(`    headers: {`);
+  lines.push(headerLines);
+  lines.push(`    },`);
+  lines.push(`  });`);
+  lines.push(`  check(${resVar}, { '${name.replace(/'/g, "\\'")} status is 2xx/3xx': (r) => r.status >= 200 && r.status < 400 });`);
+  for (const { varName, jsonPath, sourceLocation } of (sourceFields || [])) {
+    if (sourceLocation === 'header') {
+      lines.push(`  const ${varName} = ${k6HeaderAccessor(resVar, jsonPath)};`);
+    } else if (sourceLocation === 'cookie') {
+      lines.push(`  const ${varName} = ${k6CookieAccessor(resVar, jsonPath)};`);
+    } else {
+      lines.push(`  const ${varName} = ${resVar}.json()${jsonPathToOptionalChain(jsonPath)};`);
+    }
+  }
+  lines.push(`  sleep(1);`);
+  return lines.join('\n');
+}
+
+// Deterministic k6 script builder — mirrors buildJmxTemplate's structure and reuses the
+// exact same helpers (normalizeEp, detectCapturedFields, correlation grouping, CSV
+// substitution) so both engines apply identical correlation/CSV/override logic instead of
+// k6 depending on an LLM re-deriving it from a raw JSON dump on every generation.
+function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules, preRunData, testType) {
+  const variables = cfg.variables || {};
+  const vusers = suite.vusers || 50;
+  const rampup = suite.rampup || 30;
+  const duration = suite.duration || 300;
+
   // All executor configs reference the top-level constants (THREADS, DURATION, RAMP_UP)
   // which are read from __ENV so they can be overridden at run time:
   //   k6 run --env THREADS=100 --env DURATION=600 --env RAMP_UP=60 script.js
@@ -1027,97 +1324,115 @@ async function generateK6(userId, suite, collection, testDataFile, cfg, endpoint
     endurance: `scenarios: { endurance: { executor: 'constant-arrival-rate', rate: THREADS, timeUnit: '1s', duration: DURATION + 's', preAllocatedVUs: THREADS } }`,
   };
 
-  const thresholds = rules.map(r => {
-    if (r.metric === 'Response Time') return `  http_req_duration: ['p(95)<${r.value}']`;
-    if (r.metric === 'Error Rate') return `  http_req_failed: ['rate<${parseFloat(r.value) / 100}']`;
-    if (r.metric === 'Throughput') return `  http_reqs: ['rate>${r.value}']`;
+  const thresholds = (rules || []).map(r => {
+    if (r.metric === 'Response Time') return `    http_req_duration: ['p(95)<${r.value}']`;
+    if (r.metric === 'Error Rate') return `    http_req_failed: ['rate<${parseFloat(r.value) / 100}']`;
+    if (r.metric === 'Throughput') return `    http_reqs: ['rate>${r.value}']`;
     return null;
   }).filter(Boolean).join(',\n');
 
-  const testDataFiles = testDataFile ? [testDataFile] : [];
-  const csvSection = testDataFiles.length ? testDataFiles.map((f, i) => {
+  // CSV — k6 has no per-request "variable" concept like JMeter's CSVDataSet, so the
+  // current VU/iteration's row is destructured into bare variables matching each column
+  // name; a `${col}` placeholder from substituteCSVVars/substituteCorrelatedLiterals then
+  // just needs a same-named variable in scope to interpolate correctly.
+  let csvCols = [];
+  let csvValueMap = new Map();
+  let csvImportLines = '';
+  let csvSetupLines = '';
+  if (testDataFile) {
     let cols = [];
-    try { cols = JSON.parse(f.columns); } catch { cols = String(f.columns || '').split(',').map(c => c.trim()).filter(Boolean); }
-    const varName = testDataFiles.length === 1 ? 'testData' : `testData${i + 1}`;
-    return `
-TEST DATA FILE ${i + 1}: ${f.original_name || f.path}
-Load using SharedArray (name: "${varName}"):
-  const ${varName} = new SharedArray('${varName}', function() {
-    return papaparse.parse(open('${f.path}'), { header: true, skipEmptyLines: true }).data;
-  });
-CSV columns (exact names, case-insensitive matching): ${cols.join(', ')}
-- Access per-VU row: const row = ${varName}[(__VU - 1 + __ITER) % ${varName}.length];
-- Use row.<columnName> to get each value (column names are case-sensitive in the row object — use exact casing from the header).
-- CRITICAL: Scan every request body in the collection. For each JSON key that matches a CSV column name (case-insensitive), replace its value with the CSV variable regardless of whether the original value is a string, number, or boolean.
-  Example: if CSV has column "expiresInMins" and a request body has "expiresInMins": 30, replace with "expiresInMins": row.expiresInMins
-  Example: if CSV has column "username" and a request body has "username": "admin", replace with "username": row.username
-- Apply this substitution to ALL matched fields across ALL endpoints.`;
-  }).join('\n') : '';
-
-  const correlationSection = preRunData ? `
-CORRELATION:
-Pre-run responses below. Extract dynamic values (tokens, IDs) from responses using regex or jsonpath.
-Pass extracted values to subsequent requests.
-${JSON.stringify(preRunData, null, 2).slice(0, 2000)}
-` : '';
-
-  // Fixes previously verified via pre-run's "Fix with AI" heal action (cfg.endpointOverrides,
-  // stored on collection_env_config) — tell the AI exactly which endpoints needed a
-  // non-default value (e.g. a refresh token instead of the access token) so the generated
-  // script doesn't fail the same way pre-run originally did before that fix was applied.
-  const overrideEntries = Object.values(cfg.endpointOverrides || {});
-  const overrideSection = overrideEntries.length ? `
-PREVIOUSLY VERIFIED FIXES (apply the same approach to the matching endpoint below):
-${overrideEntries.map(o => `- ${o.method} "${o.name}": ${o.fix || 'requires a specific header/body override'}${o.headers ? ` — headers: ${JSON.stringify(o.headers)}` : ''}${o.body !== undefined ? ` — body: ${JSON.stringify(o.body)}` : ''}`).join('\n')}
-A value written as {{captured:KEY}} means: extract KEY from the response of whichever earlier request returns it (usually login) and use that captured value here, NOT a hardcoded string.
-` : '';
-
-  const systemPrompt = `You are an expert k6 v0.50 JavaScript performance test script generator.
-Output ONLY raw valid JavaScript. No markdown fences, no explanation.`;
-
-  const userPrompt = `Generate a complete k6 test script with these specifications:
-
-TEST TYPE: ${TEST_TYPE_LABELS[testType] || testType}
-SUITE NAME: ${suite.name}
-
-RUNTIME PARAMETERS — declare these constants at the very top of the file (before the options export).
-They read from __ENV so values can be overridden at run time without editing the script:
-// Runtime override: k6 run --env THREADS=100 --env DURATION=600 --env RAMP_UP=60 --env PROTOCOL=https --env URL=api.example.com --env PORT=443 script.js
-const THREADS  = parseInt(__ENV.THREADS  || '${cfg.threads}');
-const RAMP_UP  = parseInt(__ENV.RAMP_UP  || '${cfg.rampup}');
-const DURATION = parseInt(__ENV.DURATION || '${cfg.duration}');
-const PROTOCOL = __ENV.PROTOCOL || '${cfg.protocol}';
-const URL      = __ENV.URL      || '${cfg.url}';
-const PORT     = __ENV.PORT     || '${cfg.port}';
-const BASE_URL = \`\${PROTOCOL}://\${URL}:\${PORT}\`;
-
-IMPORTANT: Use THREADS, RAMP_UP, DURATION, PROTOCOL, URL, PORT, BASE_URL throughout the script.
-Never hardcode any of these values anywhere.
-
-SCENARIO CONFIG (reference the constants above — do NOT use literal numbers):
-export const options = {
-  ${executorConfigs[testType] || executorConfigs.load},
-  thresholds: {
-${thresholds || "  http_req_duration: ['p(95)<2000']"}
+    try { cols = JSON.parse(testDataFile.columns); } catch { cols = String(testDataFile.columns || '').split(',').map(c => c.trim()).filter(Boolean); }
+    csvCols = cols.filter(c => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(c)); // must be valid JS identifiers to destructure
+    csvValueMap = buildCsvValueMap([testDataFile]);
+    const filePath = testDataFile.path.replace(/\\/g, '/').replace(/'/g, "\\'");
+    csvImportLines = `import { SharedArray } from 'k6/data';\nimport papaparse from 'https://jslib.k6.io/papaparse/5.1.1/index.js';`;
+    csvSetupLines = `const testData = new SharedArray('testData', function () {\n  return papaparse.parse(open('${filePath}'), { header: true, skipEmptyLines: true }).data;\n});`;
   }
-};
 
-HTTP REQUESTS — generate one function call per endpoint using k6's http module:
-Collection: ${collection?.name || 'No collection'}
-Endpoints:
-${JSON.stringify(endpoints, null, 2).slice(0, 4000)}
+  const loginEp = endpoints.find(isLoginEp) || null;
+  const capturedFields = loginEp ? detectCapturedFields(preRunData, loginEp) : {};
+  const tokenInfo = loginEp ? (pickDefaultField(capturedFields) || { varName: 'accessToken', jsonPath: '$.accessToken' }) : null;
+  const tokenVar = tokenInfo?.varName || null;
 
-Use BASE_URL as the URL prefix for all requests.
-Add k6 check() calls to verify HTTP 200/201 status codes.
-Add sleep(1) between requests.
-${csvSection}
-${correlationSection}
-${overrideSection}
+  const endpointOverrides = cfg.endpointOverrides || {};
+  const epIndexOf = new Map(endpoints.map((e, i) => [e, i]));
+  function overrideFor(ep) {
+    const saved = endpointOverrides[epIndexOf.get(ep)];
+    return fingerprintMatches(ep, saved) ? saved : null;
+  }
 
-Output the complete k6 JavaScript file only.`;
+  const correlationRules = filterApplicableRules(cfg.correlationRules);
+  const rulesBySource = groupRulesBySource(correlationRules);
+  const rulesByTarget = groupRulesByTarget(correlationRules);
+  function sourceFieldsFor(ep) { return rulesBySource.get(epIndexOf.get(ep)) || []; }
+  function targetRulesFor(ep) { return rulesByTarget.get(epIndexOf.get(ep)) || []; }
 
-  return callAi(userId, systemPrompt, userPrompt, 'script');
+  const generatorsByTarget = groupGeneratorsByTarget(cfg.fieldGenerators);
+  function generatorRulesFor(ep) { return generatorsByTarget.get(epIndexOf.get(ep)) || []; }
+
+  // Same login-first reorder + inbound-correlation guard as buildJmxTemplate — see its
+  // comment for why an endpoint that depends on an earlier response can't be moved ahead
+  // of that source.
+  const loginHasInboundCorrelation = loginEp && targetRulesFor(loginEp).length > 0;
+  const ordered = (loginEp && !loginHasInboundCorrelation)
+    ? [loginEp, ...endpoints.filter(e => e !== loginEp)]
+    : [...endpoints];
+
+  let tokenExtracted = false;
+  const requestBlocks = ordered.map((ep, i) => {
+    const isLogin = ep === loginEp;
+    const block = buildK6Request(ep, i, {
+      isLogin, tokenVar: tokenExtracted ? tokenVar : null, csvCols, csvValueMap,
+      override: overrideFor(ep), capturedFields, variables,
+      sourceFields: sourceFieldsFor(ep), targetRules: targetRulesFor(ep), generatorRules: generatorRulesFor(ep),
+    });
+    if (isLogin) tokenExtracted = true;
+    return block;
+  });
+
+  const rowDestructure = csvCols.length
+    ? `  const row = testData[(__VU - 1 + __ITER) % testData.length];\n  const { ${csvCols.join(', ')} } = row;\n`
+    : '';
+
+  // k6/crypto is only imported when a confirmed rule actually uses a hash transform
+  // (utils/transforms.js) — a script with no such rules shouldn't carry an unused import.
+  const needsCryptoImport = correlationRules.some(r => r.transform && K6_CRYPTO_TRANSFORMS.has(r.transform));
+
+  const lines = [];
+  lines.push(`import http from 'k6/http';`);
+  lines.push(`import { check, sleep } from 'k6';`);
+  if (needsCryptoImport) lines.push(`import crypto from 'k6/crypto';`);
+  if (csvImportLines) lines.push(csvImportLines);
+  lines.push('');
+  if (csvSetupLines) { lines.push(csvSetupLines); lines.push(''); }
+  lines.push(`// Runtime override: k6 run --env THREADS=100 --env DURATION=600 --env RAMP_UP=60 --env PROTOCOL=https --env URL=api.example.com --env PORT=443 script.js`);
+  lines.push(`const THREADS  = parseInt(__ENV.THREADS  || '${vusers}');`);
+  lines.push(`const RAMP_UP  = parseInt(__ENV.RAMP_UP  || '${rampup}');`);
+  lines.push(`const DURATION = parseInt(__ENV.DURATION || '${duration}');`);
+  lines.push(`const PROTOCOL = __ENV.PROTOCOL || '${cfg.protocol || 'https'}';`);
+  lines.push(`const URL      = __ENV.URL      || '${cfg.url || ''}';`);
+  lines.push(`const PORT     = __ENV.PORT     || '${cfg.port || '443'}';`);
+  lines.push('const BASE_URL = `${PROTOCOL}://${URL}:${PORT}`;');
+  lines.push('');
+  lines.push(`export const options = {`);
+  lines.push(`  ${executorConfigs[testType] || executorConfigs.load},`);
+  lines.push(`  thresholds: {`);
+  lines.push(thresholds || "    http_req_duration: ['p(95)<2000']");
+  lines.push(`  }`);
+  lines.push(`};`);
+  lines.push('');
+  lines.push(`export default function () {`);
+  if (rowDestructure) lines.push(rowDestructure);
+  lines.push(requestBlocks.join('\n\n'));
+  lines.push(`}`);
+  return lines.join('\n');
+}
+
+function generateK6(userId, suite, collection, testDataFile, cfg, endpoints, rules, preRunData, testType) {
+  return buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules, preRunData, testType);
 }
 
 module.exports = router;
 module.exports.generateScriptForSuite = generateScriptForSuite;
+module.exports.buildJmxTemplate = buildJmxTemplate;
+module.exports.buildK6Template = buildK6Template;

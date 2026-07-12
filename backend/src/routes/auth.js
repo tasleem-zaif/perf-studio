@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../db');
 const auth = require('../middleware/auth');
+const { decrypt } = require('../utils/encryption');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'perf_studio_secret_change_in_prod';
 const JWT_EXPIRES = '7d';
@@ -176,6 +177,26 @@ router.put('/me/password', auth, async (req, res) => {
   }
   await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(new_password, 10), req.userId);
   res.json({ ok: true });
+});
+
+// GET /auth/me/registry-token — org's npm registry token, viewable by any member
+router.get('/me/registry-token', auth, async (req, res) => {
+  try {
+    const user = await db.prepare('SELECT org_id FROM users WHERE id = ?').get(req.userId);
+    if (!user?.org_id) return res.json({ orgName: null, token: null, registryUrl: null });
+
+    const org = await db.prepare(
+      'SELECT name, registry_token_enc FROM organizations WHERE id = ?'
+    ).get(user.org_id);
+
+    res.json({
+      orgName: org?.name || null,
+      token: org?.registry_token_enc ? decrypt(org.registry_token_enc) : null,
+      registryUrl: `${process.env.ARTIFACT_KEEPER_URL || 'https://artifact-keeper.qtsolvdev.com'}/npm/qa-automation-libraries/`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load registry token' });
+  }
 });
 
 module.exports = router;

@@ -11,6 +11,8 @@ import SMTPConfigPanel from '../components/SMTPConfigPanel';
 const PROVIDERS = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'claude', label: 'Anthropic (Claude)' },
+  { value: 'gemini', label: 'Google Gemini' },
+  { value: 'azure',  label: 'Azure OpenAI' },
 ];
 
 // This list is a manually curated snapshot, not a live fetch from OpenAI/Anthropic — it will
@@ -42,9 +44,20 @@ const MODELS = {
     { value: 'claude-3-opus-20240229',       label: 'Claude 3 Opus',         desc: 'Older Opus generation' },
     { value: '__custom__',                   label: 'Custom (enter model ID)…', desc: 'Type any model ID your Anthropic account has access to — including anything released after this list was last updated.' },
   ],
+  gemini: [
+    { value: 'gemini-2.5-pro',    label: 'Gemini 2.5 Pro',    desc: 'Most capable Gemini — best for complex reasoning' },
+    { value: 'gemini-2.5-flash',  label: 'Gemini 2.5 Flash',  desc: 'Balanced quality & speed — recommended' },
+    { value: 'gemini-2.0-flash',  label: 'Gemini 2.0 Flash',  desc: 'Fast & cheap — good for simple scripts' },
+    { value: 'gemini-1.5-pro',    label: 'Gemini 1.5 Pro',    desc: 'Previous-generation Pro, large context window' },
+    { value: 'gemini-1.5-flash',  label: 'Gemini 1.5 Flash',  desc: 'Previous-generation Flash — fastest & cheapest' },
+    { value: '__custom__',        label: 'Custom (enter model ID)…', desc: 'Type any model ID your Google AI account has access to — including anything released after this list was last updated.' },
+  ],
+  // Azure has no fixed model catalog — every entry is an account-specific deployment name,
+  // so ModelRow renders a plain text input instead of a dropdown when this list is empty.
+  azure: [],
 };
 
-const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-5' };
+const DEFAULT_MODEL = { openai: 'gpt-4o', claude: 'claude-sonnet-5', gemini: 'gemini-2.5-flash', azure: '' };
 
 
 const ROLE_LABELS = { super_admin: 'Super Admin', org_admin: 'Org Admin', user: 'User' };
@@ -579,7 +592,38 @@ function UserManagementPanel({ user, projects = [] }) {
 }
 
 
-function ModelRow({ icon, title, subtitle, value, rawValue, onChange, models, iconColor, disabled = false }) {
+function ModelRow({ icon, title, subtitle, value, rawValue, onChange, models, iconColor, disabled = false, placeholder }) {
+  // Some providers (Azure) have no fixed model catalog — every value is an account-specific
+  // deployment name — so there's nothing to show in a dropdown. Render free text only.
+  if (models.length === 0) {
+    return (
+      <div style={{
+        padding: '14px 16px', marginBottom: '10px',
+        background: 'var(--color-background-secondary)',
+        border: '1px solid var(--color-border-secondary)',
+        borderRadius: 'var(--border-radius-md)',
+        opacity: disabled ? 0.7 : 1,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '10px' }}>
+          <i className={`ti ${icon}`} style={{ fontSize: '16px', color: iconColor, marginTop: '1px', flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--color-text-primary)' }}>{title}</div>
+            <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginTop: '1px' }}>{subtitle}</div>
+          </div>
+        </div>
+        <input
+          type="text"
+          className="form-input"
+          style={{ width: '100%', boxSizing: 'border-box' }}
+          placeholder={placeholder || 'Enter value…'}
+          value={rawValue}
+          disabled={disabled}
+          onChange={e => !disabled && onChange(e.target.value)}
+        />
+      </div>
+    );
+  }
+
   // `value` is the effective (fallback-applied) model — used for the dropdown's own
   // selection/description so it shows the real default when nothing's been chosen yet.
   // `rawValue` is the parent's actual unfallback-ed state — used to pre-fill the custom text
@@ -650,11 +694,13 @@ function ModelRow({ icon, title, subtitle, value, rawValue, onChange, models, ic
 }
 
 function AIConfigPanel({ user }) {
-  const [provider,   setProvider]   = useState('openai');
-  const [model,      setModel]      = useState('');
-  const [healModel,  setHealModel]  = useState('');
-  const [apiKey,     setApiKey]     = useState('');
-  const [keySet,     setKeySet]     = useState(false);
+  const [provider,          setProvider]          = useState('openai');
+  const [model,             setModel]              = useState('');
+  const [healModel,         setHealModel]          = useState('');
+  const [apiKey,            setApiKey]             = useState('');
+  const [keySet,            setKeySet]             = useState(false);
+  const [azureEndpoint,     setAzureEndpoint]      = useState('');
+  const [azureApiVersion,   setAzureApiVersion]    = useState('');
   const [saving,     setSaving]     = useState(false);
   const [saved,      setSaved]      = useState(false);
   const [error,      setError]      = useState('');
@@ -665,6 +711,8 @@ function AIConfigPanel({ user }) {
       setModel(data.model || DEFAULT_MODEL[data.provider || 'openai'] || '');
       setHealModel(data.heal_model || '');
       setKeySet(data.api_key_set);
+      setAzureEndpoint(data.azure_endpoint || '');
+      setAzureApiVersion(data.azure_api_version || '');
     }).catch(() => {});
   }, []);
 
@@ -676,12 +724,15 @@ function AIConfigPanel({ user }) {
 
   async function save() {
     if (!apiKey && !keySet) return setError('API key required');
+    if (provider === 'azure' && !azureEndpoint.trim()) return setError('Azure endpoint required');
     setSaving(true); setError(''); setSaved(false);
     try {
       const body = {
         provider,
         model:      model      || DEFAULT_MODEL[provider],
         heal_model: healModel  || DEFAULT_MODEL[provider],
+        azure_endpoint:    azureEndpoint.trim(),
+        azure_api_version: azureApiVersion.trim(),
       };
       if (apiKey) body.api_key = apiKey;
       await api.put('/settings/ai', body);
@@ -743,6 +794,31 @@ function AIConfigPanel({ user }) {
         </CustomSelect>
       </div>
 
+      {/* Azure needs a resource endpoint + API version alongside the API key —
+          the model dropdowns below hold the deployment name instead of a model ID. */}
+      {!isRegularUser && provider === 'azure' && (
+        <>
+          <div className="form-group">
+            <label className="form-label">Azure Endpoint</label>
+            <input
+              type="text"
+              value={azureEndpoint}
+              onChange={e => setAzureEndpoint(e.target.value)}
+              placeholder="https://your-resource.openai.azure.com/"
+            />
+          </div>
+          <div className="form-group">
+            <label className="form-label">API Version</label>
+            <input
+              type="text"
+              value={azureApiVersion}
+              onChange={e => setAzureApiVersion(e.target.value)}
+              placeholder="2024-10-21 (default if left blank)"
+            />
+          </div>
+        </>
+      )}
+
       {/* Script generation model */}
       <ModelRow
         icon="ti-code"
@@ -754,6 +830,7 @@ function AIConfigPanel({ user }) {
         onChange={isRegularUser ? () => {} : setModel}
         models={providerModels}
         disabled={isRegularUser}
+        placeholder={provider === 'azure' ? 'e.g. gpt-4o-deployment — your Azure deployment name' : undefined}
       />
 
       {/* Auto healer model */}
@@ -767,6 +844,7 @@ function AIConfigPanel({ user }) {
         onChange={isRegularUser ? () => {} : setHealModel}
         models={providerModels}
         disabled={isRegularUser}
+        placeholder={provider === 'azure' ? 'e.g. gpt-4o-deployment — your Azure deployment name' : undefined}
       />
 
       {/* API Key — hidden for regular users */}
@@ -785,12 +863,24 @@ function AIConfigPanel({ user }) {
               Get Anthropic key ↗
             </a>
           )}
+          {provider === 'gemini' && (
+            <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer"
+               style={{ marginLeft: '8px', fontSize: '10px', color: 'var(--accent)', fontWeight: 400 }}>
+              Get Gemini key ↗
+            </a>
+          )}
+          {provider === 'azure' && (
+            <a href="https://oai.azure.com/" target="_blank" rel="noreferrer"
+               style={{ marginLeft: '8px', fontSize: '10px', color: 'var(--accent)', fontWeight: 400 }}>
+              Open Azure AI Foundry ↗
+            </a>
+          )}
         </label>
         <input
           type="password"
           value={apiKey}
           onChange={e => setApiKey(e.target.value)}
-          placeholder={keySet ? '••••••••••••  (key saved — enter new key to update)' : provider === 'openai' ? 'sk-...' : 'sk-ant-...'}
+          placeholder={keySet ? '••••••••••••  (key saved — enter new key to update)' : provider === 'openai' ? 'sk-...' : provider === 'claude' ? 'sk-ant-...' : provider === 'gemini' ? 'AIza...' : 'your Azure resource key'}
         />
       </div>}
 

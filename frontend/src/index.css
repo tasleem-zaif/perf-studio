@@ -458,7 +458,10 @@ tr:hover td { background: var(--color-background-secondary); }
   position: fixed;
   inset: 0;
   background: var(--modal-overlay);
-  z-index: 100;
+  /* Must stay above the Pre-run Logs draggable popup (Collections.jsx, zIndex: 1000 —
+     a custom overlay, not a <Modal>), or a confirm dialog (e.g. "Delete Endpoint")
+     triggered from inside it renders behind that popup instead of on top of it. */
+  z-index: 1100;
   display: flex;
   align-items: center;
   justify-content: center;

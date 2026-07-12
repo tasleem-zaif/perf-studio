@@ -47,6 +47,19 @@ function Dot() {
   return <span style={{ margin: '0 8px', color: 'var(--color-text-tertiary)' }}>·</span>;
 }
 
+function InviteStatusBadge({ status }) {
+  const meta = {
+    accepted: { bg: 'rgba(95,201,120,0.15)', color: '#16a34a', label: 'Accepted' },
+    pending:  { bg: 'rgba(245,158,11,0.15)', color: '#b45309', label: 'Pending' },
+    expired:  { bg: 'var(--color-background-secondary)', color: 'var(--color-text-tertiary)', label: 'Expired' },
+  }[status] || { bg: 'var(--color-background-secondary)', color: 'var(--color-text-tertiary)', label: status };
+  return (
+    <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '11px', fontWeight: 600, background: meta.bg, color: meta.color }}>
+      {meta.label}
+    </span>
+  );
+}
+
 function StatCard({ icon, label, value }) {
   return (
     <div style={{ background: 'var(--color-background)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px', padding: '12px 14px' }}>
@@ -321,26 +334,47 @@ function OrgLicenseTab({ org, license, plans, onChanged }) {
 /* ── Org Admins tab ──────────────────────────────────────────────────────── */
 function OrgAdminsTab({ org, user, onInviteSent }) {
   const { toast } = useToast();
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const [admins, setAdmins] = useState(null);
   const [email, setEmail] = useState('');
   const [sending, setSending] = useState(false);
+  const [inviteResult, setInviteResult] = useState(null);
+  const [invites, setInvites] = useState([]);
+  const [revealedInvite, setRevealedInvite] = useState(null);
 
   function load() {
     api.get(`/orgs/${org.id}/admins`).then(r => setAdmins(r.data.admins || [])).catch(() => setAdmins([]));
+    // GET /invites returns platform-wide invites for a super admin — filter to this org client-side.
+    api.get('/invites').then(r => setInvites((r.data.invites || []).filter(i => i.org_id === org.id))).catch(() => setInvites([]));
   }
   useEffect(load, [org.id]);
 
   async function sendInvite() {
     if (!email.trim()) return;
-    setSending(true);
+    setSending(true); setInviteResult(null);
     try {
       const { data } = await api.post('/invites', { email: email.trim(), role: 'org_admin', org_id: org.id, frontend_url: window.location.origin });
+      setInviteResult({ ok: true, url: data.invite_url, emailSent: data.email_sent });
       toast(data.email_sent ? `Invite sent to ${email}` : 'Invite created — email not sent (SMTP not configured)', 'success');
       setEmail('');
       onInviteSent?.();
+      load();
     } catch (e) {
       toast(e.response?.data?.error || e.response?.data?.message || 'Failed to send invite', 'error');
     } finally { setSending(false); }
+  }
+
+  async function revokeInvite(id) {
+    await api.delete(`/invites/${id}`);
+    setInvites(prev => prev.filter(i => i.id !== id));
+  }
+
+  async function deleteAllInvites() {
+    const ok = await confirm(`Delete all ${invites.length} invite(s)? This cannot be undone.`, 'Delete All Invites');
+    if (!ok) return;
+    await Promise.all(invites.map(i => api.delete(`/invites/${i.id}`).catch(() => {})));
+    setInvites([]);
+    toast('All invites deleted', 'success');
   }
 
   return (
@@ -355,13 +389,34 @@ function OrgAdminsTab({ org, user, onInviteSent }) {
         <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
           An invite email will be sent. The recipient can register and manage this org's users and projects. Works whether or not they already have an account.
         </div>
-        <div style={{ display: 'flex', gap: '10px' }}>
+        <div style={{ display: 'flex', gap: '10px', marginBottom: inviteResult ? '14px' : 0 }}>
           <input value={email} onChange={e => setEmail(e.target.value)} placeholder="admin@company.com" style={{ flex: 1 }}
             autoComplete="off" onKeyDown={e => e.key === 'Enter' && sendInvite()} />
           <button className="btn-primary" onClick={sendInvite} disabled={sending || !email.trim()}>
             {sending ? <span className="spinner" /> : <i className="ti ti-send" />} Send Invite
           </button>
         </div>
+        {inviteResult?.ok && inviteResult.url && (
+          <div style={{ padding: '10px 12px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '8px' }}>
+            <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '6px' }}>
+              <i className="ti ti-link" style={{ marginRight: 4 }} />
+              Share this invite link with the admin:
+            </div>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input readOnly value={inviteResult.url} onClick={e => e.target.select()}
+                style={{ flex: 1, padding: '6px 8px', fontSize: '11px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '6px', color: 'var(--accent)' }} />
+              <button className="btn-secondary btn-sm" onClick={() => { navigator.clipboard.writeText(inviteResult.url); toast('Invite link copied!', 'success'); }}>
+                <i className="ti ti-copy" /> Copy
+              </button>
+            </div>
+            {!inviteResult.emailSent && (
+              <div style={{ marginTop: 8, fontSize: '11px', color: 'var(--warn)' }}>
+                <i className="ti ti-mail-off" style={{ marginRight: 4 }} />
+                Email not sent (SMTP not configured) — share the link above directly.
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={{ padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px' }}>
@@ -384,6 +439,157 @@ function OrgAdminsTab({ org, user, onInviteSent }) {
             </div>
           </div>
         ))}
+      </div>
+
+      <div style={{ padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px', marginTop: '16px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontWeight: 600, fontSize: '14px' }}>Invites</div>
+            <span style={{ background: 'var(--color-background)', borderRadius: '10px', padding: '1px 8px', fontSize: '11px', fontWeight: 600 }}>{invites.length}</span>
+          </div>
+          {invites.length > 0 && (
+            <button onClick={deleteAllInvites} style={{ background: 'none', border: 'none', color: 'var(--danger)', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>
+              Delete all
+            </button>
+          )}
+        </div>
+        {invites.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--color-text-tertiary)', fontSize: '12px' }}>No invites yet.</div>
+        ) : invites.map(inv => (
+          <div key={inv.id} style={{ padding: '10px 12px', background: 'var(--color-background)', borderRadius: '8px', marginBottom: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: '13px' }}>{inv.email}</div>
+                <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)' }}>{inv.role === 'org_admin' ? 'Org Admin' : 'User'}</div>
+              </div>
+              <InviteStatusBadge status={inv.status} />
+              {inv.status === 'pending' && (
+                <button className="btn-secondary btn-sm" onClick={() => setRevealedInvite(r => r === inv.id ? null : inv.id)}>
+                  Show link
+                </button>
+              )}
+              <button className="btn-secondary btn-sm" style={{ color: 'var(--danger)' }} onClick={() => revokeInvite(inv.id)}>
+                Delete
+              </button>
+            </div>
+            {revealedInvite === inv.id && (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: '8px' }}>
+                <input readOnly value={`${window.location.origin}/accept-invite/${inv.token}`} onClick={e => e.target.select()}
+                  style={{ flex: 1, padding: '5px 8px', fontSize: '11px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '6px', color: 'var(--accent)' }} />
+                <button className="btn-secondary btn-sm" onClick={() => { navigator.clipboard.writeText(`${window.location.origin}/accept-invite/${inv.token}`); toast('Link copied!', 'success'); }}>
+                  Copy
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+    </div>
+  );
+}
+
+/* ── Registry Token tab ──────────────────────────────────────────────────── */
+function OrgRegistryTokenTab({ org }) {
+  const { toast } = useToast();
+  const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
+  const [meta, setMeta] = useState(null);
+  const [expiry, setExpiry] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [revoking, setRevoking] = useState(false);
+  const [revealed, setRevealed] = useState(null);
+
+  function load() {
+    api.get(`/orgs/${org.id}/npm-token`).then(r => setMeta(r.data)).catch(() => setMeta(null));
+  }
+  useEffect(() => { setRevealed(null); load(); }, [org.id]);
+
+  async function generate() {
+    setGenerating(true);
+    try {
+      const body = {};
+      if (expiry) body.expiresAt = new Date(expiry).toISOString();
+      const { data } = await api.post(`/orgs/${org.id}/npm-token`, body);
+      setRevealed(data.token);
+      setMeta({ hasToken: true, prefix: data.prefix, createdAt: data.createdAt, expiresAt: data.expiresAt });
+      toast('Registry token generated', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to generate registry token', 'error');
+    } finally { setGenerating(false); }
+  }
+
+  async function revoke() {
+    const ok = await confirm(`Revoke the registry token for "${org.name}"? All members lose access to @peako packages until a new one is generated.`, 'Revoke Registry Token');
+    if (!ok) return;
+    setRevoking(true);
+    try {
+      await api.delete(`/orgs/${org.id}/npm-token`);
+      setMeta({ hasToken: false, prefix: null, createdAt: null, expiresAt: null });
+      setRevealed(null);
+      toast('Registry token revoked', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to revoke registry token', 'error');
+    } finally { setRevoking(false); }
+  }
+
+  if (meta === null) return <div style={{ color: 'var(--color-text-tertiary)', fontSize: '12px' }}>Loading…</div>;
+
+  return (
+    <div style={{ maxWidth: 640, display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      <ConfirmModal {...confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+
+      {meta.hasToken && (
+        <div className="card">
+          <div style={{ fontWeight: 700, fontSize: '15px', marginBottom: '14px' }}>Current Token</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '12px', marginBottom: '16px' }}>
+            <StatCard icon="ti-key" label="Token Prefix" value={`${meta.prefix}…`} />
+            <StatCard icon="ti-calendar" label="Created" value={new Date(meta.createdAt).toLocaleDateString()} />
+            <StatCard icon="ti-hourglass" label="Expires" value={meta.expiresAt ? new Date(meta.expiresAt).toLocaleDateString() : 'Never'} />
+          </div>
+          <button onClick={revoke} disabled={revoking} style={{
+            background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444',
+            borderRadius: '8px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+          }}>
+            {revoking ? <span className="spinner" /> : null} Revoke Token
+          </button>
+        </div>
+      )}
+
+      {revealed && (
+        <div className="card" style={{ background: 'rgba(34,197,94,0.05)', borderColor: 'rgba(34,197,94,0.3)' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px' }}>
+            <i className="ti ti-alert-circle" style={{ marginRight: 6, color: '#16a34a' }} />
+            Copy this token now — it won't be shown again here
+          </div>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: '10px' }}>
+            <input readOnly value={revealed} onClick={e => e.target.select()}
+              style={{ flex: 1, padding: '6px 8px', fontSize: '11px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '6px' }} />
+            <button className="btn-secondary btn-sm" onClick={() => { navigator.clipboard.writeText(revealed); toast('Token copied', 'success'); }}>
+              <i className="ti ti-copy" /> Copy
+            </button>
+          </div>
+          <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: 4 }}>.npmrc:</div>
+          <code style={{ display: 'block', fontSize: '11px', padding: '8px 10px', background: 'var(--color-background)', borderRadius: '6px', overflowX: 'auto' }}>
+            @peako:registry=https://artifact-keeper.qtsolvdev.com/npm/qa-automation-libraries/{'\n'}//artifact-keeper.qtsolvdev.com/npm/qa-automation-libraries/:_authToken={revealed}
+          </code>
+        </div>
+      )}
+
+      <div className="card">
+        <div style={{ fontWeight: 700, fontSize: '15px', marginBottom: '4px' }}>{meta.hasToken ? 'Generate New Token' : 'Generate Token'}</div>
+        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '18px' }}>
+          {meta.hasToken ? 'Generating a new token immediately revokes the existing one.' : 'No registry token has been generated for this organization yet.'}
+        </div>
+        <label className="form-label" style={{ display: 'block', marginBottom: '6px' }}>
+          Expiry Date <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(optional)</span>
+        </label>
+        <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)} style={{ maxWidth: '220px', marginBottom: '16px' }} />
+        <div>
+          <button className="btn-primary" onClick={generate} disabled={generating}>
+            {generating ? <span className="spinner" /> : null} {meta.hasToken ? 'Regenerate Token' : 'Generate Token'}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -627,6 +833,7 @@ export default function OrganizationsAdmin({ user }) {
                     { id: 'edit', label: 'Edit Details' },
                     { id: 'license', label: 'License & Limits' },
                     { id: 'admins', label: 'Org Admins' },
+                    { id: 'registry', label: 'Registry Token' },
                   ].map(t => (
                     <button key={t.id} onClick={() => setSubTab(t.id)} style={tabBtnStyle(subTab === t.id)}>{t.label}</button>
                   ))}
@@ -641,6 +848,7 @@ export default function OrganizationsAdmin({ user }) {
                     onChanged={lic => setLicenses(prev => ({ ...prev, [selectedOrg.id]: lic }))} />
                 )}
                 {subTab === 'admins' && <OrgAdminsTab org={selectedOrg} user={user} onInviteSent={loadAll} />}
+                {subTab === 'registry' && <OrgRegistryTokenTab org={selectedOrg} />}
               </>
             )}
           </div>

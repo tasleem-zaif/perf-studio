@@ -14,6 +14,14 @@ CREATE TABLE IF NOT EXISTS organizations (
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- npm registry token (Artifact Keeper) — one per org, additive columns so this
+-- is safe to re-run against a DB that already has the organizations table.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS registry_token_enc        TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS registry_token_key        TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS registry_token_prefix     TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS registry_token_created_at TIMESTAMPTZ;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS registry_token_expires_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS users (
   id            SERIAL PRIMARY KEY,
   email         TEXT UNIQUE NOT NULL,
@@ -119,6 +127,11 @@ CREATE TABLE IF NOT EXISTS ai_settings (
   model       TEXT DEFAULT '',
   heal_model  TEXT DEFAULT ''
 );
+
+-- Azure OpenAI needs a resource endpoint + API version alongside the API key
+-- (deployment name is stored in the existing model/heal_model columns).
+ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS azure_endpoint    TEXT DEFAULT '';
+ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS azure_api_version TEXT DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS test_suites (
   id                       SERIAL PRIMARY KEY,
