@@ -93,6 +93,15 @@ with open(script, "w") as f:
 print("Patch complete")
 `;
 
+// Base64 blob of the patcher, embedded directly into every generated CI YAML so the
+// "Patch JMX" step never depends on .PerfStudio/patch_jmx.py having been separately
+// committed/pushed to whichever branch the runner checks out — that push is best-effort
+// (server-side git-workspace state can be missing, stale, or out of sync with the branch
+// actually dispatched) and was the root cause of "python3: can't open file
+// '.../.PerfStudio/patch_jmx.py'" failures. Base64 avoids all YAML-indentation /
+// shell-quoting hazards of inlining raw Python source into a `run:` block.
+const PATCHER_PY_B64 = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8').toString('base64');
+
 router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -870,6 +879,8 @@ jobs:
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
           echo "Patching \$SCRIPT  users=\${{ inputs.jmeter_users }} rampup=\${{ inputs.jmeter_rampup }} duration=\${{ inputs.jmeter_duration }}"
+          mkdir -p .PerfStudio
+          echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
           python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\${{ inputs.jmeter_users }}" "\${{ inputs.jmeter_rampup }}" "\${{ inputs.jmeter_loops }}" "\${{ inputs.jmeter_duration }}"
           echo "=== ThreadGroup after patch ==="
           grep -A 30 "ThreadGroup" "\$SCRIPT" | head -50
@@ -1099,6 +1110,8 @@ pipelines:
             - |
               SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
               echo "=== Patching JMX parameters and fixing paths ==="
+              mkdir -p .PerfStudio
+              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
               python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
               echo "=== JMX state after patch ==="
               grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
@@ -1277,15 +1290,37 @@ pipelines:
         // on origin but was never fetched locally), then finally create it fresh.
         try {
           gitRun(['checkout', autoCommitBranch]);
-        } catch {
+        } catch (firstCheckoutErr) {
+          // The plain checkout can fail even when the branch already exists locally —
+          // most commonly a dirty working tree left over from a previous generate-yaml
+          // run. Stash it and retry before assuming the branch is missing, otherwise the
+          // fallback below tries `checkout -b` on a branch that already exists and fails
+          // with a confusing "A branch named 'x' already exists." instead of the real cause.
+          let stashed = false;
           try {
-            // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like
-            // a by-name `fetch origin` would — a bare URL fetch with no refspec only sets
-            // FETCH_HEAD, which the checkout below wouldn't find.
-            gitRun(['fetch', remoteUrl, `+${autoCommitBranch}:refs/remotes/origin/${autoCommitBranch}`]);
-            gitRun(['checkout', '-b', autoCommitBranch, `origin/${autoCommitBranch}`]);
+            const r = gitRun(['stash', '-u', '-m', 'peako-generate-yaml-auto-stash']);
+            stashed = !r.includes('No local changes');
+          } catch {}
+          try {
+            gitRun(['checkout', autoCommitBranch]);
           } catch {
-            gitRun(['checkout', '-b', autoCommitBranch]);
+            try {
+              // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like
+              // a by-name `fetch origin` would — a bare URL fetch with no refspec only sets
+              // FETCH_HEAD, which the checkout below wouldn't find.
+              gitRun(['fetch', remoteUrl, `+${autoCommitBranch}:refs/remotes/origin/${autoCommitBranch}`]);
+              gitRun(['checkout', '-b', autoCommitBranch, `origin/${autoCommitBranch}`]);
+            } catch {
+              // Only create a new local branch when it genuinely doesn't exist yet — '-b'
+              // on an existing branch always fails, which would otherwise mask the real
+              // reason the checkout above didn't work.
+              let branchExists = false;
+              try { gitRun(['rev-parse', '--verify', '--quiet', `refs/heads/${autoCommitBranch}`]); branchExists = true; } catch {}
+              if (branchExists) throw firstCheckoutErr;
+              gitRun(['checkout', '-b', autoCommitBranch]);
+            }
+          } finally {
+            if (stashed) { try { gitRun(['stash', 'pop']); } catch {} }
           }
         }
         // Defensive: a checkout that "succeeds" onto the wrong ref must never silently
@@ -1633,6 +1668,8 @@ pipelines:
             - |
               SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
               echo "=== Patching JMX parameters and fixing paths ==="
+              mkdir -p .PerfStudio
+              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
               python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
               echo "=== JMX state after patch ==="
               grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
