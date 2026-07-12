@@ -1291,16 +1291,30 @@ pipelines:
         try {
           gitRun(['checkout', autoCommitBranch]);
         } catch (firstCheckoutErr) {
-          // The plain checkout can fail even when the branch already exists locally —
-          // most commonly a dirty working tree left over from a previous generate-yaml
-          // run. Stash it and retry before assuming the branch is missing, otherwise the
-          // fallback below tries `checkout -b` on a branch that already exists and fails
-          // with a confusing "A branch named 'x' already exists." instead of the real cause.
-          let stashed = false;
-          try {
-            const r = gitRun(['stash', '-u', '-m', 'peako-generate-yaml-auto-stash']);
-            stashed = !r.includes('No local changes');
-          } catch {}
+          // The plain checkout typically fails here because the CI files this endpoint
+          // just generated and wrote to gitRoot (githubYaml/patcherPy/bbYaml/... above)
+          // are untracked or modified relative to whatever ref HEAD currently points at,
+          // and would be overwritten by switching to autoCommitBranch — git refuses the
+          // checkout to avoid clobbering them.
+          //
+          // A stash-based retry was tried here previously, but `git stash` (even without
+          // `-u`) sweeps up exactly those freshly-written files, which then never get
+          // staged/committed below — `generate-yaml` silently no-ops while still reporting
+          // success, leaving whatever was already on the branch (possibly missing
+          // `workflow_dispatch` entirely) in place. Copy just the generated files aside on
+          // disk instead — not through git — so the checkout can proceed, then restore
+          // them once we're on the right branch. This can never lose the payload.
+          const asideDir = path.join(os.tmpdir(), `peako-generate-yaml-aside-${process.pid}-${Math.floor(process.hrtime.bigint() % 1000000n)}`);
+          const savedFiles = [];
+          for (const f of created) {
+            const src = path.join(gitRoot, f);
+            if (fs.existsSync(src)) {
+              const dest = path.join(asideDir, f);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.copyFileSync(src, dest);
+              savedFiles.push(f);
+            }
+          }
           try {
             gitRun(['checkout', autoCommitBranch]);
           } catch {
@@ -1320,7 +1334,12 @@ pipelines:
               gitRun(['checkout', '-b', autoCommitBranch]);
             }
           } finally {
-            if (stashed) { try { gitRun(['stash', 'pop']); } catch {} }
+            for (const f of savedFiles) {
+              const dest = path.join(gitRoot, f);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.copyFileSync(path.join(asideDir, f), dest);
+            }
+            try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
           }
         }
         // Defensive: a checkout that "succeeds" onto the wrong ref must never silently
