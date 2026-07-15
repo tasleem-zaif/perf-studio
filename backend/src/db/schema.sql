@@ -442,3 +442,127 @@ CREATE TABLE IF NOT EXISTS org_licenses (
   updated_at   TIMESTAMPTZ DEFAULT NOW(),
   created_at   TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ── Trend Analysis Dashboard ──────────────────────────────────────────────────
+-- Denormalized filter columns on execution_runs so filtering by environment/build/
+-- release/browser/load profile is a single indexed scan, not a join through
+-- suite_id → test_suites.env. Nothing populates these yet except the new
+-- PATCH /trend-analysis/runs/:id/metadata route — existing runs start out NULL
+-- and simply don't match a filtered query until tagged.
+ALTER TABLE execution_runs ADD COLUMN IF NOT EXISTS environment   TEXT DEFAULT NULL;
+ALTER TABLE execution_runs ADD COLUMN IF NOT EXISTS build_number  TEXT DEFAULT NULL;
+ALTER TABLE execution_runs ADD COLUMN IF NOT EXISTS release_tag   TEXT DEFAULT NULL;
+ALTER TABLE execution_runs ADD COLUMN IF NOT EXISTS browser       TEXT DEFAULT NULL;
+ALTER TABLE execution_runs ADD COLUMN IF NOT EXISTS load_profile  TEXT DEFAULT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_execution_runs_project_filters
+  ON execution_runs(project_id, environment, build_number, release_tag);
+
+-- Per-API metrics, persisted once per run (lazily, mirroring execution_runs.report_data's
+-- cache-on-first-read pattern) from parseJtl()'s by_api[] — never re-derived from the raw
+-- JTL on every trend/comparison request. At 1000 executions x up to 10,000 APIs this is
+-- the difference between an indexed SQL scan and re-parsing gigabytes of JTL per request.
+CREATE TABLE IF NOT EXISTS run_api_metrics (
+  id           SERIAL PRIMARY KEY,
+  run_id       INTEGER NOT NULL REFERENCES execution_runs(id) ON DELETE CASCADE,
+  project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  label        TEXT NOT NULL,
+  total        INTEGER DEFAULT 0,
+  success      INTEGER DEFAULT 0,
+  failed       INTEGER DEFAULT 0,
+  error_rate   REAL DEFAULT 0,
+  avg          REAL DEFAULT 0,
+  min          REAL DEFAULT 0,
+  max          REAL DEFAULT 0,
+  median       REAL DEFAULT 0,
+  p90          REAL DEFAULT 0,
+  p95          REAL DEFAULT 0,
+  tps          REAL DEFAULT 0,
+  avg_latency  REAL DEFAULT 0,
+  avg_connect  REAL DEFAULT 0,
+  avg_bytes    REAL DEFAULT 0,
+  created_at   TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(run_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_run_api_metrics_project_label
+  ON run_api_metrics(project_id, label, run_id);
+
+-- One row per run — the six weighted scores (see scoringEngine.js for the formulas).
+-- formula_version lets a future formula change be distinguished from an actual
+-- regression when comparing scores computed at different times.
+CREATE TABLE IF NOT EXISTS trend_scores (
+  id                SERIAL PRIMARY KEY,
+  run_id            INTEGER NOT NULL UNIQUE REFERENCES execution_runs(id) ON DELETE CASCADE,
+  project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  api_health_score   REAL,
+  app_health_score   REAL,
+  regression_score   REAL,
+  reliability_score  REAL,
+  scalability_score  REAL,
+  overall_score      REAL,
+  formula_version    TEXT NOT NULL DEFAULT 'v1',
+  details_json        TEXT DEFAULT '{}',
+  computed_at         TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Cached comparison results (POST /trend-analysis/compare) — re-viewing an identical
+-- set of run_ids is a lookup, not a recompute.
+CREATE TABLE IF NOT EXISTS trend_comparisons (
+  id               SERIAL PRIMARY KEY,
+  project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_ids          INTEGER[] NOT NULL,
+  comparison_type  TEXT NOT NULL DEFAULT 'multi_run', -- baseline_vs_latest | multi_run | last_n | custom_range
+  summary_json     TEXT NOT NULL DEFAULT '{}',
+  created_by       INTEGER REFERENCES users(id),
+  created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_trend_comparisons_project ON trend_comparisons(project_id, created_at DESC);
+
+-- Auto-generated, human-readable insight bullets (deterministic, threshold-based —
+-- see insightsEngine.js), scoped either to a single run or a comparison.
+CREATE TABLE IF NOT EXISTS trend_insights (
+  id            SERIAL PRIMARY KEY,
+  project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  scope_type    TEXT NOT NULL, -- 'run' | 'comparison'
+  scope_id      INTEGER NOT NULL,
+  insight_type  TEXT NOT NULL, -- e.g. 'response_time_regression', 'consecutive_degradation'
+  severity      TEXT NOT NULL DEFAULT 'info', -- info | warn | critical
+  message       TEXT NOT NULL,
+  metric        TEXT,
+  delta_pct     REAL,
+  generated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_trend_insights_scope ON trend_insights(scope_type, scope_id);
+
+-- Ranked recommendations — rule-based root-cause scoring first (source='rule'), optionally
+-- narrated via aiClient.callAi (source='ai'); never blocks on AI being configured.
+CREATE TABLE IF NOT EXISTS trend_recommendations (
+  id              SERIAL PRIMARY KEY,
+  project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  scope_type      TEXT NOT NULL, -- 'run' | 'comparison'
+  scope_id        INTEGER NOT NULL,
+  category        TEXT NOT NULL, -- capacity | database | network | application | infrastructure
+  priority        TEXT NOT NULL DEFAULT 'medium', -- low | medium | high | critical
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL,
+  root_cause      TEXT,
+  confidence_pct  REAL,
+  source          TEXT NOT NULL DEFAULT 'rule', -- 'rule' | 'ai'
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_trend_recommendations_scope ON trend_recommendations(scope_type, scope_id);
+
+-- Forecast / capacity-planning outputs (predictionEngine.js). scope is an API label
+-- or the literal '__overall__' for suite-wide predictions.
+CREATE TABLE IF NOT EXISTS trend_predictions (
+  id                SERIAL PRIMARY KEY,
+  project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  scope             TEXT NOT NULL DEFAULT '__overall__',
+  algorithm         TEXT NOT NULL, -- linear_regression | exponential_smoothing | capacity_estimate
+  horizon           TEXT,
+  predicted_metric  TEXT NOT NULL,
+  predicted_value   REAL,
+  confidence_pct    REAL,
+  generated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_trend_predictions_project_scope ON trend_predictions(project_id, scope);

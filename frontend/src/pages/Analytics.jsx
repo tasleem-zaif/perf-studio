@@ -8,6 +8,8 @@ import { Bar, Line, Doughnut } from 'react-chartjs-2';
 import api from '../api';
 import CustomSelect from '../components/CustomSelect';
 import EnvBar from '../components/EnvBar';
+import TrendAnalysisTab from '../components/trendAnalysis/TrendAnalysisTab';
+import { D } from '../theme/analyticsDark';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Title, Tooltip, Legend, Filler);
 
@@ -19,7 +21,7 @@ const TABS = [
   { id: 'summary',     label: 'Summary Report',       icon: 'ti-clipboard-list' },
   { id: 'dashboard',   label: 'Performance Dashboard', icon: 'ti-layout-dashboard' },
   { id: 'transaction', label: 'Transaction Breakdown', icon: 'ti-table' },
-  { id: 'trend',       label: 'Trend Analysis',        icon: 'ti-trending-up' },
+  { id: 'trend',       label: 'Run Timeline',          icon: 'ti-trending-up' },
   { id: 'resource',    label: 'Resource Utilization',  icon: 'ti-cpu' },
   { id: 'errors',      label: 'Error Analysis',        icon: 'ti-alert-triangle' },
 ];
@@ -129,18 +131,7 @@ function fmtDate(d){ if (!d) return '—'; const dt = parseDbDate(d); return isN
 function trunc(s, n=20){ return s && s.length > n ? s.slice(0,n-1)+'…' : (s||''); }
 
 // ── Analytics dark theme palette (always dark regardless of app theme) ───────
-const D = {
-  pageBg:     '#1a2035',   // 25% lighter than before
-  cardBg:     '#222b42',   // card surface
-  cardBg2:    '#1e2840',   // alternate / deeper surface
-  border:     '#2e3a55',   // subtle borders
-  borderGlow: '#49CC3D',
-  textPri:    '#f0f3fa',   // bright white-ish
-  textSec:    '#b8c4d8',   // clearly readable secondary
-  textTer:    '#7a8eaa',   // muted tertiary
-  accent:     '#49CC3D',
-  accentBlue: '#58a6ff',
-};
+// Shared with the Trend Analysis components — see theme/analyticsDark.js
 
 // ── UI atoms ─────────────────────────────────────────────────────────────────
 function Card({ bg, border, children, style }) {
@@ -924,6 +915,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const [error, setError] = useState('');
   const [errorMeta, setErrorMeta] = useState(null); // { ci_run_id } when not_cached
   const [activeTab, setActiveTab] = useState('summary');
+  const [topTab, setTopTab] = useState('analytics'); // 'analytics' | 'trend-analysis'
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(false);
@@ -1106,6 +1098,36 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
       <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
+
+      {/* Top-level Analytics / Trend Analysis switcher */}
+      <div style={{ display:'flex', gap:4, marginBottom:18, borderBottom:`1px solid ${D.border}` }}>
+        {[
+          { id: 'analytics',      label: 'Analytics',       icon: 'ti-chart-bar' },
+          { id: 'trend-analysis', label: 'Trend Analysis',  icon: 'ti-chart-line' },
+        ].map(t => (
+          <button
+            key={t.id}
+            onClick={() => setTopTab(t.id)}
+            style={{
+              display:'flex', alignItems:'center', gap:7,
+              padding:'10px 18px', fontSize:13, fontWeight:700,
+              border:'none', borderBottom: topTab===t.id ? `2px solid ${D.accent}` : '2px solid transparent',
+              background:'transparent', color: topTab===t.id ? D.accent : D.textSec,
+              cursor:'pointer', whiteSpace:'nowrap', marginBottom:'-1px', transition:'color .15s',
+            }}
+          >
+            <i className={`ti ${t.icon}`} style={{ fontSize:14 }} />
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {topTab === 'trend-analysis' && (
+        <TrendAnalysisTab project={project} env={env} envs={envs} />
+      )}
+
+      {topTab === 'analytics' && (
+      <>
       {syncingCi && (
         <div style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 16px', marginBottom:12, borderRadius:8, background:'rgba(99,102,241,0.12)', border:'1px solid rgba(99,102,241,0.3)', fontSize:13, color:'#a5b4fc' }}>
           <span className="spinner" style={{ borderTopColor:'#818cf8' }} />
@@ -1249,6 +1271,8 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
             Peako — Analytics Report · {data.meta.suite_name} · Run {runNum}
           </footer>
         </div>
+      )}
+      </>
       )}
 
       {/* ── Delete confirmation dialog ─────────────────────────────────────── */}

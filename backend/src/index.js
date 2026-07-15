@@ -45,6 +45,7 @@ app.use('/api/projects/:projectId/scripts',            require('./routes/scripts
 app.use('/api/projects/:projectId/test-suites',        require('./routes/testSuites'));
 app.use('/api/projects/:projectId/test-data',          require('./routes/testData'));
 app.use('/api/projects/:projectId/config',             require('./routes/projectConfig'));
+app.use('/api/projects/:projectId/trend-analysis',     require('./routes/trendAnalysis'));
 app.use('/api/projects/:projectId/collections/:collectionId/env-config', require('./routes/envConfig'));
 app.use('/api/config',                                 require('./routes/config'));
 app.use('/api/ai',                                     require('./routes/ai'));
