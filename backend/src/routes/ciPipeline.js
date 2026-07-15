@@ -2328,9 +2328,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
-  // Parse CI parameters for the run name
+  // Parse CI parameters for the run name — also persisted onto execution_runs below
+  // (run_vusers/run_rampup/run_duration/run_loops) so Trend Analysis's capacity
+  // planning/scalability scoring has real concurrency data for CI-synced runs, not
+  // just native-execution ones.
   const ciVars    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
   const ciUsers   = ciVars.jmeter_users   || ciVars.script_users   || null;
+  const ciRampup  = ciVars.jmeter_rampup  || null;
   const ciLoops   = ciVars.jmeter_loops   || null;
   const ciDur     = ciVars.jmeter_duration|| null;
 
@@ -2471,9 +2475,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
         await db.prepare(`
-          INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
-        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id);
+          INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
 
         const healUserId = run.triggered_by || userId;
         if (run.auto_heal && !run.is_heal_run) {
@@ -2590,9 +2594,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       if (zeroBbLogs) zeroLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
 
       const zeroInsert = await db.prepare(`
-        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
-      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id);
+        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
       const zeroRunId = zeroInsert.lastInsertRowid;
 
       const healUserId0 = run.triggered_by || userId;
@@ -2692,15 +2696,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
 
     const execInsert = await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       projectId, suiteId, autoSyncRunStatus, resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
-      run.id
+      run.id, ciUsers, ciRampup, ciDur, ciLoops
     );
     const newRunId = execInsert.lastInsertRowid;
 
@@ -2921,11 +2925,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const callerRole  = callerUser1?.role;
   const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name);
 
-  // Parse CI parameters for the run name
-  const ciVars2  = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
-  const ciUsers2 = ciVars2.jmeter_users    || null;
-  const ciLoops2 = ciVars2.jmeter_loops    || null;
-  const ciDur2   = ciVars2.jmeter_duration || null;
+  // Parse CI parameters for the run name — also persisted onto execution_runs below
+  // (see the matching comment in autoSyncCiRun above for why).
+  const ciVars2   = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+  const ciUsers2  = ciVars2.jmeter_users    || null;
+  const ciRampup2 = ciVars2.jmeter_rampup   || null;
+  const ciLoops2  = ciVars2.jmeter_loops    || null;
+  const ciDur2    = ciVars2.jmeter_duration || null;
 
   let resultDir = null;
   let syncSuiteName = null;
@@ -3214,8 +3220,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     const execRunRow = await db.prepare(`
       INSERT INTO execution_runs
-        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       req.params.projectId,
       suiteId,
@@ -3226,7 +3232,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
-      run.id
+      run.id, ciUsers2, ciRampup2, ciDur2, ciLoops2
     );
 
     // Update ci_pipeline_run with result_dir reference
@@ -3972,13 +3978,15 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const quickSuite2 = quickScriptFile2
       ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
       : null;
+    const quickCiVars2 = (() => { try { return JSON.parse(quickCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
       projectId, quickSuite2?.id || null, fallbackDir,
       JSON.stringify([{ type: 'error', message: `Heal pipeline run ${quickCiRunId} failed — results not uploaded. Re-attempting fix.` }]),
-      quickCiRunId
+      quickCiRunId,
+      quickCiVars2.jmeter_users || null, quickCiVars2.jmeter_rampup || null, quickCiVars2.jmeter_duration || null, quickCiVars2.jmeter_loops || null
     );
     console.log(`[CI Heal] Created fallback execRun for heal run #${quickCiRunId}`);
   }
@@ -4042,13 +4050,15 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const fullSuite2 = fullScriptFile2
       ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
       : null;
+    const fullCiVars2 = (() => { try { return JSON.parse(fullCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
       projectId, fullSuite2?.id || null, fallbackDir2,
       JSON.stringify([{ type: 'error', message: `Full heal pipeline run ${fullCiRunId} failed — results not uploaded.` }]),
-      fullCiRunId
+      fullCiRunId,
+      fullCiVars2.jmeter_users || null, fullCiVars2.jmeter_rampup || null, fullCiVars2.jmeter_duration || null, fullCiVars2.jmeter_loops || null
     );
   }
 
@@ -4107,14 +4117,16 @@ router.post('/runs/:runId/heal', async (req, res) => {
       : null;
     const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
     fs.mkdirSync(resultDir, { recursive: true });
+    const healCiVars = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
     `).run(
       run.project_id, suiteRow?.id || null, resultDir,
       JSON.stringify([{ type: 'error', message: `CI pipeline run failed on ${run.provider}. No results were uploaded. Heal triggered manually.` }]),
       run.started_at || new Date().toISOString(),
-      run.id
+      run.id,
+      healCiVars.jmeter_users || null, healCiVars.jmeter_rampup || null, healCiVars.jmeter_duration || null, healCiVars.jmeter_loops || null
     );
     execRun = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   }

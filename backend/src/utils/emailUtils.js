@@ -103,6 +103,79 @@ function kpiCell(label, value, sub, color) {
     </td>`;
 }
 
+/** Score-tile color thresholds — matches ScoreCards.jsx's colorFor() exactly. */
+function scoreColor(value) {
+  if (value === null || value === undefined) return '#7a8eaa';
+  if (value >= 80) return '#22c55e';
+  if (value >= 50) return '#f59e0b';
+  return '#ef4444';
+}
+
+/** Render one Trend Analysis score card as a table cell (email-safe HTML). */
+function scoreCell(label, score, width, big) {
+  const value = score?.value;
+  const color = scoreColor(value);
+  const display = value === null || value === undefined
+    ? '<span style="font-size:13px;color:#7a8eaa;font-weight:600;">N/A</span>'
+    : `${value}<span style="font-size:12px;color:#7a8eaa;font-weight:500;"> / 100</span>`;
+  return `
+    <td style="width:${width};padding:4px;">
+      <div style="background:#222b42;border:1px solid #2e3a55;border-radius:10px;padding:${big ? '16px 18px' : '14px 16px'};">
+        <div style="font-size:${big ? '11px' : '10px'};font-weight:700;color:#7a8eaa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">${label}</div>
+        <div style="font-size:${big ? '28px' : '22px'};font-weight:800;color:${color};line-height:1.1;">${display}</div>
+      </div>
+    </td>`;
+}
+
+/**
+ * Trend Analysis section — 6 weighted Performance Scores + an executive summary,
+ * for this run vs. the immediately preceding run of the same test plan (see
+ * utils/trend/emailTrendSummary.js). Returns '' if there's no prior run to compare
+ * against yet, so the section is simply omitted rather than shown empty.
+ */
+function buildTrendAnalysisSectionHtml(trendData) {
+  if (!trendData) return '';
+  const { scores, aiSummary } = trendData;
+
+  const scoreRow = `<tr>
+    ${scoreCell('Performance Score', scores.overall, '40%', true)}
+    ${scoreCell('API Health', scores.apiHealth, '30%')}
+    ${scoreCell('Application Health', scores.appHealth, '30%')}
+  </tr>
+  <tr><td colspan="3" style="padding:3px 0;"></td></tr>
+  <tr>
+    ${scoreCell('Regression', scores.regression, '33.33%')}
+    ${scoreCell('Reliability', scores.reliability, '33.33%')}
+    ${scoreCell('Scalability', scores.scalability, '33.34%')}
+  </tr>`;
+
+  const badgeColor = aiSummary.source === 'ai' ? '#58a6ff' : '#7a8eaa';
+  const badgeBg    = aiSummary.source === 'ai' ? 'rgba(88,166,255,0.12)' : 'rgba(122,142,170,0.12)';
+  const badgeLabel = aiSummary.source === 'ai' ? 'AI-GENERATED' : 'RULE-BASED';
+
+  const bulletsHtml = (aiSummary.bullets || [])
+    .map(b => `<li style="font-size:13px;line-height:1.6;color:#e6edf3;margin-bottom:4px;">${b}</li>`)
+    .join('');
+
+  return `
+  <!-- Trend Analysis -->
+  <div style="padding:0 20px 20px;">
+    <div style="font-size:13px;font-weight:700;color:#f0f3fa;margin-bottom:10px;">Trend Analysis</div>
+    <table style="width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:14px;">
+      ${scoreRow}
+    </table>
+    <div style="background:linear-gradient(135deg, rgba(73,204,61,0.10), rgba(88,166,255,0.06));border:1px solid #2e3a55;border-radius:10px;padding:16px 18px;">
+      <table style="width:100%;border-collapse:collapse;margin-bottom:8px;"><tr>
+        <td style="font-size:13px;font-weight:700;color:#f0f3fa;">✦ Executive Summary</td>
+        <td style="text-align:right;">
+          <span style="font-size:9px;font-weight:700;padding:3px 8px;border-radius:10px;text-transform:uppercase;letter-spacing:.4px;color:${badgeColor};background:${badgeBg};">${badgeLabel}</span>
+        </td>
+      </tr></table>
+      <ul style="margin:0;padding-left:18px;">${bulletsHtml}</ul>
+    </div>
+  </div>`;
+}
+
 function deriveFailureReason(runData) {
   const s = runData.summary || {};
   if (!s.total_requests || s.total_requests === 0) {
@@ -120,7 +193,7 @@ function deriveFailureReason(runData) {
 }
 
 /** Build HTML email body — dark Analytics-style KPI grid */
-function buildEmailBody(runData, orgName, recipientName, reportDir) {
+function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
   const m = runData.meta || {};
   const s = runData.summary || {};
 
@@ -252,8 +325,11 @@ function buildEmailBody(runData, orgName, recipientName, reportDir) {
     </div>` : ''}
   </div>
 
-  <!-- KPI Grid -->
+  ${buildTrendAnalysisSectionHtml(trendData)}
+
+  <!-- Test Summary / KPI Grid -->
   <div style="padding:0 20px 20px;">
+    <div style="font-size:13px;font-weight:700;color:#f0f3fa;margin-bottom:10px;">Test Summary</div>
     <table style="width:100%;border-collapse:collapse;table-layout:fixed;">
       ${row1}
       <tr><td colspan="4" style="padding:3px 0;"></td></tr>
@@ -322,12 +398,28 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
     // files containing JS/HTML for security reasons. The report path is included
     // in the email body so recipients can open it directly from the server.
 
+    // Trend Analysis section — this run vs. the immediately preceding run of the same
+    // test plan. Computed once (not per-recipient); omitted entirely if there's no
+    // prior run yet, or if anything fails, rather than blocking the whole email.
+    let trendData = null;
+    if (runId) {
+      try {
+        const runRow = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
+        if (runRow) {
+          const { buildEmailTrendSummary } = require('./trend/emailTrendSummary');
+          trendData = await buildEmailTrendSummary(projectId, runRow, userId);
+        }
+      } catch (e) {
+        console.error('[Alerts] Failed to build Trend Analysis section for email:', e.message);
+      }
+    }
+
     const transport = createTransport(cfg);
     const suiteName = runData.meta?.suite_name || 'Test Plan';
     const subject   = `[Peako] ${suiteName} — Test Execution Report`;
 
     for (const recipient of recipients) {
-      const html = buildEmailBody(runData, orgName, recipient.name, reportDir);
+      const html = buildEmailBody(runData, orgName, recipient.name, reportDir, trendData);
       const s = runData.summary || {};
       const plainText = [
         `Peako — Test Execution Report`,
