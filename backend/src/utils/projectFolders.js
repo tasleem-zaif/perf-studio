@@ -1,5 +1,5 @@
 const path   = require('path');
-const { mkdirSync, writeFileSync, existsSync, rmSync } = require('fs');
+const { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } = require('fs');
 const { execSync } = require('child_process');
 const db = require('../db');
 
@@ -44,6 +44,29 @@ async function resolveUserFolder(userId) {
   }
 }
 
+/**
+ * Resolve the organization slug that owns a given project — used as the top-level
+ * grouping segment in S3 (the bucket is shared across every org/project, unlike local
+ * disk which is already segregated by directory tree per deployment).
+ * Falls back to 'unassigned' for projects owned by an org-less super_admin, or if the
+ * project/lookup can't be resolved (e.g. project already deleted) — this keeps the S3
+ * key derivation total (never throws) so a sync call never fails purely because org
+ * lookup came up empty.
+ */
+async function resolveOrgSlugForProject(projectId) {
+  try {
+    const row = await db.prepare(`
+      SELECT o.slug FROM projects p
+      JOIN users u ON u.id = p.user_id
+      LEFT JOIN organizations o ON o.id = u.org_id
+      WHERE p.id = ?
+    `).get(projectId);
+    return row?.slug || 'unassigned';
+  } catch {
+    return 'unassigned';
+  }
+}
+
 /** Add a .gitkeep to every directory in the tree so git tracks empty folders */
 function addGitkeepAll(dir) {
   if (!existsSync(dir)) return;
@@ -58,19 +81,42 @@ function addGitkeepAll(dir) {
 }
 
 /**
- * Build the project folder path for the admin workspace.
- * Each project has its own isolated workspace: git-workspaces/<ProjectName>/admin/
+ * Resolves the workspace ROOT for a given project+actor — the directory that either
+ * already contains (or will contain) that actor's `.git`. Backward-compatible by design,
+ * added when an `<Organization>` segment was introduced as the parent of `<Project>`:
+ * if this exact project+actor already has real content at the pre-org location
+ * (`git-workspaces/<Project>/<actor>/`), that location is returned UNCHANGED, forever —
+ * nothing is ever migrated or moved, and no existing project is affected by this at all.
+ * Only a project+actor with NOTHING created yet at the old location gets the new
+ * `git-workspaces/<Organization>/<Project>/<actor>/` structure, and only if an org slug
+ * was actually resolvable — if not, it falls back to the old (org-less) location rather
+ * than guess, so a caller that can't resolve org never produces a wrong/inconsistent path.
  */
-function getProjectPath(projectName) {
-  return path.join(GIT_WORKSPACES_ROOT, cleanName(projectName), 'admin');
+function resolveWorkspaceRoot(cleanProjectName, actorFolder, orgSlug) {
+  const oldRoot = path.join(GIT_WORKSPACES_ROOT, cleanProjectName, actorFolder);
+  let hasOldContent = false;
+  try { hasOldContent = existsSync(oldRoot) && readdirSync(oldRoot).length > 0; } catch (_) {}
+  if (hasOldContent || !orgSlug) return oldRoot;
+  return path.join(GIT_WORKSPACES_ROOT, cleanName(orgSlug), cleanProjectName, actorFolder);
 }
 
 /**
- * Create the project folder in git-workspaces/admin/projects/<ProjectName>/
+ * Build the project folder path for the admin workspace.
+ * git-workspaces/<Organization>/<ProjectName>/admin/ for a brand-new project, or the
+ * pre-existing git-workspaces/<ProjectName>/admin/ if that already has content — see
+ * resolveWorkspaceRoot().
+ */
+function getProjectPath(projectName, orgSlug) {
+  return resolveWorkspaceRoot(cleanName(projectName), 'admin', orgSlug);
+}
+
+/**
+ * Create the project folder in git-workspaces/[<Organization>/]<ProjectName>/admin/
  * Adds .gitkeep so the empty folder is tracked by git.
  */
-function ensureProjectFolders(projectName) {
-  const base = getProjectPath(projectName);
+async function ensureProjectFolders(projectName, projectId) {
+  const orgSlug = projectId ? await resolveOrgSlugForProject(projectId) : null;
+  const base = getProjectPath(projectName, orgSlug);
   mkdirSync(base, { recursive: true });
   addGitkeepAll(base);
   return base;
@@ -140,13 +186,67 @@ function deleteProjectFolder(folderPath) {
   }
 }
 
-function backupAndDeleteProjectFolder(folderPath, projectName, projectId) {
+function buildBackupZipName(projectName, projectId) {
+  const safe = (projectName || 'project').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  return `${safe}_${projectId}_${ts}.zip`;
+}
+
+/**
+ * PAT-mode backup: folderPath has no real local directory at all — build the zip directly
+ * from whatever's currently in S3 under that workspace's prefix (which already holds the
+ * full working-tree state, .git internals included, per gitEngine.js's session model — the
+ * exact equivalent of "the local folder" in the old disk-based design), stream it straight
+ * into an S3 multipart upload, then tombstone the workspace's S3 objects now that they're
+ * captured in the backup. Never touches local disk.
+ */
+async function backupS3Workspace(folderPath, projectName, projectId, orgSlug) {
+  const s3Sync = require('./s3Sync');
+  const archiver = require('archiver');
+  const baseKey = s3Sync.toKey(folderPath, orgSlug);
+  if (!baseKey) return null;
+  const keys = await s3Sync.listAllKeys(baseKey);
+  if (!keys.length) return null;
+
+  const zipName = buildBackupZipName(projectName, projectId);
+  const backupKey = s3Sync.toKey(path.join(BACKUPS_ROOT, zipName), orgSlug);
+  if (!backupKey) return null;
+
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  const chunks = [];
+  archive.on('data', c => chunks.push(c));
+  const done = new Promise((resolve, reject) => { archive.on('end', resolve); archive.on('error', reject); });
+  for (const key of keys) {
+    const res = await s3Sync.getBuffer(key);
+    if (res.ok) archive.append(res.data, { name: key.slice(baseKey.length + 1) });
+  }
+  archive.finalize();
+  await done;
+
+  const upload = await s3Sync.putBuffer(backupKey, Buffer.concat(chunks));
+  if (!upload.ok) return null;
+  await s3Sync.deleteAllUnderPrefix(baseKey); // tombstone — now durably captured in the backup
+  return backupKey;
+}
+
+/**
+ * folderPath is a real local directory (SSH-mode workspace) or a path-SHAPED naming string
+ * with no local presence at all (PAT-mode, S3-only) — ownerUserId (the project owner, whose
+ * workspace this backs up) determines which. Returns the local zip path (SSH) or the S3
+ * backup key (PAT), or null if there was nothing to back up.
+ */
+async function backupAndDeleteProjectFolder(folderPath, projectName, projectId, orgSlug, ownerUserId) {
+  if (ownerUserId) {
+    const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(ownerUserId, projectId);
+    if ((identity?.auth_method || 'pat') !== 'ssh') {
+      return backupS3Workspace(folderPath, projectName, projectId, orgSlug);
+    }
+  }
+
   return new Promise((resolve) => {
     if (!folderPath || !existsSync(folderPath)) { resolve(null); return; }
     mkdirSync(BACKUPS_ROOT, { recursive: true });
-    const safe    = (projectName || 'project').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const zipName = `${safe}_${projectId}_${ts}.zip`;
+    const zipName = buildBackupZipName(projectName, projectId);
     const zipPath = path.join(BACKUPS_ROOT, zipName);
     try {
       if (process.platform === 'win32') {
@@ -158,7 +258,15 @@ function backupAndDeleteProjectFolder(folderPath, projectName, projectId) {
       }
     } catch (_) {}
     try { rmSync(folderPath, { recursive: true, force: true }); } catch (_) {}
-    resolve(existsSync(zipPath) ? zipPath : null);
+    const zipExists = existsSync(zipPath);
+    if (zipExists) {
+      // Mirror the backup zip to S3 too — lazy require avoids a circular dependency
+      // (s3Sync.js itself requires this module for the root path constants).
+      require('./s3Sync').uploadFile(zipPath, orgSlug).then(up => {
+        if (!up.ok && !up.skipped) console.error('[ProjectFolders] S3 sync failed for', zipPath, ':', up.error?.message);
+      });
+    }
+    resolve(zipExists ? zipPath : null);
   });
 }
 
@@ -169,13 +277,19 @@ function backupAndDeleteProjectFolder(folderPath, projectName, projectId) {
  */
 /**
  * Returns the project content path inside a user's git workspace.
- * Structure: git-workspaces/<ProjectName>/<userName>/<ProjectName>/
+ * Structure: git-workspaces/[<Organization>/]<ProjectName>/<userName>/<ProjectName>/
  * The outer <ProjectName> is the workspace bucket; <userName> is the git repo root;
  * the inner <ProjectName> is the content subfolder where collections/scripts live.
+ * `projectId` is optional (4th arg) — pass it whenever available so a brand-new project
+ * gets the org-prefixed structure; omitting it is safe (falls back to the pre-org
+ * location) but means this specific call site won't see the new structure for a project
+ * that only ever gets touched through it — see resolveWorkspaceRoot().
  */
-async function getUserProjectPath(userId, userRole, projectName) {
+async function getUserProjectPath(userId, userRole, projectName, projectId) {
   const userFolder = await resolveUserFolder(userId);
-  return path.join(GIT_WORKSPACES_ROOT, cleanName(projectName), userFolder, cleanName(projectName));
+  const orgSlug = projectId ? await resolveOrgSlugForProject(projectId) : null;
+  const root = resolveWorkspaceRoot(cleanName(projectName), userFolder, orgSlug);
+  return path.join(root, cleanName(projectName));
 }
 
 /**
@@ -198,6 +312,8 @@ module.exports = {
   ensureAllEnvFolders,
   getUserProjectPath,
   resolveUserFolder,
+  resolveOrgSlugForProject,
+  resolveWorkspaceRoot,
   deleteProjectFolder,
   backupAndDeleteProjectFolder,
   PROJECTS_ROOT,

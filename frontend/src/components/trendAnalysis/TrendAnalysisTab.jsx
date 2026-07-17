@@ -311,7 +311,7 @@ export default function TrendAnalysisTab({ project, env }) {
 
       {!loading && !error && displayRuns.length > 0 && (
         <div style={{ overflowX:'auto', border:`1px solid ${D.border}`, borderRadius:10 }}>
-          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12.5 }}>
+          <table className="dark-table" style={{ width:'100%', borderCollapse:'collapse', fontSize:12.5 }}>
             <thead>
               <tr style={{ background:D.cardBg2 }}>
                 <th style={{ padding:'9px 10px', width:30 }} />

@@ -12,6 +12,7 @@ const { parseCollection, parsePostmanEnvironment, extractCollectionVariables } =
 const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
 const { resolveUrlSet } = require('../utils/preRunEngine');
 const { reindexAfterEndpointRemoval } = require('../utils/correlationEngine');
+const s3Sync = require('../utils/s3Sync');
 
 /**
  * Auto-populate project config URLs from a collection's parsed endpoints.
@@ -101,36 +102,21 @@ async function setupCollectionFolder(proj, colId, colName, env, sourceContent, s
   const caller = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
   const role   = caller?.role || userRole;
 
-  // userProjectPath is: git-workspaces/<ProjectName>/<userName>/<ProjectName>/
-  const userProjectPath = await getUserProjectPath(userId, role, proj.name);
+  // userProjectPath is: git-workspaces/[<Organization>/]<ProjectName>/<userName>/<ProjectName>/
+  const userProjectPath = await getUserProjectPath(userId, role, proj.name, proj.id);
   if (!userProjectPath) return null;
 
-  // gitRoot is one level up from userProjectPath — where .git lives
-  const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
-  const { resolveUserFolder } = require('../utils/projectFolders');
-  const gitRoot   = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name), await resolveUserFolder(userId));
-  const gitDotDir = path.join(gitRoot, '.git');
+  // gitRoot is one level up from userProjectPath — where .git lives. Derived via dirname
+  // (not recomputed independently) so it can never disagree with userProjectPath about
+  // whether this project+actor uses the org-prefixed structure or the pre-existing one.
+  const gitRoot = path.dirname(userProjectPath);
 
-  if (!fs.existsSync(gitDotDir)) {
-    // No .git yet — try to clone from remote so git can track files
-    try {
-      const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(proj.id);
-      if (gitCfg?.remote_url && gitCfg?.is_initialized) {
-        const { decrypt } = require('../utils/encryption');
-        const identity    = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, proj.id);
-        const rawToken    = identity?.auth_token ? decrypt(identity.auth_token)
-          : gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '';
-        if (rawToken) {
-          const u = new URL(gitCfg.remote_url);
-          u.username = rawToken;
-          u.password = rawToken;
-          const remoteWithAuth = u.toString();
-          fs.mkdirSync(gitRoot, { recursive: true });
-          require('simple-git')().clone(remoteWithAuth, gitRoot).catch(() => {});
-        }
-      }
-    } catch (_) {}
-  }
+  // Restore the workspace first if the S3 sweep reclaimed it since the last access (or if
+  // .git was never cloned into this folder at all yet) — properly awaited and also restores
+  // anything S3-only (results/), unlike the old fire-and-forget clone this replaces.
+  try {
+    await require('./git').ensureGitWorkspaceHydrated(gitRoot, proj.id, userId);
+  } catch (e) { console.error('[Collections] Workspace hydrate failed:', e.message); }
 
   try {
     const base = ensureCollectionFolders(userProjectPath, colName, env);
@@ -268,8 +254,8 @@ router.post('/', uploadWithEnv, async (req, res) => {
   const callerRow = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
   // Pass user's workspace path so config.json is written to the right location
   const projForConfig = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-  const userProjectPath = await getUserProjectPath(req.userId, callerRow?.role, projForConfig?.name || '');
-  writeCollectionConfig(savedCol, userProjectPath);
+  const userProjectPath = await getUserProjectPath(req.userId, callerRow?.role, projForConfig?.name || '', req.params.projectId);
+  writeCollectionConfig(savedCol, userProjectPath, req.userId);
   // Auto-populate project config with URLs from this collection (non-blocking) —
   // pass the resolved {{var}} values so a template-only collection (e.g. {{alpha_url}})
   // still resolves to a real host when an environment file provided one.
@@ -371,7 +357,8 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
     const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const callerRole = callerUser?.role;
     const projRow    = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '');
+    const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '', req.params.projectId);
+    if (userProjPath) await require('./git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
     if (userProjPath && !isAdminWorkspace(userProjPath)) {
       let newEnvs = [];
       try { newEnvs = JSON.parse(req.body.environments || '[]'); } catch {}
@@ -391,7 +378,7 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
       ensureAllEnvFolders(userProjPath, newName || col.name, newEnvs);
 
       // Update config.json for all envs
-      writeCollectionConfig(updatedCol, userProjPath);
+      writeCollectionConfig(updatedCol, userProjPath, req.userId);
     }
   } catch (e) {
     console.warn('[Collections] Folder sync on edit failed:', e.message);
@@ -410,14 +397,17 @@ router.delete('/:id', async (req, res) => {
   try {
     const callerUser2 = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const callerRole = callerUser2?.role;
-    const { getUserProjectPath, cleanName } = require('../utils/projectFolders');
-    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name);
+    const { getUserProjectPath, cleanName, resolveOrgSlugForProject } = require('../utils/projectFolders');
+    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name, proj.id);
     if (userProjPath) {
       const colDir = path.join(userProjPath, cleanName(col.name));
       if (fs.existsSync(colDir)) {
         fs.rmSync(colDir, { recursive: true, force: true });
         console.log(`[Collections] Deleted folder: ${colDir}`);
       }
+      const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+      const del = await s3Sync.deleteDir(colDir, orgSlug);
+      if (!del.ok && !del.skipped) console.error('[Collections] S3 delete failed for', colDir, ':', del.failed?.length, 'object(s)');
     }
   } catch (e) {
     console.warn('[Collections] Folder delete failed:', e.message);
@@ -485,8 +475,9 @@ router.post('/:id/endpoints/delete', async (req, res) => {
     const { getUserProjectPath, isAdminWorkspace } = require('../utils/projectFolders');
     const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, projRow?.name || '');
-    if (userProjPath && !isAdminWorkspace(userProjPath)) writeCollectionConfig(updatedCol, userProjPath);
+    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, projRow?.name || '', req.params.projectId);
+    if (userProjPath) await require('./git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
+    if (userProjPath && !isAdminWorkspace(userProjPath)) writeCollectionConfig(updatedCol, userProjPath, req.userId);
   } catch (e) {
     console.warn('[Collections] Config sync after endpoint delete failed:', e.message);
   }

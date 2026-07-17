@@ -77,8 +77,8 @@ router.put('/:env', async (req, res) => {
       const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
       const callerRole = callerUser?.role;
       const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-      const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '');
-      await updateCollectionConfigs(collectionId, userProjPath);
+      const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '', req.params.projectId);
+      await updateCollectionConfigs(collectionId, userProjPath, req.userId);
     } catch (_) {}
   });
 

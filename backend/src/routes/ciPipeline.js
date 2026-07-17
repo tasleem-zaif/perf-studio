@@ -24,6 +24,36 @@ const fs      = require('fs');
 const os      = require('os');
 const { randomBytes } = require('crypto');
 const { spawnSync } = require('child_process');
+const s3Sync = require('../utils/s3Sync');
+const resultsStore = require('../utils/resultsStore');
+
+// ── Download a URL straight into an in-memory Buffer — no local temp file at all.
+// Follows a single redirect hop (matches every existing call site's behavior).
+// Rejects with an Error carrying the same message shape callers already check for.
+function downloadToBuffer(urlOrOptions, extraHeaders, { followRedirect = true } = {}) {
+  return new Promise((resolve, reject) => {
+    const isUrlString = typeof urlOrOptions === 'string';
+    const client = isUrlString ? (new URL(urlOrOptions).protocol === 'https:' ? https : http) : https;
+    const opts = isUrlString ? { headers: extraHeaders, rejectUnauthorized: false } : { ...urlOrOptions, rejectUnauthorized: false };
+    const req = (isUrlString ? client.get(urlOrOptions, opts) : client.request(opts));
+    req.on('response', response => {
+      const collect = (r) => {
+        const chunks = [];
+        r.on('data', c => chunks.push(c));
+        r.on('end', () => resolve({ statusCode: r.statusCode, headers: r.headers, buffer: Buffer.concat(chunks) }));
+        r.on('error', reject);
+      };
+      if (followRedirect && (response.statusCode === 301 || response.statusCode === 302)) {
+        const redirectUrl = response.headers.location;
+        https.get(redirectUrl, { rejectUnauthorized: false }, collect).on('error', reject);
+      } else {
+        collect(response);
+      }
+    });
+    req.on('error', reject);
+    if (!isUrlString) req.end();
+  });
+}
 
 // Guards against overlapping status-poll requests for the same CI run both passing the
 // "not yet synced" check before either INSERT commits — without this, two concurrent
@@ -402,17 +432,27 @@ async function getRepoFromGit(projectId) {
 // ── Helper: extract PAT from the git remote URL (ghp_... embedded in URL) ─────
 async function getTokenFromGitRemote(projectId) {
   try {
-    const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
+    const { GIT_WORKSPACES_ROOT, cleanName, resolveOrgSlugForProject: resolveOrgForToken } = require('../utils/projectFolders');
     const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
     if (!proj) return null;
-    // Check both admin and any user-N workspace for a remote URL with an embedded token
-    const wsBase = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name));
-    const dirs = [path.join(wsBase, 'admin')];
     const fs2 = require('fs');
-    if (fs2.existsSync(wsBase)) {
-      for (const d of fs2.readdirSync(wsBase)) {
-        const full = path.join(wsBase, d);
-        if (d !== 'admin' && fs2.statSync(full).isDirectory()) dirs.push(full);
+    // Check both admin and any user-N workspace for a remote URL with an embedded token.
+    // Scan both the pre-org-prefix location AND the org-prefixed one (added when
+    // <Organization> became the parent of <Project>) — different actors of the same
+    // project can legitimately be split across the two if some were created before this
+    // change and others after, so a single project's workspaces are never assumed to all
+    // live under one or the other.
+    const orgSlugForToken = await resolveOrgForToken(projectId);
+    const wsBases = [path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name))];
+    if (orgSlugForToken) wsBases.push(path.join(GIT_WORKSPACES_ROOT, cleanName(orgSlugForToken), cleanName(proj.name)));
+    const dirs = [];
+    for (const wsBase of wsBases) {
+      dirs.push(path.join(wsBase, 'admin'));
+      if (fs2.existsSync(wsBase)) {
+        for (const d of fs2.readdirSync(wsBase)) {
+          const full = path.join(wsBase, d);
+          if (d !== 'admin' && fs2.statSync(full).isDirectory()) dirs.push(full);
+        }
       }
     }
     for (const dir of dirs) {
@@ -731,10 +771,15 @@ router.post('/generate-yaml', async (req, res) => {
   // Use per-project workspace (new structure: git-workspaces/<ProjectName>/admin/)
   const callerRow = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   const isAdmin   = ['org_admin', 'super_admin'].includes(callerRow?.role);
-  const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder } = require('../utils/projectFolders');
+  const { resolveUserFolder, resolveOrgSlugForProject, resolveWorkspaceRoot } = require('../utils/projectFolders');
+  const orgSlug      = await resolveOrgSlugForProject(req.params.projectId);
   const userFolder   = await resolveUserFolder(req.userId);
   const cleanProject = (project.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-  const gitRoot      = path.join(GIT_WORKSPACES_ROOT, cleanProject, userFolder);
+  const gitRoot      = resolveWorkspaceRoot(cleanProject, userFolder, orgSlug);
+  // Restore the workspace first if the S3 sweep reclaimed it since the last access — the
+  // unconditional mkdirSync below would otherwise silently recreate a bare, git-less folder
+  // instead of properly restoring it.
+  await require('./git').ensureGitWorkspaceHydrated(gitRoot, req.params.projectId, req.userId);
   fs.mkdirSync(gitRoot, { recursive: true });
 
   // Get all generated test plans for this project to include as YAML comments
@@ -860,6 +905,7 @@ run_jmeter:
     try {
       const dest = path.join(gitRoot, '.gitlab-ci.yml');
       fs.writeFileSync(dest, gitlabYaml, 'utf8');
+      s3Sync.uploadFile(dest, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', dest, ':', up.error?.message); });
       created.push('.gitlab-ci.yml');
     } catch (e) { errors.push(`.gitlab-ci.yml: ${e.message}`); }
   }
@@ -1100,13 +1146,17 @@ print("Patch complete")
     try {
       const workflowDir = path.join(gitRoot, '.github', 'workflows');
       fs.mkdirSync(workflowDir, { recursive: true });
-      fs.writeFileSync(path.join(workflowDir, workflowFile), githubYaml, 'utf8');
+      const workflowPath = path.join(workflowDir, workflowFile);
+      fs.writeFileSync(workflowPath, githubYaml, 'utf8');
+      s3Sync.uploadFile(workflowPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', workflowPath, ':', up.error?.message); });
       created.push(`.github/workflows/${workflowFile}`);
 
       // Commit the Python patcher alongside the YAML
       const patcherDir = path.join(gitRoot, '.PerfStudio');
       fs.mkdirSync(patcherDir, { recursive: true });
-      fs.writeFileSync(path.join(patcherDir, 'patch_jmx.py'), patcherPy, 'utf8');
+      const patcherPath = path.join(patcherDir, 'patch_jmx.py');
+      fs.writeFileSync(patcherPath, patcherPy, 'utf8');
+      s3Sync.uploadFile(patcherPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', patcherPath, ':', up.error?.message); });
       created.push(`.PerfStudio/patch_jmx.py`);
     } catch (e) { errors.push(`${e.message}`); }
   }
@@ -1249,12 +1299,15 @@ pipelines:
     try {
       const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
       fs.writeFileSync(dest, bbYaml.replace(/\r\n/g, '\n'), 'utf8');
+      s3Sync.uploadFile(dest, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', dest, ':', up.error?.message); });
       created.push('bitbucket-pipelines.yml');
 
       // Write the Python patcher alongside the YAML
       const bbPatcherDir = path.join(gitRoot, '.PerfStudio');
       fs.mkdirSync(bbPatcherDir, { recursive: true });
-      fs.writeFileSync(path.join(bbPatcherDir, 'patch_jmx.py'), BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+      const bbPatcherPath = path.join(bbPatcherDir, 'patch_jmx.py');
+      fs.writeFileSync(bbPatcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+      s3Sync.uploadFile(bbPatcherPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', bbPatcherPath, ':', up.error?.message); });
       created.push('.PerfStudio/patch_jmx.py');
     } catch (e) { errors.push(`bitbucket-pipelines.yml: ${e.message}`); }
   }
@@ -1515,6 +1568,8 @@ pipelines:
 // ── POST /trigger — trigger pipeline on GitLab or GitHub ─────────────────────
 router.post('/trigger', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
+  const { resolveOrgSlugForProject: resolveOrgSlugForTrigger } = require('../utils/projectFolders');
+  const triggerOrgSlug = await resolveOrgSlugForTrigger(req.params.projectId);
   // Workspace/repo/ref are project-level settings — always from the admin's config.
   // Auth credentials (token, username/email) come from the triggering user's own config,
   // falling back to the admin's config if the user hasn't set their own.
@@ -1614,14 +1669,24 @@ router.post('/trigger', async (req, res) => {
   // The CI runner checks out this branch — the JMX file must exist there or
   // the Patch JMX step will fail with FileNotFoundError.
   try {
-    const { GIT_WORKSPACES_ROOT, cleanName, resolveUserFolder: resolveUF } = require('../utils/projectFolders');
+    const { cleanName, resolveUserFolder: resolveUF, resolveOrgSlugForProject: resolveOrgUF, resolveWorkspaceRoot: resolveWSRoot } = require('../utils/projectFolders');
     const projectRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
     const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
     // Always use the project's initialized git_root (set by admin) for auto-push,
     // not the triggering user's workspace — the user's workspace may lack .git.
+    // gitCfg.git_root, when set, is a DB-stored absolute path — used as-is, never
+    // recomputed, since it already points at wherever that project's real data lives.
+    const orgSlugForTrigger = await resolveOrgUF(req.params.projectId);
+    const preferredRoot = gitCfg?.git_root || resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
+    // Restore the workspace first if the S3 sweep reclaimed it since the last access —
+    // otherwise a cold (but otherwise valid) git_root looks indistinguishable below from
+    // "never had git initialized," silently skipping the whole auto-push block.
+    if (gitCfg?.is_initialized) {
+      await require('./git').ensureGitWorkspaceHydrated(preferredRoot, req.params.projectId, req.userId);
+    }
     const wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git')))
       ? gitCfg.git_root
-      : path.join(GIT_WORKSPACES_ROOT, cleanName(projectRow?.name || ''), resolveUF(req.userId));
+      : resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
 
     if (gitCfg?.is_initialized && fs.existsSync(path.join(wsRoot, '.git'))) {
       const simpleGit2 = require('simple-git');
@@ -1831,7 +1896,9 @@ pipelines:
               fi
               echo "Validation passed: $TOTAL requests executed."
 `;
-          fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
+          const _bbYamlPath = path.join(wsRoot, 'bitbucket-pipelines.yml');
+          fs.writeFileSync(_bbYamlPath, _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
+          s3Sync.uploadFile(_bbYamlPath, triggerOrgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', _bbYamlPath, ':', up.error?.message); });
           console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template');
         } catch (e) {
           console.warn('[CI trigger] YAML regen failed:', e.message);
@@ -1849,6 +1916,7 @@ pipelines:
         if (!fs.existsSync(_patcherPath)) {
           fs.mkdirSync(_patcherDir, { recursive: true });
           fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+          s3Sync.uploadFile(_patcherPath, triggerOrgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', _patcherPath, ':', up.error?.message); });
           console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
         }
       } catch (e) {
@@ -2311,10 +2379,8 @@ router.get('/runs', async (req, res) => {
 // ── Auto-sync helper — called when status poll detects completion ─────────────
 // Creates an execution_runs record from CI artifacts so Analytics shows the run.
 async function autoSyncCiRun(run, cfg, projectId, userId) {
-  const os      = require('os');
-  const AdmZip  = require('adm-zip');
-  const { parseJtl } = require('../utils/parseJtl');
-  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('../utils/projectFolders');
+  const { parseJtlContent } = require('../utils/parseJtl');
+  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
 
   const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   if (!project) return;
@@ -2323,9 +2389,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (alreadySynced) { console.log(`[Auto-sync] CI run #${run.id} already synced → skipping`); return; }
 
+  const orgSlug = await resolveOrgSlugForProject(projectId);
   const callerUser0 = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
   const callerRole = callerUser0?.role;
-  const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
+  // userProjPath/resultDir below are path-SHAPED naming strings only, used to derive an S3
+  // key (via resultsStore, which calls s3Sync.toKey()) and for the existing run-numbering/
+  // display-label conventions — never created on disk, never touched via fs.*.
+  const userProjPath = await getUserProjectPath(userId, callerRole, project.name, projectId);
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
   // Parse CI parameters for the run name — also persisted onto execution_runs below
@@ -2358,9 +2428,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       : null;
     if (suite?.col_name && resolvedEnv) {
       const envPath = getCollectionPath(userProjPath, suite.col_name, resolvedEnv);
-      try { require('fs').mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
+      const resultsParent = path.join(envPath, 'results');
       let nums = [];
-      try { nums = require('fs').readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      try { nums = (await resultsStore.listRunDirs(resultsParent, orgSlug)).filter(n => !n.startsWith('Heal_')).map(extractRunNumber).filter(n => n > 0); } catch {}
       const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
       const runDirName = buildRunDirName(suiteName || scriptFile.replace(/\.jmx$/, ''), ciUsers, 'duration', ciLoops, ciDur, nextRun);
       resultDir = path.join(envPath, 'results', runDirName);
@@ -2371,7 +2441,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   if (!resultDir) {
     console.warn(`[Auto-sync] CI run #${run.id} (script "${run.script_name}") — no matching collection-scoped test suite found, falling back to project-level results`);
     try {
-      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const nums = (await resultsStore.listRunDirs(path.join(userProjPath, 'results'), orgSlug)).filter(n => !n.startsWith('Heal_')).map(extractRunNumber).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
       const scriptBase = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
       resultDir = path.join(userProjPath, 'results', buildRunDirName(suiteName || scriptBase, ciUsers, 'duration', ciLoops, ciDur, next));
@@ -2380,7 +2450,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
   }
 
-  const tmpZip = path.join(os.tmpdir(), `ci_auto_${run.id}_${Date.now()}.zip`);
+  let artifactZipBuffer = null; // GitHub/GitLab: full artifact zip; Bitbucket: unused (fetched separately below)
 
   try {
     if (run.provider === 'github') {
@@ -2392,14 +2462,8 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const dlResp = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/artifacts/${artifact.id}/zip`, 'GET', null, ghHeaders);
       const downloadUrl = dlResp.headers?.location || dlResp.headers?.Location;
       if (!downloadUrl) throw new Error('No download URL');
-      await new Promise((resolve, reject) => {
-        const fileStream = fs.createWriteStream(tmpZip);
-        https.get(downloadUrl, { rejectUnauthorized: false }, response => {
-          if (response.statusCode === 302 || response.statusCode === 301) {
-            https.get(response.headers.location, { rejectUnauthorized: false }, r2 => { r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); }); }).on('error', reject);
-          } else { response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); }); }
-        }).on('error', reject);
-      });
+      const dl = await downloadToBuffer(downloadUrl, {});
+      artifactZipBuffer = dl.buffer;
     } else if (run.provider === 'gitlab') {
       if (!cfg.gitlab_token) throw new Error('No GitLab token');
       const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
@@ -2408,18 +2472,11 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       if (jobsResp.status !== 200 || !jobsResp.body?.length) throw new Error('No jobs found');
       const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
       if (!job?.id) throw new Error('No artifact job');
-      await new Promise((resolve, reject) => {
-        const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
-        const urlObj = new URL(artifactUrl);
-        const fileStream = fs.createWriteStream(tmpZip);
-        https.request({ hostname: urlObj.hostname, port: urlObj.port || 443, path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false }, response => {
-          if (response.statusCode !== 200 && response.statusCode !== 206) {
-            fileStream.close();
-            return reject(new Error(`GitLab artifact download failed with HTTP ${response.statusCode}`));
-          }
-          response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-        }).on('error', reject).end();
-      });
+      const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
+      const urlObj = new URL(artifactUrl);
+      const dl = await downloadToBuffer({ hostname: urlObj.hostname, port: urlObj.port || 443, path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token } });
+      if (dl.statusCode !== 200 && dl.statusCode !== 206) throw new Error(`GitLab artifact download failed with HTTP ${dl.statusCode}`);
+      artifactZipBuffer = dl.buffer;
     } else if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password / API Token');
       const bbAuth2Header = await bbBasicAuth(cfg, userId);
@@ -2441,25 +2498,12 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${_jtlBranchNode}/${_jtlBasePath}/results.jtl`;
 
       let jtlMissing = false;
+      let bbJtlBuffer = null;
       try {
-        await new Promise((resolve, reject) => {
-          const fileStream = fs.createWriteStream(tmpZip); // reusing tmpZip path for the JTL
-          const options = { hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-          https.request(options, response => {
-            if (response.statusCode === 301 || response.statusCode === 302) {
-              https.get(response.headers.location, { rejectUnauthorized: false }, r2 => {
-                if (r2.statusCode !== 200) { fileStream.close(); return reject(new Error(`JTL not found on perf-results branch (HTTP ${r2.statusCode})`)); }
-                r2.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-              }).on('error', reject);
-            } else if (response.statusCode === 200) {
-              response.pipe(fileStream); fileStream.on('finish', () => { fileStream.close(); resolve(); });
-            } else {
-              fileStream.close();
-              reject(new Error(`JTL not found on perf-results branch (HTTP ${response.statusCode})`));
-            }
-          }).on('error', reject).end();
-        });
-        if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) jtlMissing = true;
+        const dl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' } });
+        if (dl.statusCode !== 200) throw new Error(`JTL not found on perf-results branch (HTTP ${dl.statusCode})`);
+        bbJtlBuffer = dl.buffer;
+        if (!bbJtlBuffer || !bbJtlBuffer.length) jtlMissing = true;
       } catch (jtlErr) {
         console.warn(`[Auto-sync] Bitbucket JTL unavailable for CI run #${run.id}: ${jtlErr.message}`);
         jtlMissing = true;
@@ -2470,7 +2514,6 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         let bbPipeLogs = '';
         try { bbPipeLogs = await fetchBbPipelineLogs(bbAuth2Header, ws2, slug2, run.external_id || pipelineId2); } catch (_) {}
 
-        fs.mkdirSync(resultDir, { recursive: true });
         const noJtlLogs = [{ type: 'error', message: 'JMeter results not uploaded — pipeline failed before JMeter could produce output.' }];
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
@@ -2504,62 +2547,39 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         });
         return;
       }
-    }
 
-    if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) throw new Error('Empty zip');
-
-    fs.mkdirSync(resultDir, { recursive: true });
-
-    if (run.provider === 'bitbucket') {
-      // tmpZip holds the raw results.jtl — copy it directly
-      const jtlDest = path.join(resultDir, 'results.jtl');
-      fs.copyFileSync(tmpZip, jtlDest);
-      fs.unlinkSync(tmpZip);
+      // Bitbucket delivered the JTL directly (not inside a zip) — write it straight to S3
+      await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', bbJtlBuffer);
 
       // Download html.zip separately from perf-results branch (non-fatal if missing)
       const _bbAuth3 = await bbBasicAuth(cfg, userId);
-      const _pid3    = (run.external_id || '').replace(/[{}]/g, '');
       const _ws3     = cfg.bitbucket_workspace;
       const _slug3   = cfg.bitbucket_repo_slug;
       const _jtlBasePath2 = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
       const _htmlZipPath  = `/2.0/repositories/${_ws3}/${_slug3}/src/${_jtlBranchNode}/${_jtlBasePath2}/html.zip`;
-      const _tmpHtml = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
       try {
-        await new Promise((resolve) => {
-          const fs2 = fs.createWriteStream(_tmpHtml);
-          const opts3 = { hostname: 'api.bitbucket.org', path: _htmlZipPath, method: 'GET', headers: { Authorization: _bbAuth3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-          https.request(opts3, res3 => {
-            const follow = (r) => {
-              if (r.statusCode === 200) { r.pipe(fs2); fs2.on('finish', () => { fs2.close(); resolve(); }); }
-              else { fs2.close(); resolve(); }
-            };
-            if (res3.statusCode === 301 || res3.statusCode === 302) {
-              https.get(res3.headers.location, { rejectUnauthorized: false }, follow).on('error', () => { fs2.close(); resolve(); });
-            } else { follow(res3); }
-          }).on('error', () => { fs2.close(); resolve(); }).end();
-        });
-        if (fs.existsSync(_tmpHtml) && fs.statSync(_tmpHtml).size > 0) {
-          const _reportDir = path.join(resultDir, 'report');
-          fs.mkdirSync(_reportDir, { recursive: true });
-          new AdmZip(_tmpHtml).extractAllTo(_reportDir, true);
-          fs.unlinkSync(_tmpHtml);
+        const dl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: _htmlZipPath, method: 'GET', headers: { Authorization: _bbAuth3, 'User-Agent': 'PerfStudio' } });
+        if (dl.statusCode === 200 && dl.buffer?.length) {
+          await resultsStore.writeZipEntries(resultDir, orgSlug, dl.buffer, { rename: name => `report/${name}` });
         }
       } catch (_e) {
         console.warn('[CI sync] html.zip download failed (non-fatal):', _e.message);
-        try { if (fs.existsSync(_tmpHtml)) fs.unlinkSync(_tmpHtml); } catch {}
       }
     } else {
-      const zip = new AdmZip(tmpZip);
-      zip.extractAllTo(resultDir, true);
-      fs.unlinkSync(tmpZip);
+      if (!artifactZipBuffer || !artifactZipBuffer.length) throw new Error('Empty zip');
 
-      // Normalise html → report folder
-      const ciHtmlDir = path.join(resultDir, 'html');
-      if (fs.existsSync(ciHtmlDir) && !fs.existsSync(path.join(resultDir, 'report'))) fs.renameSync(ciHtmlDir, path.join(resultDir, 'report'));
+      // Normalise html/ → report/ at write time (only if the archive doesn't already
+      // have its own report/ entries) — matches the original extract-then-rename behavior.
+      const AdmZip = require('adm-zip');
+      const hasReportEntries = new AdmZip(artifactZipBuffer).getEntries().some(e => e.entryName.startsWith('report/'));
+      await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
+        rename: name => (!hasReportEntries && name.startsWith('html/')) ? name.replace(/^html\//, 'report/') : name,
+      });
     }
 
-    const jtlPath    = path.join(resultDir, 'results.jtl');
-    const reportPath = path.join(resultDir, 'report', 'index.html');
+    const jtlText    = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
+    const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
+    const hasReport  = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
 
     // Resolve suite_id
     let suiteId = null;
@@ -2569,7 +2589,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       suiteId = s?.id || null;
     }
 
-    const reportData = fs.existsSync(jtlPath) ? parseJtl(jtlPath, {
+    const reportData = jtlText ? parseJtlContent(jtlText, {
       suite_name: suiteId ? (await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name : (run.script_name || 'CI Run'),
       engine: 'jmeter', started_at: run.started_at,
     }) : null;
@@ -2636,10 +2656,10 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     // Evaluate rule violations before PDF so the PDF shows correct PASSED/FAILED status
     let autoViolations = [];
     let autoRuleResult = null;
-    if (fs.existsSync(jtlPath)) {
+    if (jtlText) {
       try {
-        const { evaluateRules } = require('../utils/ruleEvaluator');
-        autoRuleResult = await evaluateRules(projectId, jtlPath);
+        const { evaluateRulesFromContent } = require('../utils/ruleEvaluator');
+        autoRuleResult = await evaluateRulesFromContent(projectId, jtlText);
         autoViolations = autoRuleResult?.violations || [];
       } catch (_) {}
     }
@@ -2670,15 +2690,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
 
     // Generate analytics PDF
-    let autoPdfPath = null;
-    if (reportData && fs.existsSync(jtlPath)) {
+    let autoPdfBuffer = null;
+    if (reportData && jtlText) {
       try {
-        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+        const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
         const runNum = (resultDir.match(/Run_?(\d+)/) || [])[1] || run.id;
-        const tmpPdf = path.join(resultDir, `Analytics_CI_Run_${runNum}.pdf`);
-        await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-        autoPdfPath = tmpPdf;
-        console.log(`[Auto-sync] PDF generated: ${path.basename(tmpPdf)}`);
+        const pdfName = `Analytics_CI_Run_${runNum}.pdf`;
+        autoPdfBuffer = await generateAnalyticsPdfBuffer(reportData, runNum);
+        await resultsStore.writeFile(resultDir, orgSlug, pdfName, autoPdfBuffer);
+        console.log(`[Auto-sync] PDF generated: ${pdfName}`);
       } catch (e) {
         console.error('[Auto-sync] PDF generation failed:', e.message);
       }
@@ -2700,7 +2720,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       projectId, suiteId, autoSyncRunStatus, resultDir,
-      fs.existsSync(reportPath) ? reportPath : null,
+      hasReport ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
@@ -2743,14 +2763,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     setImmediate(async () => {
       try {
         const { sendAlertEmail } = require('../utils/emailUtils');
-        await sendAlertEmail(newRunId, userId, projectId, emailData, autoPdfPath, null);
+        await sendAlertEmail(newRunId, userId, projectId, emailData, autoPdfBuffer, null);
         console.log(`[Auto-sync] Final report email sent for CI run #${run.id} → exec run #${newRunId}`);
       } catch (e) {
         console.error('[Auto-sync] Final report email failed:', e.message);
       }
     });
   } catch (e) {
-    try { if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip); } catch {}
     console.warn(`[Auto-sync] CI run #${run.id} failed: ${e.message}`);
   }
 }
@@ -2915,15 +2934,16 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
-  const AdmZip = require('adm-zip');
-  const os = require('os');
-  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('../utils/projectFolders');
+  const { getUserProjectPath, getCollectionPath, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
+  const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+
   // ── Determine results directory ────────────────────────────────────────────
+  // (path-SHAPED naming string only — see the matching comment in autoSyncCiRun above)
   const callerUser1 = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
   const callerRole  = callerUser1?.role;
-  const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name);
+  const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name, req.params.projectId);
 
   // Parse CI parameters for the run name — also persisted onto execution_runs below
   // (see the matching comment in autoSyncCiRun above for why).
@@ -2955,9 +2975,9 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       : null;
     if (suite?.col_name && syncResolvedEnv) {
       const envPath = getCollectionPath(userProjPath, suite.col_name, syncResolvedEnv);
-      try { fs.mkdirSync(path.join(envPath, 'results'), { recursive: true }); } catch {}
+      const resultsParent = path.join(envPath, 'results');
       let nums = [];
-      try { nums = fs.readdirSync(path.join(envPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0); } catch {}
+      try { nums = (await resultsStore.listRunDirs(resultsParent, orgSlug)).filter(n => !n.startsWith('Heal_')).map(extractRunNumber).filter(n => n > 0); } catch {}
       const nextRun = nums.length ? Math.max(...nums) + 1 : 1;
       const syncScriptBase = scriptFile.replace(/\.jmx$/, '');
       resultDir = path.join(envPath, 'results', buildRunDirName(syncSuiteName || syncScriptBase, ciUsers2, 'duration', ciLoops2, ciDur2, nextRun));
@@ -2969,7 +2989,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   if (!resultDir) {
     console.warn(`[CI Sync] Run #${run.id} (script "${run.script_name}") — no matching collection-scoped test suite found, falling back to project-level results`);
     try {
-      const nums = fs.readdirSync(path.join(userProjPath, 'results'), { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('Heal_')).map(d => extractRunNumber(d.name)).filter(n => n > 0);
+      const nums = (await resultsStore.listRunDirs(path.join(userProjPath, 'results'), orgSlug)).filter(n => !n.startsWith('Heal_')).map(extractRunNumber).filter(n => n > 0);
       const next = nums.length ? Math.max(...nums) + 1 : 1;
       const fb = run.script_name ? run.script_name.replace(/\\/g, '/').split('/').pop().replace(/\.jmx$/, '') : 'CIRun';
       resultDir = path.join(userProjPath, 'results', buildRunDirName(syncSuiteName || fb, ciUsers2, 'duration', ciLoops2, ciDur2, next));
@@ -2978,10 +2998,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     }
   }
 
-  fs.mkdirSync(resultDir, { recursive: true });
-
   // ── Download artifact zip ─────────────────────────────────────────────────
-  const tmpZip = path.join(os.tmpdir(), `ci_artifact_${run.id}_${Date.now()}.zip`);
+  let artifactZipBuffer = null;
   let bbHandledDirect = false; // Bitbucket: files placed directly, skip generic zip extraction
 
   try {
@@ -3013,25 +3031,9 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const downloadUrl = dlResp.headers?.location || dlResp.headers?.Location;
       if (!downloadUrl) return res.status(500).json({ error: 'Could not get artifact download URL from GitHub.' });
 
-      // Download the zip
-      await new Promise((resolve, reject) => {
-        const urlObj = new URL(downloadUrl);
-        const isHttps = urlObj.protocol === 'https:';
-        const fileStream = fs.createWriteStream(tmpZip);
-        (isHttps ? https : http).get(downloadUrl, { rejectUnauthorized: false }, response => {
-          // Handle another redirect if needed
-          if (response.statusCode === 302 || response.statusCode === 301) {
-            const redirectUrl = response.headers.location;
-            (isHttps ? https : http).get(redirectUrl, { rejectUnauthorized: false }, r2 => {
-              r2.pipe(fileStream);
-              fileStream.on('finish', () => { fileStream.close(); resolve(); });
-            }).on('error', reject);
-          } else {
-            response.pipe(fileStream);
-            fileStream.on('finish', () => { fileStream.close(); resolve(); });
-          }
-        }).on('error', reject);
-      });
+      // Download the zip straight into memory
+      const dl = await downloadToBuffer(downloadUrl, {});
+      artifactZipBuffer = dl.buffer;
     }
 
     if (run.provider === 'gitlab') {
@@ -3051,22 +3053,15 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
       if (!job?.id) return res.status(404).json({ error: 'No artifact-producing job found.' });
 
-      // Download artifacts zip
-      await new Promise((resolve, reject) => {
-        const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
-        const urlObj = new URL(artifactUrl);
-        const isHttps = urlObj.protocol === 'https:';
-        const fileStream = fs.createWriteStream(tmpZip);
-        const options = { hostname: urlObj.hostname, port: urlObj.port || (isHttps ? 443 : 80), path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token }, rejectUnauthorized: false };
-        (isHttps ? https : http).request(options, response => {
-          if (response.statusCode !== 200 && response.statusCode !== 206) {
-            fileStream.close();
-            return reject(new Error(`GitLab artifact download failed with HTTP ${response.statusCode}. The pipeline may still be running or artifacts may have expired.`));
-          }
-          response.pipe(fileStream);
-          fileStream.on('finish', () => { fileStream.close(); resolve(); });
-        }).on('error', reject).end();
-      });
+      // Download artifacts zip straight into memory
+      const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
+      const urlObj = new URL(artifactUrl);
+      const isHttps = urlObj.protocol === 'https:';
+      const dl = await downloadToBuffer({ hostname: urlObj.hostname, port: urlObj.port || (isHttps ? 443 : 80), path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token } });
+      if (dl.statusCode !== 200 && dl.statusCode !== 206) {
+        return res.status(500).json({ error: `GitLab artifact download failed with HTTP ${dl.statusCode}. The pipeline may still be running or artifacts may have expired.` });
+      }
+      artifactZipBuffer = dl.buffer;
     }
 
     if (run.provider === 'bitbucket') {
@@ -3088,49 +3083,21 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         ? await resolveBranchToCommit(ws3, slug3, branch3, bbAuthHdr3)
         : encodeURIComponent(branch3);
       const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/results.jtl`;
-      const tmpJtl3 = path.join(os.tmpdir(), `ci_jtl_${run.id}_${Date.now()}.jtl`);
-      await new Promise((resolve, reject) => {
-        const fs3 = fs.createWriteStream(tmpJtl3);
-        const opts3 = { hostname: 'api.bitbucket.org', path: jtlApiPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-        https.request(opts3, r => {
-          const follow = (r2) => {
-            if (r2.statusCode === 200 || r2.statusCode === 206) { r2.pipe(fs3); fs3.on('finish', () => { fs3.close(); resolve(); }); }
-            else { fs3.close(); reject(new Error(`results.jtl not found on branch "${branch3}" at ${base3} (HTTP ${r2.statusCode}). Ensure the pipeline completed and committed results.`)); }
-          };
-          if (r.statusCode === 301 || r.statusCode === 302) {
-            https.get(r.headers.location, { rejectUnauthorized: false }, follow).on('error', reject);
-          } else { follow(r); }
-        }).on('error', reject).end();
-      });
-      fs.copyFileSync(tmpJtl3, path.join(resultDir, 'results.jtl'));
-      fs.unlinkSync(tmpJtl3);
+      const jtlDl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: jtlApiPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' } });
+      if (jtlDl.statusCode !== 200 && jtlDl.statusCode !== 206) {
+        throw new Error(`results.jtl not found on branch "${branch3}" at ${base3} (HTTP ${jtlDl.statusCode}). Ensure the pipeline completed and committed results.`);
+      }
+      await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', jtlDl.buffer);
 
       // Fetch html.zip from the repo branch (non-fatal if missing)
       const htmlZipPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/html.zip`;
-      const tmpHtml3 = path.join(os.tmpdir(), `ci_html_${run.id}_${Date.now()}.zip`);
       try {
-        await new Promise((resolve) => {
-          const fsh = fs.createWriteStream(tmpHtml3);
-          const opth = { hostname: 'api.bitbucket.org', path: htmlZipPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' }, rejectUnauthorized: false };
-          https.request(opth, r => {
-            const follow = (r2) => {
-              if (r2.statusCode === 200) { r2.pipe(fsh); fsh.on('finish', () => { fsh.close(); resolve(); }); }
-              else { fsh.close(); resolve(); }
-            };
-            if (r.statusCode === 301 || r.statusCode === 302) {
-              https.get(r.headers.location, { rejectUnauthorized: false }, follow).on('error', () => { fsh.close(); resolve(); });
-            } else { follow(r); }
-          }).on('error', () => { fsh.close(); resolve(); }).end();
-        });
-        if (fs.existsSync(tmpHtml3) && fs.statSync(tmpHtml3).size > 0) {
-          const reportDir3 = path.join(resultDir, 'report');
-          fs.mkdirSync(reportDir3, { recursive: true });
-          new AdmZip(tmpHtml3).extractAllTo(reportDir3, true);
-          fs.unlinkSync(tmpHtml3);
+        const htmlDl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: htmlZipPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' } });
+        if (htmlDl.statusCode === 200 && htmlDl.buffer?.length) {
+          await resultsStore.writeZipEntries(resultDir, orgSlug, htmlDl.buffer, { rename: name => `report/${name}` });
         }
       } catch (_e) {
         console.warn('[CI sync] html.zip download failed (non-fatal):', _e.message);
-        try { if (fs.existsSync(tmpHtml3)) fs.unlinkSync(tmpHtml3); } catch {}
       }
 
       bbHandledDirect = true;
@@ -3138,38 +3105,36 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     // ── Extract zip to resultDir (GitHub / GitLab — Bitbucket writes files directly) ──
     if (!bbHandledDirect) {
-      if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) {
+      if (!artifactZipBuffer || !artifactZipBuffer.length) {
         return res.status(500).json({ error: 'Downloaded artifact is empty or missing.' });
       }
-      const zip = new AdmZip(tmpZip);
-      zip.extractAllTo(resultDir, true);
-      fs.unlinkSync(tmpZip);
-
-      // Normalise html → report folder
-      const ciHtmlDir = path.join(resultDir, 'html');
-      const localHtmlDir = path.join(resultDir, 'report');
-      if (fs.existsSync(ciHtmlDir) && !fs.existsSync(localHtmlDir)) {
-        fs.renameSync(ciHtmlDir, localHtmlDir);
-      }
+      // Normalise html/ → report/ at write time (only if the archive doesn't already
+      // have its own report/ entries) — matches the original extract-then-rename behavior.
+      const AdmZip = require('adm-zip');
+      const hasReportEntries = new AdmZip(artifactZipBuffer).getEntries().some(e => e.entryName.startsWith('report/'));
+      await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
+        rename: name => (!hasReportEntries && name.startsWith('html/')) ? name.replace(/^html\//, 'report/') : name,
+      });
     }
 
-    const reportPath = path.join(resultDir, 'report', 'index.html');
-    const jtlPath    = path.join(resultDir, 'results.jtl');
+    const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
+    const hasReportFile = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
+    const jtlText = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
 
     // ── Generate analytics PDF from JTL ──────────────────────────────────────
-    let pdfPath = null;
+    let pdfBuffer = null;
     let reportData = null;
     let ruleResult = null;
-    if (fs.existsSync(jtlPath)) {
+    if (jtlText) {
       try {
-        const { generateAnalyticsPdfToFile } = require('../utils/generateAnalyticsPdf');
+        const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
         const runNum  = (resultDir.match(/Run_(\d+)/) || [])[1] || run.id;
-        const tmpPdf  = path.join(resultDir, `Analytics_CI_Run_${runNum}.pdf`);
+        const pdfName = `Analytics_CI_Run_${runNum}.pdf`;
 
         // Parse JTL with the full parser (timeline, errors, bytes, latency, connect)
-        const { parseJtl } = require('../utils/parseJtl');
+        const { parseJtlContent } = require('../utils/parseJtl');
         const suite = await db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
-        reportData = parseJtl(jtlPath, {
+        reportData = parseJtlContent(jtlText, {
           suite_name: suite?.name || run.script_name || 'CI Run',
           engine: 'jmeter',
           started_at: run.started_at,
@@ -3183,14 +3148,14 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           } else {
             // Evaluate rules so PDF shows PASSED/FAILED correctly
             try {
-              const { evaluateRules } = require('../utils/ruleEvaluator');
-              ruleResult = await evaluateRules(req.params.projectId, jtlPath);
+              const { evaluateRulesFromContent } = require('../utils/ruleEvaluator');
+              ruleResult = await evaluateRulesFromContent(req.params.projectId, jtlText);
               reportData.rule_violations = ruleResult?.violations || [];
             } catch (_) {}
 
-            await generateAnalyticsPdfToFile(reportData, runNum, tmpPdf);
-            pdfPath = tmpPdf;
-            console.log('[CI Sync] Analytics PDF generated:', pdfPath);
+            pdfBuffer = await generateAnalyticsPdfBuffer(reportData, runNum);
+            await resultsStore.writeFile(resultDir, orgSlug, pdfName, pdfBuffer);
+            console.log('[CI Sync] Analytics PDF generated:', pdfName);
           }
         }
       } catch (e) {
@@ -3228,7 +3193,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       'jmeter',
       syncRunStatus,
       resultDir,
-      fs.existsSync(reportPath) ? reportPath : null,
+      hasReportFile ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
@@ -3266,7 +3231,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           await sendRuleViolationEmail(newRunId, req.userId, req.params.projectId, violations, resolvedSuiteName, proj?.name || '');
         }
         // Send full report email
-        await sendAlertEmail(newRunId, req.userId, req.params.projectId, emailData, pdfPath, null);
+        await sendAlertEmail(newRunId, req.userId, req.params.projectId, emailData, pdfBuffer, null);
         console.log(`[CI Sync] Alert email sent for run #${newRunId}`);
       } catch (e) {
         console.error('[CI Sync] Alert email failed:', e.message);
@@ -3291,18 +3256,17 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       });
     }
 
-    const savedFiles = fs.readdirSync(resultDir);
+    const savedFiles = await resultsStore.listFiles(resultDir, orgSlug);
     res.json({
       ok: true,
       result_dir: resultDir,
       files: savedFiles,
-      has_html_report: fs.existsSync(reportPath),
-      has_pdf: !!pdfPath,
-      message: `Results saved → ${path.basename(path.dirname(resultDir))}/${path.basename(resultDir)} (JTL + ${fs.existsSync(reportPath)?'HTML report + ':''}${pdfPath?'PDF':'no PDF'})`,
+      has_html_report: hasReportFile,
+      has_pdf: !!pdfBuffer,
+      message: `Results saved → ${path.basename(path.dirname(resultDir))}/${path.basename(resultDir)} (JTL + ${hasReportFile?'HTML report + ':''}${pdfBuffer?'PDF':'no PDF'})`,
     });
 
   } catch (e) {
-    try { if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip); } catch {}
     res.status(500).json({ error: `Failed to sync results: ${e.message}` });
   }
 });
@@ -3923,7 +3887,13 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
       if (!applied) throw new Error('None of the proposed overrides matched a real endpoint by name.');
     } else {
       if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
-      if (jmxPath) fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
+      if (jmxPath) {
+        fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
+        const { resolveOrgSlugForProject: resolveOrgSlugForHeal } = require('../utils/projectFolders');
+        const healOrgSlug = await resolveOrgSlugForHeal(projectId);
+        const up = await s3Sync.uploadFile(jmxPath, healOrgSlug);
+        if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', jmxPath, ':', up.error?.message);
+      }
     }
   } catch (e) {
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);

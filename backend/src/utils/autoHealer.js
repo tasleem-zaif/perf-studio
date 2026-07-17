@@ -4,10 +4,12 @@ const dns = require('dns').promises;
 const { spawn, execSync } = require('child_process');
 const db = require('../db');
 const { callAi, getMaxOutputTokens } = require('./aiClient');
-const { getProjectPath } = require('./projectFolders');
-const { evaluateRules } = require('./ruleEvaluator');
+const { getProjectPath, resolveOrgSlugForProject } = require('./projectFolders');
+const { evaluateRules, evaluateRulesFromContent } = require('./ruleEvaluator');
 const { patchJmxForParams } = require('./patchJmx');
 const { resolveForScript, extractAllTokens } = require('./preRunEngine');
+const s3Sync = require('./s3Sync');
+const resultsStore = require('./resultsStore');
 
 // Auto-heal gets exactly 1 automatic attempt — if it doesn't fix the run, the "Custom Heal"
 // button (which lets the user supply a targeted instruction) is the intended next step
@@ -94,7 +96,13 @@ function classifyErrors(jtlPath) {
   if (!jtlPath || !fs.existsSync(jtlPath)) {
     return { isInfra: false, infraCount: 0, scriptCount: 0, total: 0, summary: '' };
   }
-  const lines   = fs.readFileSync(jtlPath, 'utf8').split('\n');
+  return classifyErrorsFromContent(fs.readFileSync(jtlPath, 'utf8'));
+}
+
+/** Same as classifyErrors, but from already-fetched CSV text (e.g. read via resultsStore). */
+function classifyErrorsFromContent(content) {
+  if (!content) return { isInfra: false, infraCount: 0, scriptCount: 0, total: 0, summary: '' };
+  const lines   = content.split('\n');
   const headers = (lines[0] || '').split(',').map(h => h.trim().replace(/^"|"$/g, ''));
   const si  = headers.indexOf('success');
   const rcI = headers.indexOf('responseCode');
@@ -148,6 +156,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
   }
 
   const projectFolder = project.folder_path || getProjectPath(project.name, project.id);
+  const orgSlug        = await resolveOrgSlugForProject(originalRun.project_id);
   const runCount      = (await db.prepare('SELECT COUNT(*) as n FROM execution_runs WHERE project_id = ?').get(originalRun.project_id)).n;
   const runNumber     = runCount + 1;
   const resultDir     = path.join(projectFolder, 'results', `Run_${runNumber}`);
@@ -291,6 +300,11 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
 
     await db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=NOW() WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, newRunId);
+
+    s3Sync.uploadDir(resultDir, orgSlug).then(r => {
+      if (!r.ok && !r.skipped) console.error('[AutoHealer] S3 sync failed for', resultDir, ':', r.failed?.length, 'file(s)');
+    });
+
     return newRunId;
 
   } catch (e) {
@@ -352,8 +366,19 @@ async function parseJtlComprehensive(jtlPath) {
     totalFail: 0, errorSummaryText: '',
   };
   if (!jtlPath || !fs.existsSync(jtlPath)) return empty;
+  return parseJtlComprehensiveFromContent(fs.readFileSync(jtlPath, 'utf8'));
+}
 
-  const lines = fs.readFileSync(jtlPath, 'utf8').split('\n');
+/** Same as parseJtlComprehensive, but from already-fetched CSV text (e.g. via resultsStore). */
+function parseJtlComprehensiveFromContent(content) {
+  const empty = {
+    byLabel: {}, byCode: {},
+    assertionErrors: [], correlationErrors: [],
+    variableErrors: [], dnsErrors: [], requestErrors: [],
+    totalFail: 0, errorSummaryText: '',
+  };
+  if (!content) return empty;
+  const lines = content.split('\n');
   if (lines.length < 2) return empty;
   const hdr = (lines[0] || '').split(',').map(h => h.trim().replace(/^"|"$/g, ''));
   const ix = {
@@ -449,13 +474,16 @@ async function validateEndpoints(hostnames) {
 
 // ── Build rich diagnostic context (async for DNS checks) ─────────────────────
 async function buildContext(run, suite) {
-  const logPath = path.join(run.result_dir, 'jmeter.log');
+  // jtlPath stays a path-SHAPED naming string (for logging/labels) — the actual JTL
+  // content is fetched from S3 via resultsStore, since result_dir is an S3 key prefix now.
   const jtlPath = path.join(run.result_dir, 'results.jtl');
+  const orgSlug = await resolveOrgSlugForProject(run.project_id);
+  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, 'results.jtl');
 
-  // Full jmeter.log (last 15 KB — large enough to catch all lifecycle events)
-  const jmeterLog = fs.existsSync(logPath)
-    ? fs.readFileSync(logPath, 'utf8').slice(-15000)
-    : '';
+  // jmeter.log only ever existed for a native/local execution run — never produced or
+  // synced for a CI-triggered run, so this naturally comes back empty for those (same
+  // as the old fs.existsSync check would have for a path that was never created).
+  const jmeterLog = (await resultsStore.readText(run.result_dir, orgSlug, 'jmeter.log')) || '';
 
   const scriptPath    = run.engine === 'jmeter' ? suite.jmx_path : suite.js_path;
   const scriptContent = scriptPath && fs.existsSync(scriptPath)
@@ -466,12 +494,12 @@ async function buildContext(run, suite) {
     .map(l => `[${l.type}] ${l.message}`).slice(-80).join('\n');
 
   // ── JTL analysis ────────────────────────────────────────────────────────────
-  const jtl = await parseJtlComprehensive(jtlPath);
+  const jtl = parseJtlComprehensiveFromContent(jtlText);
 
   // Label sets
   const allLabels = new Set(), failingLabels = new Set();
-  if (fs.existsSync(jtlPath)) {
-    const lines = fs.readFileSync(jtlPath, 'utf8').split('\n');
+  if (jtlText) {
+    const lines = jtlText.split('\n');
     const hdr = (lines[0] || '').split(',').map(h => h.trim().replace(/^"|"$/g, ''));
     const si = hdr.indexOf('success'), li = hdr.indexOf('label');
     for (let i = 1; i < lines.length; i++) {
@@ -497,7 +525,7 @@ async function buildContext(run, suite) {
   }
 
   // ── Rule + overall hasErrors ──────────────────────────────────────────────
-  const ruleResult = await evaluateRules(run.project_id, jtlPath);
+  const ruleResult = await evaluateRulesFromContent(run.project_id, jtlText);
   let hasErrors;
   if (!ruleResult.noRules) {
     hasErrors = ruleResult.passed === false || run.status === 'failed';
@@ -516,7 +544,7 @@ async function buildContext(run, suite) {
     varRefs, missingVars,
     hostnames, endpointStatus,
     ruleViolations: ruleResult.violations || [],
-    errorClass: classifyErrors(jtlPath),
+    errorClass: classifyErrorsFromContent(jtlText),
   };
 }
 
@@ -1276,6 +1304,9 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     } else if (ctx.scriptPath) {
       if (fs.existsSync(ctx.scriptPath)) fs.copyFileSync(ctx.scriptPath, ctx.scriptPath + '.bak');
       fs.writeFileSync(ctx.scriptPath, aiResp.fixed_script, 'utf8');
+      const scriptOrgSlug = await resolveOrgSlugForProject(run.project_id);
+      const up = await s3Sync.uploadFile(ctx.scriptPath, scriptOrgSlug);
+      if (!up.ok && !up.skipped) console.error('[AutoHealer] S3 sync failed for', ctx.scriptPath, ':', up.error?.message);
     }
   } catch (e) {
     await db.prepare('UPDATE auto_heal_logs SET result=? WHERE id=?').run('failed', logId);
@@ -1380,6 +1411,12 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
  *   alert system so it can wait for the healer before deciding what to send.
  */
 async function startAutoHeal(userId, runId, onComplete) {
+  // RETIRED — this is the native/local-execution heal entry point (its only caller,
+  // execution.js's POST /run, is itself retired). CI-triggered runs heal via
+  // ciPipeline.js's startAutoHealCI/healCycleCI instead, which is unaffected.
+  console.warn(`[AutoHealer] startAutoHeal(native) called for run ${runId} but local execution heal has been retired.`);
+  if (onComplete) onComplete(runId, false);
+  return;
   const run     = await db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(runId);
   const suite   = run && await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(run.suite_id);
   const project = run && await db.prepare('SELECT * FROM projects WHERE id = ?').get(run.project_id);

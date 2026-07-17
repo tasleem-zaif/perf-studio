@@ -18,6 +18,16 @@ function pct(arr, p) {
 function parseJtl(jtlPath, runMeta = {}) {
   if (!fs.existsSync(jtlPath)) return null;
   const content = fs.readFileSync(jtlPath, 'utf8');
+  return parseJtlContent(content, runMeta);
+}
+
+/**
+ * Same as parseJtl, but takes already-fetched CSV text directly (e.g. read from S3 via
+ * resultsStore.readText()) instead of a local file path — for callers that never have a
+ * local file to read from.
+ */
+function parseJtlContent(content, runMeta = {}) {
+  if (!content) return null;
   const lines   = content.trim().split('\n').filter(Boolean);
   if (lines.length < 2) return null;
 
@@ -185,4 +195,4 @@ function parseJtl(jtlPath, runMeta = {}) {
   };
 }
 
-module.exports = { parseJtl };
+module.exports = { parseJtl, parseJtlContent };

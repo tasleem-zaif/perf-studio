@@ -819,7 +819,19 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           });
                           if (selected) {
                             const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
-                            const relPath = file.replace(/.*git-workspaces\/[^/]+\/[^/]+\//, '');
+                            // Content inside the repo always starts with <ProjectName>/<Collection>/<Env>/...,
+                            // repeating the project name a second time after the workspace-bucket segment(s)
+                            // that precede it on local disk (git-workspaces/<Project>/<actor>/... normally, or
+                            // git-workspaces/<Organization>/<Project>/<actor>/... for a project created after
+                            // the org-prefix folder structure shipped). Anchor on that repeated project-name
+                            // segment via lastIndexOf rather than assuming a fixed number of leading
+                            // directories — a fixed-depth regex here was exactly why a real CI run failed on
+                            // the "Patch JMX parameters" step for an org-prefixed project: it stripped the
+                            // wrong number of segments and sent a script_path that doesn't exist in the repo.
+                            const cleanProjName = (selectedProject?.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+                            const marker = `/${cleanProjName}/`;
+                            const lastIdx = cleanProjName ? file.lastIndexOf(marker) : -1;
+                            const relPath = lastIdx >= 0 ? file.slice(lastIdx + 1) : file.replace(/.*git-workspaces\/[^/]+\/[^/]+\//, '');
                             const fileName = file.split('/').pop();
                             setCiScriptName(fileName);
                             setCiScriptPath(relPath);
@@ -1245,6 +1257,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Local Test Run tab ───────────────────────────────────────────── */}
       {runTab === 'single' && <>
 
+      {/* ── Local/native execution UI — retired, backend routes return 410.
+          Hidden (not deleted) per the CI-pipeline-only migration; wrap in
+          {false && ...} so it's easy to find/restore later if needed. ── */}
+      {false && <>
       {/* Concurrent runs banner */}
       {activeRuns.length > 0 && !running && (
         <div style={{
@@ -1670,6 +1686,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
           )}
         </div>
       )}
+      </>}
 
       {/* Past Runs */}
       {selectedProjectId && (

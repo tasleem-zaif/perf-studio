@@ -20,8 +20,20 @@ const fs   = require('fs');
 const path = require('path');
 const db   = require('../db');
 const { resolveUrlSet } = require('./preRunEngine');
+const s3Sync = require('./s3Sync');
+const gitEngine = require('./gitEngine');
 
-function writeJson(filePath, data) {
+/** Whether userId's chosen auth method for projectId is SSH (real local workspace, unchanged)
+ * or PAT (gitEngine, S3-backed, zero local disk). Returns false (SSH/legacy path) when userId
+ * isn't known — preserves exact prior behavior for the handful of callers that don't have one
+ * readily in scope (e.g. the startup regeneration job, once threaded through, always has it). */
+async function isSshMode(userId, projectId) {
+  if (!userId || !projectId) return true;
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  return (identity?.auth_method || 'pat') === 'ssh';
+}
+
+async function writeJson(filePath, data, orgSlug) {
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const newContent = JSON.stringify(data, null, 2);
@@ -33,14 +45,40 @@ function writeJson(filePath, data) {
       } catch (_) {}
     }
     fs.writeFileSync(filePath, newContent, 'utf8');
+    // Mirror to S3 right after the local write succeeds — durable copy, additive only.
+    const up = await s3Sync.uploadFile(filePath, orgSlug);
+    if (!up.ok && !up.skipped) console.error('[ConfigWriter] S3 sync failed for', filePath, ':', up.error?.message);
   } catch (e) {
     console.error('[ConfigWriter] Failed to write', filePath, ':', e.message);
   }
 }
 
+/**
+ * PAT-mode equivalent of writeJson() — writes straight into the gitEngine in-memory session
+ * (hydrated from/flushed to S3), never touching local disk. gitDir is the real git workspace
+ * root (one level above projectFolderPath — see getUserWorkspace()); relPath is the path
+ * relative to the project's content root inside that workspace (e.g.
+ * "Collection1/QA/config/config.json").
+ */
+async function writeJsonToSession(gitDir, relPath, data, orgSlug) {
+  try {
+    const session = await gitEngine.openSession(gitDir, orgSlug);
+    const full = path.posix.join(session.dir, relPath);
+    const newContent = JSON.stringify(data, null, 2);
+    if (session.fs.existsSync(full)) {
+      try { if (session.fs.readFileSync(full, 'utf8') === newContent) return; } catch (_) {}
+    }
+    session.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+    session.fs.writeFileSync(full, newContent, 'utf8');
+    await gitEngine.persistSession(session, gitDir, orgSlug);
+  } catch (e) {
+    console.error('[ConfigWriter] Failed to write (PAT session)', relPath, ':', e.message);
+  }
+}
+
 // ── Core: write comprehensive config.json for one collection + env ────────────
 
-async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
+async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, userId = null) {
   try {
     const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
@@ -49,7 +87,6 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     const { cleanName } = require('./projectFolders');
 
     const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(col.project_id);
-    let envPath;
 
     // Use explicitly passed folder path (user's workspace). Do NOT fall back to
     // project.folder_path — that may point to the wrong (e.g. admin) workspace.
@@ -60,7 +97,7 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
     const { isAdminWorkspace } = require('./projectFolders');
     if (isAdminWorkspace(basePath)) return;
     // New clean-name format: CollectionName/Env/
-    envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
+    const envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
 
     // Project already fetched above for path derivation
 
@@ -127,7 +164,18 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
       config: mergedCfg,
     };
 
-    writeJson(path.join(envPath, 'config', 'config.json'), snapshot);
+    const { resolveOrgSlugForProject } = require('./projectFolders');
+    const orgSlug = await resolveOrgSlugForProject(col.project_id);
+
+    if (userId && !(await isSshMode(userId, col.project_id))) {
+      // PAT mode: basePath (projectFolderPath) is "<gitDir>/<ProjectName>" — gitDir is one
+      // level up, relPath is everything from the project's content root down.
+      const gitDir = path.dirname(basePath);
+      const relPath = path.posix.join(path.basename(basePath), cleanName(col.name), cleanName(envName), 'config', 'config.json');
+      await writeJsonToSession(gitDir, relPath, snapshot, orgSlug);
+    } else {
+      await writeJson(path.join(envPath, 'config', 'config.json'), snapshot, orgSlug);
+    }
     console.log(`[ConfigWriter] config.json updated → ${envPath}/config/config.json`);
   } catch (e) {
     console.error('[ConfigWriter] writeCollectionEnvConfig error:', e.message);
@@ -136,7 +184,7 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath) {
 
 // ── Update all env folders for a collection ───────────────────────────────────
 
-async function updateCollectionConfigs(collectionId, projectFolderPath) {
+async function updateCollectionConfigs(collectionId, projectFolderPath, userId = null) {
   try {
     const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
     if (!col) return;
@@ -144,7 +192,7 @@ async function updateCollectionConfigs(collectionId, projectFolderPath) {
     try { envs = JSON.parse(col.environments || '[]'); } catch {}
     if (!envs.length) envs = col.environment ? [col.environment] : ['Default'];
     for (const env of envs) {
-      await writeCollectionEnvConfig(collectionId, env, projectFolderPath);
+      await writeCollectionEnvConfig(collectionId, env, projectFolderPath, userId);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateCollectionConfigs error:', e.message);
@@ -153,14 +201,14 @@ async function updateCollectionConfigs(collectionId, projectFolderPath) {
 
 // ── Update all collections for a project ─────────────────────────────────────
 
-async function updateProjectCollectionConfigs(projectId, projectFolderPath) {
+async function updateProjectCollectionConfigs(projectId, projectFolderPath, userId = null) {
   // When no explicit user workspace path is provided, skip writing to avoid
   // accidentally writing to the wrong (e.g. admin) workspace.
   if (!projectFolderPath) return;
   try {
     const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
     for (const col of collections) {
-      await updateCollectionConfigs(col.id, projectFolderPath);
+      await updateCollectionConfigs(col.id, projectFolderPath, userId);
     }
   } catch (e) {
     console.error('[ConfigWriter] updateProjectCollectionConfigs error:', e.message);
@@ -172,18 +220,18 @@ function writeProjectConfig() { /* no-op */ }
 function writeGlobalConfig()   { /* no-op */ }
 
 // ── Legacy stubs (no-ops kept for backward compat) ───────────────────────────
-async function writeCollectionConfig(collection, projectFolderPath) {
-  if (collection?.id) await updateCollectionConfigs(collection.id, projectFolderPath);
+async function writeCollectionConfig(collection, projectFolderPath, userId) {
+  if (collection?.id) await updateCollectionConfigs(collection.id, projectFolderPath, userId);
 }
 function writeRulesConfig()         { /* no-op: use updateProjectCollectionConfigs */ }
-async function writeProjectLevelConfig(projectId) {
-  if (projectId) await updateProjectCollectionConfigs(projectId);
+async function writeProjectLevelConfig(projectId, projectFolderPath, userId) {
+  if (projectId) await updateProjectCollectionConfigs(projectId, projectFolderPath, userId);
 }
 async function writeProjectSnapshot(project, userId) {
   if (!project?.folder_path) return;
   writeProjectConfig(project);
   writeGlobalConfig(userId, project.folder_path);
-  await updateProjectCollectionConfigs(project.id);
+  await updateProjectCollectionConfigs(project.id, project.folder_path, userId);
 }
 
 // ── Auto-populate project config from all collections (called on first config load) ─

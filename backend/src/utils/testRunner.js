@@ -19,7 +19,8 @@ const os    = require('os');
 const db    = require('../db');
 const { patchJmxForParams }  = require('./patchJmx');
 const { evaluateRules }       = require('./ruleEvaluator');
-const { getUserProjectPath, getCollectionPath, resolveSuiteEnv } = require('./projectFolders');
+const { getUserProjectPath, getCollectionPath, resolveSuiteEnv, resolveOrgSlugForProject } = require('./projectFolders');
+const s3Sync = require('./s3Sync');
 
 const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
@@ -66,14 +67,20 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   const engine     = suite.engine || 'jmeter';
   const scriptPath = engine === 'jmeter' ? suite.jmx_path : suite.js_path;
 
+  // Restore the caller's own workspace first if the S3 sweep reclaimed it since the last
+  // access — must happen before the scriptPath existence check below, since the script
+  // lives inside this same workspace. Cheap once warm (a single stat inside).
+  const callerRoleRow  = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerRoleRow?.role;
+  const userProjPath = await getUserProjectPath(userId, callerRole, project.name, projectId);
+  await require('../routes/git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), projectId, userId);
+
   if (!scriptPath || !fs.existsSync(scriptPath)) {
     return { passed: false, error: `Script file not found: ${scriptPath || '(not generated)'}. Go to Test Plans and generate a script first.` };
   }
 
   // ── Resolve result directory ──────────────────────────────────────────────
-  const callerRoleRow  = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
-  const callerRole = callerRoleRow?.role;
-  const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
+  const orgSlug = await resolveOrgSlugForProject(projectId);
   const { buildRunDirName, extractRunNumber } = require('./buildRunName');
 
   function nextRunNum(dir) {
@@ -187,6 +194,10 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
           }
         } catch (e) { log('warn', `  Could not evaluate rules: ${e.message}`); }
 
+        // Mirror the full result dir (JTL + jmeter.log) to S3 — additive, doesn't block rule evaluation above.
+        const syncResult = await s3Sync.uploadDir(resultDir, orgSlug);
+        if (!syncResult.ok && !syncResult.skipped) log('warn', `  Could not sync results to S3 (${syncResult.failed?.length || 0} file(s) failed)`);
+
         resolve({ passed, exit_code: code, jtlPath });
       });
 
@@ -208,7 +219,11 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
       const proc = spawn(`"${k6Bin}"`, args, { shell: true });
       proc.stdout.on('data', c => c.toString().split('\n').forEach(async l => l.trim() && log('info', `  ${l.trim()}`)));
       proc.stderr.on('data', c => c.toString().split('\n').forEach(async l => l.trim() && log('info', `  ${l.trim()}`)));
-      proc.on('close', code => resolve({ passed: code === 0, exit_code: code, jtlPath }));
+      proc.on('close', async code => {
+        const syncResult = await s3Sync.uploadDir(resultDir, orgSlug);
+        if (!syncResult.ok && !syncResult.skipped) log('warn', `  Could not sync results to S3 (${syncResult.failed?.length || 0} file(s) failed)`);
+        resolve({ passed: code === 0, exit_code: code, jtlPath });
+      });
       proc.on('error', err => resolve({ passed: false, error: err.message, jtlPath: null }));
     });
   }
