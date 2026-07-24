@@ -86,24 +86,18 @@ function getK6Bin(customPath) {
   }
 }
 
-const resetSequence = require('../utils/resetSequence');
-
-async function cleanStaleRuns(projectId) {
-  // Remove any non-running run whose result_dir no longer exists on disk.
-  // Skip 'running' status to avoid cleaning up in-progress or CI-synced runs.
-  const runs = await db.prepare(
-    "SELECT id, result_dir, status FROM execution_runs WHERE project_id = ?"
-  ).all(projectId);
-  let deleted = false;
-  for (const run of runs) {
-    if (run.status === 'running') continue;
-    if (run.result_dir && !fs.existsSync(run.result_dir)) {
-      await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
-      deleted = true;
-    }
-  }
-  if (deleted) resetSequence('execution_runs');
-}
+// Formerly deleted any non-running execution_runs row whose result_dir no longer existed
+// ON REAL DISK — a real guard back when a result folder could be removed out from under the
+// DB by something outside the app (a manual disk cleanup, an OS-level delete). Since the
+// S3-backed, zero-local-disk migration (resultsStore.js), result_dir is a path-SHAPED S3 key
+// prefix that is NEVER a real directory — fs.existsSync(run.result_dir) is unconditionally
+// false for every row, so this used to silently wipe EVERY completed/failed run for the
+// project on every single `/runs` fetch (Analytics loading, or right after a CI sync just
+// inserted one) — the reason a freshly CI-synced run's data vanished from Analytics almost
+// immediately, and any run created moments earlier during renumbering (getNextRunNumber())
+// too. S3 objects don't silently disappear out from under the DB the way a local folder
+// could, so there's no longer a real drift case for this to guard — safe to no-op.
+async function cleanStaleRuns(_projectId) {}
 
 async function getNextRunNumber(projectId) {
   cleanStaleRuns(projectId);
@@ -1376,11 +1370,20 @@ router.get('/runs', auth, async (req, res) => {
   // Returns syncing_count so the frontend knows to poll again shortly.
   let syncingCount = 0;
   try {
-    // Only auto-sync runs completed within the last 7 days — older ones likely
+    // Only auto-sync runs finished within the last 7 days — older ones likely
     // have expired artifacts and must not trigger email notifications retroactively.
+    // Includes 'failed' as well as 'completed' — a genuinely failed CI job (JMeter crashed,
+    // pipeline errored) still deserves its own sync attempt (which will correctly find no
+    // results and mark no_results below, or record real partial results if some exist) — the
+    // ci/:runId/status route's own catch-up already treats 'completed' and 'failed' the same
+    // way; this mirrors that. Excludes no_results=1: a prior sync attempt already confirmed
+    // this run produced zero JMeter samples/artifacts — nothing real to show in Analytics, and
+    // without this exclusion it looked identical to "never tried syncing" and got retried on
+    // every single page load forever, which is what kept the "Syncing…" banner stuck.
     const unsyncedCiRuns = await db.prepare(`
       SELECT * FROM ci_pipeline_runs
-      WHERE project_id = ? AND status = 'completed'
+      WHERE project_id = ? AND status IN ('completed', 'failed')
+        AND (no_results = 0 OR no_results IS NULL)
         AND finished_at >= NOW() - INTERVAL '7 days'
         AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
     `).all(project_id);
@@ -1460,9 +1463,17 @@ router.delete('/runs/:id', auth, async (req, res) => {
   if (run.status === 'running') return res.status(400).json({ error: 'Cannot delete a run that is currently in progress' });
 
   if (req.query.delete_files === 'true') {
-    // Hard delete — wipe disk files then remove the record
-    if (run.result_dir && fs.existsSync(run.result_dir)) {
-      try { fs.rmSync(run.result_dir, { recursive: true, force: true }); } catch (_) {}
+    // Hard delete — wipe stored results then remove the record. Everything under
+    // result_dir has been S3-only since the resultsStore.js migration (no local file ever
+    // exists, not even transiently) — the old fs.rmSync-only version left every hard-deleted
+    // run's JTL/report/PDF orphaned in S3 forever, since result_dir there is a path-SHAPED
+    // string, not a real directory (fs.existsSync was always false, silently no-opping).
+    if (run.result_dir) {
+      try {
+        const orgSlugDel = await resolveOrgSlugForProject(run.project_id);
+        const del = await resultsStore.deleteAll(run.result_dir, orgSlugDel);
+        if (!del.ok && !del.skipped) console.error('[Execution] S3 delete failed for run', run.id, ':', del.error?.message);
+      } catch (e) { console.error('[Execution] Result cleanup failed for run', run.id, ':', e.message); }
     }
     await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
     res.json({ deleted: true, archived: false, id: run.id });

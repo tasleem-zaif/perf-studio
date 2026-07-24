@@ -65,24 +65,79 @@ async function listRunDirs(resultsParentDir, orgSlug) {
   return s3Sync.listSubPrefixes(key);
 }
 
+// Bounded-concurrency map — same shape/reasoning as gitEngine.js's own mapLimit (kept as a
+// separate copy rather than a shared import — each module owns its own S3 fan-out policy).
+// A 100+ file JMeter HTML report used to upload strictly one file at a time (measured: ~15s
+// for 120 small files, almost entirely round-trip wait, not actual transfer time). Capping
+// concurrency well under the AWS SDK's default 50-socket limit gets the real wall-clock win
+// without reintroducing the socket-exhaustion problem gitEngine.js's own fan-out already hit.
+const RESULTS_S3_CONCURRENCY = Number(process.env.RESULTS_S3_CONCURRENCY) || 16;
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function writeOneEntry(resultDir, orgSlug, relPath, data) {
+  let up = { ok: false };
+  for (let attempt = 1; attempt <= 3 && !up.ok; attempt++) {
+    up = await writeFile(resultDir, orgSlug, relPath, data);
+    if (!up.ok && attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt));
+  }
+  return up.ok ? { relPath, ok: true } : { relPath, ok: false, error: up.error };
+}
+
 /**
  * Write every file entry of an in-memory zip Buffer under resultDir — replaces
- * `new AdmZip(tmpZipPath).extractAllTo(resultDir, true)`. Returns the list of relative
- * paths written.
+ * `new AdmZip(tmpZipPath).extractAllTo(resultDir, true)`. Returns { written, failed }.
+ *
+ * `results.jtl` (the one file every downstream feature actually depends on) is written FIRST,
+ * awaited alone, before anything else starts — it's typically the LAST entry in the zip's own
+ * central directory (JMeter writes it before the html/ report), so leaving it to naturally take
+ * its turn meant 119 decorative CSS/JS/font files for the static report had to get through
+ * first. The rest upload with bounded concurrency instead of one at a time — a transient
+ * failure on any entry retries a few times (writeOneEntry) rather than being silently dropped;
+ * `failed` lets callers tell a genuine empty JTL apart from "the upload didn't actually happen".
  */
 async function writeZipEntries(resultDir, orgSlug, zipBuffer, { rename } = {}) {
   const AdmZip = require('adm-zip');
   const zip = new AdmZip(zipBuffer);
-  const written = [];
+  const entries = [];
+  const failed = [];
   for (const entry of zip.getEntries()) {
     if (entry.isDirectory) continue;
     let relPath = entry.entryName;
     if (rename) relPath = rename(relPath);
     if (!relPath) continue;
-    const up = await writeFile(resultDir, orgSlug, relPath, entry.getData());
-    if (up.ok) written.push(relPath);
+    try {
+      entries.push({ relPath, data: entry.getData() });
+    } catch (e) {
+      failed.push({ relPath, error: e });
+    }
   }
-  return written;
+
+  const priority = entries.filter(e => e.relPath === 'results.jtl');
+  const rest = entries.filter(e => e.relPath !== 'results.jtl');
+
+  const written = [];
+  for (const e of priority) {
+    const r = await writeOneEntry(resultDir, orgSlug, e.relPath, e.data);
+    if (r.ok) written.push(r.relPath); else failed.push(r);
+  }
+  const restResults = await mapLimit(rest, RESULTS_S3_CONCURRENCY, e => writeOneEntry(resultDir, orgSlug, e.relPath, e.data));
+  for (const r of restResults) {
+    if (r.ok) written.push(r.relPath); else failed.push(r);
+  }
+
+  return { written, failed };
 }
 
 /** Delete everything under resultDir. Returns {ok, deleted, failed}. */

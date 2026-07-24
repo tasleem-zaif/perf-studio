@@ -20,12 +20,12 @@ async function syncRules(projectId, userId) {
       const orgSlug  = await resolveOrgSlugForProject(projectId);
 
       // Regenerate config for ALL users who have a workspace for this project
-      const { isAdminWorkspace } = require('../utils/projectFolders');
+      const { isAdminRole } = require('../utils/projectFolders');
       const allUsers = await db.prepare('SELECT id, role FROM users').all();
       for (const user of allUsers) {
         try {
+          if (isAdminRole(user.role)) continue; // admin workspace tracks main directly — no direct writes
           const userProjPath = await getUserProjectPath(user.id, user.role, projName, projectId);
-          if (isAdminWorkspace(userProjPath)) continue; // admin workspace holds no files
           const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(user.id, projectId);
           const isSSH = (identity?.auth_method || 'pat') === 'ssh';
           if (isSSH) {

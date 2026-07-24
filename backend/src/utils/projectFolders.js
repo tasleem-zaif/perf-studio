@@ -226,6 +226,7 @@ async function backupS3Workspace(folderPath, projectName, projectId, orgSlug) {
   const upload = await s3Sync.putBuffer(backupKey, Buffer.concat(chunks));
   if (!upload.ok) return null;
   await s3Sync.deleteAllUnderPrefix(baseKey); // tombstone — now durably captured in the backup
+  require('./gitEngine').invalidateCache(folderPath, orgSlug); // drop stale cached bytes for this workspace
   return backupKey;
 }
 
@@ -293,17 +294,32 @@ async function getUserProjectPath(userId, userRole, projectName, projectId) {
 }
 
 /**
- * Returns true if the user is an org_admin or super_admin.
- * Replaces the old path-based /admin check now that workspace folders use real user names.
+ * True if `role` (already fetched by the caller) is an org_admin/super_admin — that actor's
+ * workspace tracks the base branch (`main`) directly, so it must never receive direct writes
+ * (config.json snapshots, generated scripts, uploaded test data, run results, etc.) outside of
+ * a real git merge. Only a regular user's own per-branch workspace gets written to before a PR
+ * lands. Use this whenever the caller already has the role in hand; use isAdminUser() below
+ * when only a userId is available.
  */
-function isAdminWorkspace(workspacePath) {
-  // workspacePath is kept for backward-compat signature — we now check by user role via DB.
-  // Callers that have the userId should prefer isAdminUser(userId) directly.
-  return false; // deprecated path-based check — always return false; callers use role check
+function isAdminRole(role) {
+  return role === 'org_admin' || role === 'super_admin';
+}
+
+/** Same check as isAdminRole(), but looks the role up by userId for callers (e.g.
+ * configWriter.js) that don't already have it in scope. */
+async function isAdminUser(userId) {
+  if (!userId) return false;
+  try {
+    const row = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+    return isAdminRole(row?.role);
+  } catch {
+    return false;
+  }
 }
 
 module.exports = {
-  isAdminWorkspace,
+  isAdminRole,
+  isAdminUser,
   getProjectPath,
   ensureProjectFolders,
   getCollectionPath,

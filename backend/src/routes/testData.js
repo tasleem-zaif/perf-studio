@@ -31,6 +31,18 @@ async function isSshMode(userId, projectId) {
   return (identity?.auth_method || 'pat') === 'ssh';
 }
 
+/** Resolve the CALLING user's own workspace root (gitDir, one level above the project's
+ * content folder) for a PAT-mode gitEngine session — every read/write must go through this,
+ * never the project-wide project.folder_path (set once at /init time by whoever initialized
+ * the repo, almost always the org admin). Falling back to folder_path meant every regular
+ * user's test data landed inside the admin's main-branch workspace instead of their own
+ * users/<name> branch, ahead of any PR merge. Returns null if git isn't initialized yet. */
+async function resolveActorGitDir(userId, projectId, projectName) {
+  const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const userProjPath = await getUserProjectPath(userId, callerUser?.role, projectName, projectId);
+  return userProjPath ? path.dirname(userProjPath) : null;
+}
+
 // Restores the calling user's own workspace if the S3 sweep reclaimed it since the last
 // access — a stored test_data_files.path lives inside that workspace. SSH-mode only (PAT-mode
 // workspaces have no local folder to restore — gitEngine hydrates from S3 per-session instead).
@@ -109,7 +121,7 @@ router.get('/', async (req, res) => {
   } else {
     const proj = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
     const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
-    const gitDir = proj?.folder_path;
+    const gitDir = await resolveActorGitDir(req.userId, req.params.projectId, proj?.name || '');
     const session = gitDir ? await gitEngine.openSession(gitDir, orgSlug) : null;
     result = files.map(f => ({ ...f, stale: !(session && session.fs.existsSync(posix.join(session.dir, f.path))) }));
   }
@@ -140,8 +152,11 @@ router.post('/', upload.single('csv'), async (req, res) => {
     }
 
     if (!isSSH) {
-      // ── PAT mode: write straight into the gitEngine in-memory session, no local file ever ──
-      const session = await gitEngine.openSession(proj.folder_path, orgSlug);
+      // ── PAT mode: write straight into the gitEngine in-memory session, no local file ever —
+      // always the CALLING user's own workspace, never proj.folder_path (the admin's) ────────
+      const gitDir = await resolveActorGitDir(req.userId, req.params.projectId, proj.name);
+      if (!gitDir) return res.status(400).json({ error: 'git_not_initialized: Git repository not initialized. Go to Configuration → Git to initialize the repository first.' });
+      const session = await gitEngine.openSession(gitDir, orgSlug);
       const contentRoot = posix.join(session.dir, cleanName(proj.name));
 
       if (colId && !envName) {
@@ -174,7 +189,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
               lastFileId = r.lastInsertRowid;
             }
           }
-          await gitEngine.persistSession(session, proj.folder_path, orgSlug);
+          await gitEngine.persistSession(session, gitDir, orgSlug);
           return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(lastFileId), copied_to_envs: allEnvs });
         }
       }
@@ -212,7 +227,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
         ).run(req.params.projectId, colId, targetEnv || envName, safeName, req.file.originalname, filePath, JSON.stringify(headers));
         fileId = result.lastInsertRowid;
       }
-      await gitEngine.persistSession(session, proj.folder_path, orgSlug);
+      await gitEngine.persistSession(session, gitDir, orgSlug);
       return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(fileId) });
     }
 
@@ -298,9 +313,11 @@ router.get('/:id/content', async (req, res) => {
 
   try {
     if (!isSSH) {
-      const proj = await db.prepare('SELECT folder_path, name FROM projects WHERE id = ?').get(req.params.projectId);
+      const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
       const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
-      const session = await gitEngine.openSession(proj.folder_path, orgSlug);
+      const gitDir = await resolveActorGitDir(req.userId, req.params.projectId, proj?.name || '');
+      if (!gitDir) return res.status(404).json({ error: 'Git repository not initialized.' });
+      const session = await gitEngine.openSession(gitDir, orgSlug);
       const full = posix.join(session.dir, file.path);
       if (!session.fs.existsSync(full)) {
         return res.status(404).json({ error: `File not found: "${file.original_name}". The file may have been deleted or the workspace was re-initialized. Please delete this record and re-upload the file.`, stale: true, file_id: file.id });
@@ -338,13 +355,15 @@ router.put('/:id/content', async (req, res) => {
     const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
 
     if (!isSSH) {
-      const proj = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
-      const session = await gitEngine.openSession(proj.folder_path, orgSlug);
+      const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+      const gitDir = await resolveActorGitDir(req.userId, req.params.projectId, proj?.name || '');
+      if (!gitDir) return res.status(404).json({ error: 'Git repository not initialized.' });
+      const session = await gitEngine.openSession(gitDir, orgSlug);
       const full = posix.join(session.dir, file.path);
       const { buildCsvContent } = require('../utils/csvUtils');
       session.fs.mkdirSync(posix.dirname(full), { recursive: true });
       session.fs.writeFileSync(full, buildCsvContent(headers, rows), 'utf8');
-      await gitEngine.persistSession(session, proj.folder_path, orgSlug);
+      await gitEngine.persistSession(session, gitDir, orgSlug);
       await db.prepare('UPDATE test_data_files SET columns = ? WHERE id = ?').run(JSON.stringify(headers), req.params.id);
       return res.json({ ok: true });
     }
@@ -415,10 +434,13 @@ router.delete('/:id', async (req, res) => {
   const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
 
   if (!isSSH) {
-    const session = await gitEngine.openSession(proj.folder_path, orgSlug);
-    const full = posix.join(session.dir, file.path);
-    try { session.fs.unlinkSync(full); } catch (_) {}
-    await gitEngine.persistSession(session, proj.folder_path, orgSlug);
+    const gitDir = await resolveActorGitDir(req.userId, req.params.projectId, proj.name);
+    if (gitDir) {
+      const session = await gitEngine.openSession(gitDir, orgSlug);
+      const full = posix.join(session.dir, file.path);
+      try { session.fs.unlinkSync(full); } catch (_) {}
+      await gitEngine.persistSession(session, gitDir, orgSlug);
+    }
   } else {
     // Delete the actual file — path is now always the correct env-specific location
     try { fs.unlinkSync(file.path); } catch (_) { /* already gone */ }

@@ -1,4 +1,19 @@
 require('dotenv').config();
+
+// ── Boot-time S3 enforcement (GDPR: zero local disk) ──────────────────────────
+// This app's zero-local-disk guarantee (PAT-mode git storage, run results/artifacts,
+// and SSH-mode's tmpfs workspaces surviving a restart) depends entirely on S3 being
+// configured — see PROJECT_MAP.md's "S3 migration" section. Refuse to start rather than
+// silently writing customer data onto this server's disk.
+const S3_SYNC_ENABLED_AT_BOOT = String(process.env.S3_SYNC_ENABLED || '').toLowerCase() === 'true';
+if (!S3_SYNC_ENABLED_AT_BOOT || !process.env.S3_BUCKET) {
+  console.error(
+    '[Boot] Refusing to start: S3_SYNC_ENABLED=true and S3_BUCKET are both required. ' +
+    'This deployment stores all customer data (git workspaces, run results, artifacts) via S3 only.'
+  );
+  process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -85,6 +100,16 @@ if (process.env.NODE_ENV === 'production') {
   }
 }
 
+async function start() {
+  const { assertBucketReachable, warnIfInsecureCredentials } = require('./utils/s3Sync');
+  warnIfInsecureCredentials();
+  try {
+    await assertBucketReachable();
+  } catch (error) {
+    console.error('[Boot] Refusing to start:', error.message);
+    process.exit(1);
+  }
+
 app.listen(PORT, () => {
   console.log(`PerfStudio API running on http://localhost:${PORT}`);
 
@@ -107,7 +132,7 @@ app.listen(PORT, () => {
   setImmediate(async () => {
     try {
       const db = require('./db');
-      const { getUserProjectPath, isAdminWorkspace } = require('./utils/projectFolders');
+      const { getUserProjectPath, isAdminRole } = require('./utils/projectFolders');
       const { updateCollectionConfigs } = require('./utils/configWriter');
 
       const { resolveOrgSlugForProject } = require('./utils/projectFolders');
@@ -122,7 +147,7 @@ app.listen(PORT, () => {
       for (const proj of projects) {
         try {
           const projectFolderPath = await getUserProjectPath(proj.user_id, proj.user_role, proj.name, proj.id);
-          if (isAdminWorkspace(projectFolderPath)) continue;
+          if (isAdminRole(proj.user_role)) continue;
           const isSSH = await isSshModeStartup(proj.user_id, proj.id);
           if (!isSSH) {
             const orgSlug = await resolveOrgSlugForProject(proj.id);
@@ -143,7 +168,7 @@ app.listen(PORT, () => {
           if (proj.user_id === user.id) continue;
           try {
             const projectFolderPath = await getUserProjectPath(user.id, user.role, proj.name, proj.id);
-            if (isAdminWorkspace(projectFolderPath)) continue;
+            if (isAdminRole(user.role)) continue;
             const isSSH = await isSshModeStartup(user.id, proj.id);
             if (isSSH) {
               const fs = require('fs');
@@ -184,3 +209,7 @@ app.listen(PORT, () => {
     }, SWEEP_INTERVAL_MS);
   }
 });
+}
+
+start();
+

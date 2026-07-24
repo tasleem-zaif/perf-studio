@@ -26,6 +26,14 @@ const { randomBytes } = require('crypto');
 const { spawnSync } = require('child_process');
 const s3Sync = require('../utils/s3Sync');
 const resultsStore = require('../utils/resultsStore');
+const gitEngine = require('../utils/gitEngine');
+
+/** Whether userId's chosen auth method for projectId is SSH (real local workspace) or PAT
+ * (gitEngine, S3-backed, zero local disk) — mirrors collections.js's/testData.js's own copy. */
+async function isSshMode(userId, projectId) {
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  return (identity?.auth_method || 'pat') === 'ssh';
+}
 
 // ── Download a URL straight into an in-memory Buffer — no local temp file at all.
 // Follows a single redirect hop (matches every existing call site's behavior).
@@ -776,11 +784,33 @@ router.post('/generate-yaml', async (req, res) => {
   const userFolder   = await resolveUserFolder(req.userId);
   const cleanProject = (project.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
   const gitRoot      = resolveWorkspaceRoot(cleanProject, userFolder, orgSlug);
-  // Restore the workspace first if the S3 sweep reclaimed it since the last access — the
-  // unconditional mkdirSync below would otherwise silently recreate a bare, git-less folder
-  // instead of properly restoring it.
-  await require('./git').ensureGitWorkspaceHydrated(gitRoot, req.params.projectId, req.userId);
-  fs.mkdirSync(gitRoot, { recursive: true });
+  const isSSH        = await isSshMode(req.userId, req.params.projectId);
+
+  if (isSSH) {
+    // Restore the workspace first if the S3 sweep reclaimed it since the last access — the
+    // unconditional mkdirSync below would otherwise silently recreate a bare, git-less folder
+    // instead of properly restoring it.
+    await require('./git').ensureGitWorkspaceHydrated(gitRoot, req.params.projectId, req.userId);
+    fs.mkdirSync(gitRoot, { recursive: true });
+  }
+  // PAT mode: no real folder is ever created here — every generated file below is staged
+  // in-memory (patPendingFiles) and only materialized inside a gitEngine session, flushed to
+  // S3 via persistSession() once the whole commit succeeds. See the auto-push section below.
+  const patPendingFiles = [];
+  /** Write a generated CI file. SSH-mode: real disk + fire-and-forget S3 mirror (unchanged
+   * behavior). PAT-mode: deferred — actually written into the gitEngine session's in-memory
+   * volume just before commit, once the target branch is already checked out (so a later
+   * branch switch can never clobber it — the same problem the SSH path's checkout-conflict
+   * retry logic exists to work around, sidestepped here by ordering instead). */
+  function writeGeneratedFile(relPath, content, destAbsPath) {
+    if (isSSH) {
+      fs.mkdirSync(path.dirname(destAbsPath), { recursive: true });
+      fs.writeFileSync(destAbsPath, content, 'utf8');
+      s3Sync.uploadFile(destAbsPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', destAbsPath, ':', up.error?.message); });
+    } else {
+      patPendingFiles.push({ relPath, content });
+    }
+  }
 
   // Get all generated test plans for this project to include as YAML comments
   const suites = await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
@@ -904,8 +934,7 @@ run_jmeter:
 `;
     try {
       const dest = path.join(gitRoot, '.gitlab-ci.yml');
-      fs.writeFileSync(dest, gitlabYaml, 'utf8');
-      s3Sync.uploadFile(dest, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', dest, ':', up.error?.message); });
+      writeGeneratedFile('.gitlab-ci.yml', gitlabYaml, dest);
       created.push('.gitlab-ci.yml');
     } catch (e) { errors.push(`.gitlab-ci.yml: ${e.message}`); }
   }
@@ -1145,18 +1174,14 @@ print("Patch complete")
 
     try {
       const workflowDir = path.join(gitRoot, '.github', 'workflows');
-      fs.mkdirSync(workflowDir, { recursive: true });
       const workflowPath = path.join(workflowDir, workflowFile);
-      fs.writeFileSync(workflowPath, githubYaml, 'utf8');
-      s3Sync.uploadFile(workflowPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', workflowPath, ':', up.error?.message); });
+      writeGeneratedFile(`.github/workflows/${workflowFile}`, githubYaml, workflowPath);
       created.push(`.github/workflows/${workflowFile}`);
 
       // Commit the Python patcher alongside the YAML
       const patcherDir = path.join(gitRoot, '.PerfStudio');
-      fs.mkdirSync(patcherDir, { recursive: true });
       const patcherPath = path.join(patcherDir, 'patch_jmx.py');
-      fs.writeFileSync(patcherPath, patcherPy, 'utf8');
-      s3Sync.uploadFile(patcherPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', patcherPath, ':', up.error?.message); });
+      writeGeneratedFile('.PerfStudio/patch_jmx.py', patcherPy, patcherPath);
       created.push(`.PerfStudio/patch_jmx.py`);
     } catch (e) { errors.push(`${e.message}`); }
   }
@@ -1298,16 +1323,13 @@ pipelines:
 `;
     try {
       const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
-      fs.writeFileSync(dest, bbYaml.replace(/\r\n/g, '\n'), 'utf8');
-      s3Sync.uploadFile(dest, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', dest, ':', up.error?.message); });
+      writeGeneratedFile('bitbucket-pipelines.yml', bbYaml.replace(/\r\n/g, '\n'), dest);
       created.push('bitbucket-pipelines.yml');
 
       // Write the Python patcher alongside the YAML
       const bbPatcherDir = path.join(gitRoot, '.PerfStudio');
-      fs.mkdirSync(bbPatcherDir, { recursive: true });
       const bbPatcherPath = path.join(bbPatcherDir, 'patch_jmx.py');
-      fs.writeFileSync(bbPatcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
-      s3Sync.uploadFile(bbPatcherPath, orgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', bbPatcherPath, ':', up.error?.message); });
+      writeGeneratedFile('.PerfStudio/patch_jmx.py', BB_PATCHER_PY.replace(/\r\n/g, '\n'), bbPatcherPath);
       created.push('.PerfStudio/patch_jmx.py');
     } catch (e) { errors.push(`bitbucket-pipelines.yml: ${e.message}`); }
   }
@@ -1319,7 +1341,95 @@ pipelines:
   let pushMessage = '';
   try {
     const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
-    if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
+    if (!isSSH) {
+      // ── PAT mode: commit + push via gitEngine's in-memory, S3-backed session — no real
+      // disk ever touched. Land on the target branch BEFORE writing any generated file into
+      // the session, so a branch checkout/creation can never clobber freshly-written content
+      // (the exact problem the SSH path's checkout-conflict-retry/copy-aside dance below
+      // exists to work around — sidestepped here by ordering instead). ────────────────────
+      if (gitCfg?.is_initialized) {
+        const providerInRequest = (providers[0] || 'github');
+        const authMethodKey = `${providerInRequest}_auth_method`;
+        if (cfg?.[authMethodKey] === 'ssh' && !!cfg?.ssh_private_key) {
+          throw new Error(`This project's git workspace uses PAT-mode (S3-backed) storage, which has no SSH transport support — configure an HTTPS access token for the ${providerInRequest} CI push instead of an SSH key.`);
+        }
+        const { decrypt: dec } = require('../utils/encryption');
+        const userIdentity = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?')
+          .get(req.userId, req.params.projectId);
+        const rawToken = (userIdentity?.auth_token ? dec(userIdentity.auth_token) : '')
+          || (gitCfg.auth_token ? dec(gitCfg.auth_token) : '');
+        if (!rawToken) throw new Error('No git access token configured for this project — go to Configuration → Git and set one up.');
+
+        const autoCommitBranch = gitCfg?.base_branch || baseBranch;
+        const session = await gitEngine.openSession(gitRoot, orgSlug);
+        if (!session.hadState) throw new Error('Git workspace has not been initialized yet — go to Configuration → Git and initialize/clone first.');
+
+        try {
+          await gitEngine.checkout(session, autoCommitBranch);
+        } catch {
+          try {
+            await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: autoCommitBranch, token: rawToken });
+            await gitEngine.checkout(session, autoCommitBranch, { create: true, startRef: `refs/remotes/origin/${autoCommitBranch}` });
+          } catch {
+            await gitEngine.checkout(session, autoCommitBranch, { create: true });
+          }
+        }
+        // Same defensive check as the SSH path below — never silently commit to the wrong branch.
+        const actualBranch = await gitEngine.currentBranch(session);
+        if (actualBranch !== autoCommitBranch) {
+          throw new Error(`Expected to be on branch "${autoCommitBranch}" before committing the generated CI config, but git reports "${actualBranch}" — aborting instead of committing to the wrong branch.`);
+        }
+
+        // Sync with the remote before writing/committing anything new — once this branch
+        // already exists in the persisted session (true on every call after the first), the
+        // checkout above is a same-session no-op that never looks at origin at all. If origin
+        // moved ahead since this session was last persisted (someone pushed directly on
+        // GitHub, a /trigger run, etc.), pushing without this would be rejected as non-fast-
+        // forward — exactly the "/trigger" route already has to handle. Preserve any
+        // pre-existing uncommitted tracked edits first (the stash-equivalent — isomorphic-git
+        // has no stash primitive), same as /trigger's auto-push does.
+        const preSyncStatus = await gitEngine.status(session);
+        const preservedEdits = new Map();
+        for (const relPath of preSyncStatus.modified) {
+          try { preservedEdits.set(relPath, session.fs.readFileSync(path.posix.join(session.dir, relPath))); } catch {}
+        }
+        try {
+          await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: autoCommitBranch, token: rawToken });
+          try {
+            await gitEngine.merge(session, `refs/remotes/origin/${autoCommitBranch}`, callerRow.name, callerRow.email, 'sync with remote before generating CI YAML', { fastForwardOnly: true });
+          } catch {
+            await gitEngine.resetHardToRef(session, autoCommitBranch, `refs/remotes/origin/${autoCommitBranch}`);
+          }
+        } catch (fetchErr) {
+          console.warn('[generate-yaml] PAT-mode remote sync failed (continuing with local session state):', fetchErr.message);
+        }
+        for (const [relPath, content] of preservedEdits) {
+          const full = path.posix.join(session.dir, relPath);
+          session.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+          session.fs.writeFileSync(full, content);
+        }
+
+        for (const { relPath, content } of patPendingFiles) {
+          const full = path.posix.join(session.dir, relPath);
+          session.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+          session.fs.writeFileSync(full, content, 'utf8');
+        }
+
+        await gitEngine.addAll(session);
+        const status = await gitEngine.status(session);
+        if (status.isClean()) {
+          pushMessage = ` Files unchanged — already up to date on ${autoCommitBranch}.`;
+        } else {
+          await gitEngine.commit(session, 'ci: add Peako Performance Test workflow [auto]', callerRow.name, callerRow.email);
+          await gitEngine.push(session, { url: gitCfg.remote_url, ref: autoCommitBranch, token: rawToken });
+          pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
+        }
+        // Flush the whole session (working tree + .git) back to S3 — atomically, awaited,
+        // before responding. Fixes the earlier bug where the S3 mirror was a fire-and-forget
+        // per-file upload that could lose the race with the response (or fail silently).
+        await gitEngine.persistSession(session, gitRoot, orgSlug);
+      }
+    } else if (gitCfg?.is_initialized && fs.existsSync(path.join(gitRoot, '.git'))) {
       const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
       // Detect SSH auth: any enabled provider using SSH key auth
@@ -1509,10 +1619,14 @@ pipelines:
       const _bbBranch = gitCfgBb?.base_branch || baseBranch || 'main';
       const _boundary = `bbpush${randomBytes(8).toString('hex')}`;
 
+      // Reads real disk first (SSH-mode, or PAT-mode's own patPendingFiles never applies here
+      // since that only exists inside /generate-yaml's own request scope) — falls back to the
+      // in-memory content this same request already generated above (always true for PAT-mode,
+      // since gitRoot is never a real path there).
       const yamlDest    = path.join(gitRoot, 'bitbucket-pipelines.yml');
       const yamlContent = fs.existsSync(yamlDest) ? fs.readFileSync(yamlDest) : Buffer.from(bbYaml || '', 'utf8');
       const patcherDest  = path.join(gitRoot, '.PerfStudio', 'patch_jmx.py');
-      const patcherContent = fs.existsSync(patcherDest) ? fs.readFileSync(patcherDest) : null;
+      const patcherContent = fs.existsSync(patcherDest) ? fs.readFileSync(patcherDest) : Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
 
       const _chunks = [];
       const _add = s => _chunks.push(Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8'));
@@ -1668,27 +1782,57 @@ router.post('/trigger', async (req, res) => {
   // ── Auto-push script file to the target branch before dispatching ──────────
   // The CI runner checks out this branch — the JMX file must exist there or
   // the Patch JMX step will fail with FileNotFoundError.
+  let autoPushError = null;
   try {
-    const { cleanName, resolveUserFolder: resolveUF, resolveOrgSlugForProject: resolveOrgUF, resolveWorkspaceRoot: resolveWSRoot } = require('../utils/projectFolders');
+    const { cleanName, resolveUserFolder: resolveUF, resolveOrgSlugForProject: resolveOrgUF, resolveWorkspaceRoot: resolveWSRoot, getUserProjectPath } = require('../utils/projectFolders');
     const projectRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
     const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
-    // Always use the project's initialized git_root (set by admin) for auto-push,
-    // not the triggering user's workspace — the user's workspace may lack .git.
-    // gitCfg.git_root, when set, is a DB-stored absolute path — used as-is, never
-    // recomputed, since it already points at wherever that project's real data lives.
     const orgSlugForTrigger = await resolveOrgUF(req.params.projectId);
-    const preferredRoot = gitCfg?.git_root || resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
-    // Restore the workspace first if the S3 sweep reclaimed it since the last access —
-    // otherwise a cold (but otherwise valid) git_root looks indistinguishable below from
-    // "never had git initialized," silently skipping the whole auto-push block.
-    if (gitCfg?.is_initialized) {
-      await require('./git').ensureGitWorkspaceHydrated(preferredRoot, req.params.projectId, req.userId);
-    }
-    const wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git')))
-      ? gitCfg.git_root
-      : resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
+    const isSSHTrigger = await isSshMode(req.userId, req.params.projectId);
 
-    if (gitCfg?.is_initialized && fs.existsSync(path.join(wsRoot, '.git'))) {
+    // PAT mode: every actor (admin or regular user) has their OWN independent, self-
+    // hydrating S3-backed gitEngine session — there's no single "project data" location to
+    // fall back to. gitCfg.git_root is specifically the ADMIN's own session key, set once at
+    // /init time by whoever initialized the repo (almost always the org admin) — see
+    // resolveActorGitDir()'s identical concern in testData.js ("every read/write must go
+    // through this, never the project-wide project.folder_path... falling back to
+    // folder_path meant every regular user's test data landed inside the admin's main-branch
+    // workspace instead of their own users/<name> branch"). Using gitCfg.git_root here for a
+    // REGULAR user's trigger silently opened the ADMIN's (script-less) session instead of
+    // the triggering user's own — its auto-push then correctly recorded, from that wrong
+    // session's point of view, that the script was "removed" and pushed exactly that broken
+    // state to the real branch, which is how the script actually disappeared from GitHub and
+    // every dispatch since has hit FileNotFoundError. For an admin caller this resolves to
+    // the exact same path gitCfg.git_root already holds, so it's a no-op in that case.
+    // SSH mode is unaffected — gitCfg.git_root there is a real, still-git_root-shaped disk
+    // path with its own "recompute if never cloned" fallback further below.
+    let preferredRoot;
+    if (isSSHTrigger) {
+      preferredRoot = gitCfg?.git_root || resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
+    } else {
+      const ownUserProjPath = await getUserProjectPath(req.userId, callerRow2?.role, projectRow?.name || '', req.params.projectId);
+      preferredRoot = ownUserProjPath
+        ? path.dirname(ownUserProjPath)
+        : (gitCfg?.git_root || resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger));
+    }
+
+    // ensureGitWorkspaceHydrated/the real-.git existence check below are SSH-mode-only
+    // concerns (they restore/inspect a REAL local directory) — gating them here fixes a
+    // second, smaller gap: this used to run unconditionally even for PAT-mode projects.
+    let wsRoot = preferredRoot;
+    if (isSSHTrigger) {
+      // Restore the workspace first if the S3 sweep reclaimed it since the last access —
+      // otherwise a cold (but otherwise valid) git_root looks indistinguishable below from
+      // "never had git initialized," silently skipping the whole auto-push block.
+      if (gitCfg?.is_initialized) {
+        await require('./git').ensureGitWorkspaceHydrated(preferredRoot, req.params.projectId, req.userId);
+      }
+      wsRoot = (gitCfg?.git_root && fs.existsSync(path.join(gitCfg.git_root, '.git')))
+        ? gitCfg.git_root
+        : resolveWSRoot(cleanName(projectRow?.name || ''), await resolveUF(req.userId), orgSlugForTrigger);
+    }
+
+    if (isSSHTrigger && gitCfg?.is_initialized && fs.existsSync(path.join(wsRoot, '.git'))) {
       const simpleGit2 = require('simple-git');
       const NO_PROMPT2 = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GIT_SSH_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GCM_NO_INTERACTIVE: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' };
 
@@ -2098,10 +2242,393 @@ pipelines:
         try { await git2.addConfig('credential.helper', '', false, 'local'); } catch {}
         await git2.push(['--set-upstream', 'origin', targetRef]);
       }
+    } else if (!isSSHTrigger && gitCfg?.is_initialized) {
+      // ── PAT mode: identical intent (get the JMX/patcher/trigger-info onto targetRef and
+      // dispatch-ready), entirely through gitEngine's in-memory, S3-backed session — no real
+      // disk touched at any point. ─────────────────────────────────────────────────────────
+      const session = await gitEngine.openSession(preferredRoot, orgSlugForTrigger);
+      if (!session.hadState) throw new Error('Git workspace has not been initialized yet — go to Configuration → Git and initialize/clone first.');
+
+      // Resolve the push credential per provider — same precedence as the SSH-mode branch
+      // above, just returned as a plain token/username pair instead of embedded into a URL
+      // (gitEngine's push/fetch build the Basic-Auth header themselves via onAuthFor()).
+      let patToken = '', patUsername;
+      if (provider === 'bitbucket') {
+        const bbPass = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
+        patToken = bbPass;
+        patUsername = bbPass.startsWith('ATATT') ? 'x-token-auth' : (adminCfg?.bitbucket_username || gitCfg.username || undefined);
+      } else if (provider === 'gitlab') {
+        patToken = cfg.gitlab_token || userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
+        patUsername = 'oauth2';
+      } else {
+        patToken = userToken || (gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '');
+        patUsername = undefined;
+      }
+
+      // Land on targetRef BEFORE writing anything new — same ordering trick /generate-yaml
+      // uses to avoid ever needing the SSH path's stash/checkout-conflict dance.
+      try {
+        await gitEngine.checkout(session, targetRef);
+      } catch {
+        try {
+          await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: targetRef, token: patToken, username: patUsername });
+          await gitEngine.checkout(session, targetRef, { create: true, startRef: `refs/remotes/origin/${targetRef}` });
+        } catch {
+          await gitEngine.checkout(session, targetRef, { create: true });
+        }
+      }
+      const actualBranchTrigger = await gitEngine.currentBranch(session);
+      if (actualBranchTrigger !== targetRef) {
+        throw new Error(`Expected to be on branch "${targetRef}" before auto-pushing, but git reports "${actualBranchTrigger}" — aborting.`);
+      }
+
+      // Sync with the remote before writing new files, same reason the SSH path does this
+      // (origin may have moved since this session was last persisted — a non-fast-forward
+      // push would otherwise never reach the CI runner). Capture any PRE-EXISTING uncommitted
+      // tracked-file edits first (e.g. an unsaved Collections/TestData change) and restore
+      // them after — the gitEngine equivalent of the SSH path's tracked-only stash/pop, since
+      // isomorphic-git has no stash primitive; a hard reset never touches untracked files
+      // either way, so nothing extra is needed to protect those.
+      const preSyncStatus = await gitEngine.status(session);
+      const preservedEdits = new Map();
+      for (const relPath of preSyncStatus.modified) {
+        try { preservedEdits.set(relPath, session.fs.readFileSync(path.posix.join(session.dir, relPath))); } catch {}
+      }
+      try {
+        await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: targetRef, token: patToken, username: patUsername });
+        try {
+          await gitEngine.merge(session, `refs/remotes/origin/${targetRef}`, callerRow2?.name, callerRow2?.email, 'sync with remote before CI trigger', { fastForwardOnly: true });
+        } catch {
+          await gitEngine.resetHardToRef(session, targetRef, `refs/remotes/origin/${targetRef}`);
+        }
+      } catch (fetchErr) {
+        console.warn('[CI trigger] PAT-mode remote sync failed (continuing with local session state):', fetchErr.message);
+      }
+      for (const [relPath, content] of preservedEdits) {
+        const full = path.posix.join(session.dir, relPath);
+        session.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+        session.fs.writeFileSync(full, content);
+      }
+
+      // Regenerate bitbucket-pipelines.yml from the canonical template — same content/reason
+      // as the SSH branch (a stale reset/merge must never leave an outdated pipeline file
+      // missing the explicit `jmeter` entrypoint).
+      let bbYamlContent = null;
+      if (provider === 'bitbucket') {
+        try {
+          const _gcRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
+            || await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
+          const _dockerImage = (JSON.parse(_gcRow?.config_json || '{}').jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
+          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
+          const _defScript = _suites.length ? path.basename(_suites[0].jmx_path || _suites[0].js_path || 'test.jmx') : 'test.jmx';
+          const _scriptList = _suites.map(s => {
+            const f = path.basename(s.jmx_path || s.js_path || '');
+            return `  # ${path.basename(s.jmx_path || s.js_path || f)} → ${f}`;
+          }).join('\n');
+          bbYamlContent = `# ============================================================
+# Peako — Bitbucket Pipelines Performance Test
+# Generated by Peako on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
+#
+# REQUIRED SETUP (Bitbucket → Repository Settings → Repository Variables):
+#   BB_USERNAME     — your Bitbucket username  (mark as Secured)
+#   BB_APP_PASSWORD — Bitbucket App Password / API Token (mark as Secured)
+#
+# Available test scripts:
+${_scriptList || '  # (no generated scripts yet — generate from Test Plans first)'}
+# ============================================================
+
+image: docker:latest
+
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  custom:
+    Peako-Performance-Test:
+      - variables:
+          - name: SCRIPT_NAME
+            default: "${_defScript}"
+          - name: SCRIPT_PATH
+            default: ""
+          - name: RESULTS_PATH
+            default: ""
+          - name: TESTDATA_PATH
+            default: "testData"
+          - name: JMETER_USERS
+            default: "10"
+          - name: JMETER_RAMPUP
+            default: "30"
+          - name: JMETER_LOOPS
+            default: "-1"
+          - name: JMETER_DURATION
+            default: "300"
+      - step:
+          name: Run JMeter Performance Test
+          size: 2x
+          services:
+            - docker
+          script:
+            - apk add --no-cache curl zip bash python3
+            - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
+            - echo "Peako Performance Test"
+            - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
+            - echo "VUsers    | $JMETER_USERS"
+            - echo "Ramp-up   | $JMETER_RAMPUP s"
+            - echo "Duration  | $JMETER_DURATION s"
+            - |
+              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+              echo "=== Patching JMX parameters and fixing paths ==="
+              mkdir -p .PerfStudio
+              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
+              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+              echo "=== JMX state after patch ==="
+              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+            - |
+              docker run --rm \\
+                -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
+                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                ${_dockerImage} \\
+                jmeter \\
+                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                -l "/workspace/results.jtl" \\
+                -e -o "/workspace/html" || true
+            - |
+              if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
+                cd "$BITBUCKET_CLONE_DIR"
+                [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
+                DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
+                # Always upload results.jtl — create header stub if JMeter crashed without output
+                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                curl -s -X POST \\
+                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                  -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                  -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
+                  -F "branch=$BITBUCKET_BRANCH" \\
+                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
+                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
+                if [ -f html.zip ]; then
+                  curl -s -X POST \\
+                    "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
+                    -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
+                    -F "message=ci-results html: \${PIPELINE_ID} [auto]" \\
+                    -F "branch=$BITBUCKET_BRANCH" \\
+                    -F "\${DEST_BASE}/html.zip=@html.zip" \\
+                    && echo "HTML report committed to $BITBUCKET_BRANCH" || echo "HTML commit failed (non-fatal)"
+                fi
+              else
+                echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
+              fi
+            - |
+              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+              if [ ! -f "$JTL" ]; then
+                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                exit 1
+              fi
+              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+              echo "JMeter sample count: $TOTAL"
+              if [ "$TOTAL" -le 0 ]; then
+                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                exit 1
+              fi
+              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+              # results sync to notice. Header-based column lookup since JMeter's CSV field
+              # order isn't guaranteed fixed.
+              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+              if [ -n "$SUCCESS_COL" ]; then
+                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                echo "Failed requests: $FAILED / $TOTAL"
+                if [ "$FAILED" -eq "$TOTAL" ]; then
+                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                  exit 1
+                fi
+              else
+                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+              fi
+              echo "Validation passed: $TOTAL requests executed."
+`.replace(/\r\n/g, '\n');
+          const _full = path.posix.join(session.dir, 'bitbucket-pipelines.yml');
+          session.fs.writeFileSync(_full, bbYamlContent, 'utf8');
+          console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template (PAT mode)');
+        } catch (e) {
+          console.warn('[CI trigger] YAML regen failed:', e.message);
+        }
+      }
+
+      // Ensure .PerfStudio/patch_jmx.py is present on the branch being pushed/dispatched.
+      let patcherContent;
+      const patcherFull = path.posix.join(session.dir, '.PerfStudio', 'patch_jmx.py');
+      if (session.fs.existsSync(patcherFull)) {
+        patcherContent = session.fs.readFileSync(patcherFull);
+      } else {
+        patcherContent = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+        session.fs.mkdirSync(path.posix.dirname(patcherFull), { recursive: true });
+        session.fs.writeFileSync(patcherFull, patcherContent);
+        console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing, PAT mode)');
+      }
+
+      // Copy the JMX/JS file to its canonical repo path — PAT-mode scripts are generated
+      // into this exact same session (testSuites.js's PAT branch opens a gitEngine session at
+      // this same project's folder_path/git_root), so no cross-directory disk search is ever
+      // needed here, unlike the SSH path's legacy multi-location fallback search.
+      let jmxContent = null;
+      if (script_name) {
+        const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
+        const suiteRow = await db.prepare(
+          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+        const srcRel = (suiteRow?.jmx_path || suiteRow?.js_path || '').replace(/\\/g, '/');
+        const srcFull = srcRel ? path.posix.join(session.dir, srcRel) : null;
+        const canonicalFull = path.posix.join(session.dir, canonicalPaths.scriptRepoPath);
+        if (srcFull && session.fs.existsSync(srcFull)) {
+          jmxContent = session.fs.readFileSync(srcFull);
+          if (!session.fs.existsSync(canonicalFull)) {
+            session.fs.mkdirSync(path.posix.dirname(canonicalFull), { recursive: true });
+            session.fs.writeFileSync(canonicalFull, jmxContent);
+          }
+        } else if (session.fs.existsSync(canonicalFull)) {
+          jmxContent = session.fs.readFileSync(canonicalFull);
+        }
+      }
+
+      // Always write a trigger-info file so every pipeline run gets a clean commit with the
+      // test name as the message — same as the SSH branch.
+      const runLabelPat = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
+      const triggerContent = JSON.stringify({
+        triggered_at: new Date().toISOString(),
+        script: script_name || '',
+        users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
+      }, null, 2);
+      const triggerFull = path.posix.join(session.dir, '.peako', 'last-run.json');
+      session.fs.mkdirSync(path.posix.dirname(triggerFull), { recursive: true });
+      session.fs.writeFileSync(triggerFull, triggerContent, 'utf8');
+
+      await gitEngine.addAll(session);
+      const stagedStatus = await gitEngine.status(session);
+      if (!stagedStatus.isClean()) {
+        await gitEngine.commit(session, `Peako Performance Test: ${runLabelPat} [auto]`, callerRow2?.name, callerRow2?.email);
+      }
+
+      if (provider === 'bitbucket') {
+        const _bbWs   = cfg.bitbucket_workspace;
+        const _bbSlug = cfg.bitbucket_repo_slug;
+        const _adminTok = (adminCfg?.bitbucket_app_password || cfg.bitbucket_app_password || '').trim();
+        const _adminCfgForAuth = {
+          ...cfg,
+          bitbucket_app_password: _adminTok,
+          bitbucket_username: adminCfg?.bitbucket_username || adminRawCfg?.bitbucket_username || cfg.bitbucket_username || '',
+        };
+        const _bbAuth = await bbBasicAuth(_adminCfgForAuth, adminRawCfg?.user_id);
+        const _boundary = 'PeakoBoundary7x3f9z';
+        const _fileParts = [];
+        if (bbYamlContent) _fileParts.push({ name: 'bitbucket-pipelines.yml', content: Buffer.from(bbYamlContent, 'utf8') });
+        _fileParts.push({ name: '.peako/last-run.json', content: Buffer.from(triggerContent, 'utf8') });
+        if (script_name && jmxContent) _fileParts.push({ name: canonicalPaths.scriptRepoPath, content: jmxContent });
+        _fileParts.push({ name: '.PerfStudio/patch_jmx.py', content: patcherContent });
+
+        // testData CSVs — search the SAME in-memory session instead of real disk.
+        const findTestDataDirInSession = (dir, depth) => {
+          if (depth > 6) return null;
+          try {
+            const entries = session.fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+              if (e.isDirectory() && e.name === 'testData') {
+                const full = path.posix.join(dir, e.name);
+                const files = session.fs.readdirSync(full);
+                if (files.some(f => f.endsWith('.csv'))) return full;
+              }
+            }
+            for (const e of entries) {
+              if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'results' && e.name !== 'node_modules') {
+                const found = findTestDataDirInSession(path.posix.join(dir, e.name), depth + 1);
+                if (found) return found;
+              }
+            }
+          } catch {}
+          return null;
+        };
+        const testDataDirSession = findTestDataDirInSession(session.dir, 0);
+        if (testDataDirSession) {
+          for (const f of session.fs.readdirSync(testDataDirSession)) {
+            if (!f.startsWith('.') && (f.endsWith('.csv') || f.endsWith('.txt') || f.endsWith('.json'))) {
+              _fileParts.push({ name: `${canonicalPaths.testDataPath}/${f}`, content: session.fs.readFileSync(path.posix.join(testDataDirSession, f)) });
+            }
+          }
+          console.log('[CI trigger] testData files pushed from (PAT session):', testDataDirSession);
+        } else {
+          console.warn('[CI trigger] No testData directory with CSV files found in PAT session');
+        }
+
+        const _chunks = [];
+        const _add = s => _chunks.push(Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8'));
+        _add(`--${_boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\nPeako Performance Test: ${runLabelPat} [auto]\r\n`);
+        _add(`--${_boundary}\r\nContent-Disposition: form-data; name="branch"\r\n\r\n${targetRef}\r\n`);
+        for (const fp of _fileParts) {
+          _add(`--${_boundary}\r\nContent-Disposition: form-data; name="${fp.name}"\r\n\r\n`);
+          _add(fp.content);
+          _add('\r\n');
+        }
+        _add(`--${_boundary}--\r\n`);
+        const _bodyBuf = Buffer.concat(_chunks);
+
+        await new Promise((resolve, reject) => {
+          const _opts = {
+            hostname: 'api.bitbucket.org',
+            port: 443,
+            path: `/2.0/repositories/${_bbWs}/${_bbSlug}/src`,
+            method: 'POST',
+            headers: {
+              Authorization: _bbAuth,
+              'Content-Type': `multipart/form-data; boundary=${_boundary}`,
+              'Content-Length': _bodyBuf.length,
+              'User-Agent': 'PerfStudio',
+            },
+            rejectUnauthorized: false,
+          };
+          const _req2 = https.request(_opts, _res2 => {
+            let _d = '';
+            _res2.on('data', c => _d += c);
+            _res2.on('end', () => {
+              if (_res2.statusCode === 201) {
+                console.log('[CI trigger] Bitbucket Files API committed YAML + JMX to branch', targetRef, '(PAT mode)');
+                resolve();
+              } else {
+                console.warn('[CI trigger] Bitbucket Files API HTTP', _res2.statusCode, _d.slice(0, 400));
+                reject(new Error(`Bitbucket Files API returned ${_res2.statusCode}: ${_d.slice(0, 200)}`));
+              }
+            });
+          });
+          _req2.on('error', reject);
+          _req2.write(_bodyBuf);
+          _req2.end();
+        });
+      } else {
+        // GitHub / GitLab — gitEngine push (no SSH transport exists in isomorphic-git, but
+        // this route never uses an SSH-key credential for its own push regardless of the
+        // workspace's own auth mode — same as the SSH-mode branch above, always token-based).
+        if (!patToken) throw new Error('No git access token configured for this provider — go to Configuration → Pipeline and set one up.');
+        await gitEngine.push(session, { url: gitCfg.remote_url, ref: targetRef, token: patToken, username: patUsername });
+      }
+
+      // Flush the whole session (working tree + .git) back to S3 — atomically, awaited,
+      // before dispatch — no more fire-and-forget per-file uploads that could lose the race.
+      await gitEngine.persistSession(session, preferredRoot, orgSlugForTrigger);
     }
   } catch (syncErr) {
     console.warn('[CI trigger] Auto-push script failed:', syncErr.message);
-    // Non-fatal — proceed with dispatch anyway; user may have pushed manually
+    autoPushError = syncErr.message;
+  }
+
+  // If the script/YAML/patcher never actually reached the target branch, dispatching anyway
+  // is guaranteed (or very likely) to fail at the runner's "Patch JMX parameters" step with a
+  // FileNotFoundError — surface the real cause now instead of a confusing downstream CI failure.
+  if (autoPushError) {
+    return res.status(502).json({
+      error: `Could not push the test script to branch "${targetRef}" before triggering CI: ${autoPushError}. `
+        + `Fix your Git configuration (Configuration → Git) — or push the script to that branch manually — then try again.`,
+    });
   }
 
   try {
@@ -2388,14 +2915,28 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   // Guard: never create duplicate execution_runs for the same CI run
   const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (alreadySynced) { console.log(`[Auto-sync] CI run #${run.id} already synced → skipping`); return; }
+  // Guard: a previous attempt already confirmed this run produced zero JMeter samples —
+  // nothing real to sync, never retry it again (see the no_results column's comment).
+  if (run.no_results) { console.log(`[Auto-sync] CI run #${run.id} previously confirmed 0 samples → skipping`); return; }
 
+  // Resolve the workspace/recipients/credentials against the run's OWN triggering user, not
+  // whichever user happens to be the one whose browser polled /status and fired this call —
+  // this function used to take the raw `userId` param (the ambient caller) straight into
+  // getUserProjectPath(), so a run triggered by a regular user but polled into completion by
+  // an admin (or vice versa) synced into the WRONG actor's workspace — a real, confirmed bug:
+  // it's how two independent copies of the same run's results ended up scattered across both
+  // the admin's and the regular user's S3 namespaces. Every other use of `userId` below already
+  // preferred `run.triggered_by` on its own (the healUserId/sendAlertEmail call sites) — this
+  // makes that the single source of truth for the whole function instead of an inconsistent
+  // per-call-site pattern.
+  const effectiveUserId = run.triggered_by || userId;
   const orgSlug = await resolveOrgSlugForProject(projectId);
-  const callerUser0 = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerUser0 = await db.prepare('SELECT role FROM users WHERE id = ?').get(effectiveUserId);
   const callerRole = callerUser0?.role;
   // userProjPath/resultDir below are path-SHAPED naming strings only, used to derive an S3
   // key (via resultsStore, which calls s3Sync.toKey()) and for the existing run-numbering/
   // display-label conventions — never created on disk, never touched via fs.*.
-  const userProjPath = await getUserProjectPath(userId, callerRole, project.name, projectId);
+  const userProjPath = await getUserProjectPath(effectiveUserId, callerRole, project.name, projectId);
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
   // Parse CI parameters for the run name — also persisted onto execution_runs below
@@ -2451,25 +2992,79 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   }
 
   let artifactZipBuffer = null; // GitHub/GitLab: full artifact zip; Bitbucket: unused (fetched separately below)
+  let bbHandledDirect = false; // Bitbucket writes results.jtl/html.zip directly — skips generic zip extraction below
+
+  // GitHub/GitLab both index a completed job's artifacts a few seconds AFTER the run itself
+  // reports "completed" — the frontend's status poll (Runner.jsx's pollCiStatus) stops polling
+  // the instant it sees a terminal status, so this call, fired from that exact same poll via
+  // setImmediate, used to get exactly one shot: if the artifact wasn't indexed yet in that
+  // narrow window, "No artifacts yet"/"No jobs found" was thrown, caught by the outer catch
+  // below, and NEVER retried — nothing else ever calls autoSyncCiRun again for an already-
+  // terminal run, so the only way to actually get the results into S3/Analytics was the
+  // separate manual "Sync Results" button. Retrying the artifact lookup itself here (a few
+  // short attempts, well within this fire-and-forget setImmediate call) closes that gap
+  // without depending on any further poll ever happening.
+  // 5×3s (15s total) was not always enough — confirmed for real: a run whose artifact was
+  // fully present and valid (verified by downloading it directly) still got misdiagnosed as
+  // producing 0 samples and had its status incorrectly flipped to 'failed', purely because
+  // GitHub's artifact-listing endpoint hadn't caught up yet within that window. This call is
+  // fire-and-forget (setImmediate, no request waiting on it), so there's no real cost to
+  // waiting much longer before concluding a run genuinely has no results.
+  const NOT_READY_RETRIES = 20;
+  const NOT_READY_DELAY_MS = 6000;
+  async function withArtifactRetry(fn) {
+    let lastErr;
+    for (let attempt = 1; attempt <= NOT_READY_RETRIES; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastErr = e;
+        if (!/No artifacts yet|No jobs found/.test(e.message) || attempt === NOT_READY_RETRIES) throw e;
+        await new Promise(r => setTimeout(r, NOT_READY_DELAY_MS));
+      }
+    }
+    throw lastErr;
+  }
 
   try {
     if (run.provider === 'github') {
       if (!cfg.github_token) throw new Error('No GitHub token');
       const ghHeaders = { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' };
-      const artifactsResp = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`, 'GET', null, ghHeaders);
-      if (artifactsResp.status !== 200 || !artifactsResp.body?.artifacts?.length) throw new Error('No artifacts yet');
+      const artifactsResp = await withArtifactRetry(async () => {
+        const r = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`, 'GET', null, ghHeaders);
+        if (r.status !== 200 || !r.body?.artifacts?.length) throw new Error('No artifacts yet');
+        return r;
+      });
       const artifact = artifactsResp.body.artifacts[0];
       const dlResp = await apiRequest(`https://api.github.com/repos/${cfg.github_repo}/actions/artifacts/${artifact.id}/zip`, 'GET', null, ghHeaders);
       const downloadUrl = dlResp.headers?.location || dlResp.headers?.Location;
       if (!downloadUrl) throw new Error('No download URL');
       const dl = await downloadToBuffer(downloadUrl, {});
       artifactZipBuffer = dl.buffer;
-    } else if (run.provider === 'gitlab') {
+    }
+
+    // Each provider is its OWN independent `if`, not an else-if chain — github/gitlab only
+    // ever set artifactZipBuffer, they don't return early, so whichever provider actually
+    // matched still needs to fall through into the generic zip-write block below. Bitbucket
+    // is the one branch that fully handles its own write (results.jtl comes from the repo,
+    // not a job artifact), so it sets bbHandledDirect to skip that block instead.
+    // NOTE: this used to be `else if`/`else`, which meant the generic zip-write block (the
+    // ONLY place that actually calls writeZipEntries to save results.jtl to S3) sat behind a
+    // final `else` that could never be reached for github/gitlab/bitbucket — i.e. every
+    // GitHub/GitLab run's artifact was downloaded but never written anywhere, so the very
+    // next line always read back nothing and misdiagnosed a genuinely successful run as
+    // "0 samples", permanently marking it no_results=1/status=failed. Confirmed against a
+    // real run (GitHub conclusion: success, artifact had a valid 2160-row results.jtl) whose
+    // S3 prefix had zero objects because this dead branch never wrote anything.
+    if (run.provider === 'gitlab') {
       if (!cfg.gitlab_token) throw new Error('No GitLab token');
       const gitlabUrl = (cfg.gitlab_url || 'https://gitlab.com').replace(/\/$/, '');
       const encodedId = encodeURIComponent(cfg.gitlab_project_id);
-      const jobsResp = await apiRequest(`${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`, 'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token });
-      if (jobsResp.status !== 200 || !jobsResp.body?.length) throw new Error('No jobs found');
+      const jobsResp = await withArtifactRetry(async () => {
+        const r = await apiRequest(`${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`, 'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token });
+        if (r.status !== 200 || !r.body?.length) throw new Error('No jobs found');
+        return r;
+      });
       const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
       if (!job?.id) throw new Error('No artifact job');
       const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
@@ -2477,9 +3072,11 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const dl = await downloadToBuffer({ hostname: urlObj.hostname, port: urlObj.port || 443, path: urlObj.pathname, method: 'GET', headers: { 'PRIVATE-TOKEN': cfg.gitlab_token } });
       if (dl.statusCode !== 200 && dl.statusCode !== 206) throw new Error(`GitLab artifact download failed with HTTP ${dl.statusCode}`);
       artifactZipBuffer = dl.buffer;
-    } else if (run.provider === 'bitbucket') {
+    }
+
+    if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) throw new Error('No Bitbucket App Password / API Token');
-      const bbAuth2Header = await bbBasicAuth(cfg, userId);
+      const bbAuth2Header = await bbBasicAuth(cfg, effectiveUserId);
       const pipelineId2 = (run.external_id || '').replace(/[{}]/g, '');
       const ws2   = cfg.bitbucket_workspace;
       const slug2 = cfg.bitbucket_repo_slug;
@@ -2522,7 +3119,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
           VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
         `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
 
-        const healUserId = run.triggered_by || userId;
+        const healUserId = effectiveUserId;
         if (run.auto_heal && !run.is_heal_run) {
           setImmediate(async () => {
             try {
@@ -2552,7 +3149,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', bbJtlBuffer);
 
       // Download html.zip separately from perf-results branch (non-fatal if missing)
-      const _bbAuth3 = await bbBasicAuth(cfg, userId);
+      const _bbAuth3 = await bbBasicAuth(cfg, effectiveUserId);
       const _ws3     = cfg.bitbucket_workspace;
       const _slug3   = cfg.bitbucket_repo_slug;
       const _jtlBasePath2 = _ciVars2.results_path ? `${_ciVars2.results_path}/${_runFolder2}` : `ci-results/${_runFolder2}`;
@@ -2565,16 +3162,27 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       } catch (_e) {
         console.warn('[CI sync] html.zip download failed (non-fatal):', _e.message);
       }
-    } else {
+
+      bbHandledDirect = true;
+    }
+
+    if (!bbHandledDirect) {
       if (!artifactZipBuffer || !artifactZipBuffer.length) throw new Error('Empty zip');
 
       // Normalise html/ → report/ at write time (only if the archive doesn't already
       // have its own report/ entries) — matches the original extract-then-rename behavior.
       const AdmZip = require('adm-zip');
       const hasReportEntries = new AdmZip(artifactZipBuffer).getEntries().some(e => e.entryName.startsWith('report/'));
-      await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
+      const zipWriteResult = await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
         rename: name => (!hasReportEntries && name.startsWith('html/')) ? name.replace(/^html\//, 'report/') : name,
       });
+      // results.jtl failing to write is NOT the same thing as the run genuinely producing 0
+      // samples — the artifact really did have data, the upload of this one file just didn't
+      // land (see writeZipEntries' own comment). Treat it as a retriable sync failure instead
+      // of falsely concluding "0 samples" and permanently marking no_results.
+      if (zipWriteResult.failed.some(f => f.relPath === 'results.jtl')) {
+        throw new Error('results.jtl failed to upload to S3 after retries — will retry this sync on the next attempt.');
+      }
     }
 
     const jtlText    = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
@@ -2596,30 +3204,26 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     const totalRequests = reportData?.summary?.total_requests || 0;
     if (totalRequests === 0) {
-      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — marking run as failed`);
-      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
+      // Genuinely nothing to show — no request trace at all in the JTL. Per product decision,
+      // these never get an execution_runs row (nothing real to plot in Analytics); mark
+      // no_results instead so the background catch-up in execution.js stops retrying this
+      // run forever. ci_pipeline_runs.status still reflects the real problem (JMeter produced
+      // nothing), unlike a rule-engine verdict, which is a genuinely different situation.
+      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — not syncing to Analytics`);
+      await db.prepare("UPDATE ci_pipeline_runs SET status='failed', no_results=1 WHERE id=?").run(run.id);
 
       // Fetch pipeline logs for AI context (helps diagnose why JMeter produced 0 requests)
       let zeroBbLogs = '';
       if (run.provider === 'bitbucket' && cfg.bitbucket_app_password) {
         try {
           zeroBbLogs = await fetchBbPipelineLogs(
-            await bbBasicAuth(cfg, userId), cfg.bitbucket_workspace, cfg.bitbucket_repo_slug,
+            await bbBasicAuth(cfg, effectiveUserId), cfg.bitbucket_workspace, cfg.bitbucket_repo_slug,
             run.external_id || ''
           );
         } catch (_) {}
       }
 
-      const zeroLogs = [{ type: 'error', message: 'JTL file contains no data rows — JMeter produced 0 samples. The test plan may be malformed or all thread groups are disabled.' }];
-      if (zeroBbLogs) zeroLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
-
-      const zeroInsert = await db.prepare(`
-        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
-      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
-      const zeroRunId = zeroInsert.lastInsertRowid;
-
-      const healUserId0 = run.triggered_by || userId;
+      const healUserId0 = effectiveUserId;
       if (run.auto_heal && !run.is_heal_run) {
         setImmediate(async () => {
           try {
@@ -2638,11 +3242,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
           const suiteName0 = suiteId
             ? ((await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name || run.script_name || 'CI Run')
             : (run.script_name || 'CI Run');
-          await sendAlertEmail(zeroRunId, healUserId0, projectId, {
+          const zeroErrors = [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }];
+          if (zeroBbLogs) zeroErrors.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
+          await sendAlertEmail(null, healUserId0, projectId, {
             meta: { suite_name: suiteName0, engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
             summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
             by_api: [], timeline: [],
-            errors: [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }],
+            errors: zeroErrors,
             rule_violations: [],
           }, null, null);
           console.log(`[Auto-sync] Failure email sent for 0-sample CI run #${run.id}`);
@@ -2681,7 +3287,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       setImmediate(async () => {
         try {
           const { sendRuleViolationEmail } = require('../utils/emailUtils');
-          await sendRuleViolationEmail(null, userId, projectId, autoViolations, emailData.meta.suite_name, project.name);
+          await sendRuleViolationEmail(null, effectiveUserId, projectId, autoViolations, emailData.meta.suite_name, project.name);
           console.log(`[Auto-sync] Rule violation email sent for CI run #${run.id}`);
         } catch (e) {
           console.error('[Auto-sync] Rule violation email failed:', e.message);
@@ -2707,13 +3313,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     // Any individual API at 100% failure → always trigger heal regardless of the auto_heal flag.
     const autoApiFullFailure = hasAnyApiFullFailure(reportData);
     // Overall pass/fail mirrors the rule engine (what the alert email/PDF already show) —
-    // falls back to raw failure count when the project has no rules configured.
+    // falls back to raw failure count when the project has no rules configured. This is
+    // Analytics' OWN pass/fail badge for the run (execution_runs.status) — intentionally NOT
+    // written back onto ci_pipeline_runs.status, which reflects the CI PROVIDER's real
+    // outcome (did the job itself complete). A response-time rule threshold being breached is
+    // not an infra failure — the rule-violation and result emails already cover that signal;
+    // CI Run History shouldn't show "failed" for a pipeline that genuinely succeeded.
     const autoRunFailed = autoApiFullFailure || autoRuleResult?.passed === false ||
       (autoRuleResult?.noRules && (reportData?.summary?.total_failed || 0) > 0);
     const autoSyncRunStatus = autoRunFailed ? 'failed' : 'completed';
-    if (autoRunFailed) {
-      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
-    }
 
     const execInsert = await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
@@ -2745,7 +3353,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       if (shouldHeal) {
         const healInstruction = buildErrorHealInstruction(reportData?.errors) || run.auto_heal_instruction || null;
         console.log(`[Auto-sync] CI run #${run.id} — triggering heal (apiFullFailure=${autoApiFullFailure}, mode: ${healInstruction ? 'custom' : (run.auto_heal_mode || 'auto')})`);
-        const healUserId2 = run.triggered_by || userId;
+        const healUserId2 = effectiveUserId;
         setImmediate(async () => {
           try {
             startAutoHealCI(healUserId2, run.id, projectId, {
@@ -2763,7 +3371,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     setImmediate(async () => {
       try {
         const { sendAlertEmail } = require('../utils/emailUtils');
-        await sendAlertEmail(newRunId, userId, projectId, emailData, autoPdfBuffer, null);
+        await sendAlertEmail(newRunId, effectiveUserId, projectId, emailData, autoPdfBuffer, null);
         console.log(`[Auto-sync] Final report email sent for CI run #${run.id} → exec run #${newRunId}`);
       } catch (e) {
         console.error('[Auto-sync] Final report email failed:', e.message);
@@ -2928,7 +3536,16 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   if (alreadySynced) return res.json({ ok: true, already_synced: true, execution_run_id: alreadySynced.id, message: 'Already synced — results are already in Analytics.' });
 
-  const cfg = decryptConfig(await getConfig(req.params.projectId, req.userId));
+  // Resolve the workspace/recipients/credentials against the run's OWN triggering user, not
+  // whoever's browser session happened to fire this call — this route is also self-POSTed in
+  // the background by execution.js's GET /runs catch-up using THAT request's auth header,
+  // which may belong to a different actor (e.g. an admin browsing Analytics) than whoever
+  // actually triggered the run. Same fix as autoSyncCiRun's effectiveUserId above, applied
+  // here too — this is how a run's results ended up written into the wrong actor's S3
+  // namespace (quarks-admin instead of quarks-user) even after that first fix landed.
+  const effectiveUserId = run.triggered_by || req.userId;
+
+  const cfg = decryptConfig(await getConfig(req.params.projectId, effectiveUserId));
   if (!cfg) return res.status(400).json({ error: 'CI configuration not found.' });
 
   const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
@@ -2941,9 +3558,9 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
   // ── Determine results directory ────────────────────────────────────────────
   // (path-SHAPED naming string only — see the matching comment in autoSyncCiRun above)
-  const callerUser1 = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+  const callerUser1 = await db.prepare('SELECT role FROM users WHERE id = ?').get(effectiveUserId);
   const callerRole  = callerUser1?.role;
-  const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name, req.params.projectId);
+  const userProjPath = await getUserProjectPath(effectiveUserId, callerRole, project.name, req.params.projectId);
 
   // Parse CI parameters for the run name — also persisted onto execution_runs below
   // (see the matching comment in autoSyncCiRun above for why).
@@ -3002,18 +3619,62 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   let artifactZipBuffer = null;
   let bbHandledDirect = false; // Bitbucket: files placed directly, skip generic zip extraction
 
+  // The background catch-up in execution.js's GET /runs self-POSTs here (with
+  // suppress_email=true) for every ci_pipeline_runs row stuck in a terminal state with no
+  // execution_runs record — retried on every single page load, forever, with no way to ever
+  // stop retrying a run that failed before producing any artifact at all (e.g. it never got
+  // past "Patch JMX parameters"). That kept `syncing_count` permanently > 0, so the "Syncing…"
+  // banner in Analytics never cleared. Per product decision, a run with no artifact/no request
+  // trace at all is never synced into execution_runs (nothing real to show in Analytics) —
+  // just mark it no_results so the catch-up query stops matching it. An INTERACTIVE click (no
+  // suppress_email) still just returns the error below without marking anything — a fresh
+  // manual click is far more likely to be racing a genuinely still-finishing pipeline, where
+  // the right answer is "let them retry in a few seconds," not permanently write it off.
+  const isBackgroundSync = req.query.suppress_email === 'true';
+  async function recordUnsyncableRun(reason) {
+    if (!isBackgroundSync) return;
+    console.warn(`[CI Sync] Run #${run.id}: ${reason} — not syncing to Analytics`);
+    await db.prepare("UPDATE ci_pipeline_runs SET no_results=1 WHERE id=?").run(run.id);
+  }
+  // GitHub/GitLab index a completed job's artifacts a few seconds AFTER the job itself reports
+  // "completed" — confirmed for real: a run whose artifact was fully present and valid (later
+  // verified by downloading it directly) still got misdiagnosed as "no artifacts" and
+  // permanently marked no_results here. Only retry for the BACKGROUND catch-up path — an
+  // interactive click should still fail fast so the user gets immediate feedback rather than
+  // waiting up to 2 minutes on a button press; the background path has no one waiting on it.
+  async function withArtifactRetryBg(fn) {
+    if (!isBackgroundSync) return fn();
+    const RETRIES = 20, DELAY_MS = 6000;
+    let lastErr;
+    for (let attempt = 1; attempt <= RETRIES; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastErr = e;
+        if (!/NOT_READY_YET/.test(e.message) || attempt === RETRIES) throw e;
+        await new Promise(r => setTimeout(r, DELAY_MS));
+      }
+    }
+    throw lastErr;
+  }
+
   try {
     if (run.provider === 'github') {
       if (!cfg.github_token) return res.status(400).json({ error: 'GitHub token not set.' });
 
       // Get artifact list for this run
-      const artifactsResp = await apiRequest(
-        `https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`,
-        'GET', null,
-        { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
-      );
+      const artifactsResp = await withArtifactRetryBg(async () => {
+        const r = await apiRequest(
+          `https://api.github.com/repos/${cfg.github_repo}/actions/runs/${run.external_id}/artifacts`,
+          'GET', null,
+          { Authorization: `token ${cfg.github_token}`, 'User-Agent': 'PerfStudio', Accept: 'application/vnd.github+json' }
+        );
+        if (r.status !== 200 || !r.body?.artifacts?.length) throw new Error('NOT_READY_YET');
+        return r;
+      }).catch(() => null);
 
-      if (artifactsResp.status !== 200 || !artifactsResp.body?.artifacts?.length) {
+      if (!artifactsResp) {
+        await recordUnsyncableRun('No artifacts were ever produced for this run — the pipeline likely failed before the "Upload report" step.');
         return res.status(404).json({ error: 'No artifacts found for this run. The pipeline may still be running or artifacts may have expired.' });
       }
 
@@ -3042,16 +3703,24 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const encodedId = encodeURIComponent(cfg.gitlab_project_id);
 
       // Get jobs for this pipeline
-      const jobsResp = await apiRequest(
-        `${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`,
-        'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token }
-      );
-      if (jobsResp.status !== 200 || !jobsResp.body?.length) {
+      const jobsResp = await withArtifactRetryBg(async () => {
+        const r = await apiRequest(
+          `${gitlabUrl}/api/v4/projects/${encodedId}/pipelines/${run.external_id}/jobs`,
+          'GET', null, { 'PRIVATE-TOKEN': cfg.gitlab_token }
+        );
+        if (r.status !== 200 || !r.body?.length) throw new Error('NOT_READY_YET');
+        return r;
+      }).catch(() => null);
+      if (!jobsResp) {
+        await recordUnsyncableRun('No jobs were ever found for this GitLab pipeline.');
         return res.status(404).json({ error: 'No jobs found for this GitLab pipeline.' });
       }
 
       const job = jobsResp.body.find(j => j.artifacts_file) || jobsResp.body[0];
-      if (!job?.id) return res.status(404).json({ error: 'No artifact-producing job found.' });
+      if (!job?.id) {
+        await recordUnsyncableRun('No artifact-producing job was ever found for this GitLab pipeline.');
+        return res.status(404).json({ error: 'No artifact-producing job found.' });
+      }
 
       // Download artifacts zip straight into memory
       const artifactUrl = `${gitlabUrl}/api/v4/projects/${encodedId}/jobs/${job.id}/artifacts`;
@@ -3066,7 +3735,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     if (run.provider === 'bitbucket') {
       if (!cfg.bitbucket_app_password) return res.status(400).json({ error: 'Bitbucket App Password / API Token not set.' });
-      const bbAuthHdr3 = await bbBasicAuth(cfg, req.userId);
+      const bbAuthHdr3 = await bbBasicAuth(cfg, effectiveUserId);
       const pid3       = (run.external_id || '').replace(/[{}]/g, '');
       const ciVars3    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
       const branch3      = ciVars3.bb_branch || 'perf-results';
@@ -3085,6 +3754,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/results.jtl`;
       const jtlDl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: jtlApiPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' } });
       if (jtlDl.statusCode !== 200 && jtlDl.statusCode !== 206) {
+        await recordUnsyncableRun(`results.jtl was never found on branch "${branch3}" at ${base3} — the pipeline likely failed before producing results.`);
         throw new Error(`results.jtl not found on branch "${branch3}" at ${base3} (HTTP ${jtlDl.statusCode}). Ensure the pipeline completed and committed results.`);
       }
       await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', jtlDl.buffer);
@@ -3112,14 +3782,27 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       // have its own report/ entries) — matches the original extract-then-rename behavior.
       const AdmZip = require('adm-zip');
       const hasReportEntries = new AdmZip(artifactZipBuffer).getEntries().some(e => e.entryName.startsWith('report/'));
-      await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
+      const zipWriteResult = await resultsStore.writeZipEntries(resultDir, orgSlug, artifactZipBuffer, {
         rename: name => (!hasReportEntries && name.startsWith('html/')) ? name.replace(/^html\//, 'report/') : name,
       });
+      // results.jtl failing to write is NOT the same thing as the run genuinely producing 0
+      // samples — see writeZipEntries' own comment. Fail this sync attempt outright (nothing
+      // gets marked/recorded) so it's retried later, instead of falsely concluding "0 samples".
+      if (zipWriteResult.failed.some(f => f.relPath === 'results.jtl')) {
+        return res.status(502).json({ error: 'results.jtl failed to upload to S3 after retries. Please try syncing again in a moment.' });
+      }
     }
 
     const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
     const hasReportFile = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
     const jtlText = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
+
+    // The artifact zip downloaded fine but contains no results.jtl at all (not even an empty
+    // one) — same "nothing real to show" situation as 0 samples below, just caught earlier.
+    if (!jtlText) {
+      await recordUnsyncableRun('Downloaded artifact contained no results.jtl at all.');
+      return res.status(404).json({ error: 'Artifact downloaded but contained no results.jtl. The pipeline may have failed before JMeter ran.' });
+    }
 
     // ── Generate analytics PDF from JTL ──────────────────────────────────────
     let pdfBuffer = null;
@@ -3141,10 +3824,30 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
           status: 'completed',
         });
         if (reportData) {
-          // Don't generate PDF or send email for 0-sample runs
+          // Genuinely nothing to show — no request trace at all in the JTL. Mark no_results
+          // and stop here entirely: never insert an execution_runs row for this (nothing real
+          // to plot in Analytics), matching autoSyncCiRun's identical zero-sample handling.
           if ((reportData.summary?.total_requests || 0) === 0) {
-            console.warn('[CI Sync] JTL has 0 samples — skipping PDF/email.');
-            reportData = null;
+            console.warn(`[CI Sync] Run #${run.id}: JTL has 0 samples — not syncing to Analytics`);
+            await db.prepare("UPDATE ci_pipeline_runs SET status='failed', no_results=1 WHERE id=?").run(run.id);
+            if (!isBackgroundSync) {
+              setImmediate(async () => {
+                try {
+                  const { sendAlertEmail } = require('../utils/emailUtils');
+                  await sendAlertEmail(null, effectiveUserId, req.params.projectId, {
+                    meta: { suite_name: run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+                    summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
+                    by_api: [], timeline: [],
+                    errors: [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }],
+                    rule_violations: [],
+                  }, null, null);
+                  console.log(`[CI Sync] Failure email sent for 0-sample run #${run.id}`);
+                } catch (e) {
+                  console.error('[CI Sync] Failure email failed (0-sample):', e.message);
+                }
+              });
+            }
+            return res.json({ ok: true, no_results: true, message: 'JMeter produced 0 requests — nothing to sync to Analytics.' });
           } else {
             // Evaluate rules so PDF shows PASSED/FAILED correctly
             try {
@@ -3175,13 +3878,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
     // Any individual API at 100% failure → mark run failed and always trigger heal, regardless of status code.
     const syncApiFullFailure = hasAnyApiFullFailure(reportData);
     // Overall pass/fail mirrors the rule engine (what the alert email/PDF already show) —
-    // falls back to raw failure count when the project has no rules configured.
+    // falls back to raw failure count when the project has no rules configured. This is
+    // Analytics' own pass/fail badge (execution_runs.status) — intentionally NOT written back
+    // onto ci_pipeline_runs.status, which reflects the CI provider's real outcome. A rule
+    // threshold breach isn't an infra failure; the violation/result emails already cover it.
     const syncRunFailed = syncApiFullFailure || ruleResult?.passed === false ||
       (ruleResult?.noRules && (reportData?.summary?.total_failed || 0) > 0);
     const syncRunStatus = syncRunFailed ? 'failed' : 'completed';
-    if (syncRunFailed) {
-      await db.prepare("UPDATE ci_pipeline_runs SET status='failed' WHERE id=?").run(run.id);
-    }
 
     const execRunRow = await db.prepare(`
       INSERT INTO execution_runs
@@ -3228,10 +3931,10 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         // Send rule violation email first (as soon as violations are known, before full report)
         if (violations.length > 0) {
           const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-          await sendRuleViolationEmail(newRunId, req.userId, req.params.projectId, violations, resolvedSuiteName, proj?.name || '');
+          await sendRuleViolationEmail(newRunId, effectiveUserId, req.params.projectId, violations, resolvedSuiteName, proj?.name || '');
         }
         // Send full report email
-        await sendAlertEmail(newRunId, req.userId, req.params.projectId, emailData, pdfBuffer, null);
+        await sendAlertEmail(newRunId, effectiveUserId, req.params.projectId, emailData, pdfBuffer, null);
         console.log(`[CI Sync] Alert email sent for run #${newRunId}`);
       } catch (e) {
         console.error('[CI Sync] Alert email failed:', e.message);
@@ -3246,7 +3949,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       console.log(`[CI Sync] Run #${run.id} failed (apiFullFailure=${syncApiFullFailure}) — triggering auto-heal`);
       setImmediate(async () => {
         try {
-          startAutoHealCI(req.userId, run.id, req.params.projectId, {
+          startAutoHealCI(effectiveUserId, run.id, req.params.projectId, {
             mode: syncHealInstruction ? 'custom' : (run.auto_heal_mode || 'auto'),
             customInstruction: syncHealInstruction,
           });
@@ -3521,6 +4224,29 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
   const jmxDiskPath  = healCanonical.jmxDiskPath;
 
+  // Read the (possibly just-healed) JMX content — same PAT-mode caveat as
+  // pushJmxAndTriggerGitHub above: jmxDiskPath is only a real disk path in SSH mode.
+  let healedJmxContent = null;
+  const healIsSSHBb = await isSshMode(userId, projectId);
+  if (healIsSSHBb) {
+    if (jmxDiskPath && fs.existsSync(jmxDiskPath)) healedJmxContent = fs.readFileSync(jmxDiskPath);
+  } else if (jmxDiskPath) {
+    try {
+      const gitCfgHealBb = await db.prepare('SELECT git_root FROM git_configs WHERE project_id = ?').get(projectId);
+      const projRowBb    = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(projectId);
+      const healRootBb   = gitCfgHealBb?.git_root || projRowBb?.folder_path;
+      if (healRootBb) {
+        const { resolveOrgSlugForProject } = require('../utils/projectFolders');
+        const healOrgSlugBb = await resolveOrgSlugForProject(projectId);
+        const sessionBb = await gitEngine.openSession(healRootBb, healOrgSlugBb);
+        const fullBb = path.posix.join(sessionBb.dir, jmxDiskPath.replace(/\\/g, '/'));
+        if (sessionBb.fs.existsSync(fullBb)) healedJmxContent = sessionBb.fs.readFileSync(fullBb);
+      }
+    } catch (e) {
+      console.warn('[CI Heal] Could not read fixed JMX from PAT-mode session:', e.message);
+    }
+  }
+
   // Build multipart file push
   const boundary = 'PeakoHealBoundary9z';
   const fileParts = [];
@@ -3533,8 +4259,8 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   }
 
   // Include fixed JMX at canonical repo path
-  if (jmxDiskPath && fs.existsSync(jmxDiskPath)) {
-    fileParts.push({ name: healCanonical.scriptRepoPath, content: fs.readFileSync(jmxDiskPath) });
+  if (healedJmxContent) {
+    fileParts.push({ name: healCanonical.scriptRepoPath, content: healedJmxContent });
   }
 
   // Trigger marker so Bitbucket shows a meaningful pipeline title
@@ -3658,9 +4384,35 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
   const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
   const jmxDiskPath   = healCanonical.jmxDiskPath;
 
+  // Read the (possibly just-healed) JMX content. For SSH-mode workspaces jmxDiskPath is a
+  // real absolute path on local disk. For PAT-mode/S3-only workspaces (see healCycleCI's
+  // matching fix-apply branch) it's a path RELATIVE to the project's gitEngine session root,
+  // not a real disk path — fs.existsSync(jmxDiskPath) always returned false for those, so the
+  // healed script silently never reached GitHub and the subsequent dispatch checked out a
+  // branch missing the file entirely (FileNotFoundError in the "Patch JMX parameters" step).
+  let jmxContent = null;
+  const healIsSSHPush = await isSshMode(userId, projectId);
+  if (healIsSSHPush) {
+    if (jmxDiskPath && fs.existsSync(jmxDiskPath)) jmxContent = fs.readFileSync(jmxDiskPath);
+  } else if (jmxDiskPath) {
+    try {
+      const gitCfgHeal = await db.prepare('SELECT git_root FROM git_configs WHERE project_id = ?').get(projectId);
+      const projRow    = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(projectId);
+      const healRoot   = gitCfgHeal?.git_root || projRow?.folder_path;
+      if (healRoot) {
+        const { resolveOrgSlugForProject } = require('../utils/projectFolders');
+        const healOrgSlug = await resolveOrgSlugForProject(projectId);
+        const session = await gitEngine.openSession(healRoot, healOrgSlug);
+        const full = path.posix.join(session.dir, jmxDiskPath.replace(/\\/g, '/'));
+        if (session.fs.existsSync(full)) jmxContent = session.fs.readFileSync(full);
+      }
+    } catch (e) {
+      console.warn('[CI Heal] Could not read fixed JMX from PAT-mode session:', e.message);
+    }
+  }
+
   // Push fixed JMX to GitHub via Contents API
-  if (jmxDiskPath && fs.existsSync(jmxDiskPath)) {
-    const jmxContent    = fs.readFileSync(jmxDiskPath);
+  if (jmxContent) {
     const base64Content = jmxContent.toString('base64');
     const repoFilePath  = healCanonical.scriptRepoPath;
     // Get current SHA (required for updates; absent for new files)
@@ -3877,22 +4629,43 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     return retryOrGiveUp('exhausted');
   }
 
-  // Apply fix to the local JMX file
+  // Apply fix to the JMX/JS script
   setCiHealStatus(ciRunId, 'applying_fix');
   const jmxPath = suite.jmx_path || suite.js_path;
   try {
     if (isEndpointPatch) {
-      if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
+      // applyEndpointOverrides is entirely DB-based (collection_env_config) — it never reads
+      // or writes jmxPath, so there's no PAT/SSH distinction to make for this branch at all.
       const applied = await applyEndpointOverrides(userId, projectId, suite, aiResp.overrides);
       if (!applied) throw new Error('None of the proposed overrides matched a real endpoint by name.');
-    } else {
-      if (jmxPath && fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
-      if (jmxPath) {
+    } else if (jmxPath) {
+      const healIsSSH = await isSshMode(userId, projectId);
+      const { resolveOrgSlugForProject: resolveOrgSlugForHeal } = require('../utils/projectFolders');
+      const healOrgSlug = await resolveOrgSlugForHeal(projectId);
+      if (healIsSSH) {
+        if (fs.existsSync(jmxPath)) fs.copyFileSync(jmxPath, jmxPath + '.bak');
         fs.writeFileSync(jmxPath, aiResp.fixed_script, 'utf8');
-        const { resolveOrgSlugForProject: resolveOrgSlugForHeal } = require('../utils/projectFolders');
-        const healOrgSlug = await resolveOrgSlugForHeal(projectId);
         const up = await s3Sync.uploadFile(jmxPath, healOrgSlug);
         if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', jmxPath, ':', up.error?.message);
+      } else {
+        // PAT mode: jmxPath is a path-shaped string RELATIVE to the project's gitEngine
+        // session root (testSuites.js's PAT branch generated it into proj.folder_path via
+        // this exact same session) — NOT a real disk path. Treating it as one here used to
+        // silently write the "healed" script to a bogus relative path under the server
+        // process's own cwd, leaving the user's actual script unfixed while still reporting
+        // success — a correctness bug on top of the local-disk-write one.
+        const projRow = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(projectId);
+        const gitCfgHeal = await db.prepare('SELECT git_root FROM git_configs WHERE project_id = ?').get(projectId);
+        const healRoot = gitCfgHeal?.git_root || projRow?.folder_path;
+        if (!healRoot) throw new Error('Git workspace not initialized for this project — cannot apply the fix.');
+        const session = await gitEngine.openSession(healRoot, healOrgSlug);
+        const full = path.posix.join(session.dir, jmxPath.replace(/\\/g, '/'));
+        if (session.fs.existsSync(full)) {
+          session.fs.writeFileSync(`${full}.bak`, session.fs.readFileSync(full));
+        }
+        session.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+        session.fs.writeFileSync(full, aiResp.fixed_script, 'utf8');
+        await gitEngine.persistSession(session, healRoot, healOrgSlug);
       }
     }
   } catch (e) {

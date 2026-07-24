@@ -15,6 +15,7 @@
 // never for anything else. Nothing in this module ever touches the local filesystem.
 
 const path = require('path');
+const crypto = require('crypto');
 const git = require('isomorphic-git');
 const http = require('isomorphic-git/http/node');
 const { Volume, createFsFromVolume } = require('memfs');
@@ -23,29 +24,125 @@ const s3Sync = require('./s3Sync');
 
 const VROOT = '/workspace';
 
+// ── In-process byte cache ───────────────────────────────────────────────────────────
+// Caches each workspace's file CONTENTS (not a live memfs Volume) keyed by its S3 base key,
+// so a repeat openSession() for the same workspace can populate a fresh, private in-memory
+// volume straight from these buffers instead of re-downloading every object from S3. Each
+// call still gets its own isolated Volume instance (built fresh from the cached bytes), so
+// two concurrent requests against the same workspace never share — and can't corrupt —
+// the same live memfs object; they only share read-only source bytes.
+//
+// Single-process assumption (same as workspaceLifecycle.js's old SSH-mode disk cache) —
+// fine for a single backend instance; would need a shared cache to stay correct across
+// multiple replicas behind a load balancer.
+const SESSION_CACHE_TTL_MS = Number(process.env.GIT_ENGINE_SESSION_CACHE_TTL_MS) || 15 * 60 * 1000;
+const sessionByteCache = new Map(); // cacheKey -> { files: Map<relPath, {data: Buffer, hash: string}>, lastAccess }
+
+function hashOf(buf) {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+// The AWS SDK's default Node HTTP handler caps concurrent sockets at 50 — a workspace with
+// hundreds/thousands of small tracked files (a JMeter HTML report's asset tree is a common
+// case) used to fan out one GetObject/PutObject per file via a single unbounded
+// `Promise.all(files.map(...))`, instantly queueing far past that cap
+// ("@smithy/node-http-handler:WARN - socket usage at capacity=50 and N additional requests
+// are enqueued"). Every OTHER request sharing this process's S3 client competes for the same
+// 50 sockets, so a large openSession()/persistSession() call could starve a concurrent CI
+// trigger's own S3 calls long enough to time out ("socket hang up") — not a bug in the
+// trigger itself, just unbounded fan-out here. Chunking to a concurrency well under the
+// socket cap keeps this module's own usage bounded and leaves headroom for other callers.
+const S3_FANOUT_CONCURRENCY = Number(process.env.GIT_ENGINE_S3_CONCURRENCY) || 16;
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+function getCacheEntry(cacheKey) {
+  const entry = sessionByteCache.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.lastAccess > SESSION_CACHE_TTL_MS) {
+    sessionByteCache.delete(cacheKey);
+    return null;
+  }
+  return entry;
+}
+
+// Periodic sweep so an idle workspace's cached bytes actually get freed — getCacheEntry()
+// only evicts lazily on the next access to that SAME key, which never happens for a
+// workspace nobody touches again. unref() so this timer never keeps the process alive.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of sessionByteCache) {
+    if (now - entry.lastAccess > SESSION_CACHE_TTL_MS) sessionByteCache.delete(key);
+  }
+}, SESSION_CACHE_TTL_MS).unref();
+
+/** Drop any cached bytes for gitDir — call after something outside gitEngine (e.g. a
+ * project-delete tombstone) deletes or replaces the workspace's S3 objects directly, so a
+ * later openSession() doesn't serve stale cached content instead of the real S3 state. */
+function invalidateCache(gitDir, orgSlug) {
+  const baseKey = s3Sync.toKey(gitDir, orgSlug);
+  if (baseKey) sessionByteCache.delete(baseKey);
+}
+
 /**
- * Hydrate a fresh in-memory volume from S3 for gitDir (a path-SHAPED naming string — see
+ * Hydrate a fresh in-memory volume for gitDir (a path-SHAPED naming string — see
  * s3Sync.toKey() — never a real directory). Returns { fs, dir } for use with every other
  * function in this module. If S3 has nothing yet, returns an empty volume (caller must
  * initFromRemote() or initEmpty() before doing anything else).
+ *
+ * Serves from the in-process byte cache when warm (pure in-memory copy, no S3 calls at
+ * all); only re-downloads from S3 on a cold/expired cache. Either way the returned session
+ * also carries a private baseline (`_baseline`/`_cacheKey`) that persistSession() uses to
+ * upload only what actually changed, not the whole tree.
  */
 async function openSession(gitDir, orgSlug) {
   const vfs = createFsFromVolume(new Volume());
   vfs.mkdirSync(VROOT, { recursive: true });
   const baseKey = s3Sync.toKey(gitDir, orgSlug);
-  if (baseKey) {
-    const keys = await s3Sync.listAllKeys(baseKey);
-    await Promise.all(keys.map(async (key) => {
-      const rel = key.slice(baseKey.length + 1);
-      if (!rel) return;
-      const res = await s3Sync.getBuffer(key);
-      if (!res.ok) return;
-      const fullPath = path.posix.join(VROOT, rel);
-      vfs.mkdirSync(path.posix.dirname(fullPath), { recursive: true });
-      vfs.writeFileSync(fullPath, res.data);
-    }));
+  let entry = baseKey ? getCacheEntry(baseKey) : null;
+
+  if (!entry) {
+    const files = new Map();
+    if (baseKey) {
+      const keys = await s3Sync.listAllKeys(baseKey);
+      await mapLimit(keys, S3_FANOUT_CONCURRENCY, async (key) => {
+        const rel = key.slice(baseKey.length + 1);
+        if (!rel) return;
+        const res = await s3Sync.getBuffer(key);
+        if (!res.ok) return;
+        files.set(rel, { data: res.data, hash: hashOf(res.data) });
+      });
+    }
+    entry = { files, lastAccess: Date.now() };
+    if (baseKey) sessionByteCache.set(baseKey, entry);
+  } else {
+    entry.lastAccess = Date.now();
   }
-  return { fs: vfs, dir: VROOT, hadState: (await s3Sync.listAllKeys(baseKey || '')).length > 0 };
+
+  for (const [rel, { data }] of entry.files) {
+    const fullPath = path.posix.join(VROOT, rel);
+    vfs.mkdirSync(path.posix.dirname(fullPath), { recursive: true });
+    vfs.writeFileSync(fullPath, data);
+  }
+
+  const baseline = new Map();
+  for (const [rel, { hash }] of entry.files) baseline.set(rel, hash);
+
+  return {
+    fs: vfs, dir: VROOT, hadState: entry.files.size > 0,
+    _cacheKey: baseKey, _baseline: baseline, _cacheSnapshot: entry.files,
+  };
 }
 
 /** Recursively collect every file's relative (posix) path under dir in an in-memory volume. */
@@ -63,21 +160,69 @@ function listAllFiles(vfs, dir) {
 }
 
 /**
- * Flush the ENTIRE in-memory volume (including .git/) back to S3 — mirrors exactly what
- * local disk used to hold, so the next openSession (a different request, possibly a
- * different process) picks up right where this one left off, uncommitted changes included.
+ * Flush ONLY WHAT CHANGED in the in-memory volume (including .git/) back to S3 — diffs the
+ * volume's current content against the baseline captured at openSession() time (or, for a
+ * session that's already been persisted once this request, against the state left by that
+ * prior persist — see below), uploads new/modified files, deletes files that were removed,
+ * and leaves everything untouched alone. This is what keeps a single-file config save from
+ * costing a whole-workspace re-upload.
+ *
+ * Mirrors exactly what local disk used to hold, so the next openSession (a different
+ * request, possibly after this cache entry expires) picks up right where this one left
+ * off, uncommitted changes included.
  */
-async function persistSession({ fs: vfs, dir }, gitDir, orgSlug) {
+async function persistSession(session, gitDir, orgSlug) {
+  const { fs: vfs, dir } = session;
   const baseKey = s3Sync.toKey(gitDir, orgSlug);
   if (!baseKey) return { ok: false, error: new Error(`gitEngine: could not derive S3 key for ${gitDir}`) };
+  const baseline = session._baseline || new Map();
+  const prevFiles = session._cacheSnapshot || new Map();
+
   const relFiles = listAllFiles(vfs, dir);
-  const failed = [];
-  await Promise.all(relFiles.map(async (rel) => {
+  const current = new Map(); // rel -> {data, hash}
+  for (const rel of relFiles) {
     const data = vfs.readFileSync(path.posix.join(dir, rel));
-    const up = await s3Sync.putBuffer(`${baseKey}/${rel}`, data);
-    if (!up.ok && !up.skipped) failed.push({ rel, error: up.error });
-  }));
-  return { ok: failed.length === 0, failed };
+    current.set(rel, { data, hash: hashOf(data) });
+  }
+
+  const toUpload = [];
+  for (const [rel, { hash }] of current) {
+    if (baseline.get(rel) !== hash) toUpload.push(rel);
+  }
+  const toDelete = [];
+  for (const rel of baseline.keys()) {
+    if (!current.has(rel)) toDelete.push(rel);
+  }
+
+  const failedUploads = new Set();
+  const failedDeletes = new Set();
+  const failed = [];
+  await mapLimit(toUpload, S3_FANOUT_CONCURRENCY, async (rel) => {
+    const up = await s3Sync.putBuffer(`${baseKey}/${rel}`, current.get(rel).data);
+    if (!up.ok && !up.skipped) { failedUploads.add(rel); failed.push({ rel, error: up.error }); }
+  });
+  await mapLimit(toDelete, S3_FANOUT_CONCURRENCY, async (rel) => {
+    const del = await s3Sync.deleteKey(`${baseKey}/${rel}`);
+    if (!del.ok && !del.skipped) { failedDeletes.add(rel); failed.push({ rel, error: del.error }); }
+  });
+
+  // Keep the in-process byte cache reflecting only CONFIRMED-durable S3 state: a file whose
+  // upload failed keeps its old cached bytes (still the last known-good copy actually in
+  // S3); a file whose delete failed stays in the cache too (it may well still be in S3).
+  const newCacheFiles = new Map(prevFiles);
+  for (const rel of toUpload) if (!failedUploads.has(rel)) newCacheFiles.set(rel, current.get(rel));
+  for (const rel of toDelete) if (!failedDeletes.has(rel)) newCacheFiles.delete(rel);
+  if (session._cacheKey) sessionByteCache.set(session._cacheKey, { files: newCacheFiles, lastAccess: Date.now() });
+
+  // Update this session's own baseline/snapshot so a SECOND persistSession() call on the
+  // same session object later in the same request (a common pattern in git.js's routes)
+  // sees "nothing changed" and does no redundant S3 calls at all.
+  const newBaseline = new Map();
+  for (const [rel, { hash }] of current) newBaseline.set(rel, hash);
+  session._baseline = newBaseline;
+  session._cacheSnapshot = current;
+
+  return { ok: failed.length === 0, failed, uploaded: toUpload, deleted: toDelete };
 }
 
 /** Author object for isomorphic-git calls. */
@@ -174,12 +319,28 @@ async function fetchRemote({ fs: vfs, dir }, { url, ref, token, username, single
   return git.fetch({ fs: vfs, http, dir, url, ref, singleBranch, onAuth: onAuthFor(token, username) });
 }
 
-/** Merge theirRef into the current branch. `allowUnrelated` mirrors --allow-unrelated-histories. */
-async function merge({ fs: vfs, dir }, theirRef, authorName, authorEmail, message) {
+/** Merge theirRef into the current branch. `fastForwardOnly` throws instead of creating a
+ * merge commit when the histories have diverged — mirrors `git merge --ff-only`. */
+async function merge({ fs: vfs, dir }, theirRef, authorName, authorEmail, message, { fastForwardOnly = false } = {}) {
   return git.merge({
     fs: vfs, dir, ours: await git.currentBranch({ fs: vfs, dir }), theirs: theirRef,
-    author: author(authorName, authorEmail), message,
+    author: author(authorName, authorEmail), message, fastForwardOnly,
   });
+}
+
+/**
+ * Force `branch`'s tip to exactly match `ref` (e.g. a remote-tracking ref after a fetch) and
+ * sync the working tree to it — the isomorphic-git equivalent of `git reset --hard <ref>`
+ * (isomorphic-git has no literal reset-hard porcelain). Used when a fast-forward merge isn't
+ * possible (local and remote have diverged) and remote must win, same as the real-git SSH
+ * path's `git reset --hard origin/<branch>` fallback. Any local changes the caller wants to
+ * keep must be captured and re-applied by the caller AFTER this call — this discards them
+ * from the working tree exactly like a real hard reset would.
+ */
+async function resetHardToRef({ fs: vfs, dir }, branch, ref) {
+  const oid = await git.resolveRef({ fs: vfs, dir, ref });
+  await git.writeRef({ fs: vfs, dir, ref: `refs/heads/${branch}`, value: oid, force: true });
+  await git.checkout({ fs: vfs, dir, ref: branch, force: true });
 }
 
 async function push({ fs: vfs, dir }, { url, ref, token, username, force = false } = {}) {
@@ -288,9 +449,9 @@ async function changeStatsSinceHead({ fs: vfs, dir }, changedPaths) {
 }
 
 module.exports = {
-  openSession, persistSession,
+  openSession, persistSession, invalidateCache,
   cloneFromRemote, initEmpty, setConfig,
   addAll, status, commit, currentBranch, branchLocal, checkout,
-  fetchRemote, merge, push, getRemoteInfo, listRemotes, setRemoteUrl, log,
+  fetchRemote, merge, resetHardToRef, push, getRemoteInfo, listRemotes, setRemoteUrl, log,
   verifyPushLanded, diffFile, changeStatsSinceHead,
 };

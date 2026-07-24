@@ -382,10 +382,21 @@ function userNameSlug(name) {
 // resolveWorkspaceRoot's own comment). `proj.org_slug` comes from ownsProject()'s LEFT JOIN
 // to organizations — already resolved by the time `proj` reaches here, so this function can
 // stay synchronous (it's called without `await` at every one of its 14 call sites in this file).
+// IMPORTANT: normalize null the same way resolveOrgSlugForProject() does ('unassigned') for
+// an org-less owner — every other subsystem (testSuites.js/testData.js/collections.js/
+// configWriter.js) resolves gitDir via resolveOrgSlugForProject(), which never returns null.
+// Passing the raw null through here used to send this function down resolveWorkspaceRoot()'s
+// "no org segment" branch while every writer took the "unassigned" org-prefixed branch —
+// for an org-less project with no legacy pre-org content, that's not just a stale-cache
+// slowdown, it's two different S3 prefixes: the Git panel (status/commit/push/diff/...)
+// silently read/wrote an empty workspace that no generated script/config/test-data ever
+// reached, while also guaranteeing every git.js session was a cold, full-workspace S3
+// rehydrate (never warmed by any other route's persistSession) — the "data appears
+// extremely late" symptom.
 function getUserWorkspace(proj, user) {
   const userFolder = userNameSlug(user.name) || `user-${user.id}`;
   const cleanProjectName = getCleanProjectName(proj);
-  return resolveWorkspaceRoot(cleanProjectName, userFolder, proj.org_slug);
+  return resolveWorkspaceRoot(cleanProjectName, userFolder, proj.org_slug || 'unassigned');
 }
 
 // `ensureUserWorkspace` (below) rebuilds collection/env folders and copies scripts from
@@ -1987,10 +1998,14 @@ router.post('/branch', async (req, res) => {
       const session = await ensurePatSession(cfg, caller, gitRoot, orgSlug, branchRemoteUrlAuth, patToken);
 
       const branchSummary = await gitEngine.branchLocal(session);
+      // Check the remote regardless of local state — a prior attempt may have already
+      // pushed this branch (e.g. its local session state didn't persist), and creating a
+      // fresh local branch from base in that case would push a diverging, non-fast-forward ref.
+      const remoteInfo = await gitEngine.getRemoteInfo(branchRemoteUrlAuth, patToken).catch(() => ({ refs: {} }));
+      const existsOnRemote = !!(remoteInfo.refs?.heads && branchName.split('/').reduce((o, seg) => o?.[seg], remoteInfo.refs.heads));
+
       if (branchSummary.all.includes(branchName)) {
         await gitEngine.checkout(session, branchName);
-        const remoteInfo = await gitEngine.getRemoteInfo(branchRemoteUrlAuth, patToken).catch(() => ({ refs: {} }));
-        const existsOnRemote = !!(remoteInfo.refs?.heads && branchName.split('/').reduce((o, seg) => o?.[seg], remoteInfo.refs.heads));
         if (!existsOnRemote) {
           await gitEngine.push(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
           await gitEngine.persistSession(session, gitRoot, orgSlug);
@@ -2001,6 +2016,14 @@ router.post('/branch', async (req, res) => {
         return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
       }
       const baseBranch = getBaseBranch(cfg);
+      if (existsOnRemote) {
+        // Branch already exists on the remote — track it instead of branching from base,
+        // which would diverge and make the push a non-fast-forward.
+        await gitEngine.fetchRemote(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
+        await gitEngine.checkout(session, branchName, { create: true, startRef: `origin/${branchName}` });
+        await gitEngine.persistSession(session, gitRoot, orgSlug);
+        return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
+      }
       try { await gitEngine.fetchRemote(session, { url: branchRemoteUrlAuth, ref: baseBranch, token: patToken }); } catch {}
       await gitEngine.checkout(session, branchName, { create: true, startRef: `origin/${baseBranch}` });
       await gitEngine.push(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
@@ -2013,7 +2036,7 @@ router.post('/branch', async (req, res) => {
     }
   }
 
-  // ── SSH mode: unchanged — real git binary, tmpfs-mountable directory ──────────────────
+  // ── SSH mode: real git binary, tmpfs-mountable directory ──────────────────
   let sshCleanup = () => {};
   try {
     const r = await ensureUserWorkspace(gitRoot, { ...cfg, project_id: req.params.projectId }, caller);
@@ -2021,14 +2044,17 @@ router.post('/branch', async (req, res) => {
     sshCleanup = r.sshCleanup || (() => {});
 
     const branchSummary = await git.branchLocal();
+    // Check the remote regardless of local state — a prior attempt may have already pushed
+    // this branch (e.g. its local workspace didn't persist), and branching fresh from base
+    // in that case would push a diverging, non-fast-forward ref.
+    await disableGcm(git, gitRoot);
+    const lsResult = spawnSync('git', ['ls-remote', '--heads', branchRemoteUrl, branchName], {
+      env: { ...process.env, ...NO_PROMPT_ENV }, cwd: gitRoot, timeout: 15000, encoding: 'utf8', windowsHide: true,
+    });
+    const existsOnRemote = lsResult.status === 0 && lsResult.stdout.includes(branchName);
+
     if (branchSummary.all.includes(branchName)) {
       await safeCheckout(git, gitRoot, branchName);
-      // Branch exists locally — check if it's on the remote too; push if not
-      await disableGcm(git, gitRoot);
-      const lsResult = spawnSync('git', ['ls-remote', '--heads', branchRemoteUrl, branchName], {
-        env: { ...process.env, ...NO_PROMPT_ENV }, cwd: gitRoot, timeout: 15000, encoding: 'utf8', windowsHide: true,
-      });
-      const existsOnRemote = lsResult.status === 0 && lsResult.stdout.includes(branchName);
       if (!existsOnRemote) {
         gitExec(['push', '--set-upstream', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {});
         await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
@@ -2037,6 +2063,13 @@ router.post('/branch', async (req, res) => {
       return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
     }
     const baseBranch = getBaseBranch(cfg);
+    if (existsOnRemote) {
+      // Branch already exists on the remote — track it instead of branching from base,
+      // which would diverge and make the push a non-fast-forward.
+      try { gitExec(['fetch', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {}); } catch {}
+      await withCheckoutConflictRetry(gitRoot, () => git.checkoutBranch(branchName, `origin/${branchName}`));
+      return res.json({ message: `Switched to existing branch: ${branchName}`, branch: branchName });
+    }
     // Create from latest base branch
     try { gitExec(['fetch', branchRemoteUrl, baseBranch], gitRoot, r.sshEnv || {}); } catch {}
     try { await safeCheckout(git, gitRoot, baseBranch); } catch {}

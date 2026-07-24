@@ -93,9 +93,9 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, us
     const basePath = projectFolderPath;
     if (!basePath) return; // no user workspace path supplied — skip write
 
-    // Admin workspace holds only empty folders — never write config.json there
-    const { isAdminWorkspace } = require('./projectFolders');
-    if (isAdminWorkspace(basePath)) return;
+    // Admin workspace tracks main directly — never write config.json there outside a merge
+    const { isAdminUser } = require('./projectFolders');
+    if (await isAdminUser(userId)) return;
     // New clean-name format: CollectionName/Env/
     const envPath = path.join(basePath, cleanName(col.name), cleanName(envName));
 

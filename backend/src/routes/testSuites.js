@@ -217,16 +217,33 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
 
   const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
   const isSSH = (identity?.auth_method || 'pat') === 'ssh';
-  const { resolveOrgSlugForProject, cleanName } = require('../utils/projectFolders');
+  const { resolveOrgSlugForProject, cleanName, getUserProjectPath, getCollectionPath, isAdminRole } = require('../utils/projectFolders');
   const orgSlug = await resolveOrgSlugForProject(projectId);
+
+  // Every actor (including PAT mode) writes into their OWN branch-scoped workspace, never
+  // the project-wide folder_path (that's whoever last ran /init, almost always the org admin) —
+  // otherwise every user's generated scripts end up inside the admin's main-branch workspace
+  // instead of their own users/<name> branch, ahead of any PR merge.
+  const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerUser?.role;
+
+  // Admin's own workspace tracks main directly — scripts only ever land there via a real git
+  // merge, never generated straight into it.
+  if (isAdminRole(callerRole)) {
+    return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
+  }
+
+  const userProjPath = await getUserProjectPath(userId, callerRole, proj.name, projectId);
+  if (!userProjPath) return { error: 'Git repository not initialized.', status: 400 };
+  const gitDir = require('path').dirname(userProjPath);
 
   try {
     // PAT mode: pre-read each test-data file's content from the gitEngine session (no local
     // file to read otherwise) so generateJmx/generateK6's CSV value-matching (buildCsvValueMap)
     // works the same as it does for SSH-mode's real local files.
     let patSession = null;
-    if (!isSSH && proj.folder_path) {
-      patSession = await gitEngine.openSession(proj.folder_path, orgSlug);
+    if (!isSSH) {
+      patSession = await gitEngine.openSession(gitDir, orgSlug);
       for (const f of testDataFiles) {
         // f.path is stored as "<ProjectName>/<Collection>/<Env>/testData/<file>" for PAT-mode
         // uploads (see testData.js) — resolve it directly against the session's content root.
@@ -255,46 +272,27 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
     const relDir = collection ? require('path').posix.join(cleanName(collection.name), cleanName(targetEnv || 'Default'), 'script') : 'script';
 
     if (!isSSH) {
-      if (patSession) {
-        const contentRoot = require('path').posix.join(patSession.dir, cleanName(proj.name));
-        const relScriptPath = require('path').posix.join(relDir, filename);
-        patSession.fs.mkdirSync(require('path').posix.join(contentRoot, relDir), { recursive: true });
-        patSession.fs.writeFileSync(require('path').posix.join(contentRoot, relScriptPath), scriptContent, 'utf8');
-        await gitEngine.persistSession(patSession, proj.folder_path, orgSlug);
-        filePath = require('path').posix.join(cleanName(proj.name), relScriptPath);
-      }
+      const contentRoot = require('path').posix.join(patSession.dir, cleanName(proj.name));
+      const relScriptPath = require('path').posix.join(relDir, filename);
+      patSession.fs.mkdirSync(require('path').posix.join(contentRoot, relDir), { recursive: true });
+      patSession.fs.writeFileSync(require('path').posix.join(contentRoot, relScriptPath), scriptContent, 'utf8');
+      await gitEngine.persistSession(patSession, gitDir, orgSlug);
+      filePath = require('path').posix.join(cleanName(proj.name), relScriptPath);
     } else {
-      let scriptBaseDir = null;
-      const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
-      const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
-      const callerRole = callerUser?.role;
-      const userProjPath = await getUserProjectPath(userId, callerRole, proj.name, projectId);
-
       // Restore the workspace first if the S3 sweep reclaimed it since the last access —
       // mkdirSync below would otherwise happily recreate a bare folder tree with no .git and
       // none of the workspace's other content, masking the problem instead of fixing it.
-      if (userProjPath) {
-        await require('../routes/git').ensureGitWorkspaceHydrated(require('path').dirname(userProjPath), projectId, userId);
-      }
+      await require('../routes/git').ensureGitWorkspaceHydrated(gitDir, projectId, userId);
 
-      // Admin workspace holds only empty folders — skip script generation for admin
-      if (isAdminWorkspace(userProjPath)) {
-        return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
-      }
-      if (collection && userProjPath) {
-        const envPath = getCollectionPath(userProjPath, collection.name, targetEnv);
-        scriptBaseDir = require('path').join(envPath, 'script');
-      } else if (userProjPath) {
-        scriptBaseDir = require('path').join(userProjPath, 'script');
-      }
+      const scriptBaseDir = collection
+        ? require('path').join(getCollectionPath(userProjPath, collection.name, targetEnv), 'script')
+        : require('path').join(userProjPath, 'script');
 
-      if (scriptBaseDir) {
-        require('fs').mkdirSync(scriptBaseDir, { recursive: true });
-        filePath = require('path').join(scriptBaseDir, filename);
-        writeFileSync(filePath, scriptContent, 'utf8');
-        const up = await s3Sync.uploadFile(filePath, orgSlug);
-        if (!up.ok && !up.skipped) console.error('[TestSuites] S3 sync failed for', filePath, ':', up.error?.message);
-      }
+      require('fs').mkdirSync(scriptBaseDir, { recursive: true });
+      filePath = require('path').join(scriptBaseDir, filename);
+      writeFileSync(filePath, scriptContent, 'utf8');
+      const up = await s3Sync.uploadFile(filePath, orgSlug);
+      if (!up.ok && !up.skipped) console.error('[TestSuites] S3 sync failed for', filePath, ':', up.error?.message);
     }
 
     // Update DB
@@ -329,9 +327,16 @@ router.get('/:id/download/:type', async (req, res) => {
 
   if (!isSSH) {
     try {
-      const { resolveOrgSlugForProject } = require('../utils/projectFolders');
+      const { resolveOrgSlugForProject, getUserProjectPath } = require('../utils/projectFolders');
       const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
-      const session = await gitEngine.openSession(proj.folder_path, orgSlug);
+      // The script was generated into the CALLING user's own workspace (see
+      // generateScriptForSuite above) — read it back from that same actor-scoped session,
+      // never the shared project.folder_path.
+      const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+      const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, proj.name, req.params.projectId);
+      if (!userProjPath) return res.status(404).json({ error: 'Git repository not initialized.' });
+      const gitDir = path.dirname(userProjPath);
+      const session = await gitEngine.openSession(gitDir, orgSlug);
       const full = path.posix.join(session.dir, filePath.replace(/\\/g, '/'));
       if (!session.fs.existsSync(full)) return res.status(404).json({ error: 'File not found' });
       const content = session.fs.readFileSync(full);

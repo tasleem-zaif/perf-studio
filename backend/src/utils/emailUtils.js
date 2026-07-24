@@ -783,4 +783,4 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
   }
 }
 
-module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients };
+module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients, createTransport };
