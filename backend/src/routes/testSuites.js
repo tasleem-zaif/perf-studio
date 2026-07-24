@@ -5,9 +5,11 @@ const { writeFileSync } = require('fs');
 const db = require('../db');
 const auth = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
-const { readCsv } = require('../utils/csvUtils');
+const { readCsv, readCsvContent } = require('../utils/csvUtils');
+const gitEngine = require('../utils/gitEngine');
 const resetSequence = require('../utils/resetSequence');
 const { updateCollectionConfigs, updateProjectCollectionConfigs } = require('../utils/configWriter');
+const s3Sync = require('../utils/s3Sync');
 const { TOKEN_KEYS, fingerprintMatches, resolveUrlSet, resolveForScript } = require('../utils/preRunEngine');
 const {
   filterApplicableRules, groupRulesBySource, groupRulesByTarget, substituteCorrelatedLiterals,
@@ -65,7 +67,7 @@ router.post('/', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(collection_id, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(collection_id, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
@@ -103,7 +105,7 @@ router.put('/:id', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
@@ -123,7 +125,7 @@ router.delete('/:id', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
@@ -213,7 +215,44 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   const testType = suite.test_type || 'load';
   const safeName = suite.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+  const { resolveOrgSlugForProject, cleanName, getUserProjectPath, getCollectionPath, isAdminRole } = require('../utils/projectFolders');
+  const orgSlug = await resolveOrgSlugForProject(projectId);
+
+  // Every actor (including PAT mode) writes into their OWN branch-scoped workspace, never
+  // the project-wide folder_path (that's whoever last ran /init, almost always the org admin) —
+  // otherwise every user's generated scripts end up inside the admin's main-branch workspace
+  // instead of their own users/<name> branch, ahead of any PR merge.
+  const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerUser?.role;
+
+  // Admin's own workspace tracks main directly — scripts only ever land there via a real git
+  // merge, never generated straight into it.
+  if (isAdminRole(callerRole)) {
+    return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
+  }
+
+  const userProjPath = await getUserProjectPath(userId, callerRole, proj.name, projectId);
+  if (!userProjPath) return { error: 'Git repository not initialized.', status: 400 };
+  const gitDir = require('path').dirname(userProjPath);
+
   try {
+    // PAT mode: pre-read each test-data file's content from the gitEngine session (no local
+    // file to read otherwise) so generateJmx/generateK6's CSV value-matching (buildCsvValueMap)
+    // works the same as it does for SSH-mode's real local files.
+    let patSession = null;
+    if (!isSSH) {
+      patSession = await gitEngine.openSession(gitDir, orgSlug);
+      for (const f of testDataFiles) {
+        // f.path is stored as "<ProjectName>/<Collection>/<Env>/testData/<file>" for PAT-mode
+        // uploads (see testData.js) — resolve it directly against the session's content root.
+        const relFromContentRoot = f.path ? f.path.replace(/\\/g, '/').split('/').slice(1).join('/') : '';
+        const fullPath = require('path').posix.join(patSession.dir, cleanName(proj.name), relFromContentRoot);
+        try { f.__content = patSession.fs.existsSync(fullPath) ? patSession.fs.readFileSync(fullPath) : undefined; } catch { f.__content = undefined; }
+      }
+    }
+
     let scriptContent;
     if (engine === 'jmeter') {
       scriptContent = cleanScript(await generateJmx(userId, suite, collection, testDataFiles, cfg, endpoints, rules, preRunData, testType), 'jmeter');
@@ -226,31 +265,34 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
     const filename = `${safeName}.${ext}`;
     let filePath = '';
 
-    let scriptBaseDir = null;
-    const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
-    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
-    const callerRole = callerUser?.role;
-    const userProjPath = await getUserProjectPath(userId, callerRole, proj.name);
-
-    // Admin workspace holds only empty folders — skip script generation for admin
-    if (isAdminWorkspace(userProjPath)) {
-      return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
+    let targetEnv = suite.env;
+    if (!targetEnv && collection) {
+      try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
     }
-    if (collection && userProjPath) {
-      let targetEnv = suite.env;
-      if (!targetEnv && collection) {
-        try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
-      }
-      const envPath = getCollectionPath(userProjPath, collection.name, targetEnv);
-      scriptBaseDir = require('path').join(envPath, 'script');
-    } else if (userProjPath) {
-      scriptBaseDir = require('path').join(userProjPath, 'script');
-    }
+    const relDir = collection ? require('path').posix.join(cleanName(collection.name), cleanName(targetEnv || 'Default'), 'script') : 'script';
 
-    if (scriptBaseDir) {
+    if (!isSSH) {
+      const contentRoot = require('path').posix.join(patSession.dir, cleanName(proj.name));
+      const relScriptPath = require('path').posix.join(relDir, filename);
+      patSession.fs.mkdirSync(require('path').posix.join(contentRoot, relDir), { recursive: true });
+      patSession.fs.writeFileSync(require('path').posix.join(contentRoot, relScriptPath), scriptContent, 'utf8');
+      await gitEngine.persistSession(patSession, gitDir, orgSlug);
+      filePath = require('path').posix.join(cleanName(proj.name), relScriptPath);
+    } else {
+      // Restore the workspace first if the S3 sweep reclaimed it since the last access —
+      // mkdirSync below would otherwise happily recreate a bare folder tree with no .git and
+      // none of the workspace's other content, masking the problem instead of fixing it.
+      await require('../routes/git').ensureGitWorkspaceHydrated(gitDir, projectId, userId);
+
+      const scriptBaseDir = collection
+        ? require('path').join(getCollectionPath(userProjPath, collection.name, targetEnv), 'script')
+        : require('path').join(userProjPath, 'script');
+
       require('fs').mkdirSync(scriptBaseDir, { recursive: true });
       filePath = require('path').join(scriptBaseDir, filename);
       writeFileSync(filePath, scriptContent, 'utf8');
+      const up = await s3Sync.uploadFile(filePath, orgSlug);
+      if (!up.ok && !up.skipped) console.error('[TestSuites] S3 sync failed for', filePath, ':', up.error?.message);
     }
 
     // Update DB
@@ -278,8 +320,41 @@ router.get('/:id/download/:type', async (req, res) => {
 
   const filePath = req.params.type === 'jmx' ? suite.jmx_path : suite.js_path;
   if (!filePath) return res.status(404).json({ error: 'Script not generated yet' });
-
   const filename = path.basename(filePath);
+
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+  const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+
+  if (!isSSH) {
+    try {
+      const { resolveOrgSlugForProject, getUserProjectPath } = require('../utils/projectFolders');
+      const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+      // The script was generated into the CALLING user's own workspace (see
+      // generateScriptForSuite above) — read it back from that same actor-scoped session,
+      // never the shared project.folder_path.
+      const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+      const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, proj.name, req.params.projectId);
+      if (!userProjPath) return res.status(404).json({ error: 'Git repository not initialized.' });
+      const gitDir = path.dirname(userProjPath);
+      const session = await gitEngine.openSession(gitDir, orgSlug);
+      const full = path.posix.join(session.dir, filePath.replace(/\\/g, '/'));
+      if (!session.fs.existsSync(full)) return res.status(404).json({ error: 'File not found' });
+      const content = session.fs.readFileSync(full);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(content);
+    } catch (e) {
+      return res.status(500).json({ error: `Failed to read script: ${e.message}` });
+    }
+  }
+
+  // ── SSH mode: unchanged ──────────────────────────────────────────────────────────────
+  try {
+    const { getUserProjectPath } = require('../utils/projectFolders');
+    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, proj.name, req.params.projectId);
+    if (userProjPath) await require('../routes/git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
+  } catch (e) { console.error('[TestSuites] Workspace hydrate failed:', e.message); }
+
   res.download(filePath, filename, err => {
     if (err) res.status(404).json({ error: 'File not found on disk' });
   });
@@ -639,9 +714,12 @@ function escapeRegexStr(s) {
 function buildCsvValueMap(testDataFiles) {
   const valueMap = new Map(); // lc(value) → columnName
   for (const f of (testDataFiles || [])) {
-    if (!f.path || !fs.existsSync(f.path)) continue;
+    // f.__content is pre-read content for PAT-mode workspaces (no local file to read here —
+    // see generateScriptForSuite, which populates it from the gitEngine session up front).
+    // SSH-mode workspaces still have a real local file, read directly as before.
+    if (f.__content === undefined && (!f.path || !fs.existsSync(f.path))) continue;
     try {
-      const { headers, rows } = readCsv(f.path, 50); // sample first 50 rows
+      const { headers, rows } = f.__content !== undefined ? readCsvContent(f.__content, 50) : readCsv(f.path, 50); // sample first 50 rows
       for (let ci = 0; ci < headers.length; ci++) {
         const col = headers[ci];
         if (!col) continue;

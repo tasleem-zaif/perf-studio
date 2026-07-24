@@ -415,6 +415,9 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciHealStates,  setCiHealStates]  = useState({});    // runId → { status, logs, heal_ci_run_id }
   const [ciManualHeal,  setCiManualHeal]  = useState({});    // runId → { showing, text, loading }
   const ciHealPollRef = useRef({});
+  // Tracks which runIds already have a real pollCiStatus() loop resumed this session, so the
+  // effect below doesn't start a second overlapping poller for the same run on every re-render.
+  const ciStatusResumedRef = useRef({});
 
   // Auto-poll heal status for any run with an active heal in progress when history loads
   useEffect(() => {
@@ -422,6 +425,24 @@ export default function Runner({ projects, activeProject, activeCollection, acti
     ciRuns.forEach(r => {
       if (r.heal_status && ACTIVE.includes(r.heal_status) && !ciHealPollRef.current[r.id]) {
         startCiHealPolling(r.id);
+      }
+    });
+  }, [ciRuns]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Resume REAL status polling (pollCiStatus, which actually calls the CI provider and is
+  // what triggers auto-sync + email server-side) for any run still in-flight when the list
+  // loads or refreshes — e.g. after a page reload, or the tab having been left open/backgrounded
+  // since before the run finished. Without this, only the plain `/ci/runs` list re-fetch below
+  // ever ran automatically, which just re-reads whatever's already in the DB — it never asks
+  // the provider anything, so a run that finished with nobody watching stayed "pending"/
+  // "running" forever until someone opened this page and manually clicked refresh, which is
+  // also the only thing that ever kicked off auto-sync/email. This closes that gap.
+  useEffect(() => {
+    const IN_FLIGHT_RUN = new Set(['pending','queued','running','in_progress']);
+    ciRuns.forEach(r => {
+      if (IN_FLIGHT_RUN.has(r.status) && !ciStatusResumedRef.current[r.id]) {
+        ciStatusResumedRef.current[r.id] = true;
+        pollCiStatus(r.id);
       }
     });
   }, [ciRuns]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -819,7 +840,19 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           });
                           if (selected) {
                             const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
-                            const relPath = file.replace(/.*git-workspaces\/[^/]+\/[^/]+\//, '');
+                            // Content inside the repo always starts with <ProjectName>/<Collection>/<Env>/...,
+                            // repeating the project name a second time after the workspace-bucket segment(s)
+                            // that precede it on local disk (git-workspaces/<Project>/<actor>/... normally, or
+                            // git-workspaces/<Organization>/<Project>/<actor>/... for a project created after
+                            // the org-prefix folder structure shipped). Anchor on that repeated project-name
+                            // segment via lastIndexOf rather than assuming a fixed number of leading
+                            // directories — a fixed-depth regex here was exactly why a real CI run failed on
+                            // the "Patch JMX parameters" step for an org-prefixed project: it stripped the
+                            // wrong number of segments and sent a script_path that doesn't exist in the repo.
+                            const cleanProjName = (selectedProject?.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+                            const marker = `/${cleanProjName}/`;
+                            const lastIdx = cleanProjName ? file.lastIndexOf(marker) : -1;
+                            const relPath = lastIdx >= 0 ? file.slice(lastIdx + 1) : file.replace(/.*git-workspaces\/[^/]+\/[^/]+\//, '');
                             const fileName = file.split('/').pop();
                             setCiScriptName(fileName);
                             setCiScriptPath(relPath);
@@ -1245,6 +1278,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {/* ── Local Test Run tab ───────────────────────────────────────────── */}
       {runTab === 'single' && <>
 
+      {/* ── Local/native execution UI — retired, backend routes return 410.
+          Hidden (not deleted) per the CI-pipeline-only migration; wrap in
+          {false && ...} so it's easy to find/restore later if needed. ── */}
+      {false && <>
       {/* Concurrent runs banner */}
       {activeRuns.length > 0 && !running && (
         <div style={{
@@ -1670,6 +1707,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
           )}
         </div>
       )}
+      </>}
 
       {/* Past Runs */}
       {selectedProjectId && (

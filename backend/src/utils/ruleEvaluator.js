@@ -19,8 +19,14 @@ const db   = require('../db');
 // ── Parse JTL and compute aggregate metrics ───────────────────────────────────
 function parseJtlMetrics(jtlPath) {
   if (!jtlPath || !fs.existsSync(jtlPath)) return null;
+  return parseJtlMetricsFromContent(fs.readFileSync(jtlPath, 'utf8'));
+}
 
-  const lines   = fs.readFileSync(jtlPath, 'utf8').trim().split('\n').filter(Boolean);
+/** Same as parseJtlMetrics, but from already-fetched CSV text (e.g. read via resultsStore). */
+function parseJtlMetricsFromContent(content) {
+  if (!content) return null;
+
+  const lines   = content.trim().split('\n').filter(Boolean);
   if (lines.length < 2) return null;
 
   const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
@@ -104,6 +110,15 @@ function compare(actual, op, threshold, thresholdMin, thresholdMax) {
  * @returns {{ passed: boolean, violations: Array, metrics: object|null, noRules: boolean }}
  */
 async function evaluateRules(projectId, jtlPath) {
+  return evaluateRulesFromMetrics(projectId, parseJtlMetrics(jtlPath));
+}
+
+/** Same as evaluateRules, but from already-fetched CSV text (e.g. read via resultsStore). */
+async function evaluateRulesFromContent(projectId, jtlContent) {
+  return evaluateRulesFromMetrics(projectId, parseJtlMetricsFromContent(jtlContent));
+}
+
+async function evaluateRulesFromMetrics(projectId, metrics) {
   const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
 
   if (!rules || rules.length === 0) {
@@ -111,7 +126,6 @@ async function evaluateRules(projectId, jtlPath) {
     return { passed: null, violations: [], metrics: null, noRules: true };
   }
 
-  const metrics = parseJtlMetrics(jtlPath);
   if (!metrics) {
     // Can't parse JTL — no verdict
     return { passed: null, violations: [], metrics: null, noRules: false };
@@ -155,4 +169,4 @@ async function evaluateRules(projectId, jtlPath) {
   return { passed, violations, metrics, noRules: false };
 }
 
-module.exports = { evaluateRules, parseJtlMetrics };
+module.exports = { evaluateRules, evaluateRulesFromContent, parseJtlMetrics, parseJtlMetricsFromContent };

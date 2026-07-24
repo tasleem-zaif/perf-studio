@@ -1,0 +1,31 @@
+{
+  "_comment": "Least-privilege IAM policy for the running app (attach to an EC2/ECS/EKS instance or task role — prefer this over static S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY when hosting on AWS; the AWS SDK's default credential chain picks up an instance/task role automatically once it's attached and S3_ACCESS_KEY_ID is left unset). Scoped to day-to-day object read/write/delete/list under the app's own prefix only — NOT bucket-admin actions (encryption/versioning/lifecycle config, which belong to provisionS3Bucket.js run with separate, elevated credentials, and bucket create/delete). Replace REPLACE_WITH_BUCKET_NAME and REPLACE_WITH_PREFIX (defaults to the S3_PREFIX env var, 'git-workspaces') below.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PerfStudioObjectReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME/REPLACE_WITH_PREFIX*",
+        "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME/REPLACE_WITH_PREFIX-workspaces*",
+        "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME/REPLACE_WITH_PREFIX-projects*",
+        "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME/REPLACE_WITH_PREFIX-backups*"
+      ]
+    },
+    {
+      "Sid": "PerfStudioBucketListAndReachabilityProbe",
+      "_comment": "Unconditional on purpose: HeadBucket (the boot-time reachability probe in s3Sync.js's assertBucketReachable) and every ListObjectsV2 call span several prefixes (git-workspaces/projects/backups namespaces) — an s3:prefix condition here would silently break HeadBucket, which passes no prefix at all.",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME"
+    }
+  ]
+}

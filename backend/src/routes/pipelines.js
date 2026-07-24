@@ -68,6 +68,8 @@ router.get('/runs/:runId', async (req, res) => {
 
 // ── POST /:id/run — trigger pipeline run with SSE streaming ───────────────────
 router.post('/:id/run', auth, async (req, res) => {
+  // RETIRED — internal sequential pipeline execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local pipeline execution has been retired. Run tests via the CI pipeline instead.' });
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
   const pipeline = await db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);

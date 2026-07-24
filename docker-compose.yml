@@ -56,8 +56,18 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/perf_studio
     volumes:
       - PerfStudio_projects:/app/projects # project files, scripts, test data
-      - PerfStudio_git:/app/git-workspaces
       - PerfStudio_backups:/app/backups
+    # SSH-mode git workspaces only (PAT-mode is fully S3-backed — see s3Sync.js/gitEngine.js —
+    # and never touches disk at all). RAM-backed so no customer data persists to physical disk,
+    # per the GDPR zero-local-disk requirement (see PROJECT_MAP.md "S3 migration"). Contents are
+    # lost on container restart/recreate by design: workspaceLifecycle.js lazily rehydrates any
+    # workspace from S3 on next access, so this is a cold-start cost, not data loss.
+    # Default size assumes ~20 concurrent SSH-mode workspaces averaging ~200MB each (working
+    # tree + .git history + test data/scripts) = ~4GB, plus headroom. Tune GIT_WORKSPACES_TMPFS_SIZE
+    # in .env.docker for your actual concurrency/repo sizes — ensure the host has enough free
+    # RAM (+ swap) to back it, since tmpfs is not backed by the volume/disk layer at all.
+    tmpfs:
+      - /app/git-workspaces:size=${GIT_WORKSPACES_TMPFS_SIZE:-6g}
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,5 +82,4 @@ services:
 volumes:
   pg_data:
   PerfStudio_projects:
-  PerfStudio_git:
   PerfStudio_backups:

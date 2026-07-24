@@ -9,23 +9,33 @@ router.use(auth);
 async function syncRules(projectId, userId) {
   setImmediate(async () => {
     try {
-      const { getUserProjectPath } = require('../utils/projectFolders');
+      const { getUserProjectPath, resolveOrgSlugForProject } = require('../utils/projectFolders');
       const { updateCollectionConfigs } = require('../utils/configWriter');
+      const gitEngine = require('../utils/gitEngine');
       const fs = require('fs');
 
       const projRow  = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
       const projName = projRow?.name || '';
       const cols     = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
+      const orgSlug  = await resolveOrgSlugForProject(projectId);
 
       // Regenerate config for ALL users who have a workspace for this project
-      const { isAdminWorkspace } = require('../utils/projectFolders');
+      const { isAdminRole } = require('../utils/projectFolders');
       const allUsers = await db.prepare('SELECT id, role FROM users').all();
       for (const user of allUsers) {
         try {
-          const userProjPath = await getUserProjectPath(user.id, user.role, projName);
-          if (isAdminWorkspace(userProjPath)) continue; // admin workspace holds no files
-          if (!fs.existsSync(userProjPath)) continue;  // skip if workspace not initialised
-          cols.forEach(async c => await updateCollectionConfigs(c.id, userProjPath));
+          if (isAdminRole(user.role)) continue; // admin workspace tracks main directly — no direct writes
+          const userProjPath = await getUserProjectPath(user.id, user.role, projName, projectId);
+          const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(user.id, projectId);
+          const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+          if (isSSH) {
+            if (!fs.existsSync(userProjPath)) continue;  // skip if workspace not initialised
+          } else {
+            const gitDir = require('path').dirname(userProjPath);
+            const session = await gitEngine.openSession(gitDir, orgSlug);
+            if (!session.hadState) continue; // skip if this user has never interacted with the workspace yet
+          }
+          cols.forEach(async c => await updateCollectionConfigs(c.id, userProjPath, user.id));
         } catch (_) {}
       }
     } catch (_) {}

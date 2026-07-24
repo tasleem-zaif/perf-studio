@@ -1,6 +1,7 @@
 const router = require('express').Router({ mergeParams: true });
 const multer = require('multer');
 const path   = require('path');
+const posix  = path.posix;
 const fs     = require('fs');
 const db     = require('../db');
 const resetSequence = require('../utils/resetSequence');
@@ -9,9 +10,43 @@ const auth   = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
 const { parseCurl } = require('../utils/parseCurl');
 const { parseCollection, parsePostmanEnvironment, extractCollectionVariables } = require('../utils/parseCollection');
-const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
+const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath, cleanName, resolveOrgSlugForProject } = require('../utils/projectFolders');
 const { resolveUrlSet } = require('../utils/preRunEngine');
 const { reindexAfterEndpointRemoval } = require('../utils/correlationEngine');
+const s3Sync = require('../utils/s3Sync');
+const gitEngine = require('../utils/gitEngine');
+
+/** Whether userId's chosen auth method for projectId is SSH (real local workspace) or PAT
+ * (gitEngine, S3-backed, zero local disk) — mirrors testData.js's/git.js's own precedence. */
+async function isSshMode(userId, projectId) {
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  return (identity?.auth_method || 'pat') === 'ssh';
+}
+
+/**
+ * PAT-mode equivalent of projectFolders.js's ensureCollectionFolders() — creates the
+ * env's 4 standard subfolders + .gitkeep directly in a gitEngine session's in-memory
+ * volume, never touching local disk. Mirrors the exact folder shape the SSH path
+ * produces so a later git init/commit sees the same tree either way.
+ */
+function ensureCollectionFoldersInSession(session, contentRoot, collectionName, env) {
+  const envDir = posix.join(contentRoot, cleanName(collectionName), cleanName(env || 'Default'));
+  for (const sub of ['config', 'testData', 'script', 'results']) {
+    session.fs.mkdirSync(posix.join(envDir, sub), { recursive: true });
+  }
+  const gk = posix.join(envDir, '.gitkeep');
+  if (!session.fs.existsSync(gk)) session.fs.writeFileSync(gk, '');
+  const colGk = posix.join(contentRoot, cleanName(collectionName), '.gitkeep');
+  if (!session.fs.existsSync(colGk)) session.fs.writeFileSync(colGk, '');
+  return envDir;
+}
+
+/** PAT-mode equivalent of projectFolders.js's ensureAllEnvFolders(). */
+function ensureAllEnvFoldersInSession(session, contentRoot, collectionName, environments) {
+  const envList = Array.isArray(environments) && environments.length ? environments : ['Default'];
+  for (const env of envList) ensureCollectionFoldersInSession(session, contentRoot, collectionName, env);
+  return posix.join(contentRoot, cleanName(collectionName));
+}
 
 /**
  * Auto-populate project config URLs from a collection's parsed endpoints.
@@ -101,36 +136,50 @@ async function setupCollectionFolder(proj, colId, colName, env, sourceContent, s
   const caller = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
   const role   = caller?.role || userRole;
 
-  // userProjectPath is: git-workspaces/<ProjectName>/<userName>/<ProjectName>/
-  const userProjectPath = await getUserProjectPath(userId, role, proj.name);
+  // userProjectPath is: git-workspaces/[<Organization>/]<ProjectName>/<userName>/<ProjectName>/
+  // — kept as a path-SHAPED naming string even in PAT mode (no real folder exists), so the
+  // env dir this returns still lines up with what configWriter.js's PAT branch (called
+  // right after, via writeCollectionConfig) derives its own gitEngine session key from.
+  const userProjectPath = await getUserProjectPath(userId, role, proj.name, proj.id);
   if (!userProjectPath) return null;
 
-  // gitRoot is one level up from userProjectPath — where .git lives
-  const { GIT_WORKSPACES_ROOT, cleanName } = require('../utils/projectFolders');
-  const { resolveUserFolder } = require('../utils/projectFolders');
-  const gitRoot   = path.join(GIT_WORKSPACES_ROOT, cleanName(proj.name), await resolveUserFolder(userId));
-  const gitDotDir = path.join(gitRoot, '.git');
+  // gitRoot is one level up from userProjectPath — where .git lives. Derived via dirname
+  // (not recomputed independently) so it can never disagree with userProjectPath about
+  // whether this project+actor uses the org-prefixed structure or the pre-existing one.
+  const gitRoot = path.dirname(userProjectPath);
 
-  if (!fs.existsSync(gitDotDir)) {
-    // No .git yet — try to clone from remote so git can track files
+  if (!(await isSshMode(userId, proj.id))) {
+    // ── PAT mode: create folders + write files straight into the gitEngine in-memory
+    // session (S3-backed), no local file ever. ──────────────────────────────────────────
     try {
-      const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(proj.id);
-      if (gitCfg?.remote_url && gitCfg?.is_initialized) {
-        const { decrypt } = require('../utils/encryption');
-        const identity    = await db.prepare('SELECT auth_token FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, proj.id);
-        const rawToken    = identity?.auth_token ? decrypt(identity.auth_token)
-          : gitCfg.auth_token ? decrypt(gitCfg.auth_token) : '';
-        if (rawToken) {
-          const u = new URL(gitCfg.remote_url);
-          u.username = rawToken;
-          u.password = rawToken;
-          const remoteWithAuth = u.toString();
-          fs.mkdirSync(gitRoot, { recursive: true });
-          require('simple-git')().clone(remoteWithAuth, gitRoot).catch(() => {});
-        }
+      const orgSlug = await resolveOrgSlugForProject(proj.id);
+      const session = await gitEngine.openSession(gitRoot, orgSlug);
+      const contentRoot = posix.join(session.dir, cleanName(proj.name));
+      const envDir = ensureCollectionFoldersInSession(session, contentRoot, colName, env);
+
+      const safeName = (colName || 'collection').replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (sourceContent) {
+        const ext = sourceType === 'swagger' ? (originalFilename?.endsWith('.yaml') || originalFilename?.endsWith('.yml') ? '.yaml' : '.json') : '.json';
+        session.fs.writeFileSync(posix.join(envDir, 'testData', `${safeName}_source${ext}`), sourceContent, 'utf8');
       }
-    } catch (_) {}
+      if (environmentFileContent) {
+        session.fs.writeFileSync(posix.join(envDir, 'testData', `${safeName}_environment.json`), environmentFileContent, 'utf8');
+      }
+      await gitEngine.persistSession(session, gitRoot, orgSlug);
+      return path.join(userProjectPath, cleanName(colName), cleanName(env || 'Default'));
+    } catch (e) {
+      console.error('[Collections] PAT folder setup failed:', e.message);
+      return null;
+    }
   }
+
+  // ── SSH mode: unchanged — real local workspace directory ──────────────────────────────
+  // Restore the workspace first if the S3 sweep reclaimed it since the last access (or if
+  // .git was never cloned into this folder at all yet) — properly awaited and also restores
+  // anything S3-only (results/), unlike the old fire-and-forget clone this replaces.
+  try {
+    await require('./git').ensureGitWorkspaceHydrated(gitRoot, proj.id, userId);
+  } catch (e) { console.error('[Collections] Workspace hydrate failed:', e.message); }
 
   try {
     const base = ensureCollectionFolders(userProjectPath, colName, env);
@@ -268,27 +317,14 @@ router.post('/', uploadWithEnv, async (req, res) => {
   const callerRow = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
   // Pass user's workspace path so config.json is written to the right location
   const projForConfig = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-  const userProjectPath = await getUserProjectPath(req.userId, callerRow?.role, projForConfig?.name || '');
-  writeCollectionConfig(savedCol, userProjectPath);
+  const userProjectPath = await getUserProjectPath(req.userId, callerRow?.role, projForConfig?.name || '', req.params.projectId);
+  writeCollectionConfig(savedCol, userProjectPath, req.userId);
   // Auto-populate project config with URLs from this collection (non-blocking) —
   // pass the resolved {{var}} values so a template-only collection (e.g. {{alpha_url}})
   // still resolves to a real host when an environment file provided one.
   setImmediate(() => autoPopulateProjectConfig(req.params.projectId, savedCol.json_content, colId, collectionVariables));
   // Seed {{var}} values (from the collection and/or uploaded environment file) into each env
   setImmediate(() => seedEnvVariables(colId, envsArr, collectionVariables));
-
-  // Create folder structure in git-workspaces for all environments
-  try {
-    const { ensureCollectionFolders, ensureAllEnvFolders, getUserProjectPath } = require('../utils/projectFolders');
-    const proj = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
-    if (proj?.folder_path) {
-      let envs = [];
-      try { envs = JSON.parse(req.body.environments || '[]'); } catch {}
-      if (!envs.length && req.body.environment) envs = [req.body.environment];
-      if (!envs.length) envs = ['Default'];
-      ensureCollectionFolders(proj.folder_path, req.body.name || '', envs);
-    }
-  } catch (_) {}
 
   res.json({ collection: savedCol });
 });
@@ -367,31 +403,53 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
 
   // Sync folder structure + config.json in current user's workspace
   try {
-    const { ensureAllEnvFolders, getUserProjectPath, isAdminWorkspace, cleanName } = require('../utils/projectFolders');
+    const { getUserProjectPath, isAdminRole } = require('../utils/projectFolders');
     const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const callerRole = callerUser?.role;
     const projRow    = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '');
-    if (userProjPath && !isAdminWorkspace(userProjPath)) {
+    const userProjPath = await getUserProjectPath(req.userId, callerRole, projRow?.name || '', req.params.projectId);
+    const isSSH = await isSshMode(req.userId, req.params.projectId);
+    if (userProjPath && isSSH) await require('./git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
+    if (userProjPath && !isAdminRole(callerRole)) {
       let newEnvs = [];
       try { newEnvs = JSON.parse(req.body.environments || '[]'); } catch {}
       if (!newEnvs.length && req.body.environment) newEnvs = [req.body.environment];
       if (!newEnvs.length) newEnvs = ['Default'];
 
-      // If collection was renamed, rename the folder
-      if (col.name !== newName) {
-        const oldDir = path.join(userProjPath, cleanName(col.name));
-        const newDir = path.join(userProjPath, cleanName(newName));
-        if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) {
-          fs.renameSync(oldDir, newDir);
+      if (!isSSH) {
+        // ── PAT mode: rename/create folders straight in the gitEngine session, no local
+        // fs ever. gitDir/contentRoot derived the same way configWriter.js's PAT branch
+        // does (dirname(userProjPath) / basename(userProjPath)) — called right below via
+        // writeCollectionConfig — so both land in the same S3-backed session. ────────────
+        const gitDir = path.dirname(userProjPath);
+        const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+        const session = await gitEngine.openSession(gitDir, orgSlug);
+        const contentRoot = posix.join(session.dir, cleanName(projRow?.name || ''));
+
+        if (col.name !== newName) {
+          const oldDir = posix.join(contentRoot, cleanName(col.name));
+          const newDir = posix.join(contentRoot, cleanName(newName));
+          if (session.fs.existsSync(oldDir) && !session.fs.existsSync(newDir)) {
+            session.fs.renameSync(oldDir, newDir);
+          }
         }
+        ensureAllEnvFoldersInSession(session, contentRoot, newName || col.name, newEnvs);
+        await gitEngine.persistSession(session, gitDir, orgSlug);
+      } else {
+        // If collection was renamed, rename the folder
+        if (col.name !== newName) {
+          const oldDir = path.join(userProjPath, cleanName(col.name));
+          const newDir = path.join(userProjPath, cleanName(newName));
+          if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) {
+            fs.renameSync(oldDir, newDir);
+          }
+        }
+        // Ensure all env folders exist (creates new ones, keeps existing)
+        ensureAllEnvFolders(userProjPath, newName || col.name, newEnvs);
       }
 
-      // Ensure all env folders exist (creates new ones, keeps existing)
-      ensureAllEnvFolders(userProjPath, newName || col.name, newEnvs);
-
       // Update config.json for all envs
-      writeCollectionConfig(updatedCol, userProjPath);
+      writeCollectionConfig(updatedCol, userProjPath, req.userId);
     }
   } catch (e) {
     console.warn('[Collections] Folder sync on edit failed:', e.message);
@@ -410,14 +468,17 @@ router.delete('/:id', async (req, res) => {
   try {
     const callerUser2 = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const callerRole = callerUser2?.role;
-    const { getUserProjectPath, cleanName } = require('../utils/projectFolders');
-    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name);
+    const { getUserProjectPath, cleanName, resolveOrgSlugForProject } = require('../utils/projectFolders');
+    const userProjPath = await getUserProjectPath(req.userId, callerRole, proj.name, proj.id);
     if (userProjPath) {
       const colDir = path.join(userProjPath, cleanName(col.name));
       if (fs.existsSync(colDir)) {
         fs.rmSync(colDir, { recursive: true, force: true });
         console.log(`[Collections] Deleted folder: ${colDir}`);
       }
+      const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+      const del = await s3Sync.deleteDir(colDir, orgSlug);
+      if (!del.ok && !del.skipped) console.error('[Collections] S3 delete failed for', colDir, ':', del.failed?.length, 'object(s)');
     }
   } catch (e) {
     console.warn('[Collections] Folder delete failed:', e.message);
@@ -482,11 +543,14 @@ router.post('/:id/endpoints/delete', async (req, res) => {
   // Sync the workspace's config.json snapshot, same as the PUT route above — otherwise it
   // keeps listing endpoints that no longer exist until some unrelated edit refreshes it.
   try {
-    const { getUserProjectPath, isAdminWorkspace } = require('../utils/projectFolders');
+    const { getUserProjectPath, isAdminRole } = require('../utils/projectFolders');
     const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
     const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
-    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, projRow?.name || '');
-    if (userProjPath && !isAdminWorkspace(userProjPath)) writeCollectionConfig(updatedCol, userProjPath);
+    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, projRow?.name || '', req.params.projectId);
+    if (userProjPath && await isSshMode(req.userId, req.params.projectId)) {
+      await require('./git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
+    }
+    if (userProjPath && !isAdminRole(callerUser?.role)) writeCollectionConfig(updatedCol, userProjPath, req.userId);
   } catch (e) {
     console.warn('[Collections] Config sync after endpoint delete failed:', e.message);
   }

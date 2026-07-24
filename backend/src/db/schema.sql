@@ -357,6 +357,13 @@ CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
   finished_at           TIMESTAMPTZ
 );
 
+-- Set once a sync attempt confirms this run produced zero JMeter samples (no artifact was
+-- ever uploaded, or the JTL it did produce has no data rows) — these runs are never synced
+-- into execution_runs/Analytics (nothing real to show), but without this flag the background
+-- catch-up in execution.js's GET /runs retried them forever on every page load, since
+-- "no execution_runs row yet" looked identical to "haven't tried syncing yet".
+ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS no_results INTEGER DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS ci_auto_heal_logs (
   id            SERIAL PRIMARY KEY,
   ci_run_id     INTEGER NOT NULL,
