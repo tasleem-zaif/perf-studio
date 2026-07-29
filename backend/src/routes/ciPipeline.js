@@ -93,6 +93,82 @@ with open(script, "w") as f:
 print("Patch complete")
 `;
 
+// Base64 blob of the patcher, embedded directly into every generated CI YAML so the
+// "Patch JMX" step never depends on .PerfStudio/patch_jmx.py having been separately
+// committed/pushed to whichever branch the runner checks out — that push is best-effort
+// (server-side git-workspace state can be missing, stale, or out of sync with the branch
+// actually dispatched) and was the root cause of "python3: can't open file
+// '.../.PerfStudio/patch_jmx.py'" failures. Base64 avoids all YAML-indentation /
+// shell-quoting hazards of inlining raw Python source into a `run:` block.
+const PATCHER_PY_B64 = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8').toString('base64');
+
+// Mirrors git.js's safeCheckout/parseCheckoutConflictPaths (duplicated rather than
+// shared across route files, consistent with this codebase's existing convention —
+// see cleanName/getCleanProjectName duplicated between git.js and projectFolders.js).
+// A plain `checkout(branch)` here can fail with "Your local changes... would be
+// overwritten by checkout" if the shared admin workspace was left dirty by a prior
+// request; falling straight to `checkout -b` in that case fails a second time with
+// "A branch named 'x' already exists.", masking the real cause instead of fixing it.
+function parseCheckoutConflictPaths(gitErrorMessage) {
+  const paths = [];
+  let inList = false;
+  for (const rawLine of (gitErrorMessage || '').split('\n')) {
+    const line = rawLine.trim();
+    if (/^error: (Your local changes to the following files would be overwritten by checkout|The following untracked working tree files would be overwritten by checkout)/.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    if (line === '' || /^(Please |Aborting)/.test(line)) { inList = false; continue; }
+    paths.push(line);
+  }
+  return paths;
+}
+
+// Generic retry wrapper (mirrors git.js's withCheckoutConflictRetry) — not specific to
+// plain `checkout(branch)`. `checkout -b <new> <start>` / `checkoutLocalBranch` hit the
+// identical conflict since they also have to update the working tree to match <start>,
+// so every checkout-shaped git2 call in this file needs to go through this.
+async function withCheckoutConflictRetrySimpleGit(gitRoot, fn) {
+  try {
+    await fn();
+    return;
+  } catch (err) {
+    const conflictPaths = parseCheckoutConflictPaths(err.message || '');
+    if (!conflictPaths.length) throw err;
+
+    const asideDir = path.join(os.tmpdir(), `peako-ci-checkout-aside-${process.pid}-${Date.now()}`);
+    const saved = [];
+    for (const rel of conflictPaths) {
+      const src = path.join(gitRoot, rel);
+      if (fs.existsSync(src)) {
+        const dest = path.join(asideDir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+        // Must actually remove it here, not just copy — the retry below hits the exact
+        // same "would be overwritten" conflict otherwise, since the file is still sitting
+        // in gitRoot blocking it. (Verified against real git.)
+        fs.rmSync(src, { force: true });
+        saved.push(rel);
+      }
+    }
+    try {
+      await fn();
+    } finally {
+      for (const rel of saved) {
+        const dest = path.join(gitRoot, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(asideDir, rel), dest);
+      }
+      try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+async function safeCheckoutSimpleGit(git, gitRoot, branch) {
+  return withCheckoutConflictRetrySimpleGit(gitRoot, () => git.checkout(branch));
+}
+
 router.use(auth);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -870,6 +946,8 @@ jobs:
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
           echo "Patching \$SCRIPT  users=\${{ inputs.jmeter_users }} rampup=\${{ inputs.jmeter_rampup }} duration=\${{ inputs.jmeter_duration }}"
+          mkdir -p .PerfStudio
+          echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
           python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\${{ inputs.jmeter_users }}" "\${{ inputs.jmeter_rampup }}" "\${{ inputs.jmeter_loops }}" "\${{ inputs.jmeter_duration }}"
           echo "=== ThreadGroup after patch ==="
           grep -A 30 "ThreadGroup" "\$SCRIPT" | head -50
@@ -1099,6 +1177,8 @@ pipelines:
             - |
               SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
               echo "=== Patching JMX parameters and fixing paths ==="
+              mkdir -p .PerfStudio
+              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
               python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
               echo "=== JMX state after patch ==="
               grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
@@ -1277,15 +1357,60 @@ pipelines:
         // on origin but was never fetched locally), then finally create it fresh.
         try {
           gitRun(['checkout', autoCommitBranch]);
-        } catch {
+        } catch (firstCheckoutErr) {
+          // The plain checkout typically fails here because the CI files this endpoint
+          // just generated and wrote to gitRoot (githubYaml/patcherPy/bbYaml/... above)
+          // are untracked or modified relative to whatever ref HEAD currently points at,
+          // and would be overwritten by switching to autoCommitBranch — git refuses the
+          // checkout to avoid clobbering them.
+          //
+          // A stash-based retry was tried here previously, but `git stash` (even without
+          // `-u`) sweeps up exactly those freshly-written files, which then never get
+          // staged/committed below — `generate-yaml` silently no-ops while still reporting
+          // success, leaving whatever was already on the branch (possibly missing
+          // `workflow_dispatch` entirely) in place. Copy just the generated files aside on
+          // disk instead — not through git — so the checkout can proceed, then restore
+          // them once we're on the right branch. This can never lose the payload.
+          const asideDir = path.join(os.tmpdir(), `peako-generate-yaml-aside-${process.pid}-${Date.now()}`);
+          const savedFiles = [];
+          for (const f of created) {
+            const src = path.join(gitRoot, f);
+            if (fs.existsSync(src)) {
+              const dest = path.join(asideDir, f);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.copyFileSync(src, dest);
+              // Must actually remove it here, not just copy — the checkout retry below
+              // hits the exact same "would be overwritten" conflict otherwise, since the
+              // file is still sitting in gitRoot blocking it. (Verified against real git.)
+              fs.rmSync(src, { force: true });
+              savedFiles.push(f);
+            }
+          }
           try {
-            // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like
-            // a by-name `fetch origin` would — a bare URL fetch with no refspec only sets
-            // FETCH_HEAD, which the checkout below wouldn't find.
-            gitRun(['fetch', remoteUrl, `+${autoCommitBranch}:refs/remotes/origin/${autoCommitBranch}`]);
-            gitRun(['checkout', '-b', autoCommitBranch, `origin/${autoCommitBranch}`]);
+            gitRun(['checkout', autoCommitBranch]);
           } catch {
-            gitRun(['checkout', '-b', autoCommitBranch]);
+            try {
+              // Explicit refspec so this populates refs/remotes/origin/<branch> exactly like
+              // a by-name `fetch origin` would — a bare URL fetch with no refspec only sets
+              // FETCH_HEAD, which the checkout below wouldn't find.
+              gitRun(['fetch', remoteUrl, `+${autoCommitBranch}:refs/remotes/origin/${autoCommitBranch}`]);
+              gitRun(['checkout', '-b', autoCommitBranch, `origin/${autoCommitBranch}`]);
+            } catch {
+              // Only create a new local branch when it genuinely doesn't exist yet — '-b'
+              // on an existing branch always fails, which would otherwise mask the real
+              // reason the checkout above didn't work.
+              let branchExists = false;
+              try { gitRun(['rev-parse', '--verify', '--quiet', `refs/heads/${autoCommitBranch}`]); branchExists = true; } catch {}
+              if (branchExists) throw firstCheckoutErr;
+              gitRun(['checkout', '-b', autoCommitBranch]);
+            }
+          } finally {
+            for (const f of savedFiles) {
+              const dest = path.join(gitRoot, f);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.copyFileSync(path.join(asideDir, f), dest);
+            }
+            try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
           }
         }
         // Defensive: a checkout that "succeeds" onto the wrong ref must never silently
@@ -1543,12 +1668,16 @@ router.post('/trigger', async (req, res) => {
       await git2.addConfig('user.email', callerRow2?.email || 'noreply@perfstudio.com');
       await git2.remote(['set-url', 'origin', authUrl]);
       await git2.fetch(['origin']).catch(() => {});
-      try {
-        await git2.checkout(targetRef);
-      } catch {
+      const localBranchesForTrigger = await git2.branchLocal();
+      if (localBranchesForTrigger.all.includes(targetRef)) {
+        await safeCheckoutSimpleGit(git2, wsRoot, targetRef);
+      } else {
         // Branch may exist on remote but not locally — try to track it
-        try { await git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]); }
-        catch { await git2.checkoutLocalBranch(targetRef); }
+        try {
+          await withCheckoutConflictRetrySimpleGit(wsRoot, () => git2.raw(['checkout', '-b', targetRef, `origin/${targetRef}`]));
+        } catch {
+          await withCheckoutConflictRetrySimpleGit(wsRoot, () => git2.checkoutLocalBranch(targetRef));
+        }
       }
       // Sync with remote BEFORE committing new files so the push is fast-forward.
       // Without this, if origin/main has new commits (workflow file updates, CI artifacts, etc.)
@@ -1633,6 +1762,8 @@ pipelines:
             - |
               SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
               echo "=== Patching JMX parameters and fixing paths ==="
+              mkdir -p .PerfStudio
+              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
               python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
               echo "=== JMX state after patch ==="
               grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
@@ -1702,17 +1833,26 @@ pipelines:
 `;
           fs.writeFileSync(path.join(wsRoot, 'bitbucket-pipelines.yml'), _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
           console.log('[CI trigger] bitbucket-pipelines.yml regenerated from canonical template');
-          // Ensure .PerfStudio/patch_jmx.py is present (may already be there from git checkout)
-          const _patcherDir = path.join(wsRoot, '.PerfStudio');
-          const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
-          if (!fs.existsSync(_patcherPath)) {
-            fs.mkdirSync(_patcherDir, { recursive: true });
-            fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
-            console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
-          }
         } catch (e) {
           console.warn('[CI trigger] YAML regen failed:', e.message);
         }
+      }
+
+      // Ensure .PerfStudio/patch_jmx.py is present on the branch being pushed/dispatched —
+      // for EVERY provider, not just Bitbucket. It's normally committed to main via
+      // /generate-yaml, but a user's branch may have been created before that, or may
+      // never have merged it in, leaving GitHub Actions unable to find it at checkout
+      // ("python3: can't open file '.../.PerfStudio/patch_jmx.py'").
+      try {
+        const _patcherDir = path.join(wsRoot, '.PerfStudio');
+        const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
+        if (!fs.existsSync(_patcherPath)) {
+          fs.mkdirSync(_patcherDir, { recursive: true });
+          fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+          console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
+        }
+      } catch (e) {
+        console.warn('[CI trigger] patch_jmx.py ensure failed:', e.message);
       }
 
       // Copy the JMX/JS file into the workspace if it only exists in admin workspace.
@@ -2188,9 +2328,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   const userProjPath = await getUserProjectPath(userId, callerRole, project.name);
   const { buildRunDirName, extractRunNumber } = require('../utils/buildRunName');
 
-  // Parse CI parameters for the run name
+  // Parse CI parameters for the run name — also persisted onto execution_runs below
+  // (run_vusers/run_rampup/run_duration/run_loops) so Trend Analysis's capacity
+  // planning/scalability scoring has real concurrency data for CI-synced runs, not
+  // just native-execution ones.
   const ciVars    = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
   const ciUsers   = ciVars.jmeter_users   || ciVars.script_users   || null;
+  const ciRampup  = ciVars.jmeter_rampup  || null;
   const ciLoops   = ciVars.jmeter_loops   || null;
   const ciDur     = ciVars.jmeter_duration|| null;
 
@@ -2331,9 +2475,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
         await db.prepare(`
-          INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
-        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id);
+          INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
 
         const healUserId = run.triggered_by || userId;
         if (run.auto_heal && !run.is_heal_run) {
@@ -2450,9 +2594,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       if (zeroBbLogs) zeroLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
 
       const zeroInsert = await db.prepare(`
-        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
-      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id);
+        INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+        VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+      `).run(projectId, suiteId, resultDir, JSON.stringify(zeroLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
       const zeroRunId = zeroInsert.lastInsertRowid;
 
       const healUserId0 = run.triggered_by || userId;
@@ -2552,15 +2696,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
 
     const execInsert = await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       projectId, suiteId, autoSyncRunStatus, resultDir,
       fs.existsSync(reportPath) ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
-      run.id
+      run.id, ciUsers, ciRampup, ciDur, ciLoops
     );
     const newRunId = execInsert.lastInsertRowid;
 
@@ -2781,11 +2925,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const callerRole  = callerUser1?.role;
   const userProjPath = await getUserProjectPath(req.userId, callerRole, project.name);
 
-  // Parse CI parameters for the run name
-  const ciVars2  = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
-  const ciUsers2 = ciVars2.jmeter_users    || null;
-  const ciLoops2 = ciVars2.jmeter_loops    || null;
-  const ciDur2   = ciVars2.jmeter_duration || null;
+  // Parse CI parameters for the run name — also persisted onto execution_runs below
+  // (see the matching comment in autoSyncCiRun above for why).
+  const ciVars2   = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
+  const ciUsers2  = ciVars2.jmeter_users    || null;
+  const ciRampup2 = ciVars2.jmeter_rampup   || null;
+  const ciLoops2  = ciVars2.jmeter_loops    || null;
+  const ciDur2    = ciVars2.jmeter_duration || null;
 
   let resultDir = null;
   let syncSuiteName = null;
@@ -3074,8 +3220,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     const execRunRow = await db.prepare(`
       INSERT INTO execution_runs
-        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+        (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       req.params.projectId,
       suiteId,
@@ -3086,7 +3232,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
       reportData ? JSON.stringify(reportData) : null,
-      run.id
+      run.id, ciUsers2, ciRampup2, ciDur2, ciLoops2
     );
 
     // Update ci_pipeline_run with result_dir reference
@@ -3832,13 +3978,15 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const quickSuite2 = quickScriptFile2
       ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
       : null;
+    const quickCiVars2 = (() => { try { return JSON.parse(quickCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
       projectId, quickSuite2?.id || null, fallbackDir,
       JSON.stringify([{ type: 'error', message: `Heal pipeline run ${quickCiRunId} failed — results not uploaded. Re-attempting fix.` }]),
-      quickCiRunId
+      quickCiRunId,
+      quickCiVars2.jmeter_users || null, quickCiVars2.jmeter_rampup || null, quickCiVars2.jmeter_duration || null, quickCiVars2.jmeter_loops || null
     );
     console.log(`[CI Heal] Created fallback execRun for heal run #${quickCiRunId}`);
   }
@@ -3902,13 +4050,15 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const fullSuite2 = fullScriptFile2
       ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
       : null;
+    const fullCiVars2 = (() => { try { return JSON.parse(fullCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
       projectId, fullSuite2?.id || null, fallbackDir2,
       JSON.stringify([{ type: 'error', message: `Full heal pipeline run ${fullCiRunId} failed — results not uploaded.` }]),
-      fullCiRunId
+      fullCiRunId,
+      fullCiVars2.jmeter_users || null, fullCiVars2.jmeter_rampup || null, fullCiVars2.jmeter_duration || null, fullCiVars2.jmeter_loops || null
     );
   }
 
@@ -3967,14 +4117,16 @@ router.post('/runs/:runId/heal', async (req, res) => {
       : null;
     const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
     fs.mkdirSync(resultDir, { recursive: true });
+    const healCiVars = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
-      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id)
-      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?)
+      INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
+      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
     `).run(
       run.project_id, suiteRow?.id || null, resultDir,
       JSON.stringify([{ type: 'error', message: `CI pipeline run failed on ${run.provider}. No results were uploaded. Heal triggered manually.` }]),
       run.started_at || new Date().toISOString(),
-      run.id
+      run.id,
+      healCiVars.jmeter_users || null, healCiVars.jmeter_rampup || null, healCiVars.jmeter_duration || null, healCiVars.jmeter_loops || null
     );
     execRun = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
   }

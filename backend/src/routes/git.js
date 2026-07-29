@@ -256,6 +256,82 @@ function getUserWorkspace(proj, user) {
   return path.join(GIT_WORKSPACES_ROOT, cleanProjectName, userFolder);
 }
 
+// `ensureUserWorkspace` (below) rebuilds collection/env folders and copies scripts from
+// the DB straight into gitRoot's working tree — onto whatever branch happens to be
+// checked out at that moment. If a later `git.checkout(<otherBranch>)` in the same
+// request needs to switch off of that branch, git refuses when the freshly-written
+// files (tracked-and-modified, or brand new untracked scaffolding like .gitkeep) would
+// be overwritten by the target branch's version: "Your local changes to the following
+// files would be overwritten by checkout" / "The following untracked working tree files
+// would be overwritten by checkout". Git's own error message conveniently lists the
+// exact conflicting paths — copy just those aside (not `git stash`, which can fail to
+// pop on a conflict and silently swallow the very content we're trying to preserve, per
+// the identical bug fixed in ciPipeline.js's /generate-yaml), checkout, then restore them
+// so they land on the new branch instead of being discarded.
+function parseCheckoutConflictPaths(gitErrorMessage) {
+  const paths = [];
+  let inList = false;
+  for (const rawLine of (gitErrorMessage || '').split('\n')) {
+    const line = rawLine.trim();
+    if (/^error: (Your local changes to the following files would be overwritten by checkout|The following untracked working tree files would be overwritten by checkout)/.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    if (line === '' || /^(Please |Aborting)/.test(line)) { inList = false; continue; }
+    paths.push(line);
+  }
+  return paths;
+}
+
+// Generic retry wrapper: runs any git operation (plain checkout, `checkout -b`, etc.),
+// and if it fails with the "would be overwritten by checkout" conflict, copies the exact
+// conflicting paths (as reported by git itself) aside, retries the SAME operation, then
+// restores them. Not specific to `checkout <branch>` — `checkout -b <new> <start>` triggers
+// the identical conflict (it still has to update the working tree to match <start>), so
+// every checkout-shaped git call in this file needs to go through this, not just the ones
+// that switch to an already-existing local branch.
+async function withCheckoutConflictRetry(gitRoot, fn) {
+  try {
+    await fn();
+    return;
+  } catch (err) {
+    const conflictPaths = parseCheckoutConflictPaths(err.message || '');
+    if (!conflictPaths.length) throw err;
+
+    const asideDir = path.join(os.tmpdir(), `peako-checkout-aside-${process.pid}-${Date.now()}`);
+    const saved = [];
+    for (const rel of conflictPaths) {
+      const src = path.join(gitRoot, rel);
+      if (fs.existsSync(src)) {
+        const dest = path.join(asideDir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+        // Must actually remove it here, not just copy — the retry below hits the exact
+        // same "would be overwritten" conflict otherwise, since the file is still sitting
+        // in gitRoot blocking it. (Verified against real git: a plain copy-without-remove
+        // does not unblock the checkout.)
+        fs.rmSync(src, { force: true });
+        saved.push(rel);
+      }
+    }
+    try {
+      await fn();
+    } finally {
+      for (const rel of saved) {
+        const dest = path.join(gitRoot, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(asideDir, rel), dest);
+      }
+      try { fs.rmSync(asideDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+async function safeCheckout(git, gitRoot, branch) {
+  return withCheckoutConflictRetry(gitRoot, () => git.checkout(branch));
+}
+
 // Clone or pull-update a user's workspace from the remote
 async function ensureUserWorkspace(gitRoot, cfg, user) {
   const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?')
@@ -340,19 +416,36 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
   // folders if they were created after the last push, or this is a fresh clone.
   try {
     const { ensureAllEnvFolders, cleanName: cn } = require('../utils/projectFolders');
-    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
-    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
+    // Content lives one level under the workspace root, inside a folder named after
+    // the project — this MUST match getUserProjectPath() (used by testSuites.js /
+    // collections.js / testData.js to actually write scripts/config/testData) and
+    // buildCanonicalRepoPaths() in ciPipeline.js (used to compute the script_path the
+    // CI workflow patches). Scaffolding folders at gitRoot directly — as this used to
+    // do — created a second, empty, out-of-sync tree alongside the real one and left
+    // the CI "Patch JMX" step looking for a script_path that didn't exist there.
+    // Standard: <workspace>/<ProjectName>/<CollectionName>/<Env>/script|testData|config|results/
+    const projRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(cfg.project_id);
+    const projectContentDir = path.join(gitRoot, cn(projRow?.name || ''));
     const collections = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(cfg.project_id);
     for (const col of collections) {
+      // Remove the stale duplicate this function used to scaffold directly at the
+      // workspace root (gitRoot/<CollectionName>) before content moved under
+      // gitRoot/<ProjectName>/<CollectionName> — otherwise it keeps getting
+      // re-created/re-committed on every commit even after the code fix.
+      const staleFlatDir = path.join(gitRoot, cn(col.name || 'Default'));
+      if (staleFlatDir !== projectContentDir && fs.existsSync(staleFlatDir)) {
+        fs.rmSync(staleFlatDir, { recursive: true, force: true });
+      }
+
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitRoot, col.name, envs);
+      ensureAllEnvFolders(projectContentDir, col.name, envs);
     }
 
     // Copy JMX/JS scripts into this workspace if they don't exist here yet.
-    // Destination is always: gitRoot/<CollectionName>/<Env>/script/<filename>
+    // Destination is always: gitRoot/<ProjectName>/<CollectionName>/<Env>/script/<filename>
     const suites = await db.prepare(`
       SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
       FROM test_suites ts
@@ -363,7 +456,7 @@ async function ensureUserWorkspace(gitRoot, cfg, user) {
       const srcAbs = suite.jmx_path || suite.js_path;
       if (!srcAbs || !fs.existsSync(srcAbs)) continue;
       const destAbs = path.join(
-        gitRoot,
+        projectContentDir,
         cn(suite.col_name || 'Default'),
         cn(suite.env || 'Default'),
         'script',
@@ -600,23 +693,31 @@ router.post('/init', async (req, res) => {
     // Project files go DIRECTLY at the workspace root — no projects/ subdirectory.
     // This means pushing to GitHub only includes THIS project's files.
     //
-    // GitHub structure:
+    // GitHub structure (must match getUserProjectPath() in projectFolders.js — used by
+    // testSuites.js/collections.js/testData.js to actually write scripts/config/testData —
+    // and buildCanonicalRepoPaths() in ciPipeline.js, which computes the script_path the
+    // CI "Patch JMX" step opens):
     //   <repo_root>/
-    //   ├── <CollectionName>/
-    //   │   └── <Env>/
-    //   │       ├── config/
-    //   │       ├── script/
-    //   │       ├── testData/
-    //   │       └── results/  (gitignored)
+    //   ├── <ProjectName>/
+    //   │   └── <CollectionName>/
+    //   │       └── <Env>/
+    //   │           ├── config/
+    //   │           ├── script/
+    //   │           ├── testData/
+    //   │           └── results/  (gitignored)
     //   ├── .gitignore
     //   └── README.md
     const gitRoot = getUserWorkspace(proj, caller);  // git-workspaces/<ProjectName>/admin/
 
-    // Collections go DIRECTLY at the workspace root — no project-name subfolder.
-    // Standard: <workspace>/<CollectionName>/<Env>/script|testData|config|results/
+    // Collections live under a <ProjectName> content folder inside the workspace root —
+    // scaffolding them directly at gitRoot (as this used to do) produced a second, empty
+    // folder tree alongside the real one and left the CI patch step looking for a
+    // script_path that didn't exist there.
+    // Standard: <workspace>/<ProjectName>/<CollectionName>/<Env>/script|testData|config|results/
     fs.mkdirSync(gitRoot, { recursive: true });
 
     const { ensureAllEnvFolders, cleanName } = require('../utils/projectFolders');
+    const contentRoot = path.join(gitRoot, cleanName(proj.name));
 
     // Create collection subfolders for all existing collections
     const existingCols = await db.prepare('SELECT * FROM collections WHERE project_id = ?').all(proj.id);
@@ -625,7 +726,7 @@ router.post('/init', async (req, res) => {
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
       if (!envs.length && col.environment) envs = [col.environment];
       if (!envs.length) envs = ['Default'];
-      ensureAllEnvFolders(gitRoot, col.name, envs);
+      ensureAllEnvFolders(contentRoot, col.name, envs);
     }
 
     // Update folder_path in DB to the workspace root
@@ -669,16 +770,17 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
 
 \`\`\`
 <repo_root>/
-├── <CollectionName>/         # One folder per API Source
-│   ├── QA/
-│   │   ├── testData/         # CSV files for QA environment
-│   │   ├── script/           # Generated JMeter (.jmx) / K6 (.js) scripts
-│   │   ├── results/          # Test run output & reports
-│   │   └── config/           # Environment-specific config (URLs, ports)
-│   ├── Staging/
-│   │   └── ...               # Same structure as QA
-│   └── UAT/
-│       └── ...               # Same structure as QA
+├── <ProjectName>/
+│   └── <CollectionName>/     # One folder per API Source
+│       ├── QA/
+│       │   ├── testData/     # CSV files for QA environment
+│       │   ├── script/       # Generated JMeter (.jmx) / K6 (.js) scripts
+│       │   ├── results/      # Test run output & reports
+│       │   └── config/       # Environment-specific config (URLs, ports)
+│       ├── Staging/
+│       │   └── ...           # Same structure as QA
+│       └── UAT/
+│           └── ...           # Same structure as QA
 ├── .github/workflows/        # CI pipeline definition
 └── README.md
 \`\`\`
@@ -731,7 +833,16 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
       for (const col of collections) {
         // Clean name only — no ID suffix (IDs are stored in DB, not needed in folder names)
         const colFolderName = col.name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-        const colDir = path.join(gitRoot, colFolderName);
+        const colDir = path.join(contentRoot, colFolderName);
+
+        // Remove the stale duplicate this endpoint used to scaffold directly at the
+        // workspace root (gitRoot/<CollectionName>) before content moved under
+        // gitRoot/<ProjectName>/<CollectionName> — otherwise it keeps getting
+        // re-created/re-committed on every init even after the code fix.
+        const staleFlatDir = path.join(gitRoot, colFolderName);
+        if (staleFlatDir !== contentRoot && fs.existsSync(staleFlatDir)) {
+          fs.rmSync(staleFlatDir, { recursive: true, force: true });
+        }
 
         // .gitkeep directly in collection folder so GitHub shows it as its own folder
         // (without this, GitHub collapses colFolder/env into a single path)
@@ -967,9 +1078,13 @@ router.post('/commit', async (req, res) => {
     try { gitExec(['fetch', result.remoteWithAuth, `+${baseBranch}:refs/remotes/origin/${baseBranch}`], gitDir, result.sshEnv || {}); } catch {}
     const branches = await git.branchLocal();
     if (branches.all.includes(branch)) {
-      await git.checkout(branch);
+      await safeCheckout(git, gitDir, branch);
     } else {
-      await git.checkout(['-b', branch, `origin/${baseBranch}`]).catch(() => git.checkout(['-b', branch]));
+      try {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${baseBranch}`]));
+      } catch {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch]));
+      }
     }
 
     // Stage all changes
@@ -1018,9 +1133,16 @@ router.post('/push', async (req, res) => {
 
     const baseBranch = getBaseBranch(cfg);
     // Ensure on correct branch
-    await git.checkout(branch).catch(async () => {
-      await git.checkout(['-b', branch, baseBranch]).catch(() => git.checkout(['-b', branch]));
-    });
+    const localBranches = await git.branchLocal();
+    if (localBranches.all.includes(branch)) {
+      await safeCheckout(git, gitDir, branch);
+    } else {
+      try {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, baseBranch]));
+      } catch {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch]));
+      }
+    }
 
     // Keep 'origin' on the CLEAN url — fetch/push below pass remoteUrl (authenticated)
     // directly as the command's URL argument, so origin never needs to carry the token.
@@ -1092,7 +1214,12 @@ router.post('/pull', async (req, res) => {
 
     if (branchExistsOnRemote) {
       // Branch exists on remote — pull directly from it
-      await git.checkout(branch).catch(() => git.checkout(['-b', branch, `origin/${branch}`]));
+      const localBranchesForPull = await git.branchLocal();
+      if (localBranchesForPull.all.includes(branch)) {
+        await safeCheckout(git, gitDir, branch);
+      } else {
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${branch}`]));
+      }
       gitExec(['pull', remoteUrl, branch, '--no-rebase'], gitDir, sshEnv);
       res.json({ ok: true, message: `Pulled latest from origin/${branch}.` });
     } else {
@@ -1105,9 +1232,9 @@ router.post('/pull', async (req, res) => {
 
       const localBranches = await git.branchLocal();
       if (!localBranches.all.includes(branch)) {
-        await git.checkout(['-b', branch, `origin/${baseBranch}`]);
+        await withCheckoutConflictRetry(gitDir, () => git.checkout(['-b', branch, `origin/${baseBranch}`]));
       } else {
-        await git.checkout(branch);
+        await safeCheckout(git, gitDir, branch);
         await git.merge([`origin/${baseBranch}`, '--no-edit']).catch(() => {});
       }
 
@@ -1280,7 +1407,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
 
     const baseBranch = getBaseBranch(cfg);
     // Switch to base branch
-    await git.checkout(baseBranch);
+    await safeCheckout(git, gitDir, baseBranch);
     gitExec(['pull', mergeRemoteUrl, baseBranch, '--no-rebase'], gitDir, mergeSshEnv);
 
     // Merge feature branch
@@ -1471,7 +1598,7 @@ router.post('/branch', async (req, res) => {
 
     const branchSummary = await git.branchLocal();
     if (branchSummary.all.includes(branchName)) {
-      await git.checkout(branchName);
+      await safeCheckout(git, gitRoot, branchName);
       // Branch exists locally — check if it's on the remote too; push if not
       await disableGcm(git, gitRoot);
       const lsResult = spawnSync('git', ['ls-remote', '--heads', branchRemoteUrl, branchName], {
@@ -1488,8 +1615,8 @@ router.post('/branch', async (req, res) => {
     const baseBranch = getBaseBranch(cfg);
     // Create from latest base branch
     try { gitExec(['fetch', branchRemoteUrl, baseBranch], gitRoot, r.sshEnv || {}); } catch {}
-    try { await git.checkout(baseBranch); } catch {}
-    await git.checkoutLocalBranch(branchName);
+    try { await safeCheckout(git, gitRoot, baseBranch); } catch {}
+    await withCheckoutConflictRetry(gitRoot, () => git.checkoutLocalBranch(branchName));
 
     // Push branch to remote and apply protection
     await disableGcm(git, gitRoot);
@@ -1792,7 +1919,7 @@ router.post('/sync', async (req, res) => {
     const currentBranch = (await r.git.status()).current;
     if (currentBranch !== branch) {
       const branches = await r.git.branchLocal();
-      if (branches.all.includes(branch)) await r.git.checkout(branch);
+      if (branches.all.includes(branch)) await safeCheckout(r.git, gitDir, branch);
     }
     await r.git.merge([`origin/${baseBranch}`, '--no-edit', '--allow-unrelated-histories']);
     res.json({ ok: true, message: `Branch "${branch}" synced with latest ${baseBranch}.` });
