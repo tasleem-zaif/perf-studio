@@ -6,11 +6,14 @@
 // mirrors). Purely additive: resultsStore.js's own S3 mirror (used by Analytics/Trend
 // Analysis/CI/alerts) is untouched — this reads FROM that durable copy, it doesn't replace it.
 //
-// execution.js always computes execution_runs.result_dir against the PROJECT'S OWN (admin)
-// content root, regardless of which user actually ran the test — one canonical results tree
-// per project, same as it's always been. So "show up in the git panel to commit/push" only
-// works per-actor (each user has their own branch/workspace); this re-roots the exact same
-// relative path result_dir already has under the calling user's own workspace instead.
+// result_dir's root differs by caller: execution.js's live /run handler always computes it
+// against the PROJECT'S OWN (admin) content root, regardless of who ran the test — one
+// canonical results tree per project. ciPipeline.js's CI-sync/auto-heal paths, by contrast,
+// already root it under getUserProjectPath(effectiveUserId, ...) — the SAME user this function
+// is asked to sync into. This function accepts either shape: it tries the admin root first,
+// then falls back to the target user's own root (a no-op re-root in that second case, since
+// it's already there) — so one call site works for both without the caller having to know
+// which shape its result_dir has.
 
 const path = require('path');
 const posix = path.posix;
@@ -67,20 +70,24 @@ async function syncRunResultsToUserWorkspace(run, userId) {
 
     const orgSlug = await resolveOrgSlugForProject(run.project_id);
 
-    // result_dir's shape is always <adminContentRoot>/<Collection>/<Env>/results/<RunDirName>
-    // (or <adminContentRoot>/results/<RunDirName> for a suite with no collection) — re-derive
-    // the relative suffix rather than recomputing collection/env from scratch, so this can
-    // never disagree with whatever path execution.js actually used to create it.
+    const userProjectPath = await getUserProjectPath(userId, role, project.name, project.id);
+    const gitDir = path.dirname(userProjectPath);
+
+    // Try both possible roots result_dir may have been computed against — see file-level
+    // comment. A valid relative suffix never starts with ".." or is itself absolute.
+    const isValidRel = (rel) => !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
     const adminContentRoot = project.folder_path || getProjectPath(project.name, project.id);
-    const relSuffix = path.relative(adminContentRoot, run.result_dir);
-    if (!relSuffix || relSuffix.startsWith('..') || path.isAbsolute(relSuffix)) return;
+    let relSuffix = path.relative(adminContentRoot, run.result_dir);
+    if (!isValidRel(relSuffix)) relSuffix = path.relative(userProjectPath, run.result_dir);
+    if (!isValidRel(relSuffix)) {
+      console.warn(`[ResultsWorkspaceSync] result_dir "${run.result_dir}" is not under the admin root ` +
+        `("${adminContentRoot}") or user root ("${userProjectPath}") — skipping sync for run #${run.id}`);
+      return;
+    }
     const relSuffixPosix = relSuffix.split(path.sep).join('/');
 
     const files = await resultsStore.listFiles(run.result_dir, orgSlug);
     if (!files.length) return;
-
-    const userProjectPath = await getUserProjectPath(userId, role, project.name, project.id);
-    const gitDir = path.dirname(userProjectPath);
 
     if (!(await isSshMode(userId, run.project_id))) {
       // ── PAT mode: write straight into the gitEngine in-memory session ──────────────────
