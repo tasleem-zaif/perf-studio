@@ -165,7 +165,15 @@ async function setupCollectionFolder(proj, colId, colName, env, sourceContent, s
       if (environmentFileContent) {
         session.fs.writeFileSync(posix.join(envDir, 'testData', `${safeName}_environment.json`), environmentFileContent, 'utf8');
       }
-      await gitEngine.persistSession(session, gitRoot, orgSlug);
+      const persisted = await gitEngine.persistSession(session, gitRoot, orgSlug);
+      // persistSession never throws — a real S3 failure comes back as {ok:false, failed:[...]}
+      // (each file's own error already reported to ops via s3Sync's alertOpsFailure). Without
+      // this check, that failure was invisible: this function still returned a "success" path,
+      // collections.js still set the collection's folder_path as if the S3 write landed, and
+      // nothing was ever logged — the folder just silently never showed up in the bucket.
+      if (!persisted.ok) {
+        throw new Error(`S3 persist failed for ${persisted.failed.length} file(s): ${persisted.failed.map(f => f.rel).join(', ')}`);
+      }
       return path.join(userProjectPath, cleanName(colName), cleanName(env || 'Default'));
     } catch (e) {
       console.error('[Collections] PAT folder setup failed:', e.message);
