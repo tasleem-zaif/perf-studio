@@ -70,8 +70,10 @@ async function scaffoldWorkspaceInSession(session, proj, projectId) {
   vfs.writeFileSync(posix.join(session.dir, '.gitignore'), [
     '# PerfStudio — ignore large binary files and temp artifacts',
     '*_workspace/', '*.log', '*.tmp', 'node_modules/', '.env', '',
-    '# Execution results (JTL, JMeter HTML reports, analytics PDFs) — these are mirrored to',
-    '# S3, not git.', 'results/',
+    '# Execution results (JTL, JMeter HTML reports, analytics PDFs) are tracked — a user',
+    '# commits/pushes their own run results like any other file. jmeter.log is explicitly',
+    '# un-ignored since it would otherwise match the *.log rule above.',
+    '!**/jmeter.log',
   ].join('\n'));
 
   vfs.writeFileSync(posix.join(session.dir, 'README.md'), `# ${proj.name}
@@ -960,10 +962,10 @@ router.post('/init', async (req, res) => {
       'node_modules/',
       '.env',
       '',
-      '# Execution results (JTL, JMeter HTML reports, analytics PDFs) — these are mirrored to',
-      '# S3, not git. *.log alone never caught them: the JTL file is named "results.jtl" (no',
-      '# .jtl pattern above), and HTML report dirs/zips and PDFs aren\'t log/tmp files either.',
-      'results/',
+      '# Execution results (JTL, JMeter HTML reports, analytics PDFs) are tracked — a user',
+      '# commits/pushes their own run results like any other file. jmeter.log is explicitly',
+      '# un-ignored since it would otherwise match the *.log rule above.',
+      '!**/jmeter.log',
     ].join('\n'));
 
     // Create / update README at the workspace root

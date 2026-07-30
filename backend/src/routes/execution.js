@@ -1205,6 +1205,14 @@ router.post('/run', auth, async (req, res) => {
     // Mirror results (JTL, jmeter.log) to S3 right away — additive, doesn't block anything below.
     s3Sync.uploadDir(resultDir, orgSlug).then(r => {
       if (!r.ok && !r.skipped) console.error('[Execution] S3 sync failed for', resultDir, ':', r.failed?.length, 'file(s)');
+      // Only once results are durably in S3: mirror them into the EXECUTING USER's own git
+      // workspace too, so they show up to commit/push in the Git panel like config.json/
+      // testData already do (see resultsWorkspaceSync.js for why this needs its own pass
+      // rather than just writing straight to disk here — result_dir is always rooted under
+      // the project's admin workspace, not whichever user actually ran the test).
+      const { syncRunResultsToUserWorkspace } = require('../utils/resultsWorkspaceSync');
+      syncRunResultsToUserWorkspace({ id: runId, project_id, result_dir: resultDir }, req.userId)
+        .catch(e => console.error('[Execution] Failed to sync results into user workspace:', e.message));
     });
 
     // ── Auto-zip JMeter HTML report into results folder ───────────────────────
