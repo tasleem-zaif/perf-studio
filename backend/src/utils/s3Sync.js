@@ -154,6 +154,15 @@ function toKey(localPath, orgSlug) {
     const base = `${nsPrefix}/${org}`;
     return relKey ? `${base}/${relKey}` : base;
   }
+  // Every caller (resultsStore.js, gitEngine.js, ...) treats a null key exactly like "file
+  // legitimately doesn't exist yet" — no error, just an empty/null read. That's indistinguishable
+  // from the real failure mode: localPath was computed against a GIT_WORKSPACES_ROOT/PROJECTS_ROOT/
+  // BACKUPS_ROOT value that doesn't match what's configured now (e.g. a stored DB path — a
+  // project's folder_path, a run's result_dir — computed under a different root config than the
+  // one this process is currently running with), so it silently never matches ANY known root and
+  // every downstream feature reading it just gets empty data with no trail to explain why.
+  console.warn(`[s3Sync] toKey: "${localPath}" is not under any known root — ` +
+    knownRoots().map(r => `${r.name}=${r.root}`).join(', '));
   return null;
 }
 

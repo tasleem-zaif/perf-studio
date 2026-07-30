@@ -15,7 +15,7 @@ const ownsProject = require('../utils/ownsProject');
 const { getProjectPath, PROJECTS_ROOT, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
 const { generateAnalyticsPdf } = require('../utils/generateAnalyticsPdf');
 const { startAutoHeal, getHealStatus } = require('../utils/autoHealer');
-const { evaluateRules } = require('../utils/ruleEvaluator');
+const { evaluateRules, evaluateRulesFromContent } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
 const { parseJtl, parseJtlContent } = require('../utils/parseJtl');
 const s3Sync = require('../utils/s3Sync');
@@ -1255,10 +1255,20 @@ router.post('/run', auth, async (req, res) => {
         `).get(targetRunId);
         if (!runRow) return;
 
-        const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
-        console.log('[Alerts] Checking JTL at:', jtlPath);
-        if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
+        // Read the JTL via resultsStore (S3-backed) rather than the local disk — this run may
+        // have executed in a spawned Docker container or on a container whose local disk this
+        // process never shares/retains, so `fs.existsSync` here used to silently bail out in
+        // production while working locally (native execution, same process, same disk). This
+        // was also the ONLY place in the run-completion flow that backfills execution_runs.
+        // report_data automatically, so its local-disk dependency meant runs never opened via
+        // the single-run Analytics view (which also backfills it) had no report_data at all —
+        // forcing every later read (including Trend Analysis for multiple runs) to fall back to
+        // this same JTL, which by then may genuinely never have synced to S3 either.
+        const orgSlugAlert = await resolveOrgSlugForProject(runRow.project_id);
+        console.log('[Alerts] Checking JTL via resultsStore for result_dir:', runRow.result_dir);
+        const jtlText = runRow.result_dir ? await resultsStore.readText(runRow.result_dir, orgSlugAlert, 'results.jtl') : null;
+        if (!jtlText) {
+          console.warn('[Alerts] JTL not found in S3 — result_dir:', runRow.result_dir);
           return;
         }
         console.log('[Alerts] JTL found, building report data for email...');
@@ -1268,13 +1278,14 @@ router.post('/run', auth, async (req, res) => {
           engine: runRow.engine, status: runRow.status,
           started_at: runRow.started_at, finished_at: runRow.finished_at,
         };
-        const parsed = parseJtl(jtlPath, runMeta);
+        const parsed = parseJtlContent(jtlText, runMeta);
         if (!parsed) return;
 
-        // Evaluate rules against this run's JTL so violations appear in the email
+        // Evaluate rules against this run's JTL so violations appear in the email — from the
+        // content already fetched via resultsStore above, not a local jtlPath (see note above).
         let ruleViolationsForEmail = [];
         try {
-          const rr = await evaluateRules(runRow.project_id, jtlPath);
+          const rr = await evaluateRulesFromContent(runRow.project_id, jtlText);
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
