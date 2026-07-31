@@ -1404,12 +1404,24 @@ router.get('/runs', auth, async (req, res) => {
       WHERE project_id = ? AND status IN ('completed', 'failed')
         AND (no_results = 0 OR no_results IS NULL)
         AND finished_at >= NOW() - INTERVAL '7 days'
+        AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < NOW() - INTERVAL '2 minutes')
         AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
     `).all(project_id);
 
     syncingCount = unsyncedCiRuns.length;
     if (syncingCount > 0) {
       console.log(`[Auto-sync] Found ${syncingCount} unsynced CI run(s) for project ${project_id}`);
+      // Stamp before dispatching (not after completion) so a poll landing seconds later —
+      // this endpoint is polled every 5s while syncing_count > 0 — can't re-select the same
+      // run while its own sync-results attempt (up to ~2 minutes of artifact retries) is
+      // still in flight. See last_sync_attempt_at's schema.sql comment for the full story.
+      // NOTE: db.prepare(...).run() flattens a *single* array argument into individual
+      // positional params (its .run(idsArray) convenience case) — passing the id list that
+      // way would silently mis-bind against a single `= ANY(?)` placeholder. Building the
+      // placeholder list explicitly and passing ids as separate args (run(...ids)) avoids that.
+      const idPlaceholders = unsyncedCiRuns.map(() => '?').join(',');
+      await db.prepare(`UPDATE ci_pipeline_runs SET last_sync_attempt_at = NOW() WHERE id IN (${idPlaceholders})`)
+        .run(...unsyncedCiRuns.map(r => r.id));
       const http = require('http');
       const authHeader = req.headers.authorization || '';
       for (const ciRun of unsyncedCiRuns) {
