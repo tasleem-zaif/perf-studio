@@ -1437,16 +1437,29 @@ router.get('/runs', auth, async (req, res) => {
   const includeArchived = req.query.include_archived === 'true';
   const runs = await db.prepare(`
     SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id,
+           c.environment as col_environment, c.environments as col_environments,
            ci.web_url as ci_web_url, ci.provider as ci_provider, ci.external_id as ci_external_id
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
+    LEFT JOIN collections c ON c.id = s.collection_id
     LEFT JOIN ci_pipeline_runs ci ON ci.id = r.ci_run_id
     WHERE r.project_id = ? AND (r.archived = 0 OR r.archived IS NULL OR ? = 1)
     ORDER BY r.started_at DESC
   `).all(project_id, includeArchived ? 1 : 0);
 
-  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
+  const { GIT_WORKSPACES_ROOT, resolveSuiteEnv } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
+    // test_suites.env is frequently blank (suite relies on its collection's default
+    // env instead — see resolveSuiteEnv's own doc comment) — every other place that
+    // needs a suite's real environment (autoSyncCiRun, ciPipeline's manual sync route)
+    // already calls resolveSuiteEnv() for this reason. This list endpoint was reading
+    // the raw, often-null s.env straight into suite_env instead, so any CI-synced run
+    // whose suite had no explicit env silently vanished from Analytics the moment the
+    // frontend filtered runs down to a specific environment tab — even though the run
+    // genuinely existed and had real results.
+    if (r.collection_id) {
+      r.suite_env = resolveSuiteEnv({ environment: r.col_environment, environments: r.col_environments }, { env: r.suite_env });
+    }
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
       // Use lower-case comparison to handle Windows case-insensitive paths

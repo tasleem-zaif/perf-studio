@@ -128,7 +128,21 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
 
   useEffect(() => {
     if (collections.length > 0 && !activeCollection) {
-      const col = collections[0];
+      // Collections are fetched newest-first (ORDER BY created_at DESC), so blindly taking
+      // collections[0] here meant adding a second collection to a project silently switched
+      // every env-aware page (Analytics/Reports/Runner/...) onto the brand-new, resultless
+      // collection the next time this component remounted (project switch, page reload) —
+      // with no collection picker anywhere in the UI to switch back, a project's whole run
+      // history just appeared to vanish. Prefer restoring whichever collection the user was
+      // last actually looking at, if it still exists, over always jumping to the newest one.
+      let col = collections[0];
+      try {
+        const savedId = localStorage.getItem(`ps_active_collection_${project?.id}`);
+        if (savedId) {
+          const restored = collections.find(c => String(c.id) === savedId);
+          if (restored) col = restored;
+        }
+      } catch (_) {}
       setActiveCollection(col);
       let envs = [];
       try { envs = JSON.parse(col.environments || '[]'); } catch {}
@@ -139,6 +153,12 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
     // after this project's initial mount) — [project?.id] alone missed that case, leaving
     // no collection ever auto-selected and the env-scoped Configuration sections stuck hidden.
   }, [project?.id, collections.length]);
+
+  useEffect(() => {
+    if (project?.id && activeCollection?.id) {
+      try { localStorage.setItem(`ps_active_collection_${project.id}`, String(activeCollection.id)); } catch (_) {}
+    }
+  }, [project?.id, activeCollection?.id]);
 
   const collectionEnvs = (() => {
     if (!activeCollection) return [];

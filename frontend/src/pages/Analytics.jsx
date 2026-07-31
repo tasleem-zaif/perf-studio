@@ -922,6 +922,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const [deleting, setDeleting] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [restoring, setRestoring] = useState(null); // run id being restored
+  const [runsError, setRunsError] = useState('');
   const [syncingCi, setSyncingCi] = useState(false); // CI results being auto-synced
   const analyticsRef = useRef(null);
   const syncPollRef = useRef(null);
@@ -931,6 +932,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
     setLoading(true);
     setSelectedId('');
     setData(null);
+    setRunsError('');
     api.get('/execution/runs', { params: { project_id: project.id, include_archived: includeArchived ? 'true' : 'false' } })
       .then(({ data: d }) => {
         let list = (d.runs || []).filter(r => r.engine === 'jmeter');
@@ -975,7 +977,10 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           if (syncPollRef.current) { clearInterval(syncPollRef.current); syncPollRef.current = null; }
         }
       })
-      .catch(() => {})
+      .catch(e => {
+        console.error('[Analytics] Failed to fetch runs:', e);
+        setRunsError(e.response?.data?.error || e.message || 'Failed to load runs.');
+      })
       .finally(() => setLoading(false));
   }
 
@@ -1142,6 +1147,10 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           </label>
           {loading ? (
             <span style={{ fontSize:12, color:D.textSec }}><span className="spinner" /> Loading…</span>
+          ) : runsError ? (
+            <div style={{ fontSize:13, color:'#f87171' }}>
+              Failed to load runs: {runsError} — <a href="#" onClick={e => { e.preventDefault(); fetchRuns(showArchived); }} style={{ color:'#f87171', textDecoration:'underline' }}>retry</a>
+            </div>
           ) : (
             <>
               {runs.filter(r => !r.archived).length === 0 && !showArchived ? (
