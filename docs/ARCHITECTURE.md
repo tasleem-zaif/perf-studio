@@ -1,4 +1,4 @@
-# Performance Studio — Architecture & Flow Diagrams
+# Peako — Architecture & Flow Diagrams
 
 All diagrams are authored in [Mermaid](https://mermaid.js.org/) (source `.mmd` files in `docs/images/`) and rendered to PNG for compatibility across GitHub, Bitbucket, and anywhere else that doesn't render Mermaid natively. To regenerate one after editing its `.mmd` source: `npx @mermaid-js/mermaid-cli -i docs/images/<name>.mmd -o docs/images/<name>.png -b white -s 2`.
 
