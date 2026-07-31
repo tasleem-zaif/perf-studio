@@ -1,6 +1,6 @@
 flowchart TB
     subgraph Auth["Authentication"]
-        A1["JWT HS256<br/>7-day expiry<br/>stored in localStorage"]
+        A1["JWT HS256 default (algorithm not explicitly pinned)<br/>7-day expiry<br/>stored in localStorage"]
         A2["bcrypt, 10 rounds<br/>password hashing"]
         A3["Password Reset<br/>30-min token, expires on use"]
     end
@@ -19,17 +19,19 @@ flowchart TB
     subgraph Enc["Encryption at Rest"]
         E1["AES-256-CBC<br/>all secrets in PostgreSQL"]
         E2["Encrypted: AI API keys, Git PATs,<br/>SMTP passwords, CI tokens"]
+        E3["⚠ Key falls back to JWT_SECRET, then a<br/>hardcoded default, if ENCRYPTION_KEY unset —<br/>always set explicitly"]
     end
 
     subgraph Net["Network Security"]
-        N1["Strict CORS<br/>CORS_ORIGIN env var"]
-        N2["SSRF Protection<br/>blocks RFC1918 + loopback in pre-run"]
+        N1["⚠ CORS currently permissive<br/>(code's own comment: 'allow all in current<br/>setup — restrict via CORS_ORIGIN in production')"]
+        N2["SSRF Protection<br/>blocks RFC1918 + loopback in pre-run's<br/>live outbound requests"]
         N3["PAT injection<br/>at runtime only, never in .git/config"]
+        N4["No rate limiting, no Helmet/security-headers<br/>middleware detected"]
     end
 
-    subgraph Cont["Container Security"]
-        C1["Non-root user<br/>in JMeter + K6 containers"]
-        C2["Read-only source mounts<br/>for script files"]
+    subgraph Store["Storage Security"]
+        S1["S3 mandatory at boot — assertBucketReachable()<br/>all git workspace + run-result data lives here"]
+        S2["SSH-mode git workspaces: tmpfs (RAM-backed),<br/>not persisted across container restart"]
     end
 
-    Auth --> Authz --> Lic --> Enc --> Net --> Cont
+    Auth --> Authz --> Lic --> Enc --> Net --> Store

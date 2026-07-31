@@ -17,7 +17,7 @@ This guide walks you through using Performance Studio from start to finish — f
 9. [Configuring Environment URLs](#9-configuring-environment-urls)
 10. [Creating a Test Plan](#10-creating-a-test-plan)
 11. [Generating a Test Script](#11-generating-a-test-script)
-12. [Running Tests via CI Pipeline](#12-running-tests-via-ci-pipeline)
+12. [Running Tests via an External CI Pipeline](#12-running-tests-via-an-external-ci-pipeline)
 13. [Viewing Analytics & Reports](#13-viewing-analytics--reports)
 14. [Exporting Analytics as PDF](#14-exporting-analytics-as-pdf)
 15. [Git Workflow — Commit, Push & Pull Request](#15-git-workflow--commit-push--pull-request)
@@ -256,30 +256,33 @@ Once a Test Plan is saved, you can generate the JMeter script using AI.
 
 ---
 
-## 12. Running Tests via CI Pipeline
+## 12. Running Tests via an External CI Pipeline
 
-Performance Studio runs tests through a CI Pipeline — a sequential set of test plans executed one after another.
+**⚠ Updated 2026-07-31 — this section previously described an internal, sequential test-plan pipeline builder that has since been retired.** Performance Studio does not execute JMeter/K6 on its own server anymore. Instead, it triggers a real run on an **external CI provider** — GitHub Actions, GitLab CI, or Bitbucket Pipelines — and that provider's own runner is where the load test actually executes. Performance Studio's role is to generate the pipeline config, push it to your repo, trigger the run, and pull the results back afterward.
 
-### 12.1 Create a Pipeline
+### 12.1 Connect a CI Provider
 
-1. Go to **CI/CD** in the sidebar
-2. Click **New Pipeline**
-3. Enter a name and add test plan steps in order
-4. Toggle **Stop on failure** if you want the pipeline to halt when a step fails
-5. Click **Save**
+1. Open your project → click **CI/CD** in the sidebar
+2. Choose your provider — **GitHub**, **GitLab**, or **Bitbucket**
+3. Enter the required connection details for that provider (repo owner/name, a personal access token or trigger token with permission to dispatch workflows/pipelines, and the target branch)
+4. Click **Save**
 
-### 12.2 Run the Pipeline
+### 12.2 Generate and Push the Pipeline Config
 
-1. Find your pipeline and click **Run**
-2. A live log window opens showing real-time output
-3. Each step shows its status: **Running → Passed / Failed**
-4. If a step fails and auto-heal is enabled, the AI will attempt to fix the script and re-run automatically (up to 3 attempts)
-5. When all steps complete, the pipeline shows a summary:
-   - ✔ Steps passed
-   - ✘ Steps failed
-   - ⊘ Steps skipped (if stop on failure triggered)
+1. Still in **CI/CD**, click **Generate CI Config**
+2. Performance Studio builds the provider-specific file (`.github/workflows/*.yml`, `.gitlab-ci.yml`, or `bitbucket-pipelines.yml`) referencing your generated test script
+3. Click **Push** (or commit it via the **Git** panel) so the CI provider can see it
 
-### 12.3 Understanding Test Types
+### 12.3 Trigger a Run
+
+1. Click **Run via CI** (or **Trigger**)
+2. Performance Studio pushes the current script, then dispatches a workflow/pipeline run on your configured provider
+3. A status panel polls the run and shows: **Pending → Running → Completed / Failed**
+4. Once the provider's runner finishes, Performance Studio downloads the result artifact (JTL + HTML report) and evaluates it against your configured rules
+5. If the run failed and auto-heal is enabled, the AI diagnoses the failure and attempts **one automatic fix-and-re-run**. If that single attempt doesn't resolve it, use the **Heal Again** button with a written instruction to steer a follow-up attempt — auto-heal no longer retries blindly multiple times on its own.
+6. When the run completes, you'll see a summary: total requests, pass/fail against your rules, and a link to the full report
+
+### 12.4 Understanding Test Types
 
 | Type | Pattern | Use For |
 |---|---|---|
@@ -372,8 +375,8 @@ Use this checklist when setting up a new project from scratch.
 - [ ] Configure environment URLs (QA, Staging, etc.)
 - [ ] Create test plan (select collection, users, duration, test data)
 - [ ] Generate test script (AI creates JMX from all the above)
-- [ ] Create CI pipeline and add test plan as a step
-- [ ] Run pipeline and monitor live logs
+- [ ] Connect a CI provider (GitHub/GitLab/Bitbucket) and generate/push the pipeline config
+- [ ] Trigger the run via CI and monitor status
 - [ ] View results in Analytics
 - [ ] Export PDF report
 - [ ] Commit and push scripts via Git panel

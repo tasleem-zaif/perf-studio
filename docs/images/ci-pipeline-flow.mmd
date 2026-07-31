@@ -1,50 +1,54 @@
 sequenceDiagram
     actor User
-    participant PC as PipelineConfig.jsx
-    participant CI as pipelines.js + ciPipeline.js
+    participant PC as PipelineConfig.jsx / Runner.jsx
+    participant CI as ciPipeline.js
     participant DB as Database (Postgres)
-    participant FS as File System
-    participant CIP as GitHub Actions / GitLab CI
+    participant S3 as S3 (resultsStore.js)
+    participant GP as Git Platform (GitHub/GitLab/Bitbucket)
+    participant CIP as CI Runner<br/>(GitHub Actions / GitLab CI / Bitbucket Pipelines)
+    participant Target as Target Application
 
     rect rgb(255, 245, 200)
-    Note over User,CIP: Setup - configure pipeline
-    User->>PC: Create pipeline (name, test plan steps, stop_on_failure)
-    PC->>CI: POST /api/projects/:id/pipelines
-    CI->>DB: INSERT pipeline_configs (steps as JSON array)
-    CI-->>PC: Pipeline saved
+    Note over User,CIP: Setup - configure external CI provider
+    User->>PC: Configure CI provider (repo, branch, trigger token/PAT)
+    PC->>CI: POST /api/projects/:id/ci/config
+    CI->>DB: INSERT/UPDATE ci_pipeline_configs
 
     User->>PC: Generate CI YAML file
     PC->>CI: POST /api/projects/:id/ci/generate-yaml
-    CI->>DB: Fetch test suites to get script paths
-    CI->>CI: Resolve workspace - admin or per-user
-    CI->>DB: Fetch user branch from user_git_configs
-    CI->>FS: Write gitlab-ci.yml / github-actions.yml with branch refs
-    CI-->>PC: Generated, push to branch
-
-    User->>PC: Commit and push YAML via GitPanel
-    PC->>CIP: CI provider detects workflow file
+    CI->>DB: Fetch test suite(s) to get script paths
+    CI->>CI: Build .github/workflows/*.yml or .gitlab-ci.yml or bitbucket-pipelines.yml<br/>(includes a JTL validation step: exit 1 on 0 requests or 100% error rate)
+    CI->>GP: Commit + push generated workflow file
     end
 
     rect rgb(210, 235, 255)
-    Note over User,CIP: Runtime - trigger pipeline run
-    User->>PC: Click Run Pipeline
-    PC->>CI: POST /api/projects/:id/pipelines/:id/run
-    CI->>DB: INSERT pipeline_runs (status running)
-    CI->>CI: Open SSE stream to frontend
-
-    loop For each step, sequential
-        CI->>CI: runSuite(suiteId, projectId, userId)
-        CI->>CI: docker run JMeter/K6 for this step
-        CI->>CI: Evaluate rules - pass or fail
-        CI->>DB: UPDATE pipeline_runs steps_result
-        CI-->>PC: SSE step_update
-        alt stop_on_failure true AND step failed
-            CI->>CI: Mark remaining steps as skipped
-            Note over CI: Break loop
-        end
+    Note over User,CIP: Runtime - trigger and execute (JMeter/K6 run on the CI runner, NOT the Peako server)
+    User->>PC: Click "Run via CI"
+    PC->>CI: POST /api/projects/:id/ci/trigger
+    CI->>GP: Push generated script to workspace repo
+    CI->>GP: Dispatch workflow_dispatch / pipeline trigger / pipeline API call
+    CI->>DB: INSERT ci_pipeline_runs (status pending)
+    GP->>CIP: Runner picks up the job
+    CIP->>Target: jmeter -n -t script.jmx  /  k6 run script.js
+    CIP->>CIP: Validate JTL — exit 1 immediately on 0 requests or 100% error rate
+    CIP->>GP: Upload results.jtl + HTML report as CI artifact
     end
 
-    CI->>DB: UPDATE pipeline_runs SET status completed or failed
+    rect rgb(220, 250, 220)
+    Note over User,CIP: Result sync - Peako pulls artifacts back
+    PC->>CI: Poll GET /ci/runs/:runId/status
+    CI->>GP: Check run/job status via provider API
+    CI->>GP: Download artifact zip
+    CI->>S3: writeZipEntries() - JTL + report, zero local disk
+    CI->>CI: evaluateRules() against project rules
+    CI->>DB: UPDATE ci_pipeline_runs / execution_runs SET status
     CI->>CI: sendAlertEmail (pipeline summary)
-    CI-->>PC: SSE done, passed, failed, skipped
+    CI-->>PC: Status: completed / failed
+
+    alt run failed
+        CI->>CI: autoHealer.js diagnoseWithAi() - 1 automatic attempt
+        CI->>GP: Push fixed script
+        CI->>CIP: Re-trigger CI job
+        Note over User,CIP: Additional attempts require manual "Heal Again" with a steering instruction
+    end
     end

@@ -26,7 +26,12 @@ All diagrams are authored in [Mermaid](https://mermaid.js.org/) (source `.mmd` f
 
 ## 1. System Architecture
 
-High-level view of every component and how they relate. Auto-Healer is triggered by a failed Test Executor run (not by Request Handler directly), asks the AI Engine for a fix, overwrites the script file on disk, then reruns via the Test Executor.
+High-level view of every component and how they relate. **As of 2026-07-31, this diagram (and its `.mmd` source) has been corrected to reflect two major, already-merged changes** (`git log`: `8a97fb1`, `15e7026`, `c93b872`):
+
+- **Test execution is external-CI-only.** The Peako server never runs JMeter/K6 itself — local/native/Docker-spawned execution routes all return HTTP 410. A CI runner (GitHub Actions/GitLab CI/Bitbucket Pipelines) executes the script against the target application; Peako only triggers the run and pulls results back afterward.
+- **AWS S3 (or an S3-compatible store) is a mandatory, boot-blocking dependency.** All git workspace data (PAT-mode auth) and all test-run results live in S3 only — never on local disk.
+
+Auto-Healer is triggered by a **failed CI run** (not a local Test Executor run), asks the AI Engine for a fix, pushes the fixed script to the git workspace, and re-triggers the CI provider.
 
 ![system-architecture](./images/system-architecture.png)
 
@@ -72,7 +77,7 @@ How live API responses are captured to power correlation and token extraction in
 
 ## 7. Test Execution Flow
 
-How a test run is triggered, streamed, and reported.
+How a test run is triggered, streamed, and reported. **⚠ This diagram predates the CI-only execution retirement (see §1 above) and has not yet been redrawn — treat it as historical/pending update.** The current, accurate flow is: trigger via `POST /ci/trigger` → script pushed to the git repo → CI provider (GitHub Actions/GitLab CI/Bitbucket Pipelines) runs JMeter/K6 on its own runner against the target application → results uploaded as a CI artifact → Peako polls status and downloads the artifact → results written to S3 (`resultsStore.js`) → rules evaluated → email/dashboard updated. See §10 (CI Pipeline Flow), which has been corrected, for the accurate sequence.
 
 ![test-execution-flow](./images/test-execution-flow.png)
 
@@ -80,7 +85,7 @@ How a test run is triggered, streamed, and reported.
 
 ## 8. Auto-Heal Flow
 
-How failed test scripts are automatically diagnosed and fixed by AI.
+How failed test scripts are automatically diagnosed and fixed by AI. **⚠ Predates two changes, not yet redrawn:** (1) auto-heal now triggers off a **failed CI run**, not a local test-executor run (local execution is retired); (2) auto-heal is now capped at **1 automatic attempt** (was 3) — a follow-up attempt requires the user to click "Heal Again" with a steering instruction, rather than retrying blindly.
 
 ![auto-heal-flow](./images/auto-heal-flow.png)
 
@@ -96,7 +101,7 @@ How test scripts are versioned, pushed, and merged via Git.
 
 ## 10. CI Pipeline Flow
 
-How sequential performance test pipelines are configured, triggered, and tracked.
+How a test run is configured, triggered against an **external** CI provider, and tracked. **Updated 2026-07-31**: this diagram previously depicted the internal sequential test-plan pipeline runner (`pipelines.js`), which is now retired — every route in `pipelines.js` returns HTTP 410, and `runSuite()`/`testRunner.js` (which it called) is confirmed dead code. The diagram now shows the real, current path: `ciPipeline.js` triggering GitHub Actions, GitLab CI, or Bitbucket Pipelines, where JMeter/K6 actually execute — this is the platform's only real test-execution path today.
 
 ![ci-pipeline-flow](./images/ci-pipeline-flow.png)
 
@@ -134,6 +139,11 @@ git-workspaces/
         └── (same structure as above)
 ```
 
+> **⚠ Updated 2026-07-31 — this tree is no longer always a real directory on local disk.** It depends on the git auth mode:
+> - **PAT-mode auth** (HTTPS + token): fully zero-disk. `git.js` runs `isomorphic-git` against an in-memory (`memfs`) session, hydrated from/flushed to **S3** on each request (`utils/gitEngine.js`). This tree shape describes the S3 key layout, not a real folder.
+> - **SSH-mode auth** (real SSH keys): still the real `git` binary against a real workspace directory. In the documented direct-deployment model (see `docs/DEPLOYMENT.md`), this directory is recommended to be mounted as a real Linux **tmpfs** (RAM-backed) filesystem rather than left on normal disk, so it isn't a persistent store either. Contents are lost on reboot/unmount by design (GDPR zero-physical-disk requirement) and are lazily re-hydrated from S3 on next access.
+> - **All test-run results** (JTL, HTML report, PDF) are S3-only via `utils/resultsStore.js` regardless of git auth mode — never written to local disk, not even transiently.
+
 **Isolation guarantees:**
 - Every DB query that touches test data, configs, or scripts is scoped by `collection_id + env`
 - Switching environment in the UI never shows data from another environment
@@ -157,9 +167,11 @@ git-workspaces/
 | **Route authorization** | Role checks per operation; `ownsProject()` for all project-scoped routes |
 | **License enforcement** | `auth` middleware checks the caller's org license (`getOrgAccessStatus()`) on every request for non-super-admin users — `403 org_disabled` / `license_expired` blocks access when the org's license is disabled or past `expires_at` |
 | **SSRF protection** | Pre-run blocks RFC1918 IPs, loopback, and requires http/https scheme |
-| **CORS** | Strict origin whitelist via `CORS_ORIGIN` env var |
-| **Docker containers** | Non-root user; read-only source mounts |
+| **CORS** | **⚠ Currently permissive, not a strict whitelist.** The code's own comment in `backend/src/index.js` reads "allow all in current setup — restrict in production via CORS_ORIGIN env var"; the callback returns `true` for any origin today. `CORS_ORIGIN` is read but not yet enforced as a hard whitelist — flagged as an open item for the dev team, not a hidden gap |
+| **Storage** | **AWS S3 (or S3-compatible) is a mandatory, boot-blocking dependency** — `backend/src/index.js` calls `assertBucketReachable()` at startup and exits the process if S3 isn't configured/reachable. All git workspace data (PAT-mode) and all test-run results live in S3 only |
+| **Process isolation** | The documented deployment model runs the app as a plain Node.js process (systemd-managed, non-root recommended) directly on the host — see `docs/DEPLOYMENT.md` |
 | **Invite system** | Scoped token per email+org+role; expires 7 days after creation |
+| **Rate limiting / security headers** | Not implemented — no rate limiting, no Helmet or equivalent security-headers middleware detected |
 
 ---
 
@@ -171,7 +183,8 @@ git-workspaces/
 | **Backend** | Node.js, Express 4, nodemon (dev) |
 | **Database** | PostgreSQL via `pg` (`db/index.js` is the entry point every route imports, re-exporting `db/pg.js`'s async wrapper; `schema.sql` applied by `migrate.js`). No SQLite code remains — the migration is fully complete. |
 | **AI Generation** | OpenAI GPT-4o (`openai` SDK) · Anthropic Claude — routed through one client (`utils/aiClient.js`); Anthropic is called via an OpenAI-compatible endpoint shape |
-| **Test Engines** | Apache JMeter 5.6.3 · Grafana K6 — bundled in the all-in-one Docker image for native execution, or spawned as containers when `EXECUTION_MODE=docker` |
+| **Test Engines** | Apache JMeter 5.6.3 · Grafana K6 — **run only on external CI runners** (GitHub Actions/GitLab CI/Bitbucket Pipelines), never on the Peako host. Local/native/Docker-spawned execution is retired (every such route returns HTTP 410). The binaries are still bundled in the all-in-one Docker image and `EXECUTION_MODE`/`JMETER_DOCKER_IMAGE`/`K6_DOCKER_IMAGE` still exist as env vars, but none of it is reachable anymore — confirmed dead code |
+| **Object Storage** | AWS S3 (or S3-compatible, e.g. MinIO) via `@aws-sdk/client-s3` — **mandatory, boot-blocking.** All git workspace data (PAT-mode) and all test-run results live in S3 only, never on local disk |
 | **Git Integration** | `simple-git` (local ops) · `@octokit/rest` (GitHub API) · raw HTTP for GitLab/Bitbucket REST APIs |
 | **Email** | `nodemailer` (SMTP transport, TLS) |
 | **PDF Reports** | `puppeteer` (HTML → screenshot) · `pdfkit` (page stitching) |
@@ -179,9 +192,9 @@ git-workspaces/
 | **Encryption** | `crypto` (Node built-in AES-256-CBC) · `bcryptjs` |
 | **File uploads** | `multer` (memory + disk storage) |
 | **Backups** | `archiver` (ZIP on project delete) |
-| **Containerisation** | Docker · Docker Compose (`postgres` + all-in-one app service) |
+| **Process supervision** | systemd (direct deployment — see `docs/DEPLOYMENT.md`) |
 | **CI/CD** | GitHub Actions (`workflow_dispatch`) · GitLab CI (`pipeline_trigger`) · Bitbucket Pipelines |
-| **Deployment** | Single Docker image (`Dockerfile`) or Compose stack, with a Postgres service alongside it |
+| **Deployment** | Direct (bare-metal/VM) — a Node.js process managed by systemd, against a directly-installed or managed PostgreSQL instance and an S3 (or S3-compatible) bucket — see `docs/DEPLOYMENT.md` |
 
 ---
 
