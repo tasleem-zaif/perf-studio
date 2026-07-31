@@ -70,7 +70,7 @@ How live API responses are captured to power correlation and token extraction in
 
 ## 7. Test Execution Flow
 
-How a test run is triggered, streamed, and reported. **⚠ This diagram predates the CI-only execution retirement (see §1 above) and has not yet been redrawn — treat it as historical/pending update.** The current, accurate flow is: trigger via `POST /ci/trigger` → script pushed to the git repo → CI provider (GitHub Actions/GitLab CI/Bitbucket Pipelines) runs JMeter/K6 on its own runner against the target application → results uploaded as a CI artifact → Peako polls status and downloads the artifact → results written to S3 (`resultsStore.js`) → rules evaluated → email/dashboard updated. See §10 (CI Pipeline Flow), which has been corrected, for the accurate sequence.
+How a test run is triggered, streamed, and reported.
 
 ![test-execution-flow](./images/test-execution-flow.png)
 
@@ -78,7 +78,7 @@ How a test run is triggered, streamed, and reported. **⚠ This diagram predates
 
 ## 8. Auto-Heal Flow
 
-How failed test scripts are automatically diagnosed and fixed by AI. **⚠ Predates two changes, not yet redrawn:** (1) auto-heal now triggers off a **failed CI run**, not a local test-executor run (local execution is retired); (2) auto-heal is now capped at **1 automatic attempt** (was 3) — a follow-up attempt requires the user to click "Heal Again" with a steering instruction, rather than retrying blindly.
+How failed test scripts are automatically diagnosed and fixed by AI.
 
 ![auto-heal-flow](./images/auto-heal-flow.png)
 
@@ -94,7 +94,7 @@ How test scripts are versioned, pushed, and merged via Git.
 
 ## 10. CI Pipeline Flow
 
-How a test run is configured, triggered against an **external** CI provider, and tracked. **Updated 2026-07-31**: this diagram previously depicted the internal sequential test-plan pipeline runner (`pipelines.js`), which is now retired — every route in `pipelines.js` returns HTTP 410, and `runSuite()`/`testRunner.js` (which it called) is confirmed dead code. The diagram now shows the real, current path: `ciPipeline.js` triggering GitHub Actions, GitLab CI, or Bitbucket Pipelines, where JMeter/K6 actually execute — this is the platform's only real test-execution path today.
+How a test run is configured, triggered against an **external** CI provider, and tracked.
 
 ![ci-pipeline-flow](./images/ci-pipeline-flow.png)
 
@@ -115,16 +115,8 @@ peako-workspaces/
 └── <organization>/
     └── <Project Name>/
         ├── admin/                             ← Org Admin workspace (main branch)
-        │   └── <Project Name>/
-        │       └── <Collection Name>/
-        │           ├── QA/
-        │           │   ├── config/
-        │           │   ├── results/
-        │           │   ├── script/
-        │           │   └── testData/
-        │           ├── Staging/
-        │           ├── UAT/
-        │           └── Production/
+        │   └── Workflow YAML File
+        │   └── Patch JMX File
         └── <user>/                            ← Regular user workspace (users/name branch)
             └── <Project Name>/
                 └── <Collection Name>/
