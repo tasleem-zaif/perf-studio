@@ -26,12 +26,7 @@ All diagrams are authored in [Mermaid](https://mermaid.js.org/) (source `.mmd` f
 
 ## 1. System Architecture
 
-High-level view of every component and how they relate. **As of 2026-07-31, this diagram (and its `.mmd` source) has been corrected to reflect two major, already-merged changes** (`git log`: `8a97fb1`, `15e7026`, `c93b872`):
-
-- **Test execution is external-CI-only.** The Peako server never runs JMeter/K6 itself — local/native/Docker-spawned execution routes all return HTTP 410. A CI runner (GitHub Actions/GitLab CI/Bitbucket Pipelines) executes the script against the target application; Peako only triggers the run and pulls results back afterward.
-- **AWS S3 (or an S3-compatible store) is a mandatory, boot-blocking dependency.** All git workspace data (PAT-mode auth) and all test-run results live in S3 only — never on local disk.
-
-Auto-Healer is triggered by a **failed CI run** (not a local Test Executor run), asks the AI Engine for a fix, pushes the fixed script to the git workspace, and re-triggers the CI provider.
+High-level view of every component and how they relate.
 
 ![system-architecture](./images/system-architecture.png)
 
