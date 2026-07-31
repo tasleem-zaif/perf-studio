@@ -1,0 +1,43 @@
+flowchart TD
+    Start((Super Admin))
+    Start -->|1 Create organization| N1[Organization created]
+    N1 -->|2 Send email invite to Org Admin| N2[Invite token emailed]
+    N2 -->|3 Org Admin registers with token| N3[Account created & joined org]
+    N3 -->|4 Create project| N4[Project record saved in DB]
+    N4 -->|5 Auto-scaffold workspace folders| N5["peako-workspaces/&lt;org&gt;/Project_Name/admin/<br/>Project_Name/Collection/ENV/testData · script · config"]
+    N5 -->|6 Configure AI provider| N6[AI key saved AES-256-CBC encrypted<br/>OpenAI GPT-4o or Anthropic Claude]
+    N6 -->|7 Invite regular users| N7[Users assigned to project]
+    N7 -->|8 Add API Source collection| Import{Import method}
+
+    Import -->|Postman JSON upload| I1[Postman v2.1 parser → endpoints]
+    Import -->|Swagger / OpenAPI| I2[OpenAPI 3 / Swagger 2 parser → endpoints]
+    Import -->|cURL paste| I3[cURL parser → single endpoint]
+    Import -->|Raw JSON| I4[Manual endpoint array]
+    I1 --> N8[Collection saved to DB<br/>json_content = normalized endpoint array]
+    I2 --> N8
+    I3 --> N8
+    I4 --> N8
+
+    N8 -->|9 Run Pre-run on API Source| N9["POST /api/ai/pre-run<br/>Fire all endpoints live · 5s timeout · SSRF-safe"]
+    N9 --> N9b[Capture auth tokens<br/>401 retry with extracted token]
+    N9b --> N9c[Pre-run responses saved to collections.pre_run_data<br/>Hash stored for freshness check]
+    N9c -->|10 Upload CSV test data| N10[CSV tagged by collection + env<br/>Columns parsed & stored]
+    N10 -->|11 Configure performance rules| N11["Rules saved per project<br/>metric · operator · value · severity<br/>(Response Time · Error Rate · Throughput)"]
+    N11 -->|12 Configure env URLs| N12[Per-env URL/port config saved]
+    N12 -->|13 Create Test Plan| N13[Test suite record created<br/>Linked to collection + env + test data<br/>vusers · rampup · duration configured]
+    N13 -->|14 Generate JMX/K6 script| N14["Script assembled from:<br/>· Collection endpoints<br/>· Merged config (global → project → env → suite)<br/>· CSV column names<br/>· Pre-run correlation data<br/>· Performance rules as thresholds"]
+    N14 --> N14b["Script written to disk<br/>peako-workspaces/&lt;org&gt;/Project/user-id/<br/>Project/Collection/ENV/script/suite_load.jmx"]
+
+    N14b -->|15 Run test via CI pipeline| CIRun["CI Pipeline<br/>Sequential pipeline steps · stop_on_failure · pass/fail<br/>SSE progress stream to frontend"]
+    CIRun --> Passed{Rules passed?}
+    Passed -->|Fail — auto heal on| Heal["Auto Healer:<br/>Read errors → AI diagnosis → apply fix → re-run<br/>1 automatic attempt, then manual Heal Again"]
+    Heal --> Passed
+    Passed -->|Pass| Results[Results persisted to DB<br/>HTML report generated]
+
+    Results -->|16 View Analytics| Analytics[Analytics dashboard:<br/>Response time · Throughput<br/>Error rate · Rule violations]
+    Results -->|Rules-based alerts| Alert["Email report dispatched to all recipients<br/>PDF analytics + HTML report ZIP<br/>(only on rule violation or failure)"]
+
+    Analytics -->|17 Commit & push to Git| RoleGit{Role}
+    Alert -->|17 Commit & push to Git| RoleGit
+    RoleGit -->|Org Admin| G1[Push direct to main branch]
+    RoleGit -->|Regular user| G2["Push to users/name branch<br/>Raise PR → Org Admin merges"]

@@ -118,37 +118,32 @@ How test results trigger email notifications with analytics.
 ## 12. Multi-Environment Isolation
 
 ```
-git-workspaces/
-├── admin/                                ← Org Admin workspace (main branch)
-│   └── Project_Name/
-│       ├── .git/
-│       ├── .gitignore
-│       └── Project_Name/
-│           └── CollectionName_ID/
-│               ├── QA/
-│               │   ├── testData/         ← env-scoped CSV files
-│               │   ├── script/           ← generated JMX / K6 scripts
-│               │   ├── results/          ← JMeter results.jtl + HTML report
-│               │   └── config/           ← config.json (URLs · rules · test plans)
-│               ├── Staging/
-│               ├── UAT/
-│               └── Production/
-│
-└── user-{id}/                            ← Regular user workspace (users/name branch)
-    └── Project_Name/
-        └── (same structure as above)
+peako-workspaces/
+└── <organization>/
+    └── <Project Name>/
+        ├── admin/                             ← Org Admin workspace (main branch)
+        │   └── <Project Name>/
+        │       └── <Collection Name>/
+        │           ├── QA/
+        │           │   ├── config/
+        │           │   ├── results/
+        │           │   ├── script/
+        │           │   └── testData/
+        │           ├── Staging/
+        │           ├── UAT/
+        │           └── Production/
+        └── <user>/                            ← Regular user workspace (users/name branch)
+            └── <Project Name>/
+                └── <Collection Name>/
+                    ├── QA/
+                    │   ├── config/
+                    │   ├── results/
+                    │   ├── script/
+                    │   └── testData/
+                    ├── Staging/
+                    ├── UAT/
+                    └── Production/
 ```
-
-> **⚠ Updated 2026-07-31 — this tree is no longer always a real directory on local disk.** It depends on the git auth mode:
-> - **PAT-mode auth** (HTTPS + token): fully zero-disk. `git.js` runs `isomorphic-git` against an in-memory (`memfs`) session, hydrated from/flushed to **S3** on each request (`utils/gitEngine.js`). This tree shape describes the S3 key layout, not a real folder.
-> - **SSH-mode auth** (real SSH keys): still the real `git` binary against a real workspace directory. In the documented direct-deployment model (see `docs/DEPLOYMENT.md`), this directory is recommended to be mounted as a real Linux **tmpfs** (RAM-backed) filesystem rather than left on normal disk, so it isn't a persistent store either. Contents are lost on reboot/unmount by design (GDPR zero-physical-disk requirement) and are lazily re-hydrated from S3 on next access.
-> - **All test-run results** (JTL, HTML report, PDF) are S3-only via `utils/resultsStore.js` regardless of git auth mode — never written to local disk, not even transiently.
-
-**Isolation guarantees:**
-- Every DB query that touches test data, configs, or scripts is scoped by `collection_id + env`
-- Switching environment in the UI never shows data from another environment
-- Regular users write only to their own `user-{id}` workspace; admin workspace is read-only for users
-- Script generation is blocked in the admin workspace — users must generate in their own workspace
 
 ---
 
