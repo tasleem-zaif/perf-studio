@@ -1,6 +1,6 @@
-# 🚀 Performance Studio
+# 🚀 Peako
 
-**AI-Powered Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, real-time analytics, Git integration, and team collaboration.
+**Next Gen Performance Testing Platform** — Multi-environment load testing with JMeter & K6, AI script generation, auto-healing, real-time analytics, Git integration, and team collaboration.
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/tasleemzaif/PerfStudio-backend)](https://hub.docker.com/r/tasleemzaif/PerfStudio-backend)
 [![Build](https://github.com/tasleem-zaif/PerfStudio/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/tasleem-zaif/PerfStudio/actions)
