@@ -36,7 +36,7 @@ export default function EnvBar({ envs = [], activeEnv, onEnvChange, hint, collec
               padding: '4px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600,
               border: '1.5px solid var(--color-border-secondary)',
               background: 'var(--color-background-primary)', color: 'var(--color-text-primary)',
-              cursor: 'pointer', flexShrink: 0,
+              cursor: 'pointer', flexShrink: 0, width: 'auto', maxWidth: 260,
             }}>
             {collections.map(c => (
               <option key={c.id} value={c.id}>{c.name}</option>
