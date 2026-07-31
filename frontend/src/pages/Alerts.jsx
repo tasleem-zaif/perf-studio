@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from '../hooks/useToast';
-import EnvBar from '../components/EnvBar';
 
 const BLANK_CFG = {
   smtp_host: '', smtp_port: '587', smtp_secure: false,
@@ -10,7 +9,7 @@ const BLANK_CFG = {
   enabled: false,
 };
 
-export default function Alerts({ project, collection, collections, onCollectionChange, env, envs, onEnvChange }) {
+export default function Alerts({ project }) {
   const { toast } = useToast();
   const [cfg, setCfg]             = useState({ ...BLANK_CFG });
   const [saving, setSaving]       = useState(false);
@@ -124,8 +123,9 @@ export default function Alerts({ project, collection, collections, onCollectionC
 
   return (
     <div className="page fade-in">
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to configure alert settings"
-        collections={collections} activeCollectionId={collection?.id} onCollectionChange={onCollectionChange} />
+      {/* SMTP config and recipients are project-wide, not per-environment — see
+          loadConfig()/loadProjectRecs() above, neither takes an env param — so this page
+          intentionally has no environment/collection selector. */}
       <div style={{ maxWidth: 740, display: 'flex', flexDirection: 'column', gap: 20 }}>
 
         {/* SMTP Config */}
