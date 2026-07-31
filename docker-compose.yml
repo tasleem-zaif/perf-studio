@@ -1,7 +1,11 @@
 version: '3.9'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PerfStudio — All-in-one Docker Compose
+# PerfStudio — All-in-one Docker Compose (undocumented/legacy deployment path)
+#
+# ⚠ The documented deployment model is DIRECT (a plain Node.js process, no
+# containers) — see docs/DEPLOYMENT.md. This file still works but is no longer
+# the recommended/documented way to run Peako.
 #
 # Single container: Node.js backend + React frontend + Java + JMeter + K6 + Git
 #

@@ -46,7 +46,7 @@ function StatusBadge({ status }) {
   );
 }
 
-export default function Reports({ project, collection, env, envs, onEnvChange }) {
+export default function Reports({ project, collection, collections, onCollectionChange, env, envs, onEnvChange }) {
   const [runs,     setRuns]     = useState([]);
   const [selectedId, setSelectedId] = useState('');
   const [selected, setSelected] = useState(null); // explicit state — avoids timing bugs
@@ -89,7 +89,8 @@ export default function Reports({ project, collection, env, envs, onEnvChange })
 
   return (
     <div className="page fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view JMeter reports" />
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view JMeter reports"
+        collections={collections} activeCollectionId={collection?.id} onCollectionChange={onCollectionChange} />
 
       {/* Controls bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>

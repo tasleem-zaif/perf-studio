@@ -165,7 +165,15 @@ async function setupCollectionFolder(proj, colId, colName, env, sourceContent, s
       if (environmentFileContent) {
         session.fs.writeFileSync(posix.join(envDir, 'testData', `${safeName}_environment.json`), environmentFileContent, 'utf8');
       }
-      await gitEngine.persistSession(session, gitRoot, orgSlug);
+      const persisted = await gitEngine.persistSession(session, gitRoot, orgSlug);
+      // persistSession never throws — a real S3 failure comes back as {ok:false, failed:[...]}
+      // (each file's own error already reported to ops via s3Sync's alertOpsFailure). Without
+      // this check, that failure was invisible: this function still returned a "success" path,
+      // collections.js still set the collection's folder_path as if the S3 write landed, and
+      // nothing was ever logged — the folder just silently never showed up in the bucket.
+      if (!persisted.ok) {
+        throw new Error(`S3 persist failed for ${persisted.failed.length} file(s): ${persisted.failed.map(f => f.rel).join(', ')}`);
+      }
       return path.join(userProjectPath, cleanName(colName), cleanName(env || 'Default'));
     } catch (e) {
       console.error('[Collections] PAT folder setup failed:', e.message);
@@ -212,16 +220,35 @@ const uploadWithEnv = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'env
  */
 async function seedEnvVariables(collectionId, envs, variables) {
   if (!variables || !Object.keys(variables).length) return;
-  for (const env of envs) {
-    const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(collectionId, env);
-    const cfg = row ? JSON.parse(row.config_json || '{}') : {};
-    cfg.variables = { ...variables, ...(cfg.variables || {}) };
-    if (row) {
-      await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?').run(JSON.stringify(cfg), collectionId, env);
-    } else {
-      await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)').run(collectionId, env, JSON.stringify(cfg));
+  try {
+    for (const env of envs) {
+      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(collectionId, env);
+      const cfg = row ? JSON.parse(row.config_json || '{}') : {};
+      cfg.variables = { ...variables, ...(cfg.variables || {}) };
+      if (row) {
+        await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?').run(JSON.stringify(cfg), collectionId, env);
+      } else {
+        await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)').run(collectionId, env, JSON.stringify(cfg));
+      }
     }
+  } catch (e) {
+    console.error('[Collections] seedEnvVariables error:', e.message);
   }
+}
+
+/**
+ * autoPopulateProjectConfig and seedEnvVariables both do an independent read-modify-write
+ * of the same collection_env_config row per env. Firing them as two separate setImmediate
+ * calls let them race: whichever's write landed last silently discarded the other's field
+ * (or, if both raced past their SELECT before either INSERTed, the loser hit the
+ * UNIQUE(collection_id, env) constraint and threw — swallowed by seedEnvVariables having no
+ * try/catch of its own). Local's low-latency DB happened to serialize the two consistently;
+ * production's DB latency didn't, which is why uploaded environment-file variables went
+ * missing there but not locally. Running them sequentially removes the race entirely.
+ */
+async function syncCollectionEnvConfig(projectId, jsonContent, collectionId, envs, variables) {
+  await autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables);
+  await seedEnvVariables(collectionId, envs, variables);
 }
 
 router.use(auth);
@@ -322,9 +349,10 @@ router.post('/', uploadWithEnv, async (req, res) => {
   // Auto-populate project config with URLs from this collection (non-blocking) —
   // pass the resolved {{var}} values so a template-only collection (e.g. {{alpha_url}})
   // still resolves to a real host when an environment file provided one.
-  setImmediate(() => autoPopulateProjectConfig(req.params.projectId, savedCol.json_content, colId, collectionVariables));
-  // Seed {{var}} values (from the collection and/or uploaded environment file) into each env
-  setImmediate(() => seedEnvVariables(colId, envsArr, collectionVariables));
+  // Also seeds {{var}} values (from the collection and/or uploaded environment file) into
+  // each env — run sequentially (not as two racing setImmediate calls) so both writes to
+  // the same collection_env_config row never clobber each other.
+  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, savedCol.json_content, colId, envsArr, collectionVariables));
 
   res.json({ collection: savedCol });
 });
@@ -396,10 +424,10 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
         colBasePath, req.params.id);
 
   const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(req.params.id);
-  // Re-populate project config if endpoints changed
-  setImmediate(() => autoPopulateProjectConfig(req.params.projectId, updatedCol.json_content, updatedCol.id, collectionVariables));
-  // Seed any newly-discovered {{var}} values into each env (never overwrites existing values)
-  setImmediate(() => seedEnvVariables(updatedCol.id, envsArr, collectionVariables));
+  // Re-populate project config if endpoints changed, then seed any newly-discovered
+  // {{var}} values into each env (never overwrites existing values) — sequentially, see
+  // syncCollectionEnvConfig's comment for why these can't run as two racing setImmediates.
+  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, updatedCol.json_content, updatedCol.id, envsArr, collectionVariables));
 
   // Sync folder structure + config.json in current user's workspace
   try {

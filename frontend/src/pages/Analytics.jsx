@@ -906,7 +906,7 @@ function LogsTab({ data, ciWebUrl, ciProvider, ciExternalId }) {
 }
 
 // ── main component ────────────────────────────────────────────────────────────
-export default function Analytics({ project, collection, env, envs, onEnvChange }) {
+export default function Analytics({ project, collection, collections, onCollectionChange, env, envs, onEnvChange }) {
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState('');
   const [data, setData] = useState(null);
@@ -922,6 +922,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
   const [deleting, setDeleting] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [restoring, setRestoring] = useState(null); // run id being restored
+  const [runsError, setRunsError] = useState('');
   const [syncingCi, setSyncingCi] = useState(false); // CI results being auto-synced
   const analyticsRef = useRef(null);
   const syncPollRef = useRef(null);
@@ -931,6 +932,7 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
     setLoading(true);
     setSelectedId('');
     setData(null);
+    setRunsError('');
     api.get('/execution/runs', { params: { project_id: project.id, include_archived: includeArchived ? 'true' : 'false' } })
       .then(({ data: d }) => {
         let list = (d.runs || []).filter(r => r.engine === 'jmeter');
@@ -975,7 +977,10 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           if (syncPollRef.current) { clearInterval(syncPollRef.current); syncPollRef.current = null; }
         }
       })
-      .catch(() => {})
+      .catch(e => {
+        console.error('[Analytics] Failed to fetch runs:', e);
+        setRunsError(e.response?.data?.error || e.message || 'Failed to load runs.');
+      })
       .finally(() => setLoading(false));
   }
 
@@ -1097,7 +1102,8 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics"
+        collections={collections} activeCollectionId={collection?.id} onCollectionChange={onCollectionChange} />
 
       {/* Top-level Analytics / Trend Analysis switcher */}
       <div style={{ display:'flex', gap:4, marginBottom:18, borderBottom:`1px solid ${D.border}` }}>
@@ -1142,6 +1148,10 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
           </label>
           {loading ? (
             <span style={{ fontSize:12, color:D.textSec }}><span className="spinner" /> Loading…</span>
+          ) : runsError ? (
+            <div style={{ fontSize:13, color:'#f87171' }}>
+              Failed to load runs: {runsError} — <a href="#" onClick={e => { e.preventDefault(); fetchRuns(showArchived); }} style={{ color:'#f87171', textDecoration:'underline' }}>retry</a>
+            </div>
           ) : (
             <>
               {runs.filter(r => !r.archived).length === 0 && !showArchived ? (

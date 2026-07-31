@@ -27,6 +27,7 @@ const { spawnSync } = require('child_process');
 const s3Sync = require('../utils/s3Sync');
 const resultsStore = require('../utils/resultsStore');
 const gitEngine = require('../utils/gitEngine');
+const { syncRunResultsToUserWorkspace } = require('../utils/resultsWorkspaceSync');
 
 /** Whether userId's chosen auth method for projectId is SSH (real local workspace) or PAT
  * (gitEngine, S3-backed, zero local disk) — mirrors collections.js's/testData.js's own copy. */
@@ -3338,6 +3339,15 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
 
+    // Mirror these results into effectiveUserId's own git workspace too, so they show up to
+    // commit/push in the Git panel like config.json/testData already do (see
+    // resultsWorkspaceSync.js). This is THE live run-creation path — execution.js's native/
+    // Docker-spawned POST /run is retired (410) — so this single call site also covers every
+    // CI-based auto-heal retry, since healCycleCI's quick/full re-runs both funnel back
+    // through this same function.
+    syncRunResultsToUserWorkspace({ id: newRunId, project_id: projectId, result_dir: resultDir }, effectiveUserId)
+      .catch(e => console.error('[Auto-sync] Failed to sync results into user workspace:', e.message));
+
     // Auto-heal logic:
     // • 100% failure (all requests errored) → always heal, regardless of auto_heal flag.
     //   Build targeted 400/401 instruction so AI knows exactly what to fix.
@@ -3909,6 +3919,11 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
     // ── Send email alert for CI run ───────────────────────────────────────────
     const newRunId = execRunRow.lastInsertRowid;
+
+    // Mirror these results into effectiveUserId's own git workspace too — see
+    // resultsWorkspaceSync.js and the matching call in autoSyncCiRun above.
+    syncRunResultsToUserWorkspace({ id: newRunId, project_id: req.params.projectId, result_dir: resultDir }, effectiveUserId)
+      .catch(e => console.error('[CI Sync] Failed to sync results into user workspace:', e.message));
     const suppressEmail = req.query.suppress_email === 'true' || (reportData?.summary?.total_requests || 0) === 0;
     if (!suppressEmail) setImmediate(async () => {
       try {

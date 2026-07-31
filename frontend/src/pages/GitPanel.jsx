@@ -127,6 +127,7 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
   // ── Git state ─────────────────────────────────────────────────────────────
   const [status,   setStatus]   = useState(null);
+  const [statusError, setStatusError] = useState('');
   const [branches, setBranches] = useState([]);
   const [log,      setLog]      = useState([]);
   const [prs,      setPrs]      = useState([]);
@@ -197,8 +198,14 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
 
       // Phase 2: load git workspace data in background (runs git commands — slower)
       if (c?.is_initialized) {
+        setStatusError('');
         Promise.all([
-          api.get(`/projects/${pid}/git/status`).catch(() => ({ data: { initialized: false } })),
+          // A failed /status call used to fall back to { initialized: false } indistinguishably
+          // from "repo really has nothing to commit" — the changed-files list (parseStatusFiles)
+          // renders empty either way, so a real backend error (S3/workspace hydration failure,
+          // etc.) looked exactly like a clean working tree. Now the real error is captured and
+          // shown instead of silently presenting an empty list.
+          api.get(`/projects/${pid}/git/status`).catch(e => { setStatusError(e.response?.data?.error || e.message || 'Failed to load git status.'); return { data: null }; }),
           api.get(`/projects/${pid}/git/log`).catch(() => ({ data: { commits: [] } })),
           api.get(`/projects/${pid}/git/branches`).catch(() => ({ data: { branches: [] } })),
         ]).then(([statusRes, logRes, branchRes]) => {
@@ -914,6 +921,12 @@ export default function GitPanel({ project, user, workflowOnly = false, setupOnl
               {pulling ? <><span className="spinner"/>Pulling…</> : <><i className="ti ti-download"/>Pull from {baseBranch}</>}
             </button>
           </div>
+
+          {statusError && (
+            <InlineAlert type="error">
+              Couldn't load git status: {statusError} — <a href="#" onClick={e => { e.preventDefault(); loadAll(); }} style={{ color:'inherit', textDecoration:'underline' }}>retry</a>
+            </InlineAlert>
+          )}
 
           {/* ── Changed Files card ── */}
           <div style={{ background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,marginBottom:16,overflow:'hidden' }}>

@@ -15,7 +15,7 @@ const ownsProject = require('../utils/ownsProject');
 const { getProjectPath, PROJECTS_ROOT, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
 const { generateAnalyticsPdf } = require('../utils/generateAnalyticsPdf');
 const { startAutoHeal, getHealStatus } = require('../utils/autoHealer');
-const { evaluateRules } = require('../utils/ruleEvaluator');
+const { evaluateRules, evaluateRulesFromContent } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
 const { parseJtl, parseJtlContent } = require('../utils/parseJtl');
 const s3Sync = require('../utils/s3Sync');
@@ -1205,6 +1205,14 @@ router.post('/run', auth, async (req, res) => {
     // Mirror results (JTL, jmeter.log) to S3 right away — additive, doesn't block anything below.
     s3Sync.uploadDir(resultDir, orgSlug).then(r => {
       if (!r.ok && !r.skipped) console.error('[Execution] S3 sync failed for', resultDir, ':', r.failed?.length, 'file(s)');
+      // Only once results are durably in S3: mirror them into the EXECUTING USER's own git
+      // workspace too, so they show up to commit/push in the Git panel like config.json/
+      // testData already do (see resultsWorkspaceSync.js for why this needs its own pass
+      // rather than just writing straight to disk here — result_dir is always rooted under
+      // the project's admin workspace, not whichever user actually ran the test).
+      const { syncRunResultsToUserWorkspace } = require('../utils/resultsWorkspaceSync');
+      syncRunResultsToUserWorkspace({ id: runId, project_id, result_dir: resultDir }, req.userId)
+        .catch(e => console.error('[Execution] Failed to sync results into user workspace:', e.message));
     });
 
     // ── Auto-zip JMeter HTML report into results folder ───────────────────────
@@ -1255,10 +1263,20 @@ router.post('/run', auth, async (req, res) => {
         `).get(targetRunId);
         if (!runRow) return;
 
-        const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
-        console.log('[Alerts] Checking JTL at:', jtlPath);
-        if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
+        // Read the JTL via resultsStore (S3-backed) rather than the local disk — this run may
+        // have executed in a spawned Docker container or on a container whose local disk this
+        // process never shares/retains, so `fs.existsSync` here used to silently bail out in
+        // production while working locally (native execution, same process, same disk). This
+        // was also the ONLY place in the run-completion flow that backfills execution_runs.
+        // report_data automatically, so its local-disk dependency meant runs never opened via
+        // the single-run Analytics view (which also backfills it) had no report_data at all —
+        // forcing every later read (including Trend Analysis for multiple runs) to fall back to
+        // this same JTL, which by then may genuinely never have synced to S3 either.
+        const orgSlugAlert = await resolveOrgSlugForProject(runRow.project_id);
+        console.log('[Alerts] Checking JTL via resultsStore for result_dir:', runRow.result_dir);
+        const jtlText = runRow.result_dir ? await resultsStore.readText(runRow.result_dir, orgSlugAlert, 'results.jtl') : null;
+        if (!jtlText) {
+          console.warn('[Alerts] JTL not found in S3 — result_dir:', runRow.result_dir);
           return;
         }
         console.log('[Alerts] JTL found, building report data for email...');
@@ -1268,13 +1286,14 @@ router.post('/run', auth, async (req, res) => {
           engine: runRow.engine, status: runRow.status,
           started_at: runRow.started_at, finished_at: runRow.finished_at,
         };
-        const parsed = parseJtl(jtlPath, runMeta);
+        const parsed = parseJtlContent(jtlText, runMeta);
         if (!parsed) return;
 
-        // Evaluate rules against this run's JTL so violations appear in the email
+        // Evaluate rules against this run's JTL so violations appear in the email — from the
+        // content already fetched via resultsStore above, not a local jtlPath (see note above).
         let ruleViolationsForEmail = [];
         try {
-          const rr = await evaluateRules(runRow.project_id, jtlPath);
+          const rr = await evaluateRulesFromContent(runRow.project_id, jtlText);
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
@@ -1385,12 +1404,24 @@ router.get('/runs', auth, async (req, res) => {
       WHERE project_id = ? AND status IN ('completed', 'failed')
         AND (no_results = 0 OR no_results IS NULL)
         AND finished_at >= NOW() - INTERVAL '7 days'
+        AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < NOW() - INTERVAL '2 minutes')
         AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
     `).all(project_id);
 
     syncingCount = unsyncedCiRuns.length;
     if (syncingCount > 0) {
       console.log(`[Auto-sync] Found ${syncingCount} unsynced CI run(s) for project ${project_id}`);
+      // Stamp before dispatching (not after completion) so a poll landing seconds later —
+      // this endpoint is polled every 5s while syncing_count > 0 — can't re-select the same
+      // run while its own sync-results attempt (up to ~2 minutes of artifact retries) is
+      // still in flight. See last_sync_attempt_at's schema.sql comment for the full story.
+      // NOTE: db.prepare(...).run() flattens a *single* array argument into individual
+      // positional params (its .run(idsArray) convenience case) — passing the id list that
+      // way would silently mis-bind against a single `= ANY(?)` placeholder. Building the
+      // placeholder list explicitly and passing ids as separate args (run(...ids)) avoids that.
+      const idPlaceholders = unsyncedCiRuns.map(() => '?').join(',');
+      await db.prepare(`UPDATE ci_pipeline_runs SET last_sync_attempt_at = NOW() WHERE id IN (${idPlaceholders})`)
+        .run(...unsyncedCiRuns.map(r => r.id));
       const http = require('http');
       const authHeader = req.headers.authorization || '';
       for (const ciRun of unsyncedCiRuns) {
@@ -1418,16 +1449,29 @@ router.get('/runs', auth, async (req, res) => {
   const includeArchived = req.query.include_archived === 'true';
   const runs = await db.prepare(`
     SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id,
+           c.environment as col_environment, c.environments as col_environments,
            ci.web_url as ci_web_url, ci.provider as ci_provider, ci.external_id as ci_external_id
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
+    LEFT JOIN collections c ON c.id = s.collection_id
     LEFT JOIN ci_pipeline_runs ci ON ci.id = r.ci_run_id
     WHERE r.project_id = ? AND (r.archived = 0 OR r.archived IS NULL OR ? = 1)
     ORDER BY r.started_at DESC
   `).all(project_id, includeArchived ? 1 : 0);
 
-  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
+  const { GIT_WORKSPACES_ROOT, resolveSuiteEnv } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
+    // test_suites.env is frequently blank (suite relies on its collection's default
+    // env instead — see resolveSuiteEnv's own doc comment) — every other place that
+    // needs a suite's real environment (autoSyncCiRun, ciPipeline's manual sync route)
+    // already calls resolveSuiteEnv() for this reason. This list endpoint was reading
+    // the raw, often-null s.env straight into suite_env instead, so any CI-synced run
+    // whose suite had no explicit env silently vanished from Analytics the moment the
+    // frontend filtered runs down to a specific environment tab — even though the run
+    // genuinely existed and had real results.
+    if (r.collection_id) {
+      r.suite_env = resolveSuiteEnv({ environment: r.col_environment, environments: r.col_environments }, { env: r.suite_env });
+    }
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
       // Use lower-case comparison to handle Windows case-insensitive paths

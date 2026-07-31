@@ -364,6 +364,16 @@ CREATE TABLE IF NOT EXISTS ci_pipeline_runs (
 -- "no execution_runs row yet" looked identical to "haven't tried syncing yet".
 ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS no_results INTEGER DEFAULT 0;
 
+-- Throttles execution.js's GET /runs background catch-up (see the matching comment there):
+-- a sync attempt that fails with something OTHER than "no artifact ever produced" (the only
+-- case that marks no_results) — e.g. a real exception writing results for a brand-new
+-- environment's first-ever run — used to be retried from scratch on every single page load,
+-- forever, with no cooldown. Multiple browser tabs/5s-interval polls could each kick off their
+-- own ~2-minute artifact-retry loop for the SAME stuck run concurrently, piling up and
+-- degrading the whole server. This column lets the catch-up query skip a run it just attempted
+-- until enough time has passed for that attempt to have actually finished.
+ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS last_sync_attempt_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS ci_auto_heal_logs (
   id            SERIAL PRIMARY KEY,
   ci_run_id     INTEGER NOT NULL,

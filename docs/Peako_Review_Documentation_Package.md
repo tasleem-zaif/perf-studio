@@ -1,6 +1,12 @@
 # Peako (PerfStudio) — Technical & Security Review Documentation Package
 
-*Converted from [Peako_Review_Documentation_Package.docx](Peako_Review_Documentation_Package.docx) for in-repo readability. The .docx is the canonical formatted version; this file is a plain-text/Markdown mirror of the same content.*
+*Converted from Peako_Review_Documentation_Package.docx for in-repo readability (the .docx itself is not committed to this repo). This file is a plain-text/Markdown mirror of that content.*
+
+> ⚠ **STALE — flagged 2026-07-31, not yet corrected.** This document predates two major, already-merged architectural changes and has **not** been updated to reflect them (unlike README.md, PROJECT_MAP.md, and docs/ARCHITECTURE.md/DEPLOYMENT.md/LOCAL_SETUP.md/USER_WORKFLOW.md, which have been corrected as of this date):
+> 1. **Script generation is deterministic, not AI-generated.** Several places below (e.g. §1.1) state that "an AI model (OpenAI/Claude/Gemini etc) generates a JMeter or K6 load-test script" — this has never been accurate for the current codebase: `testSuites.js`'s `generateJmx()`/`generateK6()` build the script directly via a deterministic template builder, with no LLM call in either path. AI is used only for auto-heal diagnosis and an optional per-endpoint pre-run fix.
+> 2. **Local/native/Docker-spawned test execution is retired.** Every reference below to native execution, `EXECUTION_MODE=docker`, spawned JMeter/K6 containers, or a `PerfStudio_git` persistent volume describes a since-retired design. Every such execution route now returns HTTP 410; the only real execution path today is external CI (GitHub Actions/GitLab CI/Bitbucket Pipelines). `git-workspaces` is now S3-backed (PAT auth) or a RAM-backed tmpfs mount (SSH auth) — there is no `PerfStudio_git` volume anymore. AWS S3 (or an S3-compatible store) is also now a mandatory, boot-blocking dependency, which this document does not mention at all.
+>
+> A full correction pass of this ~800-line document (and its `.docx` original) was intentionally **not** done in this same session — it's large enough to warrant its own scoped pass rather than folding it into the same edit as the other docs above. See the corrected, current-state DevOps architecture document produced 2026-07-31 (delivered in-chat and as a `.docx`) for accurate current-state content in the meantime.
 
 ---
 

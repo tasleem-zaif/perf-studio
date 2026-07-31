@@ -2,13 +2,14 @@ flowchart TB
     Browser["Your Browser<br/>Performance Studio Web App<br/>React · Vite"]
     RH["Request Handler<br/>Processes all user actions"]
 
-    subgraph Server["Performance Studio Server"]
+    subgraph Server["Performance Studio Server<br/>(never runs JMeter/K6 itself)"]
         RH
-        AI["AI Engine<br/>Generates test scripts"]
+        AI["AI Engine<br/>Auto-heal diagnosis + pre-run 'Fix with AI'<br/>NOT used for initial script generation"]
         EA["Email Alerts<br/>Sends reports after each run"]
-        VC["Version Control<br/>Tracks scripts via Git"]
-        TE["Test Executor<br/>Runs JMeter and K6"]
-        AH["Auto-Healer<br/>Fixes scripts after a failed run"]
+        VC["Version Control<br/>Tracks scripts via Git<br/>PAT-mode: S3-backed, zero local disk<br/>SSH-mode: real git binary, tmpfs-only disk"]
+        SG["Script Generator<br/>Deterministic JMX/K6 template builder"]
+        CI["CI Trigger<br/>Pushes script, dispatches pipeline,<br/>polls status, downloads result artifact"]
+        AH["Auto-Healer<br/>Diagnoses a FAILED CI run,<br/>pushes a fixed script, re-triggers CI"]
     end
 
     subgraph ExtSvc["External Services"]
@@ -17,33 +18,40 @@ flowchart TB
         GP["Git Platform<br/>GitHub · GitLab · Bitbucket"]
     end
 
-    subgraph ExecEnv["Test Execution Environment"]
-        TC["Test Container<br/>JMeter · K6 · Java · Node.js"]
+    subgraph ExecEnv["External CI Runner<br/>(GitHub Actions / GitLab CI / Bitbucket Pipelines)<br/>— JMeter/K6 execute HERE, not on the Peako server"]
+        TC["CI Job Container<br/>JMeter · K6"]
+        Target["Target Application Under Test"]
     end
 
     subgraph Storage["Data Storage"]
-        DB[("Database<br/>PostgreSQL")]
-        FS["File Storage<br/>Scripts · Test data · Reports"]
+        DB[("PostgreSQL<br/>users, projects, configs, run metadata")]
+        S3[("AWS S3 (or compatible)<br/>MANDATORY — app refuses to boot without it<br/>all run results (JTL/report/PDF) + PAT-mode git workspaces")]
     end
 
     Browser -->|User actions| RH
     RH --> AI
     RH --> EA
     RH --> VC
-    RH --> TE
+    RH --> SG
+    RH --> CI
 
-    AI -->|Generate script| AIP
+    AI -->|Diagnose / suggest fix| AIP
     EA -->|Send report| ES
     VC -->|Push / pull| GP
-    TE -->|Launch container| TC
-    TC -->|Save results| FS
+    CI -->|Dispatch workflow/pipeline| GP
+    GP -->|Runs generated workflow file| TC
+    TC -->|Load test| Target
+    TC -->|Upload JTL + HTML report as CI artifact| GP
+    CI -->|Poll status, download artifact| GP
+    CI -->|Write results| S3
 
-    TE ==>|Run fails rules| AH
-    AH ==>|Ask AI to fix| AI
-    AH ==>|Overwrite script| FS
-    AH ==>|Rerun| TE
+    TC ==>|CI run failed| AH
+    AH ==>|Ask AI to diagnose| AI
+    AH ==>|Push fixed script| VC
+    AH ==>|Re-trigger| CI
 
     RH -.-> DB
-    TE -.-> DB
+    CI -.-> DB
     AH -.-> DB
     VC -.-> DB
+    VC -.-> S3

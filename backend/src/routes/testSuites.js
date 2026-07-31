@@ -923,13 +923,25 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
   // Recorded/correlated headers are added FIRST so a specific correlation rule (e.g. this
   // endpoint's Authorization needs ${refreshToken}, not the blanket default) wins; the
   // blanket "any non-login request gets the default token" fallback below only fires when
-  // this endpoint recorded no Authorization header of its own to correlate.
+  // this endpoint's Authorization is still a literal (no rule rewrote it to a ${var}
+  // reference yet) — NOT merely "absent". A realistically recorded collection almost always
+  // HAS a literal Authorization header (whatever token was live at recording time), so
+  // requiring it to be absent meant this fallback effectively never fired: correlation
+  // detection matches by comparing that old recorded token's literal bytes against values
+  // captured during THIS pre-run — but a login endpoint issues a brand-new token every time,
+  // so the old recorded literal can never contain a byte-for-byte match against a fresh one
+  // and no rule ever gets created for it, silently baking the stale recorded token into every
+  // generated script instead of a dynamic reference.
   for (const [k, v] of Object.entries(headers)) {
     if (!headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase()))
       headerEntries.push({ name: k, value: String(v) });
   }
-  if (!isLogin && tokenVar && !headerEntries.find(h => h.name.toLowerCase() === 'authorization')) {
-    headerEntries.push({ name: 'Authorization', value: `Bearer \${${tokenVar}}` });
+  const authEntryIdx = headerEntries.findIndex(h => h.name.toLowerCase() === 'authorization');
+  const authIsDynamic = authEntryIdx !== -1 && /\$\{/.test(headerEntries[authEntryIdx].value);
+  if (!isLogin && tokenVar && !authIsDynamic) {
+    const dynamicAuth = { name: 'Authorization', value: `Bearer \${${tokenVar}}` };
+    if (authEntryIdx === -1) headerEntries.push(dynamicAuth);
+    else headerEntries[authEntryIdx] = dynamicAuth;
   }
   // A saved per-endpoint fix normally wins — add or replace by header name (e.g. swap the
   // default accessToken Authorization value for {{captured:refreshToken}}'s JMeter var) —
@@ -1320,7 +1332,15 @@ function buildK6Request(ep, index, ctx) {
     const lower = k.toLowerCase();
     if (!(lower in keyByLower)) { keyByLower[lower] = k; headerEntries[k] = String(v); }
   }
-  if (!isLogin && tokenVar && !('authorization' in keyByLower)) {
+  // Fallback fires unless a rule already rewrote Authorization to a dynamic reference — see
+  // buildSamplerXml's matching comment: requiring it to be merely ABSENT effectively never
+  // fired, since a realistically recorded collection almost always has a literal (now-stale)
+  // Authorization value and correlation detection can't match a login's freshly-issued token
+  // against that old literal's bytes.
+  const existingAuthKey = keyByLower['authorization'];
+  const authIsDynamic = existingAuthKey && /\$\{/.test(headerEntries[existingAuthKey]);
+  if (!isLogin && tokenVar && !authIsDynamic) {
+    if (existingAuthKey && existingAuthKey !== 'Authorization') delete headerEntries[existingAuthKey];
     headerEntries['Authorization'] = `Bearer \${${tokenVar}}`;
     keyByLower['authorization'] = 'Authorization';
   }
