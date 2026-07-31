@@ -169,6 +169,22 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
     return e;
   })();
 
+  // Explicit collection switch — there was previously NO way to view a project's OTHER
+  // collections on env-aware pages (Analytics/Reports/Rules/Alerts/Test Plans): activeCollection
+  // was only ever set once by the auto-select effect above, so a project with 2+ collections
+  // (e.g. one per environment/release) had every one of its collections' runs/rules/config
+  // permanently invisible except whichever got auto-selected. Switching here also resets the
+  // active env to the newly-picked collection's own first environment, since the old env may
+  // not even apply to it.
+  function selectCollection(col) {
+    if (!col || col.id === activeCollection?.id) return;
+    setActiveCollection(col);
+    let envs = [];
+    try { envs = JSON.parse(col.environments || '[]'); } catch {}
+    if (!envs.length && col.environment) envs = [col.environment];
+    setActiveEnv(envs.length ? envs[0] : null);
+  }
+
   function navigate(pageId) {
     setActivePage(pageId);
     // Update browser URL — overview → /projects/:id, section → /projects/:id/section
@@ -190,7 +206,7 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
     setSuitesVersion(v => v + 1);
   }
 
-  const shared = { project, collection: activeCollection, env: activeEnv, envs: collectionEnvs, onEnvChange: setActiveEnv, onNav: navigate, onProjectUpdated };
+  const shared = { project, collection: activeCollection, collections, onCollectionChange: selectCollection, env: activeEnv, envs: collectionEnvs, onEnvChange: setActiveEnv, onNav: navigate, onProjectUpdated };
   const stats = [
     { label: 'API SOURCES', value: collections.length,        color: '#22c55e', iconBg: '#dcfce7', icon: 'ti-braces',                link: 'collections' },
     { label: 'RULES',       value: project?.rules?.length || 0, color: '#3b82f6', iconBg: '#dbeafe', icon: 'ti-adjustments-horizontal', link: 'rules' },
@@ -279,8 +295,8 @@ export default function ProjectWorkspace({ project, user, projects, onBack, onPr
         case 'test-suites': return <TestSuites project={project} {...shared} openModalTrigger={testSuitesModalTrig} onAfterSave={refreshJmeterCheck} />;
         case 'alerts':      return <Alerts project={project} {...shared} />;
         case 'runner':      return null; // rendered persistently below to preserve logs state
-        case 'analytics':   return <Analytics project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
-        case 'reports':     return <Reports project={project} collection={activeCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
+        case 'analytics':   return <Analytics project={project} collection={activeCollection} collections={collections} onCollectionChange={selectCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
+        case 'reports':     return <Reports project={project} collection={activeCollection} collections={collections} onCollectionChange={selectCollection} env={activeEnv} envs={collectionEnvs} onEnvChange={setActiveEnv} />;
         case 'recorder':    return <Recorder onAppNav={onAppNav} />;
         default: return null;
       }

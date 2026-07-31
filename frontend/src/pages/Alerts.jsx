@@ -10,7 +10,7 @@ const BLANK_CFG = {
   enabled: false,
 };
 
-export default function Alerts({ project, collection, env, envs, onEnvChange }) {
+export default function Alerts({ project, collection, collections, onCollectionChange, env, envs, onEnvChange }) {
   const { toast } = useToast();
   const [cfg, setCfg]             = useState({ ...BLANK_CFG });
   const [saving, setSaving]       = useState(false);
@@ -124,7 +124,8 @@ export default function Alerts({ project, collection, env, envs, onEnvChange }) 
 
   return (
     <div className="page fade-in">
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to configure alert settings" />
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to configure alert settings"
+        collections={collections} activeCollectionId={collection?.id} onCollectionChange={onCollectionChange} />
       <div style={{ maxWidth: 740, display: 'flex', flexDirection: 'column', gap: 20 }}>
 
         {/* SMTP Config */}

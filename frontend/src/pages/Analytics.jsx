@@ -906,7 +906,7 @@ function LogsTab({ data, ciWebUrl, ciProvider, ciExternalId }) {
 }
 
 // ── main component ────────────────────────────────────────────────────────────
-export default function Analytics({ project, collection, env, envs, onEnvChange }) {
+export default function Analytics({ project, collection, collections, onCollectionChange, env, envs, onEnvChange }) {
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState('');
   const [data, setData] = useState(null);
@@ -1102,7 +1102,8 @@ export default function Analytics({ project, collection, env, envs, onEnvChange 
 
   return (
     <div className="page fade-in" style={{ background: D.pageBg, color: D.textPri }}>
-      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics" />
+      <EnvBar envs={envs} activeEnv={env} onEnvChange={onEnvChange} hint="Select environment to view performance analytics"
+        collections={collections} activeCollectionId={collection?.id} onCollectionChange={onCollectionChange} />
 
       {/* Top-level Analytics / Trend Analysis switcher */}
       <div style={{ display:'flex', gap:4, marginBottom:18, borderBottom:`1px solid ${D.border}` }}>
