@@ -645,7 +645,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '2px solid #e2e8f0' }}>
         {[
           { id: 'ci-pipeline', icon: 'ti-brand-gitlab',   label: 'CI Pipeline'    },
-          { id: 'single',      icon: 'ti-player-play',   label: 'Local Test Run' },
+          false && { id: 'single', icon: 'ti-player-play', label: 'Local Test Run' }, // hidden — keep code for future use
         ].filter(t => t).map(t => (
           <button key={t.id} onClick={() => setRunTab(t.id)}
             style={{

@@ -11,8 +11,8 @@ import SMTPConfigPanel from '../components/SMTPConfigPanel';
 const PROVIDERS = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'claude', label: 'Anthropic (Claude)' },
-  { value: 'gemini', label: 'Google Gemini' },
-  { value: 'azure',  label: 'Azure OpenAI' },
+  // Google Gemini and Azure OpenAI removed from the selectable list — keep their entries in
+  // MODELS/DEFAULT_MODEL below so existing configs saved with those providers keep working.
 ];
 
 // This list is a manually curated snapshot, not a live fetch from OpenAI/Anthropic — it will
@@ -696,7 +696,6 @@ function ModelRow({ icon, title, subtitle, value, rawValue, onChange, models, ic
 function AIConfigPanel({ user }) {
   const [provider,          setProvider]          = useState('openai');
   const [model,             setModel]              = useState('');
-  const [healModel,         setHealModel]          = useState('');
   const [apiKey,            setApiKey]             = useState('');
   const [keySet,            setKeySet]             = useState(false);
   const [azureEndpoint,     setAzureEndpoint]      = useState('');
@@ -709,7 +708,6 @@ function AIConfigPanel({ user }) {
     api.get('/settings/ai').then(({ data }) => {
       setProvider(data.provider || 'openai');
       setModel(data.model || DEFAULT_MODEL[data.provider || 'openai'] || '');
-      setHealModel(data.heal_model || '');
       setKeySet(data.api_key_set);
       setAzureEndpoint(data.azure_endpoint || '');
       setAzureApiVersion(data.azure_api_version || '');
@@ -719,7 +717,6 @@ function AIConfigPanel({ user }) {
   function handleProviderChange(val) {
     setProvider(val);
     setModel(DEFAULT_MODEL[val] || '');
-    setHealModel('');
   }
 
   async function save() {
@@ -727,10 +724,11 @@ function AIConfigPanel({ user }) {
     if (provider === 'azure' && !azureEndpoint.trim()) return setError('Azure endpoint required');
     setSaving(true); setError(''); setSaved(false);
     try {
+      const effectiveModel = model || DEFAULT_MODEL[provider];
       const body = {
         provider,
-        model:      model      || DEFAULT_MODEL[provider],
-        heal_model: healModel  || DEFAULT_MODEL[provider],
+        model:      effectiveModel,
+        heal_model: effectiveModel,
         azure_endpoint:    azureEndpoint.trim(),
         azure_api_version: azureApiVersion.trim(),
       };
@@ -744,8 +742,7 @@ function AIConfigPanel({ user }) {
   }
 
   const providerModels  = MODELS[provider] || [];
-  const effectiveModel  = model      || DEFAULT_MODEL[provider] || '';
-  const effectiveHeal   = healModel  || DEFAULT_MODEL[provider] || '';
+  const effectiveModel  = model || DEFAULT_MODEL[provider] || '';
 
   const isRegularUser = user?.role === 'user';
 
@@ -775,8 +772,8 @@ function AIConfigPanel({ user }) {
 
       <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
         {isRegularUser
-          ? 'AI models configured by your Org Admin for this organization.'
-          : 'Configure separate AI models for script generation and auto-healing. Both use the same provider and API key.'}
+          ? 'AI model configured by your Org Admin for this organization.'
+          : 'Configure the AI provider and model used for both script generation and auto-healing.'}
       </div>
 
       {!isRegularUser && error && <div className="auth-error" style={{ marginBottom: '16px' }}>{error}</div>}
@@ -819,29 +816,15 @@ function AIConfigPanel({ user }) {
         </>
       )}
 
-      {/* Script generation model */}
+      {/* AI model — used for both script generation and auto-healing */}
       <ModelRow
-        icon="ti-code"
+        icon="ti-sparkles"
         iconColor="var(--accent)"
-        title="Script Generation Model"
-        subtitle="Used when generating JMX / K6 scripts from your API collections"
+        title="AI Model"
+        subtitle="Used for both generating JMX / K6 scripts and diagnosing/fixing failed test runs"
         value={effectiveModel}
         rawValue={model}
         onChange={isRegularUser ? () => {} : setModel}
-        models={providerModels}
-        disabled={isRegularUser}
-        placeholder={provider === 'azure' ? 'e.g. gpt-4o-deployment — your Azure deployment name' : undefined}
-      />
-
-      {/* Auto healer model */}
-      <ModelRow
-        icon="ti-first-aid-kit"
-        iconColor="#f59e0b"
-        title="Auto Healer Model"
-        subtitle="Used when diagnosing and fixing failed test runs (reasoning-heavy — use a smarter model)"
-        value={effectiveHeal}
-        rawValue={healModel}
-        onChange={isRegularUser ? () => {} : setHealModel}
         models={providerModels}
         disabled={isRegularUser}
         placeholder={provider === 'azure' ? 'e.g. gpt-4o-deployment — your Azure deployment name' : undefined}
