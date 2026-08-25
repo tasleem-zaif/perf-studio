@@ -59,7 +59,7 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   const log = (type, msg) => logFn(type, msg);
 
   // ── Resolve suite and project ─────────────────────────────────────────────
-  const suite   = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
+  const suite   = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(suiteId, projectId, userId);
   if (!suite)   return { passed: false, error: `Test suite not found (id=${suiteId})` };
   const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   if (!project) return { passed: false, error: 'Project not found' };
@@ -99,7 +99,7 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
   let resultDir;
   try {
     if (suite.collection_id) {
-      const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, userId);
       // resolveSuiteEnv falls back to the collection's own default env when suite.env
       // is blank — a collection-scoped suite should never drop to the project-level
       // fallback below just because its env wasn't explicitly set.
@@ -173,7 +173,7 @@ async function runSuite({ suiteId, projectId, userId, logFn = () => {} }) {
         let passed = true;
         try {
           if (fs.existsSync(jtlPath)) {
-            const ruleResult = await evaluateRules(projectId, jtlPath);
+            const ruleResult = await evaluateRules(projectId, jtlPath, userId);
             if (!ruleResult.noRules) {
               passed = ruleResult.passed;
               (ruleResult.violations || []).forEach(async v => log('warn', `  ⚠ Rule: ${v.label}`));

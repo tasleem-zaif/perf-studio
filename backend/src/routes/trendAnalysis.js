@@ -181,13 +181,13 @@ router.get('/runs/filter-options', async (req, res) => {
     // "environment" options come from test_suites.env (the real, always-populated
     // environment concept — see the METADATA_FIELDS comment above), not a tagged column.
     const envRows = await db.prepare(
-      "SELECT DISTINCT env as value FROM test_suites WHERE project_id = ? AND env IS NOT NULL AND env != '' ORDER BY env"
-    ).all(projectId);
+      "SELECT DISTINCT env as value FROM test_suites WHERE project_id = ? AND user_id = ? AND env IS NOT NULL AND env != '' ORDER BY env"
+    ).all(projectId, req.userId);
     options.environment = envRows.map(r => r.value);
 
     const suites = await db.prepare(
-      'SELECT id, name FROM test_suites WHERE project_id = ? ORDER BY name'
-    ).all(projectId);
+      'SELECT id, name FROM test_suites WHERE project_id = ? AND user_id = ? ORDER BY name'
+    ).all(projectId, req.userId);
     options.test_plans = suites;
     res.json(options);
   } catch (err) {

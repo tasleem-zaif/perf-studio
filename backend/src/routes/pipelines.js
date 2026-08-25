@@ -179,7 +179,7 @@ router.post('/:id/run', auth, async (req, res) => {
 
       // Parse JTL now so Analytics never needs to read from disk later
       const jtlPath    = result.jtlPath || null;
-      const stepSuite  = await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(step.suite_id);
+      const stepSuite  = await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(step.suite_id, req.userId);
       const cachedData = jtlPath ? parseJtl(jtlPath, {
         run_id: execRunId, suite_name: stepSuite?.name || step.name,
         engine: stepEngine, started_at: stepsResult[i].started_at,

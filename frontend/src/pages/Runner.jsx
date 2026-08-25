@@ -401,6 +401,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciProvider,     setCiProvider]     = useState('gitlab');
   const [ciScriptName,   setCiScriptName]   = useState('');
   const [ciScriptPath,   setCiScriptPath]   = useState('');
+  const [ciSuiteEngine,  setCiSuiteEngine]  = useState('jmeter');
   const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300, iter_mode: 'duration' });
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
@@ -510,11 +511,17 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         provider:      ciProvider,
         script_name:   ciScriptName,
         script_path:   ciScriptPath,
+        engine: ciSuiteEngine,
         jmeter_users:    ciVars.jmeter_users,
         jmeter_rampup:   ciVars.jmeter_rampup,
         // Pass only the active param; set the other to -1 so JMeter ignores it
         jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
+        // k6 uses the same VUsers/Duration/Loops fields the UI already collects — just
+        // routed under k6's own variable names so the generated pipeline picks them up.
+        k6_vus:        ciVars.jmeter_users,
+        k6_duration:   ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : 0,
+        k6_iterations: ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : 0,
         auto_heal: ciAutoHeal ? 1 : 0,
       });
       const providerLabel = ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket Pipelines';
@@ -856,6 +863,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                             const fileName = file.split('/').pop();
                             setCiScriptName(fileName);
                             setCiScriptPath(relPath);
+                            setCiSuiteEngine(selected.engine || 'jmeter');
                             // Pre-fill load parameters from the saved test suite configuration
                             setCiVars(v => ({
                               ...v,

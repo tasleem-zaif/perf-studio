@@ -51,9 +51,9 @@ router.get('/collections', auth, async (req, res) => {
              p.name AS project_name
       FROM   collections c
       JOIN   projects p ON p.id = c.project_id
-      WHERE  c.project_id IN (${sub})
+      WHERE  c.project_id IN (${sub}) AND c.user_id = ?
       ORDER  BY p.name ASC, c.name ASC
-    `).all(...params);
+    `).all(...params, req.userId);
 
     res.json({ collections, total: collections.length });
   } catch (err) {
@@ -72,9 +72,9 @@ router.get('/rules', auth, async (req, res) => {
              p.name AS project_name
       FROM   rules r
       JOIN   projects p ON p.id = r.project_id
-      WHERE  r.project_id IN (${sub})
+      WHERE  r.project_id IN (${sub}) AND r.user_id = ?
       ORDER  BY p.name ASC, r.metric ASC
-    `).all(...params);
+    `).all(...params, req.userId);
 
     res.json({ rules, total: rules.length });
   } catch (err) {
@@ -93,9 +93,9 @@ router.get('/test-plans', auth, async (req, res) => {
              p.name AS project_name
       FROM   test_suites ts
       JOIN   projects p ON p.id = ts.project_id
-      WHERE  ts.project_id IN (${sub})
+      WHERE  ts.project_id IN (${sub}) AND ts.user_id = ?
       ORDER  BY p.name ASC, ts.name ASC
-    `).all(...params);
+    `).all(...params, req.userId);
 
     res.json({ test_plans: testPlans, total: testPlans.length });
   } catch (err) {
@@ -114,9 +114,9 @@ router.get('/test-data', auth, async (req, res) => {
              p.name AS project_name
       FROM   test_data_files tdf
       JOIN   projects p ON p.id = tdf.project_id
-      WHERE  tdf.project_id IN (${sub})
+      WHERE  tdf.project_id IN (${sub}) AND tdf.user_id = ?
       ORDER  BY p.name ASC, tdf.original_name ASC
-    `).all(...params);
+    `).all(...params, req.userId);
 
     res.json({ test_data: files, total: files.length });
   } catch (err) {

@@ -48,8 +48,8 @@ before(async () => {
     // Recorded with a stale session value — the correlation rule below replaces it.
     { name: 'Get Profile', method: 'GET', url: 'https://api.example.com/me', headers: { 'X-Session': 'sess_9f8e7d6c5b' }, body: '', queryParams: {} },
   ];
-  const c = await db.prepare('INSERT INTO collections (project_id, name, json_content, environment) VALUES (?, ?, ?, ?)')
-    .run(projectId, 'Override Precedence Test Collection', JSON.stringify(endpoints), 'Default');
+  const c = await db.prepare('INSERT INTO collections (project_id, user_id, name, json_content, environment) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, userId, 'Override Precedence Test Collection', JSON.stringify(endpoints), 'Default');
   collectionId = c.lastInsertRowid;
 
   const confirmedRule = {
@@ -65,8 +65,8 @@ before(async () => {
     headers: { 'X-Session': '{{captured:staleSessionKey}}' },
     issue: 'stale pre-correlation fix', fix: 'stale', updatedAt: new Date(0).toISOString(),
   };
-  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
-    .run(collectionId, 'Default', JSON.stringify({ correlationRules: [confirmedRule], endpointOverrides: { 1: staleOverride } }));
+  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)')
+    .run(collectionId, 'Default', JSON.stringify({ correlationRules: [confirmedRule], endpointOverrides: { 1: staleOverride } }), projectId, userId);
 });
 
 after(async () => {

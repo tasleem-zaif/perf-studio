@@ -8,6 +8,8 @@ const { getProjectPath, resolveOrgSlugForProject } = require('./projectFolders')
 const { evaluateRules, evaluateRulesFromContent } = require('./ruleEvaluator');
 const { patchJmxForParams } = require('./patchJmx');
 const { resolveForScript, extractAllTokens } = require('./preRunEngine');
+const { parseK6Content } = require('./parseK6');
+const { extractK6VarRefs, extractK6DefinedVars, extractK6Hostnames } = require('./analyzeK6Script');
 const s3Sync = require('./s3Sync');
 const resultsStore = require('./resultsStore');
 
@@ -132,6 +134,40 @@ function classifyErrorsFromContent(content) {
     }
   }
 
+  const isInfra = total > 0 && (infra / total) >= 0.70;
+  return {
+    isInfra,
+    infraCount: infra, scriptCount: script, total,
+    summary: isInfra
+      ? `${infra}/${total} errors are server/network-side (${[...infraReasons].join(', ')})`
+      : '',
+  };
+}
+
+/**
+ * k6 counterpart of classifyErrorsFromContent — same infra-vs-script heuristic (>=70% of
+ * failures carrying a 5xx/429 code or a known infra message pattern means "server/network
+ * problem, script changes won't help"), but reads from parseK6Content's already-grouped
+ * `errors[]` (each entry already carries a `count`) instead of re-scanning raw CSV rows.
+ */
+function classifyK6ErrorsFromResult(parsed) {
+  if (!parsed || !parsed.errors?.length) return { isInfra: false, infraCount: 0, scriptCount: 0, total: 0, summary: '' };
+  let infra = 0, script = 0;
+  const infraReasons = new Set();
+  for (const e of parsed.errors) {
+    const rc  = (e.response_code || '').toString();
+    const msg = `${e.response_message || ''} ${e.failure_message || ''}`.toLowerCase();
+    const isInfraCode = INFRA_CODES.has(rc) || rc === '0' || rc === '' || rc === 'unknown';
+    const isInfraMsg  = INFRA_MSG_PATTERNS.some(p => msg.includes(p));
+    if (isInfraCode || isInfraMsg) {
+      infra += e.count;
+      if (rc && rc !== '0' && rc !== 'unknown') infraReasons.add(`HTTP ${rc}`);
+      else { const m = INFRA_MSG_PATTERNS.find(p => msg.includes(p)); if (m) infraReasons.add(m); }
+    } else {
+      script += e.count;
+    }
+  }
+  const total = infra + script;
   const isInfra = total > 0 && (infra / total) >= 0.70;
   return {
     isInfra,
@@ -278,7 +314,7 @@ async function spawnRun(userId, originalRun, suite, project, mode) {
     // Determine pass/fail via Rule Engine → raw fail count fallback
     let finalStatus = 'completed';
     if (jtlPath && fs.existsSync(jtlPath)) {
-      const ruleResult = await evaluateRules(originalRun.project_id, jtlPath);
+      const ruleResult = await evaluateRules(originalRun.project_id, jtlPath, userId);
       if (!ruleResult.noRules) {
         if (ruleResult.passed === false) {
           finalStatus = 'failed';
@@ -448,6 +484,65 @@ function parseJtlComprehensiveFromContent(content) {
   return out;
 }
 
+/**
+ * k6 counterpart of parseJtlComprehensiveFromContent — same grouped-by-label/code shape
+ * and failure-category buckets diagnoseWithAi/tryEndpointOverridePatch consume, built from
+ * parseK6Content's `errors[]` (already grouped by label+code, with a `count`) instead of
+ * per-row CSV. k6's parser never populates response_message/failure_message (no equivalent
+ * signal in k6's JSON output), so category detection here leans on the HTTP status code
+ * alone where the JMeter version would also inspect free-text failure messages — assertion/
+ * variable-reference categorization is consequently less precise for k6 (those two buckets
+ * will rarely populate), but DNS/correlation/request-malfunction — the categories that
+ * matter most for endpoint-scoped auto-heal — work identically since they're code-driven.
+ */
+function parseK6ComprehensiveFromResult(parsed) {
+  const empty = {
+    byLabel: {}, byCode: {},
+    assertionErrors: [], correlationErrors: [],
+    variableErrors: [], dnsErrors: [], requestErrors: [],
+    totalFail: 0, errorSummaryText: '',
+  };
+  if (!parsed || !parsed.errors?.length) return empty;
+
+  const out = { ...empty, byLabel: {}, byCode: {} };
+
+  for (const e of parsed.errors) {
+    const label   = e.label || '';
+    const code    = (e.response_code || '').toString();
+    const msg     = e.response_message || '';
+    const failMsg = e.failure_message || '';
+    const combo   = (code + ' ' + msg + ' ' + failMsg).toLowerCase();
+    out.totalFail += e.count;
+
+    if (!out.byLabel[label]) out.byLabel[label] = { count: 0, codes: {}, samples: [] };
+    out.byLabel[label].count += e.count;
+    out.byLabel[label].codes[code] = (out.byLabel[label].codes[code] || 0) + e.count;
+    if (out.byLabel[label].samples.length < 3) out.byLabel[label].samples.push({ code, msg: msg.slice(0, 120), failMsg: failMsg.slice(0, 200) });
+    out.byCode[code] = (out.byCode[code] || 0) + e.count;
+
+    const entry = { label, code, msg: msg.slice(0, 120), failMsg: failMsg.slice(0, 200) };
+
+    if (!code || code === '0' || code === 'unknown' || combo.includes('connection refused') ||
+        combo.includes('no route to host') || combo.includes('econnrefused') ||
+        combo.includes('connect timed out') || combo.includes('host not found')) {
+      out.dnsErrors.push(entry);
+    } else if (code === '401' || code === '403') {
+      out.correlationErrors.push(entry);
+    } else {
+      out.requestErrors.push(entry); // 400, 404, 405, 422, other 4xx/5xx
+    }
+  }
+
+  out.errorSummaryText = Object.entries(out.byLabel)
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([lbl, d]) => {
+      const codes = Object.entries(d.codes).map(([c, n]) => `${c}×${n}`).join(', ');
+      return `  [${lbl}] ${d.count} failures  codes: ${codes}`;
+    }).join('\n');
+
+  return out;
+}
+
 // Extract hostnames declared in JMX HTTPSampler.domain or UDV URLs
 function extractHostnames(scriptContent) {
   const hosts = new Set();
@@ -474,15 +569,17 @@ async function validateEndpoints(hostnames) {
 
 // ── Build rich diagnostic context (async for DNS checks) ─────────────────────
 async function buildContext(run, suite) {
-  // jtlPath stays a path-SHAPED naming string (for logging/labels) — the actual JTL
+  const isK6 = run.engine === 'k6';
+  const resultsFilename = isK6 ? 'results.json' : 'results.jtl';
+  // jtlPath stays a path-SHAPED naming string (for logging/labels) — the actual results
   // content is fetched from S3 via resultsStore, since result_dir is an S3 key prefix now.
-  const jtlPath = path.join(run.result_dir, 'results.jtl');
+  const jtlPath = path.join(run.result_dir, resultsFilename);
   const orgSlug = await resolveOrgSlugForProject(run.project_id);
-  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, 'results.jtl');
+  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, resultsFilename);
 
-  // jmeter.log only ever existed for a native/local execution run — never produced or
-  // synced for a CI-triggered run, so this naturally comes back empty for those (same
-  // as the old fs.existsSync check would have for a path that was never created).
+  // jmeter.log only ever existed for a native/local JMeter execution run — never produced
+  // or synced for a CI-triggered run (of either engine), so this naturally comes back empty
+  // for those (same as the old fs.existsSync check would have for a path never created).
   const jmeterLog = (await resultsStore.readText(run.result_dir, orgSlug, 'jmeter.log')) || '';
 
   const scriptPath    = run.engine === 'jmeter' ? suite.jmx_path : suite.js_path;
@@ -493,12 +590,18 @@ async function buildContext(run, suite) {
   const runLogs = (JSON.parse(run.logs || '[]'))
     .map(l => `[${l.type}] ${l.message}`).slice(-80).join('\n');
 
-  // ── JTL analysis ────────────────────────────────────────────────────────────
-  const jtl = parseJtlComprehensiveFromContent(jtlText);
+  // ── Results analysis (JTL for JMeter, parsed k6 JSON for k6) ─────────────────
+  const k6Parsed = isK6 ? parseK6Content(jtlText, { run_id: run.id }) : null;
+  const jtl = isK6 ? parseK6ComprehensiveFromResult(k6Parsed) : parseJtlComprehensiveFromContent(jtlText);
 
   // Label sets
   const allLabels = new Set(), failingLabels = new Set();
-  if (jtlText) {
+  if (isK6) {
+    for (const api of k6Parsed?.by_api || []) {
+      allLabels.add(api.label);
+      if (api.failed > 0) failingLabels.add(api.label);
+    }
+  } else if (jtlText) {
     const lines = jtlText.split('\n');
     const hdr = (lines[0] || '').split(',').map(h => h.trim().replace(/^"|"$/g, ''));
     const si = hdr.indexOf('success'), li = hdr.indexOf('label');
@@ -513,19 +616,21 @@ async function buildContext(run, suite) {
   }
 
   // ── Variable analysis ────────────────────────────────────────────────────────
-  const varRefs    = extractVarRefs(scriptContent);
-  const definedSet = new Set(extractDefinedVars(scriptContent));
+  const varRefs    = isK6 ? extractK6VarRefs(scriptContent)    : extractVarRefs(scriptContent);
+  const definedSet = new Set(isK6 ? extractK6DefinedVars(scriptContent) : extractDefinedVars(scriptContent));
   const missingVars = varRefs.filter(v => !definedSet.has(v));
 
   // ── DNS/endpoint validation (only when connection-type errors detected) ──────
-  const hostnames = extractHostnames(scriptContent);
+  const hostnames = isK6 ? extractK6Hostnames(scriptContent) : extractHostnames(scriptContent);
   let endpointStatus = {};
   if (jtl.dnsErrors.length > 0 || hostnames.length > 0) {
     endpointStatus = await validateEndpoints(hostnames);
   }
 
   // ── Rule + overall hasErrors ──────────────────────────────────────────────
-  const ruleResult = await evaluateRulesFromContent(run.project_id, jtlText);
+  // Rules are per-user now — resolve the owner via the suite's own user_id (test_suites
+  // now carries user_id) rather than adding a redundant column to execution_runs.
+  const ruleResult = await evaluateRulesFromContent(run.project_id, jtlText, suite.user_id, run.engine);
   let hasErrors;
   if (!ruleResult.noRules) {
     hasErrors = ruleResult.passed === false || run.status === 'failed';
@@ -544,7 +649,7 @@ async function buildContext(run, suite) {
     varRefs, missingVars,
     hostnames, endpointStatus,
     ruleViolations: ruleResult.violations || [],
-    errorClass: classifyErrorsFromContent(jtlText),
+    errorClass: isK6 ? classifyK6ErrorsFromResult(k6Parsed) : classifyErrorsFromContent(jtlText),
   };
 }
 
@@ -584,8 +689,8 @@ async function tryFixTemplateVars(suite, ctx) {
   let variables = {};
   if (suite.collection_id) {
     try {
-      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?')
-        .get(suite.collection_id, suite.env || 'Default');
+      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?')
+        .get(suite.collection_id, suite.env || 'Default', suite.user_id);
       variables = JSON.parse(row?.config_json || '{}')?.variables || {};
     } catch (_) {}
   }
@@ -646,7 +751,10 @@ function tryFixDisabledElements(ctx) {
 // deterministic JMX builder already knows how to honor an override, so the actual rewrite
 // costs zero extra AI tokens; the AI only ever has to describe the fix, never the file.
 async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customInstruction) {
-  if (run.engine !== 'jmeter' || !suite.collection_id) return null;
+  // buildK6Template (testSuites.js) honors collection_env_config.endpointOverrides
+  // identically to buildJmxTemplate — this cheap, zero-extra-AI-token fix path works for
+  // either engine, so only a collection is required, not a specific engine.
+  if (!suite.collection_id) return null;
   // Deliberately excludes CORRELATION_PARAMETERIZATION: that category usually needs a
   // token/session value captured from an earlier response, and this lightweight prompt
   // doesn't carry captured-field context the way the full-rewrite prompt below does — safer
@@ -656,7 +764,7 @@ async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customIns
   if (!cats.some(c => ENDPOINT_SCOPED.includes(c))) return null;
   if (!ctx.failingLabels.length) return null;
 
-  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, userId);
   let endpoints = [];
   try { endpoints = JSON.parse(collection?.json_content || '[]'); } catch {}
   if (!endpoints.length) return null;
@@ -671,7 +779,7 @@ async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customIns
   if (!targets.length) return null;
 
   const envRow = suite.env
-    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suite.env)
+    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?').get(suite.collection_id, suite.env, userId)
     : null;
   let variables = {};
   try { variables = JSON.parse(envRow?.config_json || '{}')?.variables || {}; } catch {}
@@ -705,7 +813,7 @@ async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customIns
   }).join('\n\n');
 
   const systemPrompt =
-    `You are an expert JMeter performance test auto-healer. Fix ONLY the specific failing endpoints ` +
+    `You are an expert ${run.engine === 'jmeter' ? 'JMeter' : 'k6'} performance test auto-healer. Fix ONLY the specific failing endpoints ` +
     `listed below by proposing corrected headers/body/url for each — do NOT rewrite the whole script, ` +
     `and do NOT reference or reproduce any endpoint not listed.\n\n` +
     `Output ONLY a single valid JSON object, no markdown fences:\n` +
@@ -758,14 +866,14 @@ async function tryEndpointOverridePatch(userId, run, suite, ctx, cats, customIns
 // number of overrides successfully matched to a real endpoint and applied.
 async function applyEndpointOverrides(userId, projectId, suite, overrides) {
   if (!suite.collection_id || !overrides?.length) return 0;
-  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, userId);
   let endpoints = [];
   try { endpoints = JSON.parse(collection?.json_content || '[]'); } catch {}
   if (!endpoints.length) return 0;
 
   const env = suite.env || 'Default';
-  const envRow = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?')
-    .get(suite.collection_id, env);
+  const envRow = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?')
+    .get(suite.collection_id, env, userId);
   const envCfg = envRow ? JSON.parse(envRow.config_json || '{}') : {};
   const existing = envCfg.endpointOverrides || {};
 
@@ -792,11 +900,11 @@ async function applyEndpointOverrides(userId, projectId, suite, overrides) {
 
   envCfg.endpointOverrides = existing;
   if (envRow) {
-    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?')
-      .run(JSON.stringify(envCfg), suite.collection_id, env);
+    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ? AND user_id = ?')
+      .run(JSON.stringify(envCfg), suite.collection_id, env, userId);
   } else {
-    await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
-      .run(suite.collection_id, env, JSON.stringify(envCfg));
+    await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)')
+      .run(suite.collection_id, env, JSON.stringify(envCfg), projectId, userId);
   }
 
   // Regenerate — deterministic for JMeter, so this costs no extra AI tokens and can't
@@ -1034,40 +1142,60 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruc
   // ── Category-specific fix instructions ──────────────────────────────────────
   const catGuidance = [];
   if (cats.includes('ZERO_SAMPLES')) {
-    catGuidance.push(
-      `ZERO SAMPLES — JMeter produced NO requests at all. This means either JMeter didn't start properly or the test plan is structurally broken.\n` +
-      `Common root causes (check the pipeline logs and script carefully):\n` +
-      `  1. ThreadGroup has enabled="false" — ALL thread groups must have enabled="true"\n` +
-      `  2. Thread count or duration is 0 — jmeter_users / jmeter_rampup / jmeter_duration variables may not be substituted\n` +
-      `  3. ${isJmeter ? 'HTTPSamplerProxy' : 'http.get/post'} elements disabled — check enabled attributes\n` +
-      `  4. Variable reference ${isJmeter ? '${jmeter_users}, ${jmeter_rampup}, ${jmeter_duration}' : 'VU/duration overrides'} missing from test plan\n` +
-      `  5. XML/JMX is malformed — TestPlan or ThreadGroup element broken\n` +
-      `→ REGENERATE the complete script. Ensure:\n` +
-      `  • All ThreadGroup elements: enabled="true", num_threads="\${jmeter_users}", ramp_time="\${jmeter_rampup}", duration="\${jmeter_duration}"\n` +
-      `  • TestPlan scheduler enabled where duration is used\n` +
-      `  • Every ${isJmeter ? 'HTTPSamplerProxy' : 'request'} element: enabled="true"\n` +
-      `  • User Defined Variables element defines defaults for any variable used that may not be passed at runtime`
+    catGuidance.push(isJmeter
+      ? `ZERO SAMPLES — JMeter produced NO requests at all. This means either JMeter didn't start properly or the test plan is structurally broken.\n` +
+        `Common root causes (check the pipeline logs and script carefully):\n` +
+        `  1. ThreadGroup has enabled="false" — ALL thread groups must have enabled="true"\n` +
+        `  2. Thread count or duration is 0 — jmeter_users / jmeter_rampup / jmeter_duration variables may not be substituted\n` +
+        `  3. HTTPSamplerProxy elements disabled — check enabled attributes\n` +
+        `  4. Variable reference \${jmeter_users}, \${jmeter_rampup}, \${jmeter_duration} missing from test plan\n` +
+        `  5. XML/JMX is malformed — TestPlan or ThreadGroup element broken\n` +
+        `→ REGENERATE the complete script. Ensure:\n` +
+        `  • All ThreadGroup elements: enabled="true", num_threads="\${jmeter_users}", ramp_time="\${jmeter_rampup}", duration="\${jmeter_duration}"\n` +
+        `  • TestPlan scheduler enabled where duration is used\n` +
+        `  • Every HTTPSamplerProxy element: enabled="true"\n` +
+        `  • User Defined Variables element defines defaults for any variable used that may not be passed at runtime`
+      : `ZERO SAMPLES — k6 produced NO requests at all. This means either the k6 process failed to start or the script's default function never actually calls http.get/post.\n` +
+        `Common root causes (check the pipeline logs and script carefully):\n` +
+        `  1. \`export default function\` body is empty, throws before any http.* call, or references an undefined variable\n` +
+        `  2. \`scenarios\`/executor config (if used) references a function name that doesn't exist\n` +
+        `  3. A SharedArray/CSV data source failed to load, causing the iteration to throw before any request fires\n` +
+        `  4. Script has a syntax error that k6 rejected at parse time (check the log for a JS error, not an HTTP error)\n` +
+        `→ REGENERATE the complete script. Ensure:\n` +
+        `  • \`export default function\` actually invokes http.get/post/etc. unconditionally on every iteration\n` +
+        `  • Any CSV/SharedArray data source is loaded correctly and the destructured columns match the CSV header\n` +
+        `  • No reference to a variable that was never defined earlier in the script`
     );
   }
   if (cats.includes('DNS_HOST_FAILURE')) {
     const dnsLines = Object.entries(ctx.endpointStatus)
       .map(([h, r]) => `  ${h}: ${r.ok ? 'RESOLVES → ' + r.addresses.join(',') : 'UNREACHABLE — ' + r.error}`).join('\n');
-    catGuidance.push(
-      `DNS/HOST FAILURES detected:\n${dnsLines || '  (could not validate)'}\n` +
-      `  → Verify protocol (http vs https), domain, and port in HTTPSampler.\n` +
-      `  → If domain is a variable (e.g. \${HOST}), ensure it is defined in User Defined Variables.\n` +
-      `  → Do NOT change the endpoint URL to a placeholder — use the domain that DNS resolves successfully.`
+    catGuidance.push(isJmeter
+      ? `DNS/HOST FAILURES detected:\n${dnsLines || '  (could not validate)'}\n` +
+        `  → Verify protocol (http vs https), domain, and port in HTTPSampler.\n` +
+        `  → If domain is a variable (e.g. \${HOST}), ensure it is defined in User Defined Variables.\n` +
+        `  → Do NOT change the endpoint URL to a placeholder — use the domain that DNS resolves successfully.`
+      : `DNS/HOST FAILURES detected:\n${dnsLines || '  (could not validate)'}\n` +
+        `  → Verify protocol (http vs https), domain, and port in the request URL.\n` +
+        `  → If the host is a variable (e.g. \`const BASE_URL = __ENV.BASE_URL || '...'\`), ensure the default resolves.\n` +
+        `  → Do NOT change the endpoint URL to a placeholder — use the domain that DNS resolves successfully.`
     );
   }
   if (cats.includes('CORRELATION_PARAMETERIZATION')) {
     const sample = jtl.correlationErrors.slice(0, 5).map(e => `    [${e.label}] ${e.code} ${e.failMsg || e.msg}`).join('\n');
-    catGuidance.push(
-      `CORRELATION / TOKEN FAILURES (401/403/session expired/CSRF):\n${sample}\n` +
-      `  → Identify which request returns the token/session/CSRF value (usually a login or init call).\n` +
-      `  → Add a JSON/Regex Extractor on that response to capture the value into a variable.\n` +
-      `  → Pass the extracted variable in subsequent requests as an Authorization header, cookie, or body param.\n` +
-      `  → Ensure the extraction sampler runs BEFORE the samplers that use the token.\n` +
-      `  → For CSRF: extract from the HTML form or a dedicated token endpoint, add to every state-changing request.`
+    catGuidance.push(isJmeter
+      ? `CORRELATION / TOKEN FAILURES (401/403/session expired/CSRF):\n${sample}\n` +
+        `  → Identify which request returns the token/session/CSRF value (usually a login or init call).\n` +
+        `  → Add a JSON/Regex Extractor on that response to capture the value into a variable.\n` +
+        `  → Pass the extracted variable in subsequent requests as an Authorization header, cookie, or body param.\n` +
+        `  → Ensure the extraction sampler runs BEFORE the samplers that use the token.\n` +
+        `  → For CSRF: extract from the HTML form or a dedicated token endpoint, add to every state-changing request.`
+      : `CORRELATION / TOKEN FAILURES (401/403/session expired/CSRF):\n${sample}\n` +
+        `  → Identify which request returns the token/session/CSRF value (usually a login or init call).\n` +
+        `  → Capture the value via a statement like: const token = loginRes.json('access_token') (or the correct JSON path) immediately after that request.\n` +
+        `  → Pass the captured value in subsequent requests via a template-literal interpolation, e.g. a headers object with Authorization set to a "Bearer " prefix followed by the captured token variable.\n` +
+        `  → Ensure the capturing request runs BEFORE the requests that use the token (k6 iterations run top-to-bottom in the default function).\n` +
+        `  → For CSRF: capture from the response body/cookie of a dedicated token endpoint and include it on every state-changing request.`
     );
   }
   if (cats.includes('ASSERTION_FAILURE')) {
@@ -1083,14 +1211,19 @@ async function diagnoseWithAi(userId, run, suite, ctx, attemptNum, customInstruc
   if (cats.includes('VARIABLE_REFERENCE')) {
     const missing = ctx.missingVars.length
       ? `  UNDEFINED variables used in script: ${ctx.missingVars.join(', ')}`
-      : '  (could not statically determine — check extractor placement)';
+      : '  (could not statically determine — check extractor/capture placement)';
     const sample = jtl.variableErrors.slice(0, 5).map(e => `    [${e.label}] ${e.failMsg || e.msg}`).join('\n');
-    catGuidance.push(
-      `VARIABLE / REFERENCE FAILURES:\n${missing}\n${sample}\n` +
-      `  → For each undefined variable: add a User Defined Variable element OR an extractor BEFORE the first sampler that uses it.\n` +
-      `  → Ensure CSV DataSet Config variableNames match the actual CSV header columns exactly (case-sensitive).\n` +
-      `  → Verify extractor scope — if variable is populated in one thread group, it may not be visible in another.\n` +
-      `  → If a response body is null/empty, the extractor produces empty variable — add a default value to the extractor.`
+    catGuidance.push(isJmeter
+      ? `VARIABLE / REFERENCE FAILURES:\n${missing}\n${sample}\n` +
+        `  → For each undefined variable: add a User Defined Variable element OR an extractor BEFORE the first sampler that uses it.\n` +
+        `  → Ensure CSV DataSet Config variableNames match the actual CSV header columns exactly (case-sensitive).\n` +
+        `  → Verify extractor scope — if variable is populated in one thread group, it may not be visible in another.\n` +
+        `  → If a response body is null/empty, the extractor produces empty variable — add a default value to the extractor.`
+      : `VARIABLE / REFERENCE FAILURES:\n${missing}\n${sample}\n` +
+        `  → For each undefined variable: add a \`const x = ...\` capture from the relevant response BEFORE the request that uses it.\n` +
+        `  → Ensure CSV/SharedArray destructured column names match the actual CSV header columns exactly (case-sensitive).\n` +
+        `  → Remember k6's default function re-runs top-to-bottom each iteration — a variable declared with \`const\` only lives for that one iteration, it is not shared across VUs/iterations unless read from the SharedArray/CSV row again.\n` +
+        `  → If a response body is null/empty, the capture produces \`undefined\` — guard with a fallback value.`
     );
   }
   if (cats.includes('REQUEST_MALFUNCTION')) {
@@ -1338,7 +1471,7 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     return;
   }
 
-  const quickRuleCheck  = await evaluateRules(quickRun.project_id, quickJtlPath);
+  const quickRuleCheck  = await evaluateRules(quickRun.project_id, quickJtlPath, userId);
   const quickPassed = quickRun.status === 'completed' &&
     (quickRuleCheck.noRules ? true : quickRuleCheck.passed !== false);
 
@@ -1380,7 +1513,7 @@ async function healCycle(userId, targetRunId, project, suite, attemptNum) {
     return;
   }
 
-  const fullRuleCheck = await evaluateRules(fullRun.project_id, fullJtlPath);
+  const fullRuleCheck = await evaluateRules(fullRun.project_id, fullJtlPath, userId);
   const fullPassed = fullRun.status === 'completed' &&
     (fullRuleCheck.noRules ? true : fullRuleCheck.passed !== false);
 

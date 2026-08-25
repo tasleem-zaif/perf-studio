@@ -23,8 +23,8 @@ router.get('/:env', async (req, res) => {
 
   const { collectionId, env } = req.params;
   const row = await db.prepare(
-    'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
-  ).get(collectionId, env);
+    'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?'
+  ).get(collectionId, env, req.userId);
 
   // Strict env isolation: each env only sees what was explicitly saved for it.
   // UAT never inherits QA URLs. Empty = this env has no config yet.
@@ -56,17 +56,17 @@ router.put('/:env', async (req, res) => {
   const cfg = req.body.config || req.body;
 
   const existing = await db.prepare(
-    'SELECT id FROM collection_env_config WHERE collection_id = ? AND env = ?'
-  ).get(collectionId, env);
+    'SELECT id FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?'
+  ).get(collectionId, env, req.userId);
 
   if (existing) {
     await db.prepare(
-      'UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?'
-    ).run(JSON.stringify(cfg), collectionId, env);
+      'UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ? AND user_id = ?'
+    ).run(JSON.stringify(cfg), collectionId, env, req.userId);
   } else {
     await db.prepare(
-      'INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)'
-    ).run(collectionId, env, JSON.stringify(cfg));
+      'INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)'
+    ).run(collectionId, env, JSON.stringify(cfg), req.params.projectId, req.userId);
   }
 
   // Refresh config.json in the current user's workspace

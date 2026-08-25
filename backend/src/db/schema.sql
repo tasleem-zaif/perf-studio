@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS collections (
   created_at               TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Per-user data isolation (see "Per-user data isolation" section at the bottom of this
+-- file for the backfill + NOT NULL + indexes) — each assigned user gets their own private
+-- collections instead of sharing one project-wide row set.
+ALTER TABLE collections ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);
+
 CREATE TABLE IF NOT EXISTS rules (
   id         SERIAL PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -77,6 +82,9 @@ CREATE TABLE IF NOT EXISTS rules (
   value_max  TEXT DEFAULT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Per-user data isolation — see bottom of this file.
+ALTER TABLE rules ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);
 
 CREATE TABLE IF NOT EXISTS scripts (
   id          SERIAL PRIMARY KEY,
@@ -119,6 +127,9 @@ CREATE TABLE IF NOT EXISTS test_data_files (
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Per-user data isolation — see bottom of this file.
+ALTER TABLE test_data_files ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);
+
 CREATE TABLE IF NOT EXISTS ai_settings (
   id          SERIAL PRIMARY KEY,
   user_id     INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -156,6 +167,9 @@ CREATE TABLE IF NOT EXISTS test_suites (
   env                      TEXT DEFAULT '',
   created_at               TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Per-user data isolation — see bottom of this file.
+ALTER TABLE test_suites ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);
 
 -- ── Execution ─────────────────────────────────────────────────────────────────
 
@@ -374,6 +388,12 @@ ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS no_results INTEGER DEFAULT
 -- until enough time has passed for that attempt to have actually finished.
 ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS last_sync_attempt_at TIMESTAMPTZ;
 
+-- Which test engine this CI run executed (jmeter or k6) — resolved from the triggering
+-- suite at /trigger time and stored directly here (rather than only inside the `variables`
+-- JSON blob) so auto-sync can pick the right results filename/parser (results.jtl vs
+-- results.json) without depending on a possibly-stale test_suites lookup by script name.
+ALTER TABLE ci_pipeline_runs ADD COLUMN IF NOT EXISTS engine TEXT DEFAULT 'jmeter';
+
 CREATE TABLE IF NOT EXISTS ci_auto_heal_logs (
   id            SERIAL PRIMARY KEY,
   ci_run_id     INTEGER NOT NULL,
@@ -443,6 +463,30 @@ CREATE TABLE IF NOT EXISTS collection_env_config (
   config_json   TEXT DEFAULT '{}',
   UNIQUE(collection_id, env)
 );
+
+-- Per-user data isolation — this table had no direct link to a project at all (every
+-- query trusted collection_id+env alone, protected only by an ownsProject() check several
+-- hops away). Add both project_id and user_id, and widen the unique constraint so one
+-- user's env config for a collection/env pair can't collide with another user's.
+ALTER TABLE collection_env_config ADD COLUMN IF NOT EXISTS project_id INTEGER;
+ALTER TABLE collection_env_config ADD COLUMN IF NOT EXISTS user_id    INTEGER REFERENCES users(id);
+ALTER TABLE collection_env_config DROP CONSTRAINT IF EXISTS collection_env_config_collection_id_env_key;
+-- Every sibling table's project_id FK cascades on project delete (collections/rules/
+-- test_suites/test_data_files all do) — match that here instead of leaving a bare
+-- REFERENCES with no ON DELETE action, which blocked deleting a project that still had
+-- any collection_env_config rows.
+ALTER TABLE collection_env_config DROP CONSTRAINT IF EXISTS collection_env_config_project_id_fkey;
+ALTER TABLE collection_env_config
+  ADD CONSTRAINT collection_env_config_project_id_fkey
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'collection_env_config_collection_env_user_key'
+  ) THEN
+    ALTER TABLE collection_env_config
+      ADD CONSTRAINT collection_env_config_collection_env_user_key UNIQUE (collection_id, env, user_id);
+  END IF;
+END $$;
 
 -- ── Licensing ─────────────────────────────────────────────────────────────────
 -- One row per organization. Created lazily with plan defaults the first time
@@ -583,3 +627,41 @@ CREATE TABLE IF NOT EXISTS trend_predictions (
   generated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_trend_predictions_project_scope ON trend_predictions(project_id, scope);
+
+-- ── Per-user data isolation ───────────────────────────────────────────────────
+-- collections/rules/test_suites/test_data_files/collection_env_config used to be shared
+-- across every user assigned to a project (project_id-scoped only). Backfill existing rows
+-- to the project's original creator (projects.user_id) — the same user then becomes the
+-- "canonical owner" that routes/git.js's POST /sync DB-refresh step clones from. Every
+-- statement here is safe to re-run: the UPDATEs only touch rows still missing a user_id,
+-- and SET NOT NULL is a no-op once already set.
+
+UPDATE collections SET user_id = (SELECT p.user_id FROM projects p WHERE p.id = collections.project_id)
+  WHERE user_id IS NULL;
+UPDATE rules SET user_id = (SELECT p.user_id FROM projects p WHERE p.id = rules.project_id)
+  WHERE user_id IS NULL;
+UPDATE test_suites SET user_id = (SELECT p.user_id FROM projects p WHERE p.id = test_suites.project_id)
+  WHERE user_id IS NULL;
+UPDATE test_data_files SET user_id = (SELECT p.user_id FROM projects p WHERE p.id = test_data_files.project_id)
+  WHERE user_id IS NULL;
+UPDATE collection_env_config SET
+    project_id = (SELECT c.project_id FROM collections c WHERE c.id = collection_env_config.collection_id),
+    user_id    = (SELECT c.user_id    FROM collections c WHERE c.id = collection_env_config.collection_id)
+  WHERE project_id IS NULL OR user_id IS NULL;
+
+-- Rows whose collection_id points at nothing (orphaned prior to this migration) can't be
+-- backfilled via the join above — drop them rather than leave an unenforceable NOT NULL.
+DELETE FROM collection_env_config WHERE user_id IS NULL;
+
+ALTER TABLE collections          ALTER COLUMN user_id    SET NOT NULL;
+ALTER TABLE rules                ALTER COLUMN user_id    SET NOT NULL;
+ALTER TABLE test_suites          ALTER COLUMN user_id    SET NOT NULL;
+ALTER TABLE test_data_files      ALTER COLUMN user_id    SET NOT NULL;
+ALTER TABLE collection_env_config ALTER COLUMN user_id   SET NOT NULL;
+ALTER TABLE collection_env_config ALTER COLUMN project_id SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_collections_project_user           ON collections(project_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_rules_project_user                 ON rules(project_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_test_suites_project_user           ON test_suites(project_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_test_data_files_project_user       ON test_data_files(project_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_collection_env_config_project_user ON collection_env_config(project_id, user_id);

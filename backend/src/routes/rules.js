@@ -44,7 +44,7 @@ async function syncRules(projectId, userId) {
 
 router.get('/', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const rows = await db.prepare('SELECT * FROM rules WHERE project_id = ? ORDER BY created_at ASC').all(req.params.projectId);
+  const rows = await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ? ORDER BY created_at ASC').all(req.params.projectId, req.userId);
   res.json({ rules: rows });
 });
 
@@ -59,18 +59,18 @@ router.post('/', async (req, res) => {
     if (value === undefined || value === '') return res.status(400).json({ error: 'Value is required' });
   }
   const result = await db.prepare(
-    'INSERT INTO rules (project_id, metric, operator, value, value_min, value_max, unit, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(req.params.projectId, metric, operator, value || '', value_min || null, value_max || null, unit, severity || 'error');
+    'INSERT INTO rules (project_id, user_id, metric, operator, value, value_min, value_max, unit, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(req.params.projectId, req.userId, metric, operator, value || '', value_min || null, value_max || null, unit, severity || 'error');
   syncRules(req.params.projectId, req.userId);
-  res.json({ rule: await db.prepare('SELECT * FROM rules WHERE id = ?').get(result.lastInsertRowid) });
+  res.json({ rule: await db.prepare('SELECT * FROM rules WHERE id = ? AND user_id = ?').get(result.lastInsertRowid, req.userId) });
 });
 
 router.put('/:id', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const rule = await db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const rule = await db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!rule) return res.status(404).json({ error: 'Performance rule not found — it may have been deleted by another user.' });
   const { metric, operator, value, value_min, value_max, unit, severity } = req.body;
-  await db.prepare('UPDATE rules SET metric=?, operator=?, value=?, value_min=?, value_max=?, unit=?, severity=? WHERE id=?')
+  await db.prepare('UPDATE rules SET metric=?, operator=?, value=?, value_min=?, value_max=?, unit=?, severity=? WHERE id=? AND user_id=?')
     .run(
       metric || rule.metric,
       operator || rule.operator,
@@ -79,17 +79,18 @@ router.put('/:id', async (req, res) => {
       value_max !== undefined ? value_max : rule.value_max,
       unit || rule.unit,
       severity || rule.severity,
-      req.params.id
+      req.params.id,
+      req.userId
     );
   syncRules(req.params.projectId, req.userId);
-  res.json({ rule: await db.prepare('SELECT * FROM rules WHERE id = ?').get(req.params.id) });
+  res.json({ rule: await db.prepare('SELECT * FROM rules WHERE id = ? AND user_id = ?').get(req.params.id, req.userId) });
 });
 
 router.delete('/:id', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const rule = await db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const rule = await db.prepare('SELECT * FROM rules WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!rule) return res.status(404).json({ error: 'Performance rule not found — it may have already been deleted.' });
-  await db.prepare('DELETE FROM rules WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM rules WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
   resetSequence('rules');
   syncRules(req.params.projectId, req.userId);
   res.json({ ok: true });

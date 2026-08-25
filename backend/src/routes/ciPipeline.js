@@ -236,7 +236,7 @@ async function getConfig(projectId, userId) {
  *   Project_Name/Collection_Name/Env/testData
  *   Project_Name/Collection_Name/Env/results
  */
-async function buildCanonicalRepoPaths(projectId, scriptName) {
+async function buildCanonicalRepoPaths(projectId, scriptName, userId) {
   const clean = s => (s || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'Default';
   const scriptFile = (scriptName || '').replace(/\\/g, '/').split('/').pop() || scriptName || '';
   const project    = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
@@ -245,9 +245,9 @@ async function buildCanonicalRepoPaths(projectId, scriptName) {
         SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
         FROM test_suites ts
         LEFT JOIN collections c ON c.id = ts.collection_id
-        WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
+        WHERE ts.project_id = ? AND ts.user_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
         LIMIT 1
-      `).get(projectId, `%${scriptFile}`, `%${scriptFile}`)
+      `).get(projectId, userId, `%${scriptFile}`, `%${scriptFile}`)
     : null;
 
   const projectDir    = clean(project?.name);
@@ -776,6 +776,7 @@ router.post('/generate-yaml', async (req, res) => {
     : null;
   const globalCfg = JSON.parse((globalCfgRow || globalCfgAdmin)?.config_json || '{}');
   const dockerImage = (globalCfg.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim().toLowerCase();
+  const k6Image = (globalCfg.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest').trim().toLowerCase();
 
   // Use per-project workspace (new structure: git-workspaces/<ProjectName>/admin/)
   const callerRow = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -814,7 +815,7 @@ router.post('/generate-yaml', async (req, res) => {
   }
 
   // Get all generated test plans for this project to include as YAML comments
-  const suites = await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId);
+  const suites = await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL)").all(req.params.projectId, req.userId);
 
   const gitCfgBase = await db.prepare('SELECT base_branch FROM git_configs WHERE project_id = ?').get(req.params.projectId);
   const baseBranch = gitCfgBase?.base_branch || 'main';
@@ -867,10 +868,14 @@ services:
 variables:
   DOCKER_DRIVER: overlay2
   SCRIPT_NAME: "${defaultScript}"
+  ENGINE: "jmeter"
   JMETER_USERS: "10"
   JMETER_RAMPUP: "30"
   JMETER_LOOPS: "1"
-  JMETER_DURATION: "300"${gitlabSshVars}
+  JMETER_DURATION: "300"
+  K6_VUS: "10"
+  K6_DURATION: "300"
+  K6_ITERATIONS: "0"${gitlabSshVars}
 
 stages:
   - test
@@ -879,6 +884,7 @@ run_jmeter:
   stage: test
   before_script:${gitlabSshSetup}
     - echo "PerfStudio Pipeline Execution"
+    - echo "Engine   : \${ENGINE}"
     - echo "Script   : \${SCRIPT_NAME}"
     - echo "VUsers   : \${JMETER_USERS}"
     - echo "Ramp-up  : \${JMETER_RAMPUP}s"
@@ -886,45 +892,68 @@ run_jmeter:
   script:
     - mkdir -p reports
     - |
-      docker run --rm \\
-        -v "\$CI_PROJECT_DIR":/workspace \\
-        -v "\$CI_PROJECT_DIR/reports":/output \\
-        justb4/jmeter \\
-        -Dlog4j2.formatMsgNoLookups=true \\
-        -n -t "/workspace/\${SCRIPT_PATH:-\${SCRIPT_NAME}}" \\
-        -Jusers="\${JMETER_USERS}" \\
-        -Jrampup="\${JMETER_RAMPUP}" \\
-        -Jloops="\${JMETER_LOOPS}" \\
-        -Jduration="\${JMETER_DURATION}" \\
-        -l /output/results.jtl \\
-        -e -o /output/html
+      if [ "\$ENGINE" = "k6" ]; then
+        K6_MODE_ARGS="--duration \${K6_DURATION}s"
+        if [ -n "\$K6_ITERATIONS" ] && [ "\$K6_ITERATIONS" != "0" ]; then
+          K6_MODE_ARGS="--iterations \$K6_ITERATIONS"
+        fi
+        docker run --rm \\
+          -v "\$CI_PROJECT_DIR":/workspace \\
+          -v "\$CI_PROJECT_DIR/reports":/output \\
+          ${k6Image} \\
+          run "/workspace/\${SCRIPT_PATH:-\${SCRIPT_NAME}}" \\
+          --out json=/output/results.json \\
+          --vus "\${K6_VUS}" \$K6_MODE_ARGS
+      else
+        docker run --rm \\
+          -v "\$CI_PROJECT_DIR":/workspace \\
+          -v "\$CI_PROJECT_DIR/reports":/output \\
+          justb4/jmeter \\
+          -Dlog4j2.formatMsgNoLookups=true \\
+          -n -t "/workspace/\${SCRIPT_PATH:-\${SCRIPT_NAME}}" \\
+          -Jusers="\${JMETER_USERS}" \\
+          -Jrampup="\${JMETER_RAMPUP}" \\
+          -Jloops="\${JMETER_LOOPS}" \\
+          -Jduration="\${JMETER_DURATION}" \\
+          -l /output/results.jtl \\
+          -e -o /output/html
+      fi
     - |
-      JTL="\$CI_PROJECT_DIR/reports/results.jtl"
-      if [ ! -f "\$JTL" ]; then
-        echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
-        exit 1
-      fi
-      TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
-      echo "Total requests: \$TOTAL"
-      if [ "\$TOTAL" -le 0 ]; then
-        echo "ERROR: 0 requests executed - check thread group config"
-        exit 1
-      fi
-      # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
-      # results sync to notice. Header-based column lookup since JMeter's CSV field
-      # order isn't guaranteed fixed.
-      SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
-      if [ -n "\$SUCCESS_COL" ]; then
-        FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
-        echo "Failed requests: \$FAILED / \$TOTAL"
-        if [ "\$FAILED" -eq "\$TOTAL" ]; then
-          echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
+      if [ "\$ENGINE" = "k6" ]; then
+        RESULTS="\$CI_PROJECT_DIR/reports/results.json"
+        if [ ! -s "\$RESULTS" ]; then
+          echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
           exit 1
         fi
+        echo "Validation passed: results.json present"
       else
-        echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
+        JTL="\$CI_PROJECT_DIR/reports/results.jtl"
+        if [ ! -f "\$JTL" ]; then
+          echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+          exit 1
+        fi
+        TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
+        echo "Total requests: \$TOTAL"
+        if [ "\$TOTAL" -le 0 ]; then
+          echo "ERROR: 0 requests executed - check thread group config"
+          exit 1
+        fi
+        # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+        # results sync to notice. Header-based column lookup since JMeter's CSV field
+        # order isn't guaranteed fixed.
+        SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+        if [ -n "\$SUCCESS_COL" ]; then
+          FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
+          echo "Failed requests: \$FAILED / \$TOTAL"
+          if [ "\$FAILED" -eq "\$TOTAL" ]; then
+            echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
+            exit 1
+          fi
+        else
+          echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
+        fi
+        echo "Validation passed: \$TOTAL requests"
       fi
-      echo "Validation passed: \$TOTAL requests"
   artifacts:
     paths:
       - reports/
@@ -975,8 +1004,12 @@ name: PerfStudio Performance Test
 on:
   workflow_dispatch:
     inputs:
+      engine:
+        description: 'Test engine (jmeter or k6)'
+        required: false
+        default: 'jmeter'
       script_name:
-        description: 'JMX script filename (relative to repo root)'
+        description: 'Script filename — JMX or k6 JS (relative to repo root)'
         required: true
         default: '${defaultScript}'
       script_path:
@@ -999,6 +1032,18 @@ on:
         description: 'Test duration in seconds'
         required: true
         default: '300'
+      k6_vus:
+        description: 'k6: number of virtual users'
+        required: false
+        default: '10'
+      k6_duration:
+        description: 'k6: test duration in seconds (used when k6_iterations is 0)'
+        required: false
+        default: '300'
+      k6_iterations:
+        description: 'k6: total iterations (0 = use k6_duration instead)'
+        required: false
+        default: '0'
       branch:
         description: 'Branch containing the test scripts (user workspace branch)'
         required: false
@@ -1018,6 +1063,7 @@ jobs:
           ref: \${{ inputs.branch || github.ref_name }}
 
       - name: Patch JMX parameters
+        if: \${{ inputs.engine != 'k6' }}
         run: |
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
@@ -1033,6 +1079,7 @@ jobs:
           grep "enabled=" "\$SCRIPT" | head -10
 
       - name: Cache CI Docker image
+        if: \${{ inputs.engine != 'k6' }}
         uses: actions/cache@v4
         with:
           path: /tmp/docker-cache
@@ -1040,6 +1087,7 @@ jobs:
           restore-keys: docker-perf-
 
       - name: Load cached image or pull
+        if: \${{ inputs.engine != 'k6' }}
         run: |
           if [ -f /tmp/docker-cache/perf-image.tar ]; then
             echo "Loading cached image..."
@@ -1052,6 +1100,7 @@ jobs:
           fi
 
       - name: Verify patch and CSV files
+        if: \${{ inputs.engine != 'k6' }}
         run: |
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
@@ -1065,6 +1114,7 @@ jobs:
           ls -la "/workspace/projects/Demo1/Demo1_API_Collection/QA/testData/" 2>/dev/null || echo "Path not found"
 
       - name: Run JMeter
+        if: \${{ inputs.engine != 'k6' }}
         run: |
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
@@ -1081,7 +1131,26 @@ jobs:
           echo "=== JMeter Log (last 50 lines) ==="
           tail -50 reports/jmeter.log 2>/dev/null || echo "No jmeter.log found"
 
-      - name: Validate results
+      - name: Run k6
+        if: \${{ inputs.engine == 'k6' }}
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          mkdir -p reports
+          K6_MODE_ARGS="--duration \${{ inputs.k6_duration }}s"
+          if [ -n "\${{ inputs.k6_iterations }}" ] && [ "\${{ inputs.k6_iterations }}" != "0" ]; then
+            K6_MODE_ARGS="--iterations \${{ inputs.k6_iterations }}"
+          fi
+          docker run --rm \\
+            -v "\${{ github.workspace }}":/workspace \\
+            -v "\${{ github.workspace }}/reports":/output \\
+            ${k6Image} \\
+            run "/workspace/\$SCRIPT" \\
+            --out json=/output/results.json \\
+            --vus "\${{ inputs.k6_vus }}" \$K6_MODE_ARGS || true
+
+      - name: Validate results (JMeter)
+        if: \${{ inputs.engine != 'k6' }}
         run: |
           JTL="reports/results.jtl"
           [ ! -f "\$JTL" ] && echo "ERROR: results.jtl not found" && exit 1
@@ -1104,11 +1173,21 @@ jobs:
           fi
           echo "Validation passed: \$TOTAL requests"
 
+      - name: Validate results (k6)
+        if: \${{ inputs.engine == 'k6' }}
+        run: |
+          RESULTS="reports/results.json"
+          if [ ! -s "\$RESULTS" ]; then
+            echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
+            exit 1
+          fi
+          echo "Validation passed: results.json present"
+
       - name: Upload report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: jmeter-report-\${{ github.run_number }}
+          name: perfstudio-report-\${{ github.run_number }}
           path: reports/
           retention-days: 7
 `;
@@ -1221,6 +1300,8 @@ pipelines:
   custom:
     Peako-Performance-Test:
       - variables:
+          - name: ENGINE
+            default: "jmeter"
           - name: SCRIPT_NAME
             default: "${defaultScript}"
           - name: SCRIPT_PATH
@@ -1237,8 +1318,14 @@ pipelines:
             default: "-1"
           - name: JMETER_DURATION
             default: "300"
+          - name: K6_VUS
+            default: "10"
+          - name: K6_DURATION
+            default: "300"
+          - name: K6_ITERATIONS
+            default: "0"
       - step:
-          name: Run JMeter Performance Test
+          name: Run Performance Test
           size: 2x
           services:
             - docker
@@ -1246,42 +1333,69 @@ pipelines:
             - apk add --no-cache curl zip bash python3
             - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
             - echo "Peako Performance Test"
+            - echo "Engine    | $ENGINE"
             - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
-            - echo "VUsers    | $JMETER_USERS"
-            - echo "Ramp-up   | $JMETER_RAMPUP s"
-            - echo "Duration  | $JMETER_DURATION s"
             - |
-              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
-              echo "=== Patching JMX parameters and fixing paths ==="
-              mkdir -p .PerfStudio
-              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
-              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
-              echo "=== JMX state after patch ==="
-              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              if [ "$ENGINE" = "k6" ]; then
+                echo "VUsers    | $K6_VUS"
+                echo "Duration  | $K6_DURATION s (or K6_ITERATIONS if set)"
+              else
+                echo "VUsers    | $JMETER_USERS"
+                echo "Ramp-up   | $JMETER_RAMPUP s"
+                echo "Duration  | $JMETER_DURATION s"
+              fi
             - |
-              docker run --rm \\
-                -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
-                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
-                ${dockerImage} \\
-                jmeter \\
-                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
-                -l "/workspace/results.jtl" \\
-                -e -o "/workspace/html" || true
+              if [ "$ENGINE" != "k6" ]; then
+                SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+                echo "=== Patching JMX parameters and fixing paths ==="
+                mkdir -p .PerfStudio
+                echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
+                python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+                echo "=== JMX state after patch ==="
+                grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              fi
+            - |
+              if [ "$ENGINE" = "k6" ]; then
+                K6_MODE_ARGS="--duration \${K6_DURATION}s"
+                if [ -n "$K6_ITERATIONS" ] && [ "$K6_ITERATIONS" != "0" ]; then
+                  K6_MODE_ARGS="--iterations $K6_ITERATIONS"
+                fi
+                docker run --rm \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${k6Image} \\
+                  run "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  --out json=/workspace/results.json \\
+                  --vus "$K6_VUS" $K6_MODE_ARGS || true
+              else
+                docker run --rm \\
+                  -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${dockerImage} \\
+                  jmeter \\
+                  -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  -l "/workspace/results.jtl" \\
+                  -e -o "/workspace/html" || true
+              fi
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
                 cd "$BITBUCKET_CLONE_DIR"
                 [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
                 DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
-                # Always upload results.jtl — create header stub if JMeter crashed without output
-                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
-                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                if [ "$ENGINE" = "k6" ]; then
+                  RESULTS_FILE="results.json"
+                else
+                  # Always upload results.jtl — create header stub if JMeter crashed without output
+                  # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                  [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                  RESULTS_FILE="results.jtl"
+                fi
                 curl -s -X POST \\
                   "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
                   -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
                   -F "branch=$BITBUCKET_BRANCH" \\
-                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
-                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
+                  -F "\${DEST_BASE}/\${RESULTS_FILE}=@\${RESULTS_FILE}" \\
+                  && echo "Results committed to $BITBUCKET_BRANCH" || echo "Results commit failed (non-fatal)"
                 if [ -f html.zip ]; then
                   curl -s -X POST \\
                     "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
@@ -1295,32 +1409,41 @@ pipelines:
                 echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
             - |
-              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
-              if [ ! -f "$JTL" ]; then
-                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
-                exit 1
-              fi
-              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
-              echo "JMeter sample count: $TOTAL"
-              if [ "$TOTAL" -le 0 ]; then
-                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
-                exit 1
-              fi
-              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
-              # results sync to notice. Header-based column lookup since JMeter's CSV field
-              # order isn't guaranteed fixed.
-              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
-              if [ -n "$SUCCESS_COL" ]; then
-                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
-                echo "Failed requests: $FAILED / $TOTAL"
-                if [ "$FAILED" -eq "$TOTAL" ]; then
-                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+              if [ "$ENGINE" = "k6" ]; then
+                RESULTS="$BITBUCKET_CLONE_DIR/results.json"
+                if [ ! -s "$RESULTS" ]; then
+                  echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
                   exit 1
                 fi
+                echo "Validation passed: results.json present"
               else
-                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+                if [ ! -f "$JTL" ]; then
+                  echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                  exit 1
+                fi
+                TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+                echo "JMeter sample count: $TOTAL"
+                if [ "$TOTAL" -le 0 ]; then
+                  echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                  exit 1
+                fi
+                # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+                # results sync to notice. Header-based column lookup since JMeter's CSV field
+                # order isn't guaranteed fixed.
+                SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+                if [ -n "$SUCCESS_COL" ]; then
+                  FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                  echo "Failed requests: $FAILED / $TOTAL"
+                  if [ "$FAILED" -eq "$TOTAL" ]; then
+                    echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                    exit 1
+                  fi
+                else
+                  echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                fi
+                echo "Validation passed: $TOTAL requests executed."
               fi
-              echo "Validation passed: $TOTAL requests executed."
 `;
     try {
       const dest = path.join(gitRoot, 'bitbucket-pipelines.yml');
@@ -1709,17 +1832,23 @@ router.post('/trigger', async (req, res) => {
   };
 
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration,
+          k6_vus, k6_duration, k6_iterations,
           auto_heal = 0, auto_heal_mode = 'auto', auto_heal_instruction = '' } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
   // Build human-readable run_name: {SuiteName}_{N}Users_{D}sDuration (no Run# yet — added on sync)
   const { buildRunDirName } = require('../utils/buildRunName');
   const scriptFile2 = (script_name || '').replace(/\\/g, '/').split('/').pop();
-  const matchedSuite2 = await db.prepare("SELECT name FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-    .get(req.params.projectId, `%${scriptFile2}`, `%${scriptFile2}`);
+  const matchedSuite2 = await db.prepare("SELECT name, engine FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+    .get(req.params.projectId, req.userId, `%${scriptFile2}`, `%${scriptFile2}`);
+  // engine drives which CI branch (JMeter vs k6 docker command) runs — resolve from the
+  // matched suite by default, but let the caller override explicitly (req.body.engine).
+  const engine = req.body.engine || matchedSuite2?.engine || 'jmeter';
   const ciRunDisplayName = buildRunDirName(
     matchedSuite2?.name || scriptFile2.replace(/\.jmx$|\.js$/, ''),
-    jmeter_users, 'duration', jmeter_loops, jmeter_duration, ''
+    engine === 'k6' ? (k6_vus || 10) : jmeter_users, 'duration',
+    engine === 'k6' ? (k6_iterations || 1) : jmeter_loops,
+    engine === 'k6' ? (k6_duration || 300) : jmeter_duration, ''
   ).replace(/_Run$/, ''); // strip trailing _Run (no seq# at trigger time)
 
   // Token priority for CI triggers:
@@ -1736,12 +1865,13 @@ router.post('/trigger', async (req, res) => {
   // Resolve script name from DB when not provided by the caller (frontend omits it on some flows)
   let resolvedScriptName = script_name;
   if (!resolvedScriptName) {
-    const suiteRow = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? LIMIT 1').get(req.params.projectId);
+    const suiteRow = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ? LIMIT 1').get(req.params.projectId, req.userId);
     const suiteFile = suiteRow?.jmx_path || suiteRow?.js_path || '';
     resolvedScriptName = suiteFile.replace(/\\/g, '/').split('/').pop() || '';
   }
-  const canonicalPaths = await buildCanonicalRepoPaths(req.params.projectId, resolvedScriptName || script_name);
+  const canonicalPaths = await buildCanonicalRepoPaths(req.params.projectId, resolvedScriptName || script_name, req.userId);
   const variables = {
+    engine: engine,
     script_name: resolvedScriptName || script_name,
     script_path:   canonicalPaths.scriptRepoPath,
     results_path:  canonicalPaths.resultsPath,
@@ -1750,6 +1880,9 @@ router.post('/trigger', async (req, res) => {
     jmeter_rampup:   String(jmeter_rampup   || 30),
     jmeter_loops:    String(jmeter_loops    || 1),
     jmeter_duration: String(jmeter_duration || 300),
+    k6_vus:        String(k6_vus        || 10),
+    k6_duration:   String(k6_duration   || 300),
+    k6_iterations: String(k6_iterations || 0),
   };
 
   // ── Compute targetRef here so it is in scope for both auto-push and dispatch ─
@@ -1910,8 +2043,10 @@ router.post('/trigger', async (req, res) => {
         try {
           const _gcRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
             || await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
-          const _dockerImage = (JSON.parse(_gcRow?.config_json || '{}').jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
-          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
+          const _gcParsed = JSON.parse(_gcRow?.config_json || '{}');
+          const _dockerImage = (_gcParsed.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
+          const _k6Image = (_gcParsed.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest').trim();
+          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ?').all(req.params.projectId, req.userId);
           const _defScript = _suites.length ? path.basename(_suites[0].jmx_path || _suites[0].js_path || 'test.jmx') : 'test.jmx';
           const _scriptList = _suites.map(s => {
             const f = path.basename(s.jmx_path || s.js_path || '');
@@ -1940,6 +2075,8 @@ pipelines:
   custom:
     Peako-Performance-Test:
       - variables:
+          - name: ENGINE
+            default: "jmeter"
           - name: SCRIPT_NAME
             default: "${_defScript}"
           - name: SCRIPT_PATH
@@ -1956,8 +2093,14 @@ pipelines:
             default: "-1"
           - name: JMETER_DURATION
             default: "300"
+          - name: K6_VUS
+            default: "10"
+          - name: K6_DURATION
+            default: "300"
+          - name: K6_ITERATIONS
+            default: "0"
       - step:
-          name: Run JMeter Performance Test
+          name: Run Performance Test
           size: 2x
           services:
             - docker
@@ -1965,42 +2108,69 @@ pipelines:
             - apk add --no-cache curl zip bash python3
             - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
             - echo "Peako Performance Test"
+            - echo "Engine    | $ENGINE"
             - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
-            - echo "VUsers    | $JMETER_USERS"
-            - echo "Ramp-up   | $JMETER_RAMPUP s"
-            - echo "Duration  | $JMETER_DURATION s"
             - |
-              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
-              echo "=== Patching JMX parameters and fixing paths ==="
-              mkdir -p .PerfStudio
-              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
-              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
-              echo "=== JMX state after patch ==="
-              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              if [ "$ENGINE" = "k6" ]; then
+                echo "VUsers    | $K6_VUS"
+                echo "Duration  | $K6_DURATION s (or K6_ITERATIONS if set)"
+              else
+                echo "VUsers    | $JMETER_USERS"
+                echo "Ramp-up   | $JMETER_RAMPUP s"
+                echo "Duration  | $JMETER_DURATION s"
+              fi
             - |
-              docker run --rm \\
-                -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
-                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
-                ${_dockerImage} \\
-                jmeter \\
-                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
-                -l "/workspace/results.jtl" \\
-                -e -o "/workspace/html" || true
+              if [ "$ENGINE" != "k6" ]; then
+                SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+                echo "=== Patching JMX parameters and fixing paths ==="
+                mkdir -p .PerfStudio
+                echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
+                python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+                echo "=== JMX state after patch ==="
+                grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              fi
+            - |
+              if [ "$ENGINE" = "k6" ]; then
+                K6_MODE_ARGS="--duration \${K6_DURATION}s"
+                if [ -n "$K6_ITERATIONS" ] && [ "$K6_ITERATIONS" != "0" ]; then
+                  K6_MODE_ARGS="--iterations $K6_ITERATIONS"
+                fi
+                docker run --rm \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${_k6Image} \\
+                  run "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  --out json=/workspace/results.json \\
+                  --vus "$K6_VUS" $K6_MODE_ARGS || true
+              else
+                docker run --rm \\
+                  -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${_dockerImage} \\
+                  jmeter \\
+                  -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  -l "/workspace/results.jtl" \\
+                  -e -o "/workspace/html" || true
+              fi
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
                 cd "$BITBUCKET_CLONE_DIR"
                 [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
                 DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
-                # Always upload results.jtl — create header stub if JMeter crashed without output
-                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
-                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                if [ "$ENGINE" = "k6" ]; then
+                  RESULTS_FILE="results.json"
+                else
+                  # Always upload results.jtl — create header stub if JMeter crashed without output
+                  # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                  [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                  RESULTS_FILE="results.jtl"
+                fi
                 curl -s -X POST \\
                   "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
                   -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
                   -F "branch=$BITBUCKET_BRANCH" \\
-                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
-                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
+                  -F "\${DEST_BASE}/\${RESULTS_FILE}=@\${RESULTS_FILE}" \\
+                  && echo "Results committed to $BITBUCKET_BRANCH" || echo "Results commit failed (non-fatal)"
                 if [ -f html.zip ]; then
                   curl -s -X POST \\
                     "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
@@ -2014,32 +2184,41 @@ pipelines:
                 echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
             - |
-              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
-              if [ ! -f "$JTL" ]; then
-                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
-                exit 1
-              fi
-              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
-              echo "JMeter sample count: $TOTAL"
-              if [ "$TOTAL" -le 0 ]; then
-                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
-                exit 1
-              fi
-              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
-              # results sync to notice. Header-based column lookup since JMeter's CSV field
-              # order isn't guaranteed fixed.
-              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
-              if [ -n "$SUCCESS_COL" ]; then
-                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
-                echo "Failed requests: $FAILED / $TOTAL"
-                if [ "$FAILED" -eq "$TOTAL" ]; then
-                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+              if [ "$ENGINE" = "k6" ]; then
+                RESULTS="$BITBUCKET_CLONE_DIR/results.json"
+                if [ ! -s "$RESULTS" ]; then
+                  echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
                   exit 1
                 fi
+                echo "Validation passed: results.json present"
               else
-                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+                if [ ! -f "$JTL" ]; then
+                  echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                  exit 1
+                fi
+                TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+                echo "JMeter sample count: $TOTAL"
+                if [ "$TOTAL" -le 0 ]; then
+                  echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                  exit 1
+                fi
+                # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+                # results sync to notice. Header-based column lookup since JMeter's CSV field
+                # order isn't guaranteed fixed.
+                SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+                if [ -n "$SUCCESS_COL" ]; then
+                  FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                  echo "Failed requests: $FAILED / $TOTAL"
+                  if [ "$FAILED" -eq "$TOTAL" ]; then
+                    echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                    exit 1
+                  fi
+                else
+                  echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                fi
+                echo "Validation passed: $TOTAL requests executed."
               fi
-              echo "Validation passed: $TOTAL requests executed."
 `;
           const _bbYamlPath = path.join(wsRoot, 'bitbucket-pipelines.yml');
           fs.writeFileSync(_bbYamlPath, _bbYaml.replace(/\r\n/g, '\n'), 'utf8');
@@ -2074,8 +2253,8 @@ pipelines:
       if (script_name) {
         const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
         const suiteRow   = await db.prepare(
-          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
-        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, req.userId, `%${scriptFile}`, `%${scriptFile}`);
 
         // Determine the absolute source path from the suite record
         let srcAbs = suiteRow?.jmx_path || suiteRow?.js_path || '';
@@ -2319,8 +2498,10 @@ pipelines:
         try {
           const _gcRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
             || await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
-          const _dockerImage = (JSON.parse(_gcRow?.config_json || '{}').jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
-          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ?').all(req.params.projectId);
+          const _gcParsed = JSON.parse(_gcRow?.config_json || '{}');
+          const _dockerImage = (_gcParsed.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
+          const _k6Image = (_gcParsed.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest').trim();
+          const _suites = await db.prepare('SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ?').all(req.params.projectId, req.userId);
           const _defScript = _suites.length ? path.basename(_suites[0].jmx_path || _suites[0].js_path || 'test.jmx') : 'test.jmx';
           const _scriptList = _suites.map(s => {
             const f = path.basename(s.jmx_path || s.js_path || '');
@@ -2349,6 +2530,8 @@ pipelines:
   custom:
     Peako-Performance-Test:
       - variables:
+          - name: ENGINE
+            default: "jmeter"
           - name: SCRIPT_NAME
             default: "${_defScript}"
           - name: SCRIPT_PATH
@@ -2365,8 +2548,14 @@ pipelines:
             default: "-1"
           - name: JMETER_DURATION
             default: "300"
+          - name: K6_VUS
+            default: "10"
+          - name: K6_DURATION
+            default: "300"
+          - name: K6_ITERATIONS
+            default: "0"
       - step:
-          name: Run JMeter Performance Test
+          name: Run Performance Test
           size: 2x
           services:
             - docker
@@ -2374,42 +2563,69 @@ pipelines:
             - apk add --no-cache curl zip bash python3
             - PIPELINE_ID=$(echo "$BITBUCKET_PIPELINE_UUID" | tr -d '{}')
             - echo "Peako Performance Test"
+            - echo "Engine    | $ENGINE"
             - echo "Script    | \${SCRIPT_PATH:-\$SCRIPT_NAME}"
-            - echo "VUsers    | $JMETER_USERS"
-            - echo "Ramp-up   | $JMETER_RAMPUP s"
-            - echo "Duration  | $JMETER_DURATION s"
             - |
-              SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
-              echo "=== Patching JMX parameters and fixing paths ==="
-              mkdir -p .PerfStudio
-              echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
-              python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
-              echo "=== JMX state after patch ==="
-              grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              if [ "$ENGINE" = "k6" ]; then
+                echo "VUsers    | $K6_VUS"
+                echo "Duration  | $K6_DURATION s (or K6_ITERATIONS if set)"
+              else
+                echo "VUsers    | $JMETER_USERS"
+                echo "Ramp-up   | $JMETER_RAMPUP s"
+                echo "Duration  | $JMETER_DURATION s"
+              fi
             - |
-              docker run --rm \\
-                -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
-                -v "$BITBUCKET_CLONE_DIR:/workspace" \\
-                ${_dockerImage} \\
-                jmeter \\
-                -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
-                -l "/workspace/results.jtl" \\
-                -e -o "/workspace/html" || true
+              if [ "$ENGINE" != "k6" ]; then
+                SCRIPT="\${SCRIPT_PATH:-\$SCRIPT_NAME}"
+                echo "=== Patching JMX parameters and fixing paths ==="
+                mkdir -p .PerfStudio
+                echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
+                python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\$JMETER_USERS" "\$JMETER_RAMPUP" "\$JMETER_LOOPS" "\$JMETER_DURATION"
+                echo "=== JMX state after patch ==="
+                grep -E "num_threads|ramp_time|scheduler|duration|LoopController.loops|CSV_PATH|Argument.value" "\$SCRIPT" | head -20 || true
+              fi
+            - |
+              if [ "$ENGINE" = "k6" ]; then
+                K6_MODE_ARGS="--duration \${K6_DURATION}s"
+                if [ -n "$K6_ITERATIONS" ] && [ "$K6_ITERATIONS" != "0" ]; then
+                  K6_MODE_ARGS="--iterations $K6_ITERATIONS"
+                fi
+                docker run --rm \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${_k6Image} \\
+                  run "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  --out json=/workspace/results.json \\
+                  --vus "$K6_VUS" $K6_MODE_ARGS || true
+              else
+                docker run --rm \\
+                  -e JVM_ARGS="-Dlog4j2.formatMsgNoLookups=true" \\
+                  -v "$BITBUCKET_CLONE_DIR:/workspace" \\
+                  ${_dockerImage} \\
+                  jmeter \\
+                  -n -t "/workspace/\${SCRIPT_PATH:-\$SCRIPT_NAME}" \\
+                  -l "/workspace/results.jtl" \\
+                  -e -o "/workspace/html" || true
+              fi
             - |
               if [ -n "$BB_USERNAME" ] && [ -n "$BB_APP_PASSWORD" ]; then
                 cd "$BITBUCKET_CLONE_DIR"
                 [ -d html ] && zip -r html.zip html/ 2>/dev/null || true
                 DEST_BASE="\${RESULTS_PATH:-ci-results}/Run\${BITBUCKET_BUILD_NUMBER}"
-                # Always upload results.jtl — create header stub if JMeter crashed without output
-                # so auto-sync can always download it and detect 0 samples to trigger auto-heal
-                [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                if [ "$ENGINE" = "k6" ]; then
+                  RESULTS_FILE="results.json"
+                else
+                  # Always upload results.jtl — create header stub if JMeter crashed without output
+                  # so auto-sync can always download it and detect 0 samples to trigger auto-heal
+                  [ ! -f results.jtl ] && printf 'timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect\\n' > results.jtl || true
+                  RESULTS_FILE="results.jtl"
+                fi
                 curl -s -X POST \\
                   "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
                   -u "$BB_USERNAME:$BB_APP_PASSWORD" \\
                   -F "message=ci-results: \${PIPELINE_ID} [auto]" \\
                   -F "branch=$BITBUCKET_BRANCH" \\
-                  -F "\${DEST_BASE}/results.jtl=@results.jtl" \\
-                  && echo "JTL committed to $BITBUCKET_BRANCH" || echo "JTL commit failed (non-fatal)"
+                  -F "\${DEST_BASE}/\${RESULTS_FILE}=@\${RESULTS_FILE}" \\
+                  && echo "Results committed to $BITBUCKET_BRANCH" || echo "Results commit failed (non-fatal)"
                 if [ -f html.zip ]; then
                   curl -s -X POST \\
                     "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/src" \\
@@ -2423,32 +2639,41 @@ pipelines:
                 echo "BB_USERNAME / BB_APP_PASSWORD not set — skipping results commit"
               fi
             - |
-              JTL="$BITBUCKET_CLONE_DIR/results.jtl"
-              if [ ! -f "$JTL" ]; then
-                echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
-                exit 1
-              fi
-              TOTAL=$(( $(wc -l < "$JTL") - 1 ))
-              echo "JMeter sample count: $TOTAL"
-              if [ "$TOTAL" -le 0 ]; then
-                echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
-                exit 1
-              fi
-              # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
-              # results sync to notice. Header-based column lookup since JMeter's CSV field
-              # order isn't guaranteed fixed.
-              SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
-              if [ -n "$SUCCESS_COL" ]; then
-                FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
-                echo "Failed requests: $FAILED / $TOTAL"
-                if [ "$FAILED" -eq "$TOTAL" ]; then
-                  echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+              if [ "$ENGINE" = "k6" ]; then
+                RESULTS="$BITBUCKET_CLONE_DIR/results.json"
+                if [ ! -s "$RESULTS" ]; then
+                  echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
                   exit 1
                 fi
+                echo "Validation passed: results.json present"
               else
-                echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                JTL="$BITBUCKET_CLONE_DIR/results.jtl"
+                if [ ! -f "$JTL" ]; then
+                  echo "ERROR: results.jtl not found — JMeter may have crashed before producing output."
+                  exit 1
+                fi
+                TOTAL=$(( $(wc -l < "$JTL") - 1 ))
+                echo "JMeter sample count: $TOTAL"
+                if [ "$TOTAL" -le 0 ]; then
+                  echo "ERROR: JMeter produced 0 requests — check that thread groups are enabled and the test plan is valid."
+                  exit 1
+                fi
+                # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+                # results sync to notice. Header-based column lookup since JMeter's CSV field
+                # order isn't guaranteed fixed.
+                SUCCESS_COL=$(head -1 "$JTL" | tr -d '"' | tr ',' '\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+                if [ -n "$SUCCESS_COL" ]; then
+                  FAILED=$(tail -n +2 "$JTL" | awk -F',' -v col="$SUCCESS_COL" '{gsub(/"/,"",$col)} $col!="true"{c++} END{print c+0}')
+                  echo "Failed requests: $FAILED / $TOTAL"
+                  if [ "$FAILED" -eq "$TOTAL" ]; then
+                    echo "ERROR: 100% of requests failed ($FAILED/$TOTAL) — failing the job so CI history reflects this immediately."
+                    exit 1
+                  fi
+                else
+                  echo "WARN: could not locate 'success' column in JTL header — skipping error-rate check."
+                fi
+                echo "Validation passed: $TOTAL requests executed."
               fi
-              echo "Validation passed: $TOTAL requests executed."
 `.replace(/\r\n/g, '\n');
           const _full = path.posix.join(session.dir, 'bitbucket-pipelines.yml');
           session.fs.writeFileSync(_full, bbYamlContent, 'utf8');
@@ -2478,8 +2703,8 @@ pipelines:
       if (script_name) {
         const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
         const suiteRow = await db.prepare(
-          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
-        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, req.userId, `%${scriptFile}`, `%${scriptFile}`);
         const srcRel = (suiteRow?.jmx_path || suiteRow?.js_path || '').replace(/\\/g, '/');
         const srcFull = srcRel ? path.posix.join(session.dir, srcRel) : null;
         const canonicalFull = path.posix.join(session.dir, canonicalPaths.scriptRepoPath);
@@ -2646,12 +2871,16 @@ pipelines:
       const params = new URLSearchParams();
       params.append('token', cfg.gitlab_trigger_token);
       params.append('ref',   ref);
+      params.append('variables[ENGINE]',          engine);
       params.append('variables[SCRIPT_NAME]',     script_name || 'test.jmx');
       params.append('variables[SCRIPT_PATH]',     script_path || '');
       params.append('variables[JMETER_USERS]',    String(jmeter_users || 10));
       params.append('variables[JMETER_RAMPUP]',   String(jmeter_rampup || 30));
       params.append('variables[JMETER_LOOPS]',    String(jmeter_loops || 1));
       params.append('variables[JMETER_DURATION]', String(jmeter_duration || 300));
+      params.append('variables[K6_VUS]',          String(k6_vus || 10));
+      params.append('variables[K6_DURATION]',     String(k6_duration || 300));
+      params.append('variables[K6_ITERATIONS]',   String(k6_iterations || 0));
 
       const formBody = params.toString();
       const url = new URL(`${gitlabUrl}/api/v4/projects/${encodedId}/trigger/pipeline`);
@@ -2676,8 +2905,8 @@ pipelines:
       });
 
       if (r.status === 201) {
-        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId, auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction);
+        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId, auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine);
         return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
       }
       return res.status(400).json({ error: `GitLab returned ${r.status}: ${JSON.stringify(r.body)}` });
@@ -2705,12 +2934,16 @@ pipelines:
       const dispatchBody = {
         ref,  // base branch — GitHub requires workflow_dispatch ref to be the branch where perf-test.yml lives
         inputs: {
+          engine:          engine,
           script_name:     script_name || 'test.jmx',
           script_path:     script_path || '',
           jmeter_users:    String(jmeter_users || 10),
           jmeter_rampup:   String(jmeter_rampup || 30),
           jmeter_loops:    String(jmeter_loops || 1),
           jmeter_duration: String(jmeter_duration || 300),
+          k6_vus:          String(k6_vus || 10),
+          k6_duration:     String(k6_duration || 300),
+          k6_iterations:   String(k6_iterations || 0),
           // Tell the workflow which branch to checkout for scripts/data.
           // For regular users this is their personal branch (users/<name>);
           // for admins it is the base branch. This is separate from the dispatch ref above.
@@ -2819,14 +3052,14 @@ pipelines:
           if (recentRun) { latestRun = recentRun; break; }
         }
 
-        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'github',
             latestRun ? String(latestRun.id) : null,
             latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`,
             latestRun?.status || 'queued',
             script_name, ciRunDisplayName, JSON.stringify(variables), req.userId,
-            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction
+            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine
           );
         return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions' });
       }
@@ -2871,13 +3104,13 @@ pipelines:
         const pipelineUuid   = bbResp.body.uuid;
         const bbBuildNumber  = bbResp.body.build_number || null;
         const variablesWithBuild = { ...variables, ...(bbBuildNumber ? { bb_build_number: bbBuildNumber } : {}) };
-        const bbRunInsert = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        const bbRunInsert = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(
             req.params.projectId, 'bitbucket', pipelineUuid,
             `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`,
             'pending', script_name || '', ciRunDisplayName,
             JSON.stringify(variablesWithBuild), req.userId,
-            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction
+            auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine
           );
         return res.json({ ok: true, run_id: bbRunInsert.lastInsertRowid, run_name: ciRunDisplayName, external_id: pipelineUuid, web_url: `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`, status: 'pending', message: 'Pipeline triggered on Bitbucket Pipelines' });
       }
@@ -2908,7 +3141,15 @@ router.get('/runs', async (req, res) => {
 // Creates an execution_runs record from CI artifacts so Analytics shows the run.
 async function autoSyncCiRun(run, cfg, projectId, userId) {
   const { parseJtlContent } = require('../utils/parseJtl');
+  const { parseK6Content } = require('../utils/parseK6');
   const { getUserProjectPath, getCollectionPath, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
+
+  // ci_pipeline_runs.engine is backfilled to 'jmeter' for every pre-existing row (column
+  // default applies retroactively in Postgres), so this is always populated — no suite
+  // lookup fallback needed.
+  const engine = run.engine || 'jmeter';
+  const resultsFilename = engine === 'k6' ? 'results.json' : 'results.jtl';
+  const parseResultsContent = engine === 'k6' ? parseK6Content : parseJtlContent;
 
   const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   if (!project) return;
@@ -2953,15 +3194,20 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
   // Determine result directory
   let resultDir = null;
   let suiteName = null;
+  // Resolved here (not later) — the Bitbucket "results missing" branch below needs suiteId
+  // for its execution_runs INSERT, and that branch can `return` before a later declaration
+  // would ever run.
+  let suiteId = null;
   if (run.script_name) {
     const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
     const suite = await db.prepare(`
       SELECT ts.*, c.name as col_name, c.environment as col_environment, c.environments as col_environments
       FROM test_suites ts
-      LEFT JOIN collections c ON c.id = ts.collection_id
-      WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?) LIMIT 1
-    `).get(projectId, `%${scriptFile}`, `%${scriptFile}`);
+      LEFT JOIN collections c ON c.id = ts.collection_id AND c.user_id = ts.user_id
+      WHERE ts.project_id = ? AND ts.user_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?) LIMIT 1
+    `).get(projectId, effectiveUserId, `%${scriptFile}`, `%${scriptFile}`);
     suiteName = suite?.name || null;
+    suiteId = suite?.id || null;
     // resolveSuiteEnv falls back to the collection's own default env when ts.env is
     // blank, so a collection-scoped suite never drops to the project-level fallback
     // below just because its env wasn't explicitly recorded.
@@ -3093,17 +3339,17 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       const _jtlBranchNode = _jtlBranch.includes('/')
         ? await resolveBranchToCommit(ws2, slug2, _jtlBranch, bbAuth2Header)
         : encodeURIComponent(_jtlBranch);
-      const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${_jtlBranchNode}/${_jtlBasePath}/results.jtl`;
+      const jtlApiPath   = `/2.0/repositories/${ws2}/${slug2}/src/${_jtlBranchNode}/${_jtlBasePath}/${resultsFilename}`;
 
       let jtlMissing = false;
       let bbJtlBuffer = null;
       try {
         const dl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: jtlApiPath, method: 'GET', headers: { Authorization: bbAuth2Header, 'User-Agent': 'PerfStudio' } });
-        if (dl.statusCode !== 200) throw new Error(`JTL not found on perf-results branch (HTTP ${dl.statusCode})`);
+        if (dl.statusCode !== 200) throw new Error(`${resultsFilename} not found on perf-results branch (HTTP ${dl.statusCode})`);
         bbJtlBuffer = dl.buffer;
         if (!bbJtlBuffer || !bbJtlBuffer.length) jtlMissing = true;
       } catch (jtlErr) {
-        console.warn(`[Auto-sync] Bitbucket JTL unavailable for CI run #${run.id}: ${jtlErr.message}`);
+        console.warn(`[Auto-sync] Bitbucket ${resultsFilename} unavailable for CI run #${run.id}: ${jtlErr.message}`);
         jtlMissing = true;
       }
 
@@ -3112,13 +3358,13 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         let bbPipeLogs = '';
         try { bbPipeLogs = await fetchBbPipelineLogs(bbAuth2Header, ws2, slug2, run.external_id || pipelineId2); } catch (_) {}
 
-        const noJtlLogs = [{ type: 'error', message: 'JMeter results not uploaded — pipeline failed before JMeter could produce output.' }];
+        const noJtlLogs = [{ type: 'error', message: `${engine === 'k6' ? 'k6' : 'JMeter'} results not uploaded — pipeline failed before the test could produce output.` }];
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
         await db.prepare(`
           INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-          VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
-        `).run(projectId, suiteId, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
+          VALUES (?, ?, ?, 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+        `).run(projectId, suiteId, engine, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
 
         const healUserId = effectiveUserId;
         if (run.auto_heal && !run.is_heal_run) {
@@ -3135,10 +3381,10 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
           try {
             const { sendAlertEmail } = require('../utils/emailUtils');
             await sendAlertEmail(null, healUserId, projectId, {
-              meta: { suite_name: run.run_name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+              meta: { suite_name: run.run_name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider },
               summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
               by_api: [], timeline: [],
-              errors: [{ type: 'Pipeline Error', message: 'Pipeline failed before JMeter produced results. Check pipeline logs.' }],
+              errors: [{ type: 'Pipeline Error', message: `Pipeline failed before ${engine === 'k6' ? 'k6' : 'JMeter'} produced results. Check pipeline logs.` }],
               rule_violations: [],
             }, null, null);
           } catch (_) {}
@@ -3146,8 +3392,8 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         return;
       }
 
-      // Bitbucket delivered the JTL directly (not inside a zip) — write it straight to S3
-      await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', bbJtlBuffer);
+      // Bitbucket delivered the results file directly (not inside a zip) — write it straight to S3
+      await resultsStore.writeFile(resultDir, orgSlug, resultsFilename, bbJtlBuffer);
 
       // Download html.zip separately from perf-results branch (non-fatal if missing)
       const _bbAuth3 = await bbBasicAuth(cfg, effectiveUserId);
@@ -3181,26 +3427,18 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       // samples — the artifact really did have data, the upload of this one file just didn't
       // land (see writeZipEntries' own comment). Treat it as a retriable sync failure instead
       // of falsely concluding "0 samples" and permanently marking no_results.
-      if (zipWriteResult.failed.some(f => f.relPath === 'results.jtl')) {
-        throw new Error('results.jtl failed to upload to S3 after retries — will retry this sync on the next attempt.');
+      if (zipWriteResult.failed.some(f => f.relPath === resultsFilename)) {
+        throw new Error(`${resultsFilename} failed to upload to S3 after retries — will retry this sync on the next attempt.`);
       }
     }
 
-    const jtlText    = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
+    const jtlText    = await resultsStore.readText(resultDir, orgSlug, resultsFilename);
     const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
     const hasReport  = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
 
-    // Resolve suite_id
-    let suiteId = null;
-    if (run.script_name) {
-      const sf = run.script_name.split('/').pop();
-      const s = await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${sf}`, `%${sf}`);
-      suiteId = s?.id || null;
-    }
-
-    const reportData = jtlText ? parseJtlContent(jtlText, {
-      suite_name: suiteId ? (await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name : (run.script_name || 'CI Run'),
-      engine: 'jmeter', started_at: run.started_at,
+    const reportData = jtlText ? parseResultsContent(jtlText, {
+      suite_name: suiteId ? (await db.prepare('SELECT name FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId))?.name : (run.script_name || 'CI Run'),
+      engine, started_at: run.started_at,
     }) : null;
 
     const totalRequests = reportData?.summary?.total_requests || 0;
@@ -3210,7 +3448,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       // no_results instead so the background catch-up in execution.js stops retrying this
       // run forever. ci_pipeline_runs.status still reflects the real problem (JMeter produced
       // nothing), unlike a rule-engine verdict, which is a genuinely different situation.
-      console.warn(`[Auto-sync] CI run #${run.id}: JTL has 0 samples — not syncing to Analytics`);
+      console.warn(`[Auto-sync] CI run #${run.id}: ${resultsFilename} has 0 samples — not syncing to Analytics`);
       await db.prepare("UPDATE ci_pipeline_runs SET status='failed', no_results=1 WHERE id=?").run(run.id);
 
       // Fetch pipeline logs for AI context (helps diagnose why JMeter produced 0 requests)
@@ -3241,12 +3479,12 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         try {
           const { sendAlertEmail } = require('../utils/emailUtils');
           const suiteName0 = suiteId
-            ? ((await db.prepare('SELECT name FROM test_suites WHERE id=?').get(suiteId))?.name || run.script_name || 'CI Run')
+            ? ((await db.prepare('SELECT name FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId))?.name || run.script_name || 'CI Run')
             : (run.script_name || 'CI Run');
-          const zeroErrors = [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }];
+          const zeroErrors = [{ type: 'Zero Samples', message: `${engine === 'k6' ? 'k6' : 'JMeter'} produced 0 requests. The test plan may be malformed${engine === 'jmeter' ? ' or all thread groups are disabled' : ''}.` }];
           if (zeroBbLogs) zeroErrors.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
           await sendAlertEmail(null, healUserId0, projectId, {
-            meta: { suite_name: suiteName0, engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+            meta: { suite_name: suiteName0, engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider },
             summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
             by_api: [], timeline: [],
             errors: zeroErrors,
@@ -3266,16 +3504,16 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     if (jtlText) {
       try {
         const { evaluateRulesFromContent } = require('../utils/ruleEvaluator');
-        autoRuleResult = await evaluateRulesFromContent(projectId, jtlText);
+        autoRuleResult = await evaluateRulesFromContent(projectId, jtlText, effectiveUserId, engine);
         autoViolations = autoRuleResult?.violations || [];
       } catch (_) {}
     }
     if (reportData) reportData.rule_violations = autoViolations;
 
-    const suiteLookup = suiteId ? await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId) : null;
+    const suiteLookup = suiteId ? await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(suiteId, effectiveUserId) : null;
     const emailData = {
       ...(reportData || {
-        meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'completed' },
+        meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'completed' },
         summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
         by_api: [], timeline: [], errors: [],
       }),
@@ -3296,9 +3534,10 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       });
     }
 
-    // Generate analytics PDF
+    // Generate analytics PDF — JMeter only, matching the existing /export-pdf route's
+    // restriction (no HTML-report-derived PDF layout exists for k6 results).
     let autoPdfBuffer = null;
-    if (reportData && jtlText) {
+    if (engine === 'jmeter' && reportData && jtlText) {
       try {
         const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
         const runNum = (resultDir.match(/Run_?(\d+)/) || [])[1] || run.id;
@@ -3326,9 +3565,9 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
 
     const execInsert = await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-      VALUES (?, ?, 'jmeter', ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
-      projectId, suiteId, autoSyncRunStatus, resultDir,
+      projectId, suiteId, engine, autoSyncRunStatus, resultDir,
       hasReport ? reportPath : null,
       JSON.stringify([{ type: 'info', message: `Results synced from CI pipeline run #${run.external_id} (${run.provider})` }]),
       run.started_at || new Date().toISOString(),
@@ -3504,7 +3743,7 @@ router.get('/runs/:runId/status', async (req, res) => {
           const emailData = {
             meta: {
               suite_name: `${run.run_name || run.script_name || 'CI Run'} [${mappedStatus.toUpperCase()}]`,
-              engine: 'jmeter',
+              engine: run.engine || 'jmeter',
               started_at: run.started_at,
               duration_s: run.finished_at
                 ? Math.round((new Date(run.finished_at) - new Date(run.started_at)) / 1000)
@@ -3541,6 +3780,14 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
   const run = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ? AND project_id = ?').get(req.params.runId, req.params.projectId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!run.external_id) return res.status(400).json({ error: 'No external pipeline ID — pipeline may not have started yet.' });
+
+  // See autoSyncCiRun's matching comment — ci_pipeline_runs.engine is backfilled to 'jmeter'
+  // for every pre-existing row, so this is always populated.
+  const engine = run.engine || 'jmeter';
+  const resultsFilename = engine === 'k6' ? 'results.json' : 'results.jtl';
+  const { parseJtlContent: parseJtlContentSync } = require('../utils/parseJtl');
+  const { parseK6Content: parseK6ContentSync } = require('../utils/parseK6');
+  const parseResultsContentSync = engine === 'k6' ? parseK6ContentSync : parseJtlContentSync;
 
   // Guard: don't create a second execution_runs record for the same CI run
   const alreadySynced = await db.prepare('SELECT id FROM execution_runs WHERE ci_run_id = ?').get(run.id);
@@ -3582,18 +3829,20 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
 
   let resultDir = null;
   let syncSuiteName = null;
+  let syncSuiteId = null;
   if (run.script_name) {
     const scriptFile = run.script_name.replace(/\\/g, '/').split('/').pop();
     const suite = await db.prepare(`
       SELECT ts.*, c.name as col_name, c.environment as col_environment, c.environments as col_environments
       FROM test_suites ts
-      LEFT JOIN collections c ON c.id = ts.collection_id
-      WHERE ts.project_id = ?
+      LEFT JOIN collections c ON c.id = ts.collection_id AND c.user_id = ts.user_id
+      WHERE ts.project_id = ? AND ts.user_id = ?
         AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
       LIMIT 1
-    `).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
+    `).get(req.params.projectId, effectiveUserId, `%${scriptFile}`, `%${scriptFile}`);
 
     syncSuiteName = suite?.name || null;
+    syncSuiteId = suite?.id || null;
     // resolveSuiteEnv falls back to the collection's own default env when ts.env is
     // blank, so a collection-scoped suite never drops to the project-level fallback
     // below just because its env wasn't explicitly recorded.
@@ -3754,20 +4003,20 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       const ws3        = cfg.bitbucket_workspace;
       const slug3      = cfg.bitbucket_repo_slug;
 
-      // Fetch results.jtl directly from the repo branch.
+      // Fetch results file directly from the repo branch.
       // Branches with '/' must be resolved to a commit hash — %2F in a URL path gets
       // decoded by the server before routing, turning "feature%2Fquarks-user" into
       // branch "feature" (non-existent) → 404.
       const branchNode3 = branch3.includes('/')
         ? await resolveBranchToCommit(ws3, slug3, branch3, bbAuthHdr3)
         : encodeURIComponent(branch3);
-      const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/results.jtl`;
+      const jtlApiPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/${resultsFilename}`;
       const jtlDl = await downloadToBuffer({ hostname: 'api.bitbucket.org', path: jtlApiPath3, method: 'GET', headers: { Authorization: bbAuthHdr3, 'User-Agent': 'PerfStudio' } });
       if (jtlDl.statusCode !== 200 && jtlDl.statusCode !== 206) {
-        await recordUnsyncableRun(`results.jtl was never found on branch "${branch3}" at ${base3} — the pipeline likely failed before producing results.`);
-        throw new Error(`results.jtl not found on branch "${branch3}" at ${base3} (HTTP ${jtlDl.statusCode}). Ensure the pipeline completed and committed results.`);
+        await recordUnsyncableRun(`${resultsFilename} was never found on branch "${branch3}" at ${base3} — the pipeline likely failed before producing results.`);
+        throw new Error(`${resultsFilename} not found on branch "${branch3}" at ${base3} (HTTP ${jtlDl.statusCode}). Ensure the pipeline completed and committed results.`);
       }
-      await resultsStore.writeFile(resultDir, orgSlug, 'results.jtl', jtlDl.buffer);
+      await resultsStore.writeFile(resultDir, orgSlug, resultsFilename, jtlDl.buffer);
 
       // Fetch html.zip from the repo branch (non-fatal if missing)
       const htmlZipPath3 = `/2.0/repositories/${ws3}/${slug3}/src/${branchNode3}/${base3}/html.zip`;
@@ -3798,57 +4047,55 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       // results.jtl failing to write is NOT the same thing as the run genuinely producing 0
       // samples — see writeZipEntries' own comment. Fail this sync attempt outright (nothing
       // gets marked/recorded) so it's retried later, instead of falsely concluding "0 samples".
-      if (zipWriteResult.failed.some(f => f.relPath === 'results.jtl')) {
-        return res.status(502).json({ error: 'results.jtl failed to upload to S3 after retries. Please try syncing again in a moment.' });
+      if (zipWriteResult.failed.some(f => f.relPath === resultsFilename)) {
+        return res.status(502).json({ error: `${resultsFilename} failed to upload to S3 after retries. Please try syncing again in a moment.` });
       }
     }
 
     const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
     const hasReportFile = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
-    const jtlText = await resultsStore.readText(resultDir, orgSlug, 'results.jtl');
+    const jtlText = await resultsStore.readText(resultDir, orgSlug, resultsFilename);
 
-    // The artifact zip downloaded fine but contains no results.jtl at all (not even an empty
+    // The artifact zip downloaded fine but contains no results file at all (not even an empty
     // one) — same "nothing real to show" situation as 0 samples below, just caught earlier.
     if (!jtlText) {
-      await recordUnsyncableRun('Downloaded artifact contained no results.jtl at all.');
-      return res.status(404).json({ error: 'Artifact downloaded but contained no results.jtl. The pipeline may have failed before JMeter ran.' });
+      await recordUnsyncableRun(`Downloaded artifact contained no ${resultsFilename} at all.`);
+      return res.status(404).json({ error: `Artifact downloaded but contained no ${resultsFilename}. The pipeline may have failed before the test ran.` });
     }
 
-    // ── Generate analytics PDF from JTL ──────────────────────────────────────
+    // ── Generate analytics PDF (JMeter only — see /export-pdf's identical restriction) ──────
     let pdfBuffer = null;
     let reportData = null;
     let ruleResult = null;
     if (jtlText) {
       try {
-        const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
         const runNum  = (resultDir.match(/Run_(\d+)/) || [])[1] || run.id;
         const pdfName = `Analytics_CI_Run_${runNum}.pdf`;
 
-        // Parse JTL with the full parser (timeline, errors, bytes, latency, connect)
-        const { parseJtlContent } = require('../utils/parseJtl');
-        const suite = await db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1)').get(`%${path.basename(resultDir)}%`);
-        reportData = parseJtlContent(jtlText, {
+        // Parse with the full parser (timeline, errors, bytes/latency/connect where available)
+        const suite = await db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1) AND user_id = ?').get(`%${path.basename(resultDir)}%`, effectiveUserId);
+        reportData = parseResultsContentSync(jtlText, {
           suite_name: suite?.name || run.script_name || 'CI Run',
-          engine: 'jmeter',
+          engine,
           started_at: run.started_at,
           status: 'completed',
         });
         if (reportData) {
-          // Genuinely nothing to show — no request trace at all in the JTL. Mark no_results
+          // Genuinely nothing to show — no request trace at all. Mark no_results
           // and stop here entirely: never insert an execution_runs row for this (nothing real
           // to plot in Analytics), matching autoSyncCiRun's identical zero-sample handling.
           if ((reportData.summary?.total_requests || 0) === 0) {
-            console.warn(`[CI Sync] Run #${run.id}: JTL has 0 samples — not syncing to Analytics`);
+            console.warn(`[CI Sync] Run #${run.id}: ${resultsFilename} has 0 samples — not syncing to Analytics`);
             await db.prepare("UPDATE ci_pipeline_runs SET status='failed', no_results=1 WHERE id=?").run(run.id);
             if (!isBackgroundSync) {
               setImmediate(async () => {
                 try {
                   const { sendAlertEmail } = require('../utils/emailUtils');
                   await sendAlertEmail(null, effectiveUserId, req.params.projectId, {
-                    meta: { suite_name: run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+                    meta: { suite_name: run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider },
                     summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
                     by_api: [], timeline: [],
-                    errors: [{ type: 'Zero Samples', message: 'JMeter produced 0 requests. The test plan may be malformed or all thread groups are disabled.' }],
+                    errors: [{ type: 'Zero Samples', message: `${engine === 'k6' ? 'k6' : 'JMeter'} produced 0 requests. The test plan may be malformed${engine === 'jmeter' ? ' or all thread groups are disabled' : ''}.` }],
                     rule_violations: [],
                   }, null, null);
                   console.log(`[CI Sync] Failure email sent for 0-sample run #${run.id}`);
@@ -3857,18 +4104,21 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
                 }
               });
             }
-            return res.json({ ok: true, no_results: true, message: 'JMeter produced 0 requests — nothing to sync to Analytics.' });
+            return res.json({ ok: true, no_results: true, message: `${engine === 'k6' ? 'k6' : 'JMeter'} produced 0 requests — nothing to sync to Analytics.` });
           } else {
             // Evaluate rules so PDF shows PASSED/FAILED correctly
             try {
               const { evaluateRulesFromContent } = require('../utils/ruleEvaluator');
-              ruleResult = await evaluateRulesFromContent(req.params.projectId, jtlText);
+              ruleResult = await evaluateRulesFromContent(req.params.projectId, jtlText, effectiveUserId, engine);
               reportData.rule_violations = ruleResult?.violations || [];
             } catch (_) {}
 
-            pdfBuffer = await generateAnalyticsPdfBuffer(reportData, runNum);
-            await resultsStore.writeFile(resultDir, orgSlug, pdfName, pdfBuffer);
-            console.log('[CI Sync] Analytics PDF generated:', pdfName);
+            if (engine === 'jmeter') {
+              const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
+              pdfBuffer = await generateAnalyticsPdfBuffer(reportData, runNum);
+              await resultsStore.writeFile(resultDir, orgSlug, pdfName, pdfBuffer);
+              console.log('[CI Sync] Analytics PDF generated:', pdfName);
+            }
           }
         }
       } catch (e) {
@@ -3876,15 +4126,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       }
     }
 
-    // ── Create execution_run record ───────────────────────────────────────────
-    let suiteId = null;
-    if (run.script_name) {
-      const scriptFile = run.script_name.split('/').pop();
-      const suite = await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-        .get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
-      suiteId = suite?.id || null;
-    }
-
+    // ── Create execution_run record (suite already resolved as syncSuiteId above) ──────────
     // Any individual API at 100% failure → mark run failed and always trigger heal, regardless of status code.
     const syncApiFullFailure = hasAnyApiFullFailure(reportData);
     // Overall pass/fail mirrors the rule engine (what the alert email/PDF already show) —
@@ -3902,8 +4144,8 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
     `).run(
       req.params.projectId,
-      suiteId,
-      'jmeter',
+      syncSuiteId,
+      engine,
       syncRunStatus,
       resultDir,
       hasReportFile ? reportPath : null,
@@ -3929,14 +4171,14 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       try {
         const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
         const emailData = reportData || {
-          meta: { suite_name: run.script_name || 'CI Run', engine: 'jmeter', started_at: run.started_at, duration_s: 0, status: 'completed' },
+          meta: { suite_name: run.script_name || 'CI Run', engine, started_at: run.started_at, duration_s: 0, status: 'completed' },
           summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0, p90: 0, p95: 0 },
           by_api: [], timeline: [], errors: [], rule_violations: [],
         };
-        // Use the actual suite name from the test_suites table (suiteId resolved above)
+        // Use the actual suite name from the test_suites table (syncSuiteId resolved above)
         let resolvedSuiteName = emailData.meta.suite_name;
-        if (suiteId) {
-          const sRow = await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(suiteId);
+        if (syncSuiteId) {
+          const sRow = await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(syncSuiteId, effectiveUserId);
           if (sRow?.name) { emailData.meta.suite_name = sRow.name; resolvedSuiteName = sRow.name; }
         }
         emailData.meta.run_id = newRunId;
@@ -4236,7 +4478,7 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
   // Locate the fixed JMX on disk and build canonical repo paths
   const scriptName   = originalCiRun.script_name || '';
   const scriptFile   = scriptName.replace(/\\/g, '/').split('/').pop() || scriptName || 'test';
-  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
+  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName, userId);
   const jmxDiskPath  = healCanonical.jmxDiskPath;
 
   // Read the (possibly just-healed) JMX content — same PAT-mode caveat as
@@ -4396,7 +4638,7 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
 
   const scriptName    = originalCiRun.script_name || '';
   const scriptFile    = scriptName.replace(/\\/g, '/').split('/').pop() || 'test.jmx';
-  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName);
+  const healCanonical = await buildCanonicalRepoPaths(projectId, scriptName, userId);
   const jmxDiskPath   = healCanonical.jmxDiskPath;
 
   // Read the (possibly just-healed) JMX content. For SSH-mode workspaces jmxDiskPath is a
@@ -4582,8 +4824,8 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
 
   const scriptFile = (ciRun?.script_name || '').replace(/\\/g, '/').split('/').pop();
   const suite = scriptFile
-    ? await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-        .get(projectId, `%${scriptFile}`, `%${scriptFile}`)
+    ? await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+        .get(projectId, userId, `%${scriptFile}`, `%${scriptFile}`)
     : null;
   if (!suite) {
     console.warn(`[CI Heal] No test suite for script "${ciRun?.script_name}"`);
@@ -4689,16 +4931,22 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     return;
   }
 
-  // ── Phase 1: Quick verify (1 VUser × 1 loop) ──────────────────────────────
+  // ── Phase 1: Quick verify (1 VUser × 1 loop/iteration) ────────────────────
+  // k6 needs no script-patching for this — --vus/--iterations are plain CLI flags — so the
+  // quick-verify override is just a different variable set merged over the run's originally
+  // stored variables (which already carry `engine` from /trigger); no other branching needed.
   setCiHealStatus(ciRunId, 'rerunning');
+  const quickOverrideVars = suite.engine === 'k6'
+    ? { k6_vus: String(HEAL_CI_VUSERS), k6_duration: '0', k6_iterations: String(HEAL_CI_LOOPS) }
+    : {
+        jmeter_users:    String(HEAL_CI_VUSERS),
+        jmeter_rampup:   String(HEAL_CI_RAMPUP),
+        jmeter_duration: String(HEAL_CI_DURATION),
+        jmeter_loops:    String(HEAL_CI_LOOPS),
+      };
   let quickResult;
   try {
-    quickResult = await pushJmxAndTrigger(userId, projectId, ciRun, {
-      jmeter_users:    String(HEAL_CI_VUSERS),
-      jmeter_rampup:   String(HEAL_CI_RAMPUP),
-      jmeter_duration: String(HEAL_CI_DURATION),
-      jmeter_loops:    String(HEAL_CI_LOOPS),
-    });
+    quickResult = await pushJmxAndTrigger(userId, projectId, ciRun, quickOverrideVars);
   } catch (e) {
     console.error('[CI Heal] Phase 1 trigger error:', e.message);
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('failed', lid);
@@ -4734,14 +4982,14 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const quickCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
     const quickScriptFile2 = (quickCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
     const quickSuite2 = quickScriptFile2
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, userId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
       : null;
     const quickCiVars2 = (() => { try { return JSON.parse(quickCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
-      projectId, quickSuite2?.id || null, fallbackDir,
+      projectId, quickSuite2?.id || null, quickCiRunRow?.engine || 'jmeter', fallbackDir,
       JSON.stringify([{ type: 'error', message: `Heal pipeline run ${quickCiRunId} failed — results not uploaded. Re-attempting fix.` }]),
       quickCiRunId,
       quickCiVars2.jmeter_users || null, quickCiVars2.jmeter_rampup || null, quickCiVars2.jmeter_duration || null, quickCiVars2.jmeter_loops || null
@@ -4806,14 +5054,14 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const fullCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
     const fullScriptFile2 = (fullCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
     const fullSuite2 = fullScriptFile2
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, userId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
       : null;
     const fullCiVars2 = (() => { try { return JSON.parse(fullCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, logs, started_at, finished_at, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-      VALUES (?, ?, 'jmeter', 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, 'failed', ?, ?, NOW(), NOW(), ?, ?, ?, ?, ?)
     `).run(
-      projectId, fullSuite2?.id || null, fallbackDir2,
+      projectId, fullSuite2?.id || null, fullCiRunRow?.engine || 'jmeter', fallbackDir2,
       JSON.stringify([{ type: 'error', message: `Full heal pipeline run ${fullCiRunId} failed — results not uploaded.` }]),
       fullCiRunId,
       fullCiVars2.jmeter_users || null, fullCiVars2.jmeter_rampup || null, fullCiVars2.jmeter_duration || null, fullCiVars2.jmeter_loops || null
@@ -4870,17 +5118,17 @@ router.post('/runs/:runId/heal', async (req, res) => {
     // The AI healer reads the JMX file directly from the test suite; an empty result_dir is fine.
     const scriptFile = (run.script_name || '').replace(/\\/g, '/').split('/').pop();
     const suiteRow = scriptFile
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-          .get(run.project_id, `%${scriptFile}`, `%${scriptFile}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+          .get(run.project_id, req.userId, `%${scriptFile}`, `%${scriptFile}`)
       : null;
     const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
     fs.mkdirSync(resultDir, { recursive: true });
     const healCiVars = (() => { try { return JSON.parse(run.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
       INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
-      VALUES (?, ?, 'jmeter', 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
     `).run(
-      run.project_id, suiteRow?.id || null, resultDir,
+      run.project_id, suiteRow?.id || null, run.engine || 'jmeter', resultDir,
       JSON.stringify([{ type: 'error', message: `CI pipeline run failed on ${run.provider}. No results were uploaded. Heal triggered manually.` }]),
       run.started_at || new Date().toISOString(),
       run.id,

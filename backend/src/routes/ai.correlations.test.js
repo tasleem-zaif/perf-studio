@@ -46,8 +46,8 @@ before(async () => {
     { name: 'Create Order', method: 'POST', url: 'https://api.example.com/orders', headers: { Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.abc.sig' }, body: '{"item":"widget"}', queryParams: {} },
     { name: 'Get Order', method: 'GET', url: 'https://api.example.com/orders/ord_9f8e7d', headers: {}, body: '', queryParams: {} },
   ];
-  const c = await db.prepare('INSERT INTO collections (project_id, name, json_content, environment) VALUES (?, ?, ?, ?)')
-    .run(projectId, 'Correlation Test Collection', JSON.stringify(endpoints), 'Default');
+  const c = await db.prepare('INSERT INTO collections (project_id, user_id, name, json_content, environment) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, userId, 'Correlation Test Collection', JSON.stringify(endpoints), 'Default');
   collectionId = c.lastInsertRowid;
 
   const preRunData = [
@@ -56,8 +56,8 @@ before(async () => {
     { body: { id: 'ord_9f8e7d' } },
   ];
   const rules = detectCorrelations(endpoints, preRunData);
-  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
-    .run(collectionId, 'Default', JSON.stringify({ correlationRules: rules }));
+  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)')
+    .run(collectionId, 'Default', JSON.stringify({ correlationRules: rules }), projectId, userId);
 });
 
 after(async () => {
@@ -362,8 +362,8 @@ test('setup: seed a collection for multi-target correlation tests', async () => 
     { name: 'Get Profile', method: 'GET', url: 'https://api.example.com/me', headers: {}, body: '', queryParams: {} }, // never recorded any session header either
     { name: 'Get Orders', method: 'GET', url: 'https://api.example.com/orders', headers: { 'X-Session-Token': 'sess_STALE_abc' }, body: '', queryParams: {} }, // DOES already carry the header
   ];
-  const c = await db.prepare('INSERT INTO collections (project_id, name, json_content, environment) VALUES (?, ?, ?, ?)')
-    .run(projectId, 'Multi-Target Correlation Test Collection', JSON.stringify(endpoints), 'Default');
+  const c = await db.prepare('INSERT INTO collections (project_id, user_id, name, json_content, environment) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, userId, 'Multi-Target Correlation Test Collection', JSON.stringify(endpoints), 'Default');
   multiCollectionId = c.lastInsertRowid;
 });
 

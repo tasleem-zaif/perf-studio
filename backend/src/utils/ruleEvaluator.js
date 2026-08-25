@@ -15,6 +15,7 @@
 
 const fs   = require('fs');
 const db   = require('../db');
+const { parseK6Metrics, parseK6MetricsFromContent } = require('./parseK6');
 
 // ── Parse JTL and compute aggregate metrics ───────────────────────────────────
 function parseJtlMetrics(jtlPath) {
@@ -104,22 +105,32 @@ function compare(actual, op, threshold, thresholdMin, thresholdMax) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Evaluates a JTL file against all rules defined for projectId.
+ * Evaluates a results file against all rules defined for projectId, scoped to the rule
+ * owner (userId) — rules are now per-user (Phase 2 of the per-user data isolation
+ * project), so every caller must resolve which user's rules apply to this run before
+ * calling in. execution_runs has no user_id column, so callers that only have a
+ * suite_id/projectId in scope must resolve userId via test_suites.user_id first.
  * @param {number|string} projectId
- * @param {string}        jtlPath   – absolute path to results.jtl
+ * @param {string}        resultsPath – absolute path to results.jtl (JMeter) or results.json (k6)
+ * @param {number|string} userId      – owner of the rules to evaluate against
+ * @param {string}        [engine]    – 'jmeter' (default) or 'k6' — picks the parser
  * @returns {{ passed: boolean, violations: Array, metrics: object|null, noRules: boolean }}
  */
-async function evaluateRules(projectId, jtlPath) {
-  return evaluateRulesFromMetrics(projectId, parseJtlMetrics(jtlPath));
+async function evaluateRules(projectId, resultsPath, userId, engine = 'jmeter') {
+  const metrics = engine === 'k6' ? parseK6Metrics(resultsPath) : parseJtlMetrics(resultsPath);
+  return evaluateRulesFromMetrics(projectId, metrics, userId);
 }
 
-/** Same as evaluateRules, but from already-fetched CSV text (e.g. read via resultsStore). */
-async function evaluateRulesFromContent(projectId, jtlContent) {
-  return evaluateRulesFromMetrics(projectId, parseJtlMetricsFromContent(jtlContent));
+/** Same as evaluateRules, but from already-fetched text (e.g. read via resultsStore). */
+async function evaluateRulesFromContent(projectId, resultsContent, userId, engine = 'jmeter') {
+  const metrics = engine === 'k6'
+    ? parseK6MetricsFromContent(resultsContent)
+    : parseJtlMetricsFromContent(resultsContent);
+  return evaluateRulesFromMetrics(projectId, metrics, userId);
 }
 
-async function evaluateRulesFromMetrics(projectId, metrics) {
-  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
+async function evaluateRulesFromMetrics(projectId, metrics, userId) {
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ?').all(projectId, userId);
 
   if (!rules || rules.length === 0) {
     // No rules defined — pass/fail determined by raw JTL fail count only

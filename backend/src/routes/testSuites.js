@@ -36,14 +36,14 @@ router.get('/', async (req, res) => {
   if (collection_id && env) {
     // Strict env isolation: only return suites explicitly tagged to this collection+env
     suites = await db.prepare(
-      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, collection_id, env);
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id, env, req.userId);
   } else if (collection_id) {
     suites = await db.prepare(
-      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, collection_id);
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id, req.userId);
   } else {
-    suites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+    suites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? AND user_id = ? ORDER BY created_at DESC').all(req.params.projectId, req.userId);
   }
   res.json({ suites });
 });
@@ -56,9 +56,9 @@ router.post('/', async (req, res) => {
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids ? JSON.parse(test_data_ids) : []);
   const primaryId = idsArr.length ? idsArr[0] : (test_data_id || null);
   const result = await db.prepare(
-    `INSERT INTO test_suites (project_id, name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config_json, vusers, rampup, iter_mode, loops, duration)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(req.params.projectId, name, test_type || 'load', collection_id || null, env || null, primaryId,
+    `INSERT INTO test_suites (project_id, user_id, name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config_json, vusers, rampup, iter_mode, loops, duration)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(req.params.projectId, req.userId, name, test_type || 'load', collection_id || null, env || null, primaryId,
     JSON.stringify(idsArr), engine || 'jmeter', JSON.stringify(config || {}), vusers||50, rampup||30, iter_mode||'duration', loops||1, duration||300);
   if (collection_id) {
     const _uid = req.userId, _pid = req.params.projectId;
@@ -71,19 +71,19 @@ router.post('/', async (req, res) => {
       } catch (_) {}
     });
   }
-  res.json({ suite: await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
+  res.json({ suite: await db.prepare('SELECT * FROM test_suites WHERE id = ? AND user_id = ?').get(result.lastInsertRowid, req.userId) });
 });
 
 router.put('/:id', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted in another session.' });
   const { name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config, vusers, rampup, iter_mode, loops, duration } = req.body;
   const normalId = v => (v === '' || v === undefined) ? null : v;
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids !== undefined ? JSON.parse(test_data_ids || '[]') : null);
   const primaryId = idsArr ? (idsArr.length ? idsArr[0] : null) : (test_data_id !== undefined ? normalId(test_data_id) : suite.test_data_id);
-  await db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=?`)
+  await db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=? AND user_id=?`)
     .run(name || suite.name, test_type || suite.test_type,
       collection_id !== undefined ? normalId(collection_id) : suite.collection_id,
       env !== undefined ? (env || null) : suite.env,
@@ -96,8 +96,8 @@ router.put('/:id', async (req, res) => {
       iter_mode !== undefined ? iter_mode : suite.iter_mode,
       loops !== undefined ? loops : suite.loops,
       duration !== undefined ? duration : suite.duration,
-      req.params.id);
-  const updatedSuite = await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
+      req.params.id, req.userId);
+  const updatedSuite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   if (updatedSuite?.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = updatedSuite.collection_id;
     setImmediate(async () => {
@@ -114,9 +114,9 @@ router.put('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have already been deleted.' });
-  await db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM test_suites WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
   resetSequence('test_suites');
   if (suite.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = suite.collection_id;
@@ -143,21 +143,21 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   const proj = await ownsProject(userId, projectId);
   if (!proj) return { error: 'Project not found', status: 404 };
 
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(suiteId, projectId, userId);
   if (!suite) return { error: 'Suite not found', status: 404 };
 
   // Gather context
   const collection = suite.collection_id
-    ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+    ? await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, userId)
     : null;
   // Load multiple test data files
   let dataIds = [];
   try { dataIds = JSON.parse(suite.test_data_ids || '[]'); } catch {}
   if (!dataIds.length && suite.test_data_id) dataIds = [suite.test_data_id];
   const testDataFiles = (await Promise.all(
-    dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(id))
+    dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(id, userId))
   )).filter(Boolean);
-  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ?').all(projectId, userId);
 
   const globalRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
   const projRow   = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(projectId);
@@ -168,7 +168,7 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   // Load env-specific config (highest priority) — overrides global + project
   const suiteEnv = suite.env || '';
   const envCfgRow = suiteEnv && suite.collection_id
-    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suiteEnv)
+    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?').get(suite.collection_id, suiteEnv, userId)
     : null;
   const envCfg = envCfgRow ? JSON.parse(envCfgRow.config_json || '{}') : {};
 
@@ -297,7 +297,7 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
 
     // Update DB
     const updateField = engine === 'jmeter' ? 'jmx_path' : 'js_path';
-    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, suiteId);
+    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=? AND user_id=?`).run(filePath || filename, suiteId, userId);
 
     if (suite.collection_id) setImmediate(async () => { await updateCollectionConfigs(suite.collection_id); });
     return { ok: true, filename, path: filePath };
@@ -315,7 +315,7 @@ router.post('/:id/generate', async (req, res) => {
 router.get('/:id/download/:type', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted. Try regenerating the script.' });
 
   const filePath = req.params.type === 'jmx' ? suite.jmx_path : suite.js_path;

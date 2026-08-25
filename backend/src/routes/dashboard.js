@@ -23,7 +23,8 @@ router.get('/stats', async (req, res) => {
     // ── Build WHERE clause per role ──────────────────────────────────────────
     let projectFilter;    // for the aggregate query
     let projectListSQL;   // full SELECT for the projects list
-    let params = [];
+    let params = [];       // placeholders for projectListSQL (per-row user_id filters + projectFilter's own)
+    let filterParams = []; // placeholders for projectFilter alone, reused by aggSQL below
 
     if (caller.role === 'super_admin') {
       projectFilter = '1=1';
@@ -31,66 +32,71 @@ router.get('/stats', async (req, res) => {
         SELECT p.id, p.name, p.description, p.color, p.bg, p.created_at,
                u.name  AS owner_name,
                o.name  AS org_name,
-               (SELECT COUNT(*) FROM collections   c  WHERE c.project_id  = p.id) AS collection_count,
-               (SELECT COUNT(*) FROM rules         r  WHERE r.project_id  = p.id) AS rule_count,
-               (SELECT COUNT(*) FROM test_suites   ts WHERE ts.project_id = p.id) AS test_plan_count,
-               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id) AS test_data_count
+               (SELECT COUNT(*) FROM collections   c  WHERE c.project_id  = p.id AND c.user_id  = ?) AS collection_count,
+               (SELECT COUNT(*) FROM rules         r  WHERE r.project_id  = p.id AND r.user_id  = ?) AS rule_count,
+               (SELECT COUNT(*) FROM test_suites   ts WHERE ts.project_id = p.id AND ts.user_id = ?) AS test_plan_count,
+               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id AND tdf.user_id = ?) AS test_data_count
         FROM projects p
         JOIN  users         u ON p.user_id  = u.id
         LEFT JOIN organizations o ON u.org_id = o.id
         ORDER BY o.name ASC, p.created_at DESC
       `;
+      params = [req.userId, req.userId, req.userId, req.userId];
+      filterParams = [];
     } else if (caller.role === 'org_admin') {
       projectFilter = 'u.org_id = ?';
-      params = [caller.org_id];
       projectListSQL = `
         SELECT p.id, p.name, p.description, p.color, p.bg, p.created_at,
                u.name  AS owner_name,
                o.name  AS org_name,
-               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id) AS collection_count,
-               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id) AS rule_count,
-               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id) AS test_plan_count,
-               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id) AS test_data_count
+               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id AND c.user_id   = ?) AS collection_count,
+               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id AND r.user_id   = ?) AS rule_count,
+               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id AND ts.user_id  = ?) AS test_plan_count,
+               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id AND tdf.user_id = ?) AS test_data_count
         FROM projects p
         JOIN  users         u ON p.user_id  = u.id
         LEFT JOIN organizations o ON u.org_id = o.id
         WHERE u.org_id = ?
         ORDER BY p.created_at DESC
       `;
+      params = [req.userId, req.userId, req.userId, req.userId, caller.org_id];
+      filterParams = [caller.org_id];
     } else if (caller.role === 'user') {
       projectFilter = 'EXISTS (SELECT 1 FROM project_assignments pa WHERE pa.project_id = p.id AND pa.user_id = ?)';
-      params = [req.userId];
+      filterParams = [req.userId];
       projectListSQL = `
         SELECT p.id, p.name, p.description, p.color, p.bg, p.created_at,
                u.name  AS owner_name,
                o.name  AS org_name,
-               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id) AS collection_count,
-               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id) AS rule_count,
-               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id) AS test_plan_count,
-               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id) AS test_data_count
+               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id AND c.user_id   = ?) AS collection_count,
+               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id AND r.user_id   = ?) AS rule_count,
+               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id AND ts.user_id  = ?) AS test_plan_count,
+               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id AND tdf.user_id = ?) AS test_data_count
         FROM projects p
         JOIN  project_assignments pa ON pa.project_id = p.id AND pa.user_id = ?
         JOIN  users         u ON p.user_id  = u.id
         LEFT JOIN organizations o ON u.org_id = o.id
         ORDER BY p.created_at DESC
       `;
+      params = [req.userId, req.userId, req.userId, req.userId, req.userId];
     } else {
       projectFilter = 'p.user_id = ?';
-      params = [req.userId];
+      filterParams = [req.userId];
       projectListSQL = `
         SELECT p.id, p.name, p.description, p.color, p.bg, p.created_at,
                u.name  AS owner_name,
                o.name  AS org_name,
-               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id) AS collection_count,
-               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id) AS rule_count,
-               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id) AS test_plan_count,
-               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id) AS test_data_count
+               (SELECT COUNT(*) FROM collections   c   WHERE c.project_id  = p.id AND c.user_id   = ?) AS collection_count,
+               (SELECT COUNT(*) FROM rules         r   WHERE r.project_id  = p.id AND r.user_id   = ?) AS rule_count,
+               (SELECT COUNT(*) FROM test_suites   ts  WHERE ts.project_id = p.id AND ts.user_id  = ?) AS test_plan_count,
+               (SELECT COUNT(*) FROM test_data_files tdf WHERE tdf.project_id = p.id AND tdf.user_id = ?) AS test_data_count
         FROM projects p
         JOIN  users         u ON p.user_id  = u.id
         LEFT JOIN organizations o ON u.org_id = o.id
         WHERE p.user_id = ?
         ORDER BY p.created_at DESC
       `;
+      params = [req.userId, req.userId, req.userId, req.userId, req.userId];
     }
 
     // ── Query 1: aggregate totals ────────────────────────────────────────────
@@ -104,13 +110,13 @@ router.get('/stats', async (req, res) => {
         COUNT(DISTINCT u.org_id) AS total_orgs
       FROM projects p
       JOIN  users             u   ON p.user_id    = u.id
-      LEFT JOIN collections   c   ON c.project_id  = p.id
-      LEFT JOIN rules         r   ON r.project_id  = p.id
-      LEFT JOIN test_suites   ts  ON ts.project_id = p.id
-      LEFT JOIN test_data_files tdf ON tdf.project_id = p.id
+      LEFT JOIN collections   c   ON c.project_id  = p.id AND c.user_id   = ?
+      LEFT JOIN rules         r   ON r.project_id  = p.id AND r.user_id   = ?
+      LEFT JOIN test_suites   ts  ON ts.project_id = p.id AND ts.user_id  = ?
+      LEFT JOIN test_data_files tdf ON tdf.project_id = p.id AND tdf.user_id = ?
       WHERE ${projectFilter}
     `;
-    const totals = await db.prepare(aggSQL).get(...params);
+    const totals = await db.prepare(aggSQL).get(req.userId, req.userId, req.userId, req.userId, ...filterParams);
 
     // ── Query 2: project list with per-project counts ────────────────────────
     const projects = await db.prepare(projectListSQL).all(...params);

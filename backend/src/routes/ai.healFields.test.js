@@ -57,8 +57,8 @@ before(async () => {
     { name: 'Create Order', method: 'POST', url: 'https://api.example.com/orders', headers: {}, body: '{"item":"widget"}', queryParams: {} },
     { name: 'Get Order', method: 'GET', url: 'https://api.example.com/orders/ord_9f8e7d', headers: {}, body: '', queryParams: {} },
   ];
-  const c = await db.prepare('INSERT INTO collections (project_id, name, json_content, environment) VALUES (?, ?, ?, ?)')
-    .run(projectId, 'Heal Fields Test Collection', JSON.stringify(endpoints), 'Default');
+  const c = await db.prepare('INSERT INTO collections (project_id, user_id, name, json_content, environment) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, userId, 'Heal Fields Test Collection', JSON.stringify(endpoints), 'Default');
   collectionId = c.lastInsertRowid;
 
   // Create Order succeeded and returned a fresh "id" — Get Order (index 1) failed using

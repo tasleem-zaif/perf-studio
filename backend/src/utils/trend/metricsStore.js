@@ -5,6 +5,7 @@
 // route already uses for the whole-run summary, applied at API granularity.
 const db = require('../../db');
 const { parseJtlContent } = require('../parseJtl');
+const { parseK6Content } = require('../parseK6');
 const resultsStore = require('../resultsStore');
 const { resolveOrgSlugForProject } = require('../projectFolders');
 
@@ -23,10 +24,11 @@ async function getOrBuildReportData(run) {
     try { return JSON.parse(run.report_data); } catch (_) { /* fall through to reparse */ }
   }
   if (!run.result_dir) return null;
+  const engine = run.engine || 'jmeter';
   const orgSlug = await resolveOrgSlugForProject(run.project_id);
-  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, 'results.jtl');
+  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, engine === 'k6' ? 'results.json' : 'results.jtl');
   if (!jtlText) return null;
-  const parsed = parseJtlContent(jtlText, { run_id: run.id });
+  const parsed = engine === 'k6' ? parseK6Content(jtlText, { run_id: run.id }) : parseJtlContent(jtlText, { run_id: run.id });
   if (!parsed) return null;
   if (!run.report_data) {
     try { await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(parsed), run.id); } catch (_) {}

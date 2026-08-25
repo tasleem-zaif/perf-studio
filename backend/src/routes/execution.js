@@ -734,7 +734,7 @@ router.post('/run', auth, async (req, res) => {
     return done({ ok: false, error: `Too many concurrent runs. Max ${MAX_CONCURRENT_RUNS} simultaneous runs allowed.` });
   }
 
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suite_id, project_id);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(suite_id, project_id, req.userId);
   if (!suite) { log('err', `Test suite not found (id=${suite_id})`); return done({ ok: false, error: 'Test suite not found' }); }
 
   const scriptPath = engine === 'jmeter' ? suite.jmx_path : suite.js_path;
@@ -779,7 +779,7 @@ router.post('/run', auth, async (req, res) => {
   let resultDir;
   if (suite.collection_id && projectFolderPath) {
     try {
-      const suiteCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      const suiteCol = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, req.userId);
       const resolvedEnv = resolveSuiteEnv(suiteCol, suite);
       if (suiteCol && resolvedEnv) {
         const { getCollectionPath } = require('../utils/projectFolders');
@@ -845,7 +845,7 @@ router.post('/run', auth, async (req, res) => {
       // Fall back to project/testData for legacy scripts
       let testDataHostDir, testDataExists;
       const suiteCollection = suite.collection_id
-        ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+        ? await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, req.userId)
         : null;
       const suiteEnvName = suite.env || '';
 
@@ -1035,7 +1035,7 @@ router.post('/run', auth, async (req, res) => {
       if (!jtlPath || !fs.existsSync(jtlPath)) return;
       try {
         const { evaluateRules: evalRules } = require('../utils/ruleEvaluator');
-        const result = evalRules(project_id, jtlPath);
+        const result = evalRules(project_id, jtlPath, req.userId);
         if (!result || result.noRules || !result.violations?.length) return;
 
         // Only alert on live-monitorable metrics — ignore Response Time, P95, etc.
@@ -1179,7 +1179,7 @@ router.post('/run', auth, async (req, res) => {
       log('err', '     Likely cause: target URL not configured for this environment.');
       log('err', '     Fix: Configuration → select env → add target URL → Save Config.');
     } else if (jtlPath && fs.existsSync(jtlPath)) {
-      const ruleResult = await evaluateRules(project_id, jtlPath);
+      const ruleResult = await evaluateRules(project_id, jtlPath, req.userId);
       if (!ruleResult.noRules) {
         ruleViolations = ruleResult.violations || [];
         const errorViolations = ruleViolations.filter(v => v.rule.severity === 'error');
@@ -1293,7 +1293,7 @@ router.post('/run', auth, async (req, res) => {
         // content already fetched via resultsStore above, not a local jtlPath (see note above).
         let ruleViolationsForEmail = [];
         try {
-          const rr = await evaluateRulesFromContent(runRow.project_id, jtlText);
+          const rr = await evaluateRulesFromContent(runRow.project_id, jtlText, req.userId);
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
@@ -1566,8 +1566,8 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
-  if (run.engine !== 'jmeter') return res.status(400).json({ error: 'Custom analytics only available for JMeter runs' });
 
+  const engine = run.engine || 'jmeter';
   const storedLogs = JSON.parse(run.logs || '[]');
 
   // ── serve from DB cache if available ──────────────────────────────────────
@@ -1588,8 +1588,9 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
   }
 
   // ── fall back to S3, then cache the result ───────────────────────────────
+  const resultsFilename = engine === 'k6' ? 'results.json' : 'results.jtl';
   const orgSlug0 = run.result_dir ? await resolveOrgSlugForProject(run.project_id) : null;
-  const jtlText = run.result_dir ? await resultsStore.readText(run.result_dir, orgSlug0, 'results.jtl') : null;
+  const jtlText = run.result_dir ? await resultsStore.readText(run.result_dir, orgSlug0, resultsFilename) : null;
   if (!jtlText) {
     return res.status(404).json({
       error: 'not_cached',
@@ -1606,8 +1607,9 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
     started_at:  run.started_at,
     finished_at: run.finished_at,
   };
-  const parsed = parseJtlContent(jtlText, runMeta);
-  if (!parsed) return res.status(400).json({ error: 'JTL file contains no data rows' });
+  const { parseK6Content } = require('../utils/parseK6');
+  const parsed = engine === 'k6' ? parseK6Content(jtlText, runMeta) : parseJtlContent(jtlText, runMeta);
+  if (!parsed) return res.status(400).json({ error: `${resultsFilename} contains no data rows` });
 
   // Backfill cache so next request is instant
   try {

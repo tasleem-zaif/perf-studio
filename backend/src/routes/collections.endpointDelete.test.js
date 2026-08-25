@@ -44,8 +44,8 @@ before(async () => {
     { name: 'GET static.js', method: 'GET', url: 'https://api.example.com/_next/static/chunks/x.js', headers: {}, body: '', queryParams: {} }, // garbage — index 1
     { name: 'Get Profile', method: 'GET', url: 'https://api.example.com/me', headers: { 'X-Session-Token': 'sess_STALE' }, body: '', queryParams: {} },
   ];
-  const c = await db.prepare('INSERT INTO collections (project_id, name, json_content, environment) VALUES (?, ?, ?, ?)')
-    .run(projectId, 'Endpoint Delete Test Collection', JSON.stringify(endpoints), 'Default');
+  const c = await db.prepare('INSERT INTO collections (project_id, user_id, name, json_content, environment) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, userId, 'Endpoint Delete Test Collection', JSON.stringify(endpoints), 'Default');
   collectionId = c.lastInsertRowid;
 
   const rule = {
@@ -55,9 +55,10 @@ before(async () => {
   };
   const generator = { id: '2:body:$.uuid', targetEndpointIndex: 2, targetLocation: 'body', targetKey: '$.uuid', value: 'x', generator: 'uuid' };
   const override = { 2: { method: 'GET', name: 'Get Profile', headers: { 'X-Session-Token': 'fixed' } } };
-  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)').run(
+  await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)').run(
     collectionId, 'Default',
     JSON.stringify({ correlationRules: [rule], fieldGenerators: [generator], endpointOverrides: override }),
+    projectId, userId,
   );
 });
 

@@ -61,7 +61,7 @@ function ensureAllEnvFoldersInSession(session, contentRoot, collectionName, envi
  * collections that only ever reference their host/port via variables still get a usable
  * env config instead of none at all.
  */
-async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables = {}) {
+async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables = {}, userId = null) {
   try {
     const endpoints = JSON.parse(jsonContent || '[]');
     if (!endpoints.length) return;
@@ -100,15 +100,15 @@ async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, v
     // User can then edit each env to point to their specific server.
     // Only sets URL if the env config doesn't already have one (never overwrites user edits).
     if (collectionId) {
-      const col = await db.prepare('SELECT environments, environment FROM collections WHERE id = ?').get(collectionId);
+      const col = await db.prepare('SELECT environments, environment FROM collections WHERE id = ? AND user_id = ?').get(collectionId, userId);
       let envs = [];
       try { envs = JSON.parse(col?.environments || '[]'); } catch {}
       if (!envs.length && col?.environment) envs = [col.environment];
 
       for (const env of envs) {
         const envRow = await db.prepare(
-          'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?'
-        ).get(collectionId, env);
+          'SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?'
+        ).get(collectionId, env, userId);
         const envCfg  = envRow ? JSON.parse(envRow.config_json || '{}') : {};
         const hasUrls = (envCfg.urls || []).some(u => u.url); // has user-set URLs already
 
@@ -116,11 +116,11 @@ async function autoPopulateProjectConfig(projectId, jsonContent, collectionId, v
           // No user URLs yet — auto-fill as starting point
           envCfg.urls = urlSets;
           if (envRow) {
-            await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?')
-              .run(JSON.stringify(envCfg), collectionId, env);
+            await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ? AND user_id = ?')
+              .run(JSON.stringify(envCfg), collectionId, env, userId);
           } else {
-            await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
-              .run(collectionId, env, JSON.stringify(envCfg));
+            await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)')
+              .run(collectionId, env, JSON.stringify(envCfg), projectId, userId);
           }
           console.log(`[Collections] Auto-populated ${env} env config for collection ${collectionId}`);
         }
@@ -218,17 +218,17 @@ const uploadWithEnv = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'env
  * (and script generation) can resolve them, without ever overwriting a value the
  * user already set for that env — existing keys always win over freshly harvested ones.
  */
-async function seedEnvVariables(collectionId, envs, variables) {
+async function seedEnvVariables(collectionId, envs, variables, projectId = null, userId = null) {
   if (!variables || !Object.keys(variables).length) return;
   try {
     for (const env of envs) {
-      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(collectionId, env);
+      const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?').get(collectionId, env, userId);
       const cfg = row ? JSON.parse(row.config_json || '{}') : {};
       cfg.variables = { ...variables, ...(cfg.variables || {}) };
       if (row) {
-        await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?').run(JSON.stringify(cfg), collectionId, env);
+        await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ? AND user_id = ?').run(JSON.stringify(cfg), collectionId, env, userId);
       } else {
-        await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)').run(collectionId, env, JSON.stringify(cfg));
+        await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, project_id, user_id) VALUES (?, ?, ?, ?, ?)').run(collectionId, env, JSON.stringify(cfg), projectId, userId);
       }
     }
   } catch (e) {
@@ -246,16 +246,16 @@ async function seedEnvVariables(collectionId, envs, variables) {
  * production's DB latency didn't, which is why uploaded environment-file variables went
  * missing there but not locally. Running them sequentially removes the race entirely.
  */
-async function syncCollectionEnvConfig(projectId, jsonContent, collectionId, envs, variables) {
-  await autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables);
-  await seedEnvVariables(collectionId, envs, variables);
+async function syncCollectionEnvConfig(projectId, jsonContent, collectionId, envs, variables, userId = null) {
+  await autoPopulateProjectConfig(projectId, jsonContent, collectionId, variables, userId);
+  await seedEnvVariables(collectionId, envs, variables, projectId, userId);
 }
 
 router.use(auth);
 
 router.get('/', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const collections = await db.prepare('SELECT * FROM collections WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+  const collections = await db.prepare('SELECT * FROM collections WHERE project_id = ? AND user_id = ? ORDER BY created_at DESC').all(req.params.projectId, req.userId);
   res.json({ collections });
 });
 
@@ -321,9 +321,9 @@ router.post('/', uploadWithEnv, async (req, res) => {
   }
 
   const result = await db.prepare(
-    `INSERT INTO collections (project_id, name, description, json_content, source_type, source_content, tool_target, environment, environments)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(req.params.projectId, name, description || '', json_content, stype, source_content,
+    `INSERT INTO collections (project_id, user_id, name, description, json_content, source_type, source_content, tool_target, environment, environments)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(req.params.projectId, req.userId, name, description || '', json_content, stype, source_content,
         tool_target || 'jmeter', envFirst, JSON.stringify(envsArr));
 
   const colId = result.lastInsertRowid;
@@ -337,10 +337,10 @@ router.post('/', uploadWithEnv, async (req, res) => {
   // Store the collection base path (parent of all env folders)
   if (firstFolderPath) {
     const basePath = require('path').dirname(firstFolderPath); // CollectionName_ID/
-    await db.prepare('UPDATE collections SET folder_path = ? WHERE id = ?').run(basePath, colId);
+    await db.prepare('UPDATE collections SET folder_path = ? WHERE id = ? AND user_id = ?').run(basePath, colId, req.userId);
   }
 
-  const savedCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(colId);
+  const savedCol = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(colId, req.userId);
   const callerRow = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
   // Pass user's workspace path so config.json is written to the right location
   const projForConfig = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
@@ -352,7 +352,7 @@ router.post('/', uploadWithEnv, async (req, res) => {
   // Also seeds {{var}} values (from the collection and/or uploaded environment file) into
   // each env — run sequentially (not as two racing setImmediate calls) so both writes to
   // the same collection_env_config row never clobber each other.
-  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, savedCol.json_content, colId, envsArr, collectionVariables));
+  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, savedCol.json_content, colId, envsArr, collectionVariables, req.userId));
 
   res.json({ collection: savedCol });
 });
@@ -360,7 +360,7 @@ router.post('/', uploadWithEnv, async (req, res) => {
 router.put('/:id', uploadWithEnv, async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!col) return res.status(404).json({ error: 'Collection not found — it may have been deleted in another session.' });
 
   const { name, description, source_type, tool_target } = req.body;
@@ -418,16 +418,16 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
   }
 
   await db.prepare(
-    `UPDATE collections SET name=?, description=?, json_content=?, source_type=?, source_content=?, tool_target=?, environment=?, environments=?, folder_path=? WHERE id=?`
+    `UPDATE collections SET name=?, description=?, json_content=?, source_type=?, source_content=?, tool_target=?, environment=?, environments=?, folder_path=? WHERE id=? AND user_id=?`
   ).run(newName, description ?? col.description, json_content, stype, source_content,
         tool_target || col.tool_target, envFirst, JSON.stringify(envsArr),
-        colBasePath, req.params.id);
+        colBasePath, req.params.id, req.userId);
 
-  const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(req.params.id);
+  const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   // Re-populate project config if endpoints changed, then seed any newly-discovered
   // {{var}} values into each env (never overwrites existing values) — sequentially, see
   // syncCollectionEnvConfig's comment for why these can't run as two racing setImmediates.
-  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, updatedCol.json_content, updatedCol.id, envsArr, collectionVariables));
+  setImmediate(() => syncCollectionEnvConfig(req.params.projectId, updatedCol.json_content, updatedCol.id, envsArr, collectionVariables, req.userId));
 
   // Sync folder structure + config.json in current user's workspace
   try {
@@ -489,7 +489,7 @@ router.put('/:id', uploadWithEnv, async (req, res) => {
 router.delete('/:id', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!col) return res.status(404).json({ error: 'Collection not found — it may have already been deleted.' });
 
   // Delete the collection's folder from the current user's git workspace
@@ -521,10 +521,10 @@ router.delete('/:id', async (req, res) => {
   // the test plan (keeps it around with collection_id=NULL, still generatable/runnable
   // against a now-nonexistent collection) rather than removing it — explicitly delete
   // instead so a collection's test plans go away with it, same as its test data files.
-  await db.prepare('DELETE FROM test_suites WHERE collection_id = ?').run(req.params.id);
-  await db.prepare('DELETE FROM collection_env_config WHERE collection_id = ?').run(req.params.id);
-  await db.prepare('DELETE FROM test_data_files WHERE collection_id = ?').run(req.params.id);
-  await db.prepare('DELETE FROM collections WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM test_suites WHERE collection_id = ? AND user_id = ?').run(req.params.id, req.userId);
+  await db.prepare('DELETE FROM collection_env_config WHERE collection_id = ? AND user_id = ?').run(req.params.id, req.userId);
+  await db.prepare('DELETE FROM test_data_files WHERE collection_id = ? AND user_id = ?').run(req.params.id, req.userId);
+  await db.prepare('DELETE FROM collections WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
   resetSequence('test_suites');
   resetSequence('collections');
   res.json({ ok: true });
@@ -541,7 +541,7 @@ router.delete('/:id', async (req, res) => {
 router.post('/:id/endpoints/delete', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!col) return res.status(404).json({ error: 'Collection not found — it may have been deleted in another session.' });
 
   const rawIndices = Array.isArray(req.body.indices) ? req.body.indices : [req.body.index];
@@ -556,17 +556,17 @@ router.post('/:id/endpoints/delete', async (req, res) => {
   if (!toDelete.length) return res.status(400).json({ error: 'No valid endpoint indices to delete' });
 
   const remaining = endpoints.filter((_, i) => !toDelete.includes(i));
-  await db.prepare('UPDATE collections SET json_content = ? WHERE id = ?').run(JSON.stringify(remaining), req.params.id);
+  await db.prepare('UPDATE collections SET json_content = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(remaining), req.params.id, req.userId);
 
-  const envRows = await db.prepare('SELECT id, config_json FROM collection_env_config WHERE collection_id = ?').all(req.params.id);
+  const envRows = await db.prepare('SELECT id, config_json FROM collection_env_config WHERE collection_id = ? AND user_id = ?').all(req.params.id, req.userId);
   for (const row of envRows) {
     let cfg = {};
     try { cfg = JSON.parse(row.config_json || '{}'); } catch {}
     const reindexed = reindexAfterEndpointRemoval(cfg, toDelete);
-    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE id = ?').run(JSON.stringify(reindexed), row.id);
+    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(reindexed), row.id, req.userId);
   }
 
-  const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(req.params.id);
+  const updatedCol = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
 
   // Sync the workspace's config.json snapshot, same as the PUT route above — otherwise it
   // keeps listing endpoints that no longer exist until some unrelated edit refreshes it.

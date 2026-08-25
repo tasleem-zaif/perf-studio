@@ -80,7 +80,7 @@ async function writeJsonToSession(gitDir, relPath, data, orgSlug) {
 
 async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, userId = null) {
   try {
-    const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
+    const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(collectionId, userId);
     if (!col) return;
 
     const envName = env || col.environment || 'Default';
@@ -106,7 +106,7 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, us
     try { endpointCount = JSON.parse(col.json_content || '[]').length; } catch {}
 
     // Rules for this project
-    const rules = (await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(col.project_id))
+    const rules = (await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ?').all(col.project_id, userId))
       .map(r => {
         const rule = {
           id: r.id, metric: r.metric, operator: r.operator,
@@ -122,7 +122,7 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, us
       });
 
     // Test plans linked to this collection
-    const testPlans = (await db.prepare('SELECT * FROM test_suites WHERE collection_id = ?').all(collectionId))
+    const testPlans = (await db.prepare('SELECT * FROM test_suites WHERE collection_id = ? AND user_id = ?').all(collectionId, userId))
       .map(s => ({
         id: s.id, name: s.name, engine: s.engine,
         test_type: s.test_type || 'load',
@@ -186,7 +186,7 @@ async function writeCollectionEnvConfig(collectionId, env, projectFolderPath, us
 
 async function updateCollectionConfigs(collectionId, projectFolderPath, userId = null) {
   try {
-    const col = await db.prepare('SELECT * FROM collections WHERE id = ?').get(collectionId);
+    const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(collectionId, userId);
     if (!col) return;
     let envs = [];
     try { envs = JSON.parse(col.environments || '[]'); } catch {}
@@ -206,7 +206,7 @@ async function updateProjectCollectionConfigs(projectId, projectFolderPath, user
   // accidentally writing to the wrong (e.g. admin) workspace.
   if (!projectFolderPath) return;
   try {
-    const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(projectId);
+    const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ? AND user_id = ?').all(projectId, userId);
     for (const col of collections) {
       await updateCollectionConfigs(col.id, projectFolderPath, userId);
     }
@@ -236,6 +236,10 @@ async function writeProjectSnapshot(project, userId) {
 
 // ── Auto-populate project config from all collections (called on first config load) ─
 
+// NOTE (per-user data isolation, Phase 2): this function has no userId in scope today —
+// left as a deliberate project-wide read across all users' collections/env-config for
+// reference URL data, not a per-user leak in the write sense (it only ever feeds
+// project_config's suggested URL list). Revisit if/when a caller threads userId through.
 async function autoPopulateFromCollections(projectId) {
   try {
     const cols = await db.prepare('SELECT id, environment, json_content FROM collections WHERE project_id = ?').all(projectId);

@@ -63,9 +63,9 @@ async function hydrateOwnWorkspace(projectId, userId) {
  * (e.g. "Collection1/QA/testData/users.csv"). Callers root this against either a real
  * userProjPath (SSH) or a gitEngine session's content root (PAT).
  */
-async function resolveDestination(projectId, colId, envName) {
+async function resolveDestination(projectId, colId, envName, userId) {
   if (colId) {
-    const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, projectId);
+    const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(colId, projectId, userId);
     if (col) {
       let targetEnv = envName;
       if (!targetEnv) {
@@ -90,27 +90,27 @@ router.get('/', async (req, res) => {
   if (colId && envName) {
     // Strict env isolation: filter by collection_id + env DB columns
     files = await db.prepare(
-      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, colId, envName);
+      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? AND env = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, colId, envName, req.userId);
     // Fallback: include files without DB tags but with matching path (legacy files uploaded before tagging)
     if (!files.length) {
-      const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+      const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(colId, req.params.projectId, req.userId);
       if (col) {
         const proj = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(req.params.projectId);
         const basePath = proj?.folder_path || '';
         if (basePath) {
           const filterPath = getCollectionPath(basePath, col.name, envName).replace(/\\/g, '/');
-          const legacyFiles = await db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND (collection_id IS NULL OR collection_id = 0) ORDER BY created_at DESC').all(req.params.projectId);
+          const legacyFiles = await db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND (collection_id IS NULL OR collection_id = 0) AND user_id = ? ORDER BY created_at DESC').all(req.params.projectId, req.userId);
           files = legacyFiles.filter(f => f.path && f.path.replace(/\\/g, '/').startsWith(filterPath));
         }
       }
     }
   } else if (colId) {
     files = await db.prepare(
-      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, colId);
+      "SELECT * FROM test_data_files WHERE project_id = ? AND collection_id = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, colId, req.userId);
   } else {
-    files = await db.prepare('SELECT * FROM test_data_files WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+    files = await db.prepare('SELECT * FROM test_data_files WHERE project_id = ? AND user_id = ? ORDER BY created_at DESC').all(req.params.projectId, req.userId);
   }
 
   // Flag stale files (DB record exists but file no longer available)
@@ -161,7 +161,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
 
       if (colId && !envName) {
         // "All environments" — copy file to every env folder of the collection
-        const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+        const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(colId, req.params.projectId, req.userId);
         if (col) {
           let allEnvs = [];
           try { allEnvs = JSON.parse(col.environments || '[]'); } catch {}
@@ -177,20 +177,20 @@ router.post('/', upload.single('csv'), async (req, res) => {
             const evFilePath = posix.join(cleanName(proj.name), relPath);
 
             const evExisting = await db.prepare(
-              "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ?"
-            ).get(req.params.projectId, req.file.originalname, ev, colId);
+              "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ? AND user_id = ?"
+            ).get(req.params.projectId, req.file.originalname, ev, colId, req.userId);
             if (evExisting) {
-              await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?')
-                .run(safeName, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id);
+              await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=? AND user_id=?')
+                .run(safeName, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id, req.userId);
               lastFileId = evExisting.id;
             } else {
-              const r = await db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                .run(req.params.projectId, colId, ev, safeName, req.file.originalname, evFilePath, JSON.stringify(headers));
+              const r = await db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                .run(req.params.projectId, colId, ev, safeName, req.file.originalname, evFilePath, JSON.stringify(headers), req.userId);
               lastFileId = r.lastInsertRowid;
             }
           }
           await gitEngine.persistSession(session, gitDir, orgSlug);
-          return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(lastFileId), copied_to_envs: allEnvs });
+          return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(lastFileId, req.userId), copied_to_envs: allEnvs });
         }
       }
 
@@ -198,7 +198,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
       let targetEnv = envName;
       let relDir = 'testData';
       if (colId) {
-        const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(colId, req.params.projectId);
+        const col = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(colId, req.params.projectId, req.userId);
         if (col) {
           if (!targetEnv) {
             try { const envs = JSON.parse(col.environments || '[]'); targetEnv = envs[0] || col.environment || 'Default'; } catch { targetEnv = col.environment || 'Default'; }
@@ -213,22 +213,22 @@ router.post('/', upload.single('csv'), async (req, res) => {
 
       const destPrefix = posix.dirname(filePath);
       const existing = await db.prepare(
-        "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND REPLACE(path, '\\', '/') LIKE ?"
-      ).get(req.params.projectId, req.file.originalname, `${destPrefix}/%`);
+        "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND REPLACE(path, '\\', '/') LIKE ? AND user_id = ?"
+      ).get(req.params.projectId, req.file.originalname, `${destPrefix}/%`, req.userId);
 
       let fileId;
       if (existing) {
-        await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?')
-          .run(safeName, filePath, JSON.stringify(headers), colId, targetEnv || envName, existing.id);
+        await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=? AND user_id=?')
+          .run(safeName, filePath, JSON.stringify(headers), colId, targetEnv || envName, existing.id, req.userId);
         fileId = existing.id;
       } else {
         const result = await db.prepare(
-          'INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).run(req.params.projectId, colId, targetEnv || envName, safeName, req.file.originalname, filePath, JSON.stringify(headers));
+          'INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).run(req.params.projectId, colId, targetEnv || envName, safeName, req.file.originalname, filePath, JSON.stringify(headers), req.userId);
         fileId = result.lastInsertRowid;
       }
       await gitEngine.persistSession(session, gitDir, orgSlug);
-      return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(fileId) });
+      return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(fileId, req.userId) });
     }
 
     // ── SSH mode: unchanged — write to the real local workspace directory ──────────────
@@ -237,7 +237,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
     if (!userProjPath) return res.status(400).json({ error: 'Git repository not initialized.' });
     await require('../routes/git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
 
-    const { col, relDir } = await resolveDestination(req.params.projectId, colId, envName);
+    const { col, relDir } = await resolveDestination(req.params.projectId, colId, envName, req.userId);
     const destFolder = path.join(userProjPath, ...relDir.split('/'));
     fs.mkdirSync(destFolder, { recursive: true });
     const filePath = path.join(destFolder, safeName);
@@ -263,40 +263,40 @@ router.post('/', upload.single('csv'), async (req, res) => {
         if (!evUp.ok && !evUp.skipped) console.error('[TestData] S3 sync failed for', evFilePath, ':', evUp.error?.message);
 
         const evExisting = await db.prepare(
-          "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ?"
-        ).get(req.params.projectId, req.file.originalname, ev, colId);
+          "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND env = ? AND collection_id = ? AND user_id = ?"
+        ).get(req.params.projectId, req.file.originalname, ev, colId, req.userId);
         if (evExisting) {
-          await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?')
-            .run(safeName, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id);
+          await db.prepare('UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=? AND user_id=?')
+            .run(safeName, evFilePath, JSON.stringify(headers), colId, ev, evExisting.id, req.userId);
           lastFileId = evExisting.id;
         } else {
-          const r = await db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)')
-            .run(req.params.projectId, colId, ev, safeName, req.file.originalname, evFilePath, JSON.stringify(headers));
+          const r = await db.prepare('INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(req.params.projectId, colId, ev, safeName, req.file.originalname, evFilePath, JSON.stringify(headers), req.userId);
           lastFileId = r.lastInsertRowid;
         }
       }
-      return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(lastFileId), copied_to_envs: allEnvs });
+      return res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(lastFileId, req.userId), copied_to_envs: allEnvs });
     }
 
     const destDir = path.dirname(filePath).replace(/\\/g, '/');
     const existing = await db.prepare(
-      "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND REPLACE(path, '\\', '/') LIKE ?"
-    ).get(req.params.projectId, req.file.originalname, `${destDir}/%`);
+      "SELECT id FROM test_data_files WHERE project_id = ? AND original_name = ? AND REPLACE(path, '\\', '/') LIKE ? AND user_id = ?"
+    ).get(req.params.projectId, req.file.originalname, `${destDir}/%`, req.userId);
 
     let fileId;
     if (existing) {
       await db.prepare(
-        'UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=?'
-      ).run(safeName, filePath, JSON.stringify(headers), colId, envName, existing.id);
+        'UPDATE test_data_files SET filename=?, path=?, columns=?, collection_id=?, env=? WHERE id=? AND user_id=?'
+      ).run(safeName, filePath, JSON.stringify(headers), colId, envName, existing.id, req.userId);
       fileId = existing.id;
     } else {
       const result = await db.prepare(
-        'INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).run(req.params.projectId, colId, envName, safeName, req.file.originalname, filePath, JSON.stringify(headers));
+        'INSERT INTO test_data_files (project_id, collection_id, env, filename, original_name, path, columns, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(req.params.projectId, colId, envName, safeName, req.file.originalname, filePath, JSON.stringify(headers), req.userId);
       fileId = result.lastInsertRowid;
     }
 
-    res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(fileId) });
+    res.json({ file: await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(fileId, req.userId) });
   } catch (e) {
     res.status(400).json({ error: `Failed to read file: ${e.message}` });
   }
@@ -304,7 +304,7 @@ router.post('/', upload.single('csv'), async (req, res) => {
 
 router.get('/:id/content', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   const limit = parseInt(req.query.limit) || 500;
@@ -344,7 +344,7 @@ router.get('/:id/content', async (req, res) => {
 
 router.put('/:id/content', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   const { headers, rows } = req.body;
@@ -364,7 +364,7 @@ router.put('/:id/content', async (req, res) => {
       session.fs.mkdirSync(posix.dirname(full), { recursive: true });
       session.fs.writeFileSync(full, buildCsvContent(headers, rows), 'utf8');
       await gitEngine.persistSession(session, gitDir, orgSlug);
-      await db.prepare('UPDATE test_data_files SET columns = ? WHERE id = ?').run(JSON.stringify(headers), req.params.id);
+      await db.prepare('UPDATE test_data_files SET columns = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(headers), req.params.id, req.userId);
       return res.json({ ok: true });
     }
 
@@ -373,7 +373,7 @@ router.put('/:id/content', async (req, res) => {
     writeCsv(file.path, headers, rows);
     const up = await s3Sync.uploadFile(file.path, orgSlug);
     if (!up.ok && !up.skipped) console.error('[TestData] S3 sync failed for', file.path, ':', up.error?.message);
-    await db.prepare('UPDATE test_data_files SET columns = ? WHERE id = ?').run(JSON.stringify(headers), req.params.id);
+    await db.prepare('UPDATE test_data_files SET columns = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(headers), req.params.id, req.userId);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: `Failed to write file: ${e.message}` });
@@ -385,7 +385,7 @@ router.put('/:id/content', async (req, res) => {
 // meaningful for SSH-mode workspaces, which still have a real local directory.
 router.post('/:id/open-external', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!file) return res.status(404).json({ error: 'Test data file not found — it may have been deleted. Please re-upload the file.' });
 
   const isSSH = await isSshMode(req.userId, req.params.projectId);
@@ -427,7 +427,7 @@ router.post('/:id/open-external', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const file = await db.prepare('SELECT * FROM test_data_files WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!file) return res.status(404).json({ error: 'Test data file not found — it may have already been deleted.' });
 
   const isSSH = await isSshMode(req.userId, req.params.projectId);
@@ -448,7 +448,7 @@ router.delete('/:id', async (req, res) => {
     if (!del.ok && !del.skipped) console.error('[TestData] S3 delete failed for', file.path, ':', del.error?.message);
   }
 
-  await db.prepare('DELETE FROM test_data_files WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM test_data_files WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
   resetSequence('test_data_files');
   res.json({ ok: true });
 });
