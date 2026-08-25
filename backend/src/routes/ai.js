@@ -26,20 +26,24 @@ function simpleHash(str) {
   return hash.toString();
 }
 
-async function loadEnvConfig(collectionId, env) {
-  const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(collectionId, env);
+async function loadEnvConfig(collectionId, env, userId) {
+  const row = await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?').get(collectionId, env, userId);
   let cfg = {};
   try { cfg = JSON.parse(row?.config_json || '{}'); } catch {}
   return { row, cfg };
 }
 
-async function saveEnvConfig(collectionId, env, row, cfg) {
+async function saveEnvConfig(collectionId, env, row, cfg, userId) {
   if (row) {
-    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ?')
-      .run(JSON.stringify(cfg), collectionId, env);
+    await db.prepare('UPDATE collection_env_config SET config_json = ? WHERE collection_id = ? AND env = ? AND user_id = ?')
+      .run(JSON.stringify(cfg), collectionId, env, userId);
   } else {
-    await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json) VALUES (?, ?, ?)')
-      .run(collectionId, env, JSON.stringify(cfg));
+    // collection_env_config also requires project_id (added alongside user_id) — derive it
+    // from the collection itself rather than threading a projectId param through every one
+    // of this function's call sites.
+    const col = await db.prepare('SELECT project_id FROM collections WHERE id = ?').get(collectionId);
+    await db.prepare('INSERT INTO collection_env_config (collection_id, env, config_json, user_id, project_id) VALUES (?, ?, ?, ?, ?)')
+      .run(collectionId, env, JSON.stringify(cfg), userId, col?.project_id);
   }
 }
 
@@ -47,9 +51,9 @@ async function saveEnvConfig(collectionId, env, row, cfg) {
 // enforcing the same ownership/existence checks the rest of this file uses.
 async function loadCollectionAndCfg(userId, projectId, collectionId) {
   if (!await ownsProject(userId, projectId)) return { error: [404, 'Project not found'] };
-  const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(collectionId, projectId);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(collectionId, projectId, userId);
   if (!collection) return { error: [404, 'Collection not found'] };
-  const { row: envRow, cfg: envCfg } = await loadEnvConfig(collectionId, collection.environment);
+  const { row: envRow, cfg: envCfg } = await loadEnvConfig(collectionId, collection.environment, userId);
   return { collection, envRow, envCfg };
 }
 
@@ -59,7 +63,7 @@ router.post('/pre-run', async (req, res) => {
     if (!collection_id || !project_id) return res.status(400).json({ error: 'collection_id and project_id required' });
 
     if (!await ownsProject(req.userId, project_id)) return res.status(404).json({ error: 'Project not found' });
-    const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(collection_id, project_id);
+    const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(collection_id, project_id, req.userId);
     if (!collection) return res.status(404).json({ error: 'Collection not found' });
 
     let endpoints = [];
@@ -68,7 +72,7 @@ router.post('/pre-run', async (req, res) => {
     // Load {{var}} values for this collection's default environment (set at import time,
     // from a collection's own `variable` defaults and/or an uploaded Postman environment
     // file) and any per-endpoint fixes previously applied via the "Fix with AI" heal action.
-    const { row: envRow, cfg: envCfg } = await loadEnvConfig(collection_id, collection.environment);
+    const { row: envRow, cfg: envCfg } = await loadEnvConfig(collection_id, collection.environment, req.userId);
     const variables = envCfg.variables || {};
     const overrides = envCfg.endpointOverrides || {};
 
@@ -145,11 +149,11 @@ router.post('/pre-run', async (req, res) => {
 
     // Persist results — always on collection, also on test_suite when suite_id provided (legacy)
     const hash = simpleHash(collection.json_content || '');
-    await db.prepare('UPDATE collections SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
-      .run(JSON.stringify(responses), hash, collection_id);
+    await db.prepare('UPDATE collections SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(responses), hash, collection_id, req.userId);
     if (suite_id) {
-      await db.prepare('UPDATE test_suites SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ?')
-        .run(JSON.stringify(responses), hash, suite_id);
+      await db.prepare('UPDATE test_suites SET pre_run_data = ?, pre_run_collection_hash = ? WHERE id = ? AND user_id = ?')
+        .run(JSON.stringify(responses), hash, suite_id, req.userId);
     }
 
     // Full correlation detection (tokens, query params, path segments, body fields — not
@@ -159,7 +163,7 @@ router.post('/pre-run', async (req, res) => {
     const freshRules = detectCorrelations(endpoints, responses);
     const correlationRules = mergeRules(envCfg.correlationRules, freshRules);
     envCfg.correlationRules = correlationRules;
-    await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+    await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
 
     res.json({ responses, correlationRules, extractedToken: defaultToken ? '(present — not returned for security)' : null });
   } catch (err) {
@@ -180,7 +184,7 @@ router.post('/pre-run/heal', async (req, res) => {
       return res.status(400).json({ error: 'collection_id, project_id, index, and instruction are required' });
     }
     if (!await ownsProject(req.userId, project_id)) return res.status(404).json({ error: 'Project not found' });
-    const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ?').get(collection_id, project_id);
+    const collection = await db.prepare('SELECT * FROM collections WHERE id = ? AND project_id = ? AND user_id = ?').get(collection_id, project_id, req.userId);
     if (!collection) return res.status(404).json({ error: 'Collection not found' });
 
     let endpoints = [];
@@ -194,7 +198,7 @@ router.post('/pre-run/heal', async (req, res) => {
     if (!ep || !prior) return res.status(404).json({ error: 'Endpoint not found — re-run pre-run and try again' });
     if (prior.success) return res.status(400).json({ error: 'This endpoint already succeeded — nothing to heal' });
 
-    const { row: envRow, cfg: envCfg } = await loadEnvConfig(collection_id, collection.environment);
+    const { row: envRow, cfg: envCfg } = await loadEnvConfig(collection_id, collection.environment, req.userId);
     const variables = envCfg.variables || {};
     const overrides = envCfg.endpointOverrides || {};
 
@@ -285,7 +289,7 @@ router.post('/pre-run/heal', async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
     envCfg.endpointOverrides = { ...overrides, [idx]: override };
-    await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+    await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
 
     // Re-fire just this one endpoint with the new override applied, to verify immediately.
     // Uses the combined field map so a {{captured:KEY}} the AI wrote for a non-token field
@@ -295,7 +299,7 @@ router.post('/pre-run/heal', async (req, res) => {
     result.aiFixed = true;
 
     priorResults[idx] = result;
-    await db.prepare('UPDATE collections SET pre_run_data = ? WHERE id = ?').run(JSON.stringify(priorResults), collection_id);
+    await db.prepare('UPDATE collections SET pre_run_data = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(priorResults), collection_id, req.userId);
 
     res.json({ diagnosis: { issue: diagnosis.issue, fix: diagnosis.fix, fix_type: diagnosis.fix_type }, result });
   } catch (err) {
@@ -332,7 +336,7 @@ router.post('/correlations/status', async (req, res) => {
   if (!rule) return res.status(404).json({ error: 'Correlation rule not found — re-run pre-run and try again' });
   rule.status = status;
   envCfg.correlationRules = rules;
-  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
   res.json({ correlationRules: rules });
 });
 
@@ -486,7 +490,7 @@ router.post('/correlations/manual', async (req, res) => {
   }
 
   envCfg.correlationRules = rules;
-  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
   res.json({ correlationRules: rules, created, skipped });
 });
 
@@ -498,7 +502,7 @@ router.post('/correlations/delete', async (req, res) => {
 
   const rules = (envCfg.correlationRules || []).filter(r => r.id !== id);
   envCfg.correlationRules = rules;
-  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
   res.json({ correlationRules: rules });
 });
 
@@ -533,7 +537,7 @@ router.post('/generators/manual', async (req, res) => {
   const rules = (envCfg.fieldGenerators || []).filter(r => r.id !== id);
   rules.push({ id, targetEndpointIndex: Number(targetEndpointIndex), targetLocation, targetKey, value: String(value), generator });
   envCfg.fieldGenerators = rules;
-  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
   res.json({ fieldGenerators: rules });
 });
 
@@ -545,7 +549,7 @@ router.post('/generators/delete', async (req, res) => {
 
   const rules = (envCfg.fieldGenerators || []).filter(r => r.id !== id);
   envCfg.fieldGenerators = rules;
-  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg);
+  await saveEnvConfig(collection_id, collection.environment, envRow, envCfg, req.userId);
   res.json({ fieldGenerators: rules });
 });
 

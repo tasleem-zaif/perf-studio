@@ -3,10 +3,11 @@
 // scans instead of re-parsing JTL (or re-scanning execution_runs.report_data's JSON blob)
 // on every request — the same cache-on-first-read philosophy execution.js's report-data
 // route already uses for the whole-run summary, applied at API granularity.
-const fs = require('fs');
-const path = require('path');
 const db = require('../../db');
-const { parseJtl } = require('../parseJtl');
+const { parseJtlContent } = require('../parseJtl');
+const { parseK6Content } = require('../parseK6');
+const resultsStore = require('../resultsStore');
+const { resolveOrgSlugForProject } = require('../projectFolders');
 
 /**
  * Returns the full parsed report-data object ({summary, by_api, timeline, errors})
@@ -15,16 +16,19 @@ const { parseJtl } = require('../parseJtl');
  * report-data route behavior). Shared by ensureRunApiMetrics (needs by_api) and
  * the /trend endpoint's overall-scope path (needs summary) so neither duplicates
  * this cache-or-parse fallback.
- * @param {{id:number, result_dir:string|null, report_data:string|null}} run
+ * @param {{id:number, project_id:number, result_dir:string|null, report_data:string|null}} run
  * @returns {Promise<object|null>}
  */
 async function getOrBuildReportData(run) {
   if (run.report_data) {
     try { return JSON.parse(run.report_data); } catch (_) { /* fall through to reparse */ }
   }
-  const jtlPath = run.result_dir ? path.join(run.result_dir, 'results.jtl') : null;
-  if (!jtlPath || !fs.existsSync(jtlPath)) return null;
-  const parsed = parseJtl(jtlPath, { run_id: run.id });
+  if (!run.result_dir) return null;
+  const engine = run.engine || 'jmeter';
+  const orgSlug = await resolveOrgSlugForProject(run.project_id);
+  const jtlText = await resultsStore.readText(run.result_dir, orgSlug, engine === 'k6' ? 'results.json' : 'results.jtl');
+  if (!jtlText) return null;
+  const parsed = engine === 'k6' ? parseK6Content(jtlText, { run_id: run.id }) : parseJtlContent(jtlText, { run_id: run.id });
   if (!parsed) return null;
   if (!run.report_data) {
     try { await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(parsed), run.id); } catch (_) {}

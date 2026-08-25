@@ -5,9 +5,11 @@ const { writeFileSync } = require('fs');
 const db = require('../db');
 const auth = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
-const { readCsv } = require('../utils/csvUtils');
+const { readCsv, readCsvContent } = require('../utils/csvUtils');
+const gitEngine = require('../utils/gitEngine');
 const resetSequence = require('../utils/resetSequence');
 const { updateCollectionConfigs, updateProjectCollectionConfigs } = require('../utils/configWriter');
+const s3Sync = require('../utils/s3Sync');
 const { TOKEN_KEYS, fingerprintMatches, resolveUrlSet, resolveForScript } = require('../utils/preRunEngine');
 const {
   filterApplicableRules, groupRulesBySource, groupRulesByTarget, substituteCorrelatedLiterals,
@@ -34,14 +36,14 @@ router.get('/', async (req, res) => {
   if (collection_id && env) {
     // Strict env isolation: only return suites explicitly tagged to this collection+env
     suites = await db.prepare(
-      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, collection_id, env);
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND env = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id, env, req.userId);
   } else if (collection_id) {
     suites = await db.prepare(
-      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? ORDER BY created_at DESC"
-    ).all(req.params.projectId, collection_id);
+      "SELECT * FROM test_suites WHERE project_id = ? AND collection_id = ? AND user_id = ? ORDER BY created_at DESC"
+    ).all(req.params.projectId, collection_id, req.userId);
   } else {
-    suites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? ORDER BY created_at DESC').all(req.params.projectId);
+    suites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? AND user_id = ? ORDER BY created_at DESC').all(req.params.projectId, req.userId);
   }
   res.json({ suites });
 });
@@ -54,9 +56,9 @@ router.post('/', async (req, res) => {
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids ? JSON.parse(test_data_ids) : []);
   const primaryId = idsArr.length ? idsArr[0] : (test_data_id || null);
   const result = await db.prepare(
-    `INSERT INTO test_suites (project_id, name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config_json, vusers, rampup, iter_mode, loops, duration)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(req.params.projectId, name, test_type || 'load', collection_id || null, env || null, primaryId,
+    `INSERT INTO test_suites (project_id, user_id, name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config_json, vusers, rampup, iter_mode, loops, duration)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(req.params.projectId, req.userId, name, test_type || 'load', collection_id || null, env || null, primaryId,
     JSON.stringify(idsArr), engine || 'jmeter', JSON.stringify(config || {}), vusers||50, rampup||30, iter_mode||'duration', loops||1, duration||300);
   if (collection_id) {
     const _uid = req.userId, _pid = req.params.projectId;
@@ -65,23 +67,23 @@ router.post('/', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(collection_id, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(collection_id, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
-  res.json({ suite: await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(result.lastInsertRowid) });
+  res.json({ suite: await db.prepare('SELECT * FROM test_suites WHERE id = ? AND user_id = ?').get(result.lastInsertRowid, req.userId) });
 });
 
 router.put('/:id', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted in another session.' });
   const { name, test_type, collection_id, env, test_data_id, test_data_ids, engine, config, vusers, rampup, iter_mode, loops, duration } = req.body;
   const normalId = v => (v === '' || v === undefined) ? null : v;
   const idsArr = Array.isArray(test_data_ids) ? test_data_ids : (test_data_ids !== undefined ? JSON.parse(test_data_ids || '[]') : null);
   const primaryId = idsArr ? (idsArr.length ? idsArr[0] : null) : (test_data_id !== undefined ? normalId(test_data_id) : suite.test_data_id);
-  await db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=?`)
+  await db.prepare(`UPDATE test_suites SET name=?, test_type=?, collection_id=?, env=?, test_data_id=?, test_data_ids=?, engine=?, config_json=?, vusers=?, rampup=?, iter_mode=?, loops=?, duration=? WHERE id=? AND user_id=?`)
     .run(name || suite.name, test_type || suite.test_type,
       collection_id !== undefined ? normalId(collection_id) : suite.collection_id,
       env !== undefined ? (env || null) : suite.env,
@@ -94,8 +96,8 @@ router.put('/:id', async (req, res) => {
       iter_mode !== undefined ? iter_mode : suite.iter_mode,
       loops !== undefined ? loops : suite.loops,
       duration !== undefined ? duration : suite.duration,
-      req.params.id);
-  const updatedSuite = await db.prepare('SELECT * FROM test_suites WHERE id = ?').get(req.params.id);
+      req.params.id, req.userId);
+  const updatedSuite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   if (updatedSuite?.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = updatedSuite.collection_id;
     setImmediate(async () => {
@@ -103,7 +105,7 @@ router.put('/:id', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
@@ -112,9 +114,9 @@ router.put('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have already been deleted.' });
-  await db.prepare('DELETE FROM test_suites WHERE id = ?').run(req.params.id);
+  await db.prepare('DELETE FROM test_suites WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
   resetSequence('test_suites');
   if (suite.collection_id) {
     const _uid = req.userId, _pid = req.params.projectId, _cid = suite.collection_id;
@@ -123,7 +125,7 @@ router.delete('/:id', async (req, res) => {
         const p = await db.prepare('SELECT name FROM projects WHERE id = ?').get(_pid);
         const c = await db.prepare('SELECT role FROM users WHERE id = ?').get(_uid);
         const { getUserProjectPath } = require('../utils/projectFolders');
-        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || ''));
+        await updateCollectionConfigs(_cid, await getUserProjectPath(_uid, c?.role, p?.name || '', _pid), _uid);
       } catch (_) {}
     });
   }
@@ -141,21 +143,21 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   const proj = await ownsProject(userId, projectId);
   if (!proj) return { error: 'Project not found', status: 404 };
 
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suiteId, projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(suiteId, projectId, userId);
   if (!suite) return { error: 'Suite not found', status: 404 };
 
   // Gather context
   const collection = suite.collection_id
-    ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+    ? await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, userId)
     : null;
   // Load multiple test data files
   let dataIds = [];
   try { dataIds = JSON.parse(suite.test_data_ids || '[]'); } catch {}
   if (!dataIds.length && suite.test_data_id) dataIds = [suite.test_data_id];
   const testDataFiles = (await Promise.all(
-    dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ?').get(id))
+    dataIds.map(id => db.prepare('SELECT * FROM test_data_files WHERE id = ? AND user_id = ?').get(id, userId))
   )).filter(Boolean);
-  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ?').all(projectId);
+  const rules = await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ?').all(projectId, userId);
 
   const globalRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(userId);
   const projRow   = await db.prepare('SELECT config_json FROM project_config WHERE project_id = ?').get(projectId);
@@ -166,7 +168,7 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   // Load env-specific config (highest priority) — overrides global + project
   const suiteEnv = suite.env || '';
   const envCfgRow = suiteEnv && suite.collection_id
-    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ?').get(suite.collection_id, suiteEnv)
+    ? await db.prepare('SELECT config_json FROM collection_env_config WHERE collection_id = ? AND env = ? AND user_id = ?').get(suite.collection_id, suiteEnv, userId)
     : null;
   const envCfg = envCfgRow ? JSON.parse(envCfgRow.config_json || '{}') : {};
 
@@ -213,7 +215,44 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   const testType = suite.test_type || 'load';
   const safeName = suite.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+  const { resolveOrgSlugForProject, cleanName, getUserProjectPath, getCollectionPath, isAdminRole } = require('../utils/projectFolders');
+  const orgSlug = await resolveOrgSlugForProject(projectId);
+
+  // Every actor (including PAT mode) writes into their OWN branch-scoped workspace, never
+  // the project-wide folder_path (that's whoever last ran /init, almost always the org admin) —
+  // otherwise every user's generated scripts end up inside the admin's main-branch workspace
+  // instead of their own users/<name> branch, ahead of any PR merge.
+  const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerRole = callerUser?.role;
+
+  // Admin's own workspace tracks main directly — scripts only ever land there via a real git
+  // merge, never generated straight into it.
+  if (isAdminRole(callerRole)) {
+    return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
+  }
+
+  const userProjPath = await getUserProjectPath(userId, callerRole, proj.name, projectId);
+  if (!userProjPath) return { error: 'Git repository not initialized.', status: 400 };
+  const gitDir = require('path').dirname(userProjPath);
+
   try {
+    // PAT mode: pre-read each test-data file's content from the gitEngine session (no local
+    // file to read otherwise) so generateJmx/generateK6's CSV value-matching (buildCsvValueMap)
+    // works the same as it does for SSH-mode's real local files.
+    let patSession = null;
+    if (!isSSH) {
+      patSession = await gitEngine.openSession(gitDir, orgSlug);
+      for (const f of testDataFiles) {
+        // f.path is stored as "<ProjectName>/<Collection>/<Env>/testData/<file>" for PAT-mode
+        // uploads (see testData.js) — resolve it directly against the session's content root.
+        const relFromContentRoot = f.path ? f.path.replace(/\\/g, '/').split('/').slice(1).join('/') : '';
+        const fullPath = require('path').posix.join(patSession.dir, cleanName(proj.name), relFromContentRoot);
+        try { f.__content = patSession.fs.existsSync(fullPath) ? patSession.fs.readFileSync(fullPath) : undefined; } catch { f.__content = undefined; }
+      }
+    }
+
     let scriptContent;
     if (engine === 'jmeter') {
       scriptContent = cleanScript(await generateJmx(userId, suite, collection, testDataFiles, cfg, endpoints, rules, preRunData, testType), 'jmeter');
@@ -226,36 +265,39 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
     const filename = `${safeName}.${ext}`;
     let filePath = '';
 
-    let scriptBaseDir = null;
-    const { getUserProjectPath, getCollectionPath, isAdminWorkspace } = require('../utils/projectFolders');
-    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
-    const callerRole = callerUser?.role;
-    const userProjPath = await getUserProjectPath(userId, callerRole, proj.name);
-
-    // Admin workspace holds only empty folders — skip script generation for admin
-    if (isAdminWorkspace(userProjPath)) {
-      return { error: 'Scripts cannot be generated in the admin workspace. Please use a regular user account to generate scripts.', status: 400 };
+    let targetEnv = suite.env;
+    if (!targetEnv && collection) {
+      try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
     }
-    if (collection && userProjPath) {
-      let targetEnv = suite.env;
-      if (!targetEnv && collection) {
-        try { const envs = JSON.parse(collection.environments || '[]'); targetEnv = envs[0] || collection.environment || 'Default'; } catch { targetEnv = collection.environment || 'Default'; }
-      }
-      const envPath = getCollectionPath(userProjPath, collection.name, targetEnv);
-      scriptBaseDir = require('path').join(envPath, 'script');
-    } else if (userProjPath) {
-      scriptBaseDir = require('path').join(userProjPath, 'script');
-    }
+    const relDir = collection ? require('path').posix.join(cleanName(collection.name), cleanName(targetEnv || 'Default'), 'script') : 'script';
 
-    if (scriptBaseDir) {
+    if (!isSSH) {
+      const contentRoot = require('path').posix.join(patSession.dir, cleanName(proj.name));
+      const relScriptPath = require('path').posix.join(relDir, filename);
+      patSession.fs.mkdirSync(require('path').posix.join(contentRoot, relDir), { recursive: true });
+      patSession.fs.writeFileSync(require('path').posix.join(contentRoot, relScriptPath), scriptContent, 'utf8');
+      await gitEngine.persistSession(patSession, gitDir, orgSlug);
+      filePath = require('path').posix.join(cleanName(proj.name), relScriptPath);
+    } else {
+      // Restore the workspace first if the S3 sweep reclaimed it since the last access —
+      // mkdirSync below would otherwise happily recreate a bare folder tree with no .git and
+      // none of the workspace's other content, masking the problem instead of fixing it.
+      await require('../routes/git').ensureGitWorkspaceHydrated(gitDir, projectId, userId);
+
+      const scriptBaseDir = collection
+        ? require('path').join(getCollectionPath(userProjPath, collection.name, targetEnv), 'script')
+        : require('path').join(userProjPath, 'script');
+
       require('fs').mkdirSync(scriptBaseDir, { recursive: true });
       filePath = require('path').join(scriptBaseDir, filename);
       writeFileSync(filePath, scriptContent, 'utf8');
+      const up = await s3Sync.uploadFile(filePath, orgSlug);
+      if (!up.ok && !up.skipped) console.error('[TestSuites] S3 sync failed for', filePath, ':', up.error?.message);
     }
 
     // Update DB
     const updateField = engine === 'jmeter' ? 'jmx_path' : 'js_path';
-    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=?`).run(filePath || filename, suiteId);
+    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=? AND user_id=?`).run(filePath || filename, suiteId, userId);
 
     if (suite.collection_id) setImmediate(async () => { await updateCollectionConfigs(suite.collection_id); });
     return { ok: true, filename, path: filePath };
@@ -273,13 +315,46 @@ router.post('/:id/generate', async (req, res) => {
 router.get('/:id/download/:type', async (req, res) => {
   const proj = await ownsProject(req.userId, req.params.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(req.params.id, req.params.projectId, req.userId);
   if (!suite) return res.status(404).json({ error: 'Test plan not found — it may have been deleted. Try regenerating the script.' });
 
   const filePath = req.params.type === 'jmx' ? suite.jmx_path : suite.js_path;
   if (!filePath) return res.status(404).json({ error: 'Script not generated yet' });
-
   const filename = path.basename(filePath);
+
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+  const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+
+  if (!isSSH) {
+    try {
+      const { resolveOrgSlugForProject, getUserProjectPath } = require('../utils/projectFolders');
+      const orgSlug = await resolveOrgSlugForProject(req.params.projectId);
+      // The script was generated into the CALLING user's own workspace (see
+      // generateScriptForSuite above) — read it back from that same actor-scoped session,
+      // never the shared project.folder_path.
+      const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+      const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, proj.name, req.params.projectId);
+      if (!userProjPath) return res.status(404).json({ error: 'Git repository not initialized.' });
+      const gitDir = path.dirname(userProjPath);
+      const session = await gitEngine.openSession(gitDir, orgSlug);
+      const full = path.posix.join(session.dir, filePath.replace(/\\/g, '/'));
+      if (!session.fs.existsSync(full)) return res.status(404).json({ error: 'File not found' });
+      const content = session.fs.readFileSync(full);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(content);
+    } catch (e) {
+      return res.status(500).json({ error: `Failed to read script: ${e.message}` });
+    }
+  }
+
+  // ── SSH mode: unchanged ──────────────────────────────────────────────────────────────
+  try {
+    const { getUserProjectPath } = require('../utils/projectFolders');
+    const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId);
+    const userProjPath = await getUserProjectPath(req.userId, callerUser?.role, proj.name, req.params.projectId);
+    if (userProjPath) await require('../routes/git').ensureGitWorkspaceHydrated(path.dirname(userProjPath), req.params.projectId, req.userId);
+  } catch (e) { console.error('[TestSuites] Workspace hydrate failed:', e.message); }
+
   res.download(filePath, filename, err => {
     if (err) res.status(404).json({ error: 'File not found on disk' });
   });
@@ -639,9 +714,12 @@ function escapeRegexStr(s) {
 function buildCsvValueMap(testDataFiles) {
   const valueMap = new Map(); // lc(value) → columnName
   for (const f of (testDataFiles || [])) {
-    if (!f.path || !fs.existsSync(f.path)) continue;
+    // f.__content is pre-read content for PAT-mode workspaces (no local file to read here —
+    // see generateScriptForSuite, which populates it from the gitEngine session up front).
+    // SSH-mode workspaces still have a real local file, read directly as before.
+    if (f.__content === undefined && (!f.path || !fs.existsSync(f.path))) continue;
     try {
-      const { headers, rows } = readCsv(f.path, 50); // sample first 50 rows
+      const { headers, rows } = f.__content !== undefined ? readCsvContent(f.__content, 50) : readCsv(f.path, 50); // sample first 50 rows
       for (let ci = 0; ci < headers.length; ci++) {
         const col = headers[ci];
         if (!col) continue;
@@ -845,13 +923,25 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
   // Recorded/correlated headers are added FIRST so a specific correlation rule (e.g. this
   // endpoint's Authorization needs ${refreshToken}, not the blanket default) wins; the
   // blanket "any non-login request gets the default token" fallback below only fires when
-  // this endpoint recorded no Authorization header of its own to correlate.
+  // this endpoint's Authorization is still a literal (no rule rewrote it to a ${var}
+  // reference yet) — NOT merely "absent". A realistically recorded collection almost always
+  // HAS a literal Authorization header (whatever token was live at recording time), so
+  // requiring it to be absent meant this fallback effectively never fired: correlation
+  // detection matches by comparing that old recorded token's literal bytes against values
+  // captured during THIS pre-run — but a login endpoint issues a brand-new token every time,
+  // so the old recorded literal can never contain a byte-for-byte match against a fresh one
+  // and no rule ever gets created for it, silently baking the stale recorded token into every
+  // generated script instead of a dynamic reference.
   for (const [k, v] of Object.entries(headers)) {
     if (!headerEntries.find(h => h.name.toLowerCase() === k.toLowerCase()))
       headerEntries.push({ name: k, value: String(v) });
   }
-  if (!isLogin && tokenVar && !headerEntries.find(h => h.name.toLowerCase() === 'authorization')) {
-    headerEntries.push({ name: 'Authorization', value: `Bearer \${${tokenVar}}` });
+  const authEntryIdx = headerEntries.findIndex(h => h.name.toLowerCase() === 'authorization');
+  const authIsDynamic = authEntryIdx !== -1 && /\$\{/.test(headerEntries[authEntryIdx].value);
+  if (!isLogin && tokenVar && !authIsDynamic) {
+    const dynamicAuth = { name: 'Authorization', value: `Bearer \${${tokenVar}}` };
+    if (authEntryIdx === -1) headerEntries.push(dynamicAuth);
+    else headerEntries[authEntryIdx] = dynamicAuth;
   }
   // A saved per-endpoint fix normally wins — add or replace by header name (e.g. swap the
   // default accessToken Authorization value for {{captured:refreshToken}}'s JMeter var) —
@@ -1242,7 +1332,15 @@ function buildK6Request(ep, index, ctx) {
     const lower = k.toLowerCase();
     if (!(lower in keyByLower)) { keyByLower[lower] = k; headerEntries[k] = String(v); }
   }
-  if (!isLogin && tokenVar && !('authorization' in keyByLower)) {
+  // Fallback fires unless a rule already rewrote Authorization to a dynamic reference — see
+  // buildSamplerXml's matching comment: requiring it to be merely ABSENT effectively never
+  // fired, since a realistically recorded collection almost always has a literal (now-stale)
+  // Authorization value and correlation detection can't match a login's freshly-issued token
+  // against that old literal's bytes.
+  const existingAuthKey = keyByLower['authorization'];
+  const authIsDynamic = existingAuthKey && /\$\{/.test(headerEntries[existingAuthKey]);
+  if (!isLogin && tokenVar && !authIsDynamic) {
+    if (existingAuthKey && existingAuthKey !== 'Authorization') delete headerEntries[existingAuthKey];
     headerEntries['Authorization'] = `Bearer \${${tokenVar}}`;
     keyByLower['authorization'] = 'Authorization';
   }

@@ -12,12 +12,14 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const db = require('../db');
 const ownsProject = require('../utils/ownsProject');
-const { getProjectPath, PROJECTS_ROOT, resolveSuiteEnv } = require('../utils/projectFolders');
+const { getProjectPath, PROJECTS_ROOT, resolveSuiteEnv, resolveOrgSlugForProject } = require('../utils/projectFolders');
 const { generateAnalyticsPdf } = require('../utils/generateAnalyticsPdf');
 const { startAutoHeal, getHealStatus } = require('../utils/autoHealer');
-const { evaluateRules } = require('../utils/ruleEvaluator');
+const { evaluateRules, evaluateRulesFromContent } = require('../utils/ruleEvaluator');
 const { patchJmxForParams } = require('../utils/patchJmx');
-const { parseJtl } = require('../utils/parseJtl');
+const { parseJtl, parseJtlContent } = require('../utils/parseJtl');
+const s3Sync = require('../utils/s3Sync');
+const resultsStore = require('../utils/resultsStore');
 
 const PerfStudio_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.PerfStudio');
 
@@ -84,24 +86,18 @@ function getK6Bin(customPath) {
   }
 }
 
-const resetSequence = require('../utils/resetSequence');
-
-async function cleanStaleRuns(projectId) {
-  // Remove any non-running run whose result_dir no longer exists on disk.
-  // Skip 'running' status to avoid cleaning up in-progress or CI-synced runs.
-  const runs = await db.prepare(
-    "SELECT id, result_dir, status FROM execution_runs WHERE project_id = ?"
-  ).all(projectId);
-  let deleted = false;
-  for (const run of runs) {
-    if (run.status === 'running') continue;
-    if (run.result_dir && !fs.existsSync(run.result_dir)) {
-      await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
-      deleted = true;
-    }
-  }
-  if (deleted) resetSequence('execution_runs');
-}
+// Formerly deleted any non-running execution_runs row whose result_dir no longer existed
+// ON REAL DISK — a real guard back when a result folder could be removed out from under the
+// DB by something outside the app (a manual disk cleanup, an OS-level delete). Since the
+// S3-backed, zero-local-disk migration (resultsStore.js), result_dir is a path-SHAPED S3 key
+// prefix that is NEVER a real directory — fs.existsSync(run.result_dir) is unconditionally
+// false for every row, so this used to silently wipe EVERY completed/failed run for the
+// project on every single `/runs` fetch (Analytics loading, or right after a CI sync just
+// inserted one) — the reason a freshly CI-synced run's data vanished from Analytics almost
+// immediately, and any run created moments earlier during renumbering (getNextRunNumber())
+// too. S3 objects don't silently disappear out from under the DB the way a local folder
+// could, so there's no longer a real drift case for this to guard — safe to no-op.
+async function cleanStaleRuns(_projectId) {}
 
 async function getNextRunNumber(projectId) {
   cleanStaleRuns(projectId);
@@ -132,6 +128,8 @@ function isNativeMode() {
 }
 
 router.get('/check-deps', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const native = isNativeMode();
   const deps = [];
 
@@ -174,6 +172,8 @@ router.get('/check-deps', auth, async (req, res) => {
 
 // Standalone Docker check — used by the Configuration page
 router.get('/check-docker', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   let status = 'missing', version = null;
   try {
     version = execSync('docker --version 2>&1', { timeout: 5000 }).toString().trim();
@@ -193,6 +193,8 @@ router.get('/check-docker', auth, async (req, res) => {
 // Start Docker Desktop — fires the launch command and returns immediately.
 // The frontend polls /system-check every 5s to detect when the daemon is ready.
 router.post('/start-docker', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const platform = process.platform;
   try {
     if (platform === 'win32') {
@@ -223,6 +225,8 @@ router.post('/start-docker', auth, async (req, res) => {
 // Writes a temp PS1 script and launches it in an elevated PowerShell window (UAC prompt).
 // A system restart is required after the features are enabled.
 router.post('/enable-virtualization', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   if (process.platform !== 'win32') {
     return res.status(400).json({ ok: false, message: 'Only supported on Windows.' });
   }
@@ -257,6 +261,8 @@ router.post('/enable-virtualization', auth, async (req, res) => {
 
 // Comprehensive system requirements check — used by Configuration → System Requirements
 router.get('/system-check', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const checks = [];
   const { PROJECTS_ROOT, BACKUPS_ROOT } = require('../utils/projectFolders');
 
@@ -563,6 +569,8 @@ function downloadFile(url, dest) {
 }
 
 router.post('/install-deps', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const { tool } = req.body;
   if (!tool) return res.status(400).json({ error: 'tool is required' });
 
@@ -673,6 +681,8 @@ router.post('/install-deps', auth, async (req, res) => {
 });
 
 router.post('/run', auth, async (req, res) => {
+  // RETIRED — local/native/Docker-spawned test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   // SSE setup — stream logs in real-time
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -711,6 +721,12 @@ router.post('/run', auth, async (req, res) => {
     return done({ ok: false, error: 'Git repository not initialized. Go to Configuration → Git to initialize the repository first.' });
   }
 
+  // Restore the workspace first if the S3 sweep reclaimed it since the last access — the
+  // existence check inside is a synchronous stat, so this adds no latency once warm (the
+  // common case). Must happen before the scriptPath existence check below, since scriptPath
+  // lives inside this same folder.
+  await require('./git').ensureGitWorkspaceHydrated(project.folder_path, project_id, req.userId);
+
   // Soft concurrency cap — prevent accidental resource exhaustion
   const activeCount = await countActiveRuns(req.userId);
   if (activeCount >= MAX_CONCURRENT_RUNS) {
@@ -718,7 +734,7 @@ router.post('/run', auth, async (req, res) => {
     return done({ ok: false, error: `Too many concurrent runs. Max ${MAX_CONCURRENT_RUNS} simultaneous runs allowed.` });
   }
 
-  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ?').get(suite_id, project_id);
+  const suite = await db.prepare('SELECT * FROM test_suites WHERE id = ? AND project_id = ? AND user_id = ?').get(suite_id, project_id, req.userId);
   if (!suite) { log('err', `Test suite not found (id=${suite_id})`); return done({ ok: false, error: 'Test suite not found' }); }
 
   const scriptPath = engine === 'jmeter' ? suite.jmx_path : suite.js_path;
@@ -747,7 +763,8 @@ router.post('/run', auth, async (req, res) => {
   log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   const projectFolderPath = project.folder_path || getProjectPath(project.name, project.id);
-  const runNumber = getNextRunNumber(project_id);
+  const orgSlug = await resolveOrgSlugForProject(project_id);
+  const runNumber = await getNextRunNumber(project_id);
   const { buildRunDirName } = require('../utils/buildRunName');
   const effectiveUsers    = vusers    || suite.vusers    || 1;
   const effectiveLoops    = loops     || suite.loops     || 1;
@@ -762,7 +779,7 @@ router.post('/run', auth, async (req, res) => {
   let resultDir;
   if (suite.collection_id && projectFolderPath) {
     try {
-      const suiteCol = await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id);
+      const suiteCol = await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, req.userId);
       const resolvedEnv = resolveSuiteEnv(suiteCol, suite);
       if (suiteCol && resolvedEnv) {
         const { getCollectionPath } = require('../utils/projectFolders');
@@ -828,7 +845,7 @@ router.post('/run', auth, async (req, res) => {
       // Fall back to project/testData for legacy scripts
       let testDataHostDir, testDataExists;
       const suiteCollection = suite.collection_id
-        ? await db.prepare('SELECT * FROM collections WHERE id = ?').get(suite.collection_id)
+        ? await db.prepare('SELECT * FROM collections WHERE id = ? AND user_id = ?').get(suite.collection_id, req.userId)
         : null;
       const suiteEnvName = suite.env || '';
 
@@ -1018,7 +1035,7 @@ router.post('/run', auth, async (req, res) => {
       if (!jtlPath || !fs.existsSync(jtlPath)) return;
       try {
         const { evaluateRules: evalRules } = require('../utils/ruleEvaluator');
-        const result = evalRules(project_id, jtlPath);
+        const result = evalRules(project_id, jtlPath, req.userId);
         if (!result || result.noRules || !result.violations?.length) return;
 
         // Only alert on live-monitorable metrics — ignore Response Time, P95, etc.
@@ -1162,7 +1179,7 @@ router.post('/run', auth, async (req, res) => {
       log('err', '     Likely cause: target URL not configured for this environment.');
       log('err', '     Fix: Configuration → select env → add target URL → Save Config.');
     } else if (jtlPath && fs.existsSync(jtlPath)) {
-      const ruleResult = await evaluateRules(project_id, jtlPath);
+      const ruleResult = await evaluateRules(project_id, jtlPath, req.userId);
       if (!ruleResult.noRules) {
         ruleViolations = ruleResult.violations || [];
         const errorViolations = ruleViolations.filter(v => v.rule.severity === 'error');
@@ -1185,6 +1202,19 @@ router.post('/run', auth, async (req, res) => {
     await db.prepare(`UPDATE execution_runs SET status=?, logs=?, report_path=?, finished_at=NOW() WHERE id=?`)
       .run(finalStatus, JSON.stringify(allLogs), reportPath, runId);
 
+    // Mirror results (JTL, jmeter.log) to S3 right away — additive, doesn't block anything below.
+    s3Sync.uploadDir(resultDir, orgSlug).then(r => {
+      if (!r.ok && !r.skipped) console.error('[Execution] S3 sync failed for', resultDir, ':', r.failed?.length, 'file(s)');
+      // Only once results are durably in S3: mirror them into the EXECUTING USER's own git
+      // workspace too, so they show up to commit/push in the Git panel like config.json/
+      // testData already do (see resultsWorkspaceSync.js for why this needs its own pass
+      // rather than just writing straight to disk here — result_dir is always rooted under
+      // the project's admin workspace, not whichever user actually ran the test).
+      const { syncRunResultsToUserWorkspace } = require('../utils/resultsWorkspaceSync');
+      syncRunResultsToUserWorkspace({ id: runId, project_id, result_dir: resultDir }, req.userId)
+        .catch(e => console.error('[Execution] Failed to sync results into user workspace:', e.message));
+    });
+
     // ── Auto-zip JMeter HTML report into results folder ───────────────────────
     if (engine === 'jmeter' && reportPath && fs.existsSync(path.dirname(reportPath))) {
       setImmediate(async () => {
@@ -1203,6 +1233,8 @@ router.post('/run', auth, async (req, res) => {
             archive.finalize();
           });
           log('info', `  Report ZIP : ${zipPath}`);
+          const up = await s3Sync.uploadFile(zipPath, orgSlug);
+          if (!up.ok && !up.skipped) console.error('[Execution] S3 sync failed for', zipPath, ':', up.error?.message);
         } catch (e) {
           console.error('[Execution] Failed to zip JMeter report:', e.message);
         }
@@ -1231,10 +1263,20 @@ router.post('/run', auth, async (req, res) => {
         `).get(targetRunId);
         if (!runRow) return;
 
-        const jtlPath = path.join(runRow.result_dir || '', 'results.jtl');
-        console.log('[Alerts] Checking JTL at:', jtlPath);
-        if (!fs.existsSync(jtlPath)) {
-          console.warn('[Alerts] JTL not found at:', jtlPath, '— result_dir:', runRow.result_dir);
+        // Read the JTL via resultsStore (S3-backed) rather than the local disk — this run may
+        // have executed in a spawned Docker container or on a container whose local disk this
+        // process never shares/retains, so `fs.existsSync` here used to silently bail out in
+        // production while working locally (native execution, same process, same disk). This
+        // was also the ONLY place in the run-completion flow that backfills execution_runs.
+        // report_data automatically, so its local-disk dependency meant runs never opened via
+        // the single-run Analytics view (which also backfills it) had no report_data at all —
+        // forcing every later read (including Trend Analysis for multiple runs) to fall back to
+        // this same JTL, which by then may genuinely never have synced to S3 either.
+        const orgSlugAlert = await resolveOrgSlugForProject(runRow.project_id);
+        console.log('[Alerts] Checking JTL via resultsStore for result_dir:', runRow.result_dir);
+        const jtlText = runRow.result_dir ? await resultsStore.readText(runRow.result_dir, orgSlugAlert, 'results.jtl') : null;
+        if (!jtlText) {
+          console.warn('[Alerts] JTL not found in S3 — result_dir:', runRow.result_dir);
           return;
         }
         console.log('[Alerts] JTL found, building report data for email...');
@@ -1244,13 +1286,14 @@ router.post('/run', auth, async (req, res) => {
           engine: runRow.engine, status: runRow.status,
           started_at: runRow.started_at, finished_at: runRow.finished_at,
         };
-        const parsed = parseJtl(jtlPath, runMeta);
+        const parsed = parseJtlContent(jtlText, runMeta);
         if (!parsed) return;
 
-        // Evaluate rules against this run's JTL so violations appear in the email
+        // Evaluate rules against this run's JTL so violations appear in the email — from the
+        // content already fetched via resultsStore above, not a local jtlPath (see note above).
         let ruleViolationsForEmail = [];
         try {
-          const rr = await evaluateRules(runRow.project_id, jtlPath);
+          const rr = await evaluateRulesFromContent(runRow.project_id, jtlText, req.userId);
           ruleViolationsForEmail = rr?.violations || [];
         } catch (_) {}
 
@@ -1274,6 +1317,10 @@ router.post('/run', auth, async (req, res) => {
           await generateAnalyticsPdfToFile(reportData, runNum, resultPdf);
           pdfPath = resultPdf;
           console.log('[Alerts] Analytics PDF saved:', pdfPath);
+          if (runRow.result_dir && fs.existsSync(runRow.result_dir)) {
+            const up = await s3Sync.uploadFile(pdfPath, orgSlug);
+            if (!up.ok && !up.skipped) console.error('[Alerts] S3 sync failed for', pdfPath, ':', up.error?.message);
+          }
         } catch (pdfErr) {
           console.error('[Alerts] PDF generation failed:', pdfErr.message);
         }
@@ -1342,18 +1389,39 @@ router.get('/runs', auth, async (req, res) => {
   // Returns syncing_count so the frontend knows to poll again shortly.
   let syncingCount = 0;
   try {
-    // Only auto-sync runs completed within the last 7 days — older ones likely
+    // Only auto-sync runs finished within the last 7 days — older ones likely
     // have expired artifacts and must not trigger email notifications retroactively.
+    // Includes 'failed' as well as 'completed' — a genuinely failed CI job (JMeter crashed,
+    // pipeline errored) still deserves its own sync attempt (which will correctly find no
+    // results and mark no_results below, or record real partial results if some exist) — the
+    // ci/:runId/status route's own catch-up already treats 'completed' and 'failed' the same
+    // way; this mirrors that. Excludes no_results=1: a prior sync attempt already confirmed
+    // this run produced zero JMeter samples/artifacts — nothing real to show in Analytics, and
+    // without this exclusion it looked identical to "never tried syncing" and got retried on
+    // every single page load forever, which is what kept the "Syncing…" banner stuck.
     const unsyncedCiRuns = await db.prepare(`
       SELECT * FROM ci_pipeline_runs
-      WHERE project_id = ? AND status = 'completed'
+      WHERE project_id = ? AND status IN ('completed', 'failed')
+        AND (no_results = 0 OR no_results IS NULL)
         AND finished_at >= NOW() - INTERVAL '7 days'
+        AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < NOW() - INTERVAL '2 minutes')
         AND NOT EXISTS (SELECT 1 FROM execution_runs WHERE ci_run_id = ci_pipeline_runs.id)
     `).all(project_id);
 
     syncingCount = unsyncedCiRuns.length;
     if (syncingCount > 0) {
       console.log(`[Auto-sync] Found ${syncingCount} unsynced CI run(s) for project ${project_id}`);
+      // Stamp before dispatching (not after completion) so a poll landing seconds later —
+      // this endpoint is polled every 5s while syncing_count > 0 — can't re-select the same
+      // run while its own sync-results attempt (up to ~2 minutes of artifact retries) is
+      // still in flight. See last_sync_attempt_at's schema.sql comment for the full story.
+      // NOTE: db.prepare(...).run() flattens a *single* array argument into individual
+      // positional params (its .run(idsArray) convenience case) — passing the id list that
+      // way would silently mis-bind against a single `= ANY(?)` placeholder. Building the
+      // placeholder list explicitly and passing ids as separate args (run(...ids)) avoids that.
+      const idPlaceholders = unsyncedCiRuns.map(() => '?').join(',');
+      await db.prepare(`UPDATE ci_pipeline_runs SET last_sync_attempt_at = NOW() WHERE id IN (${idPlaceholders})`)
+        .run(...unsyncedCiRuns.map(r => r.id));
       const http = require('http');
       const authHeader = req.headers.authorization || '';
       for (const ciRun of unsyncedCiRuns) {
@@ -1381,16 +1449,29 @@ router.get('/runs', auth, async (req, res) => {
   const includeArchived = req.query.include_archived === 'true';
   const runs = await db.prepare(`
     SELECT r.*, s.name as suite_name, s.env as suite_env, s.collection_id as collection_id,
+           c.environment as col_environment, c.environments as col_environments,
            ci.web_url as ci_web_url, ci.provider as ci_provider, ci.external_id as ci_external_id
     FROM execution_runs r
     LEFT JOIN test_suites s ON s.id = r.suite_id
+    LEFT JOIN collections c ON c.id = s.collection_id
     LEFT JOIN ci_pipeline_runs ci ON ci.id = r.ci_run_id
     WHERE r.project_id = ? AND (r.archived = 0 OR r.archived IS NULL OR ? = 1)
     ORDER BY r.started_at DESC
   `).all(project_id, includeArchived ? 1 : 0);
 
-  const { GIT_WORKSPACES_ROOT } = require('../utils/projectFolders');
+  const { GIT_WORKSPACES_ROOT, resolveSuiteEnv } = require('../utils/projectFolders');
   const parsed = runs.map(r => {
+    // test_suites.env is frequently blank (suite relies on its collection's default
+    // env instead — see resolveSuiteEnv's own doc comment) — every other place that
+    // needs a suite's real environment (autoSyncCiRun, ciPipeline's manual sync route)
+    // already calls resolveSuiteEnv() for this reason. This list endpoint was reading
+    // the raw, often-null s.env straight into suite_env instead, so any CI-synced run
+    // whose suite had no explicit env silently vanished from Analytics the moment the
+    // frontend filtered runs down to a specific environment tab — even though the run
+    // genuinely existed and had real results.
+    if (r.collection_id) {
+      r.suite_env = resolveSuiteEnv({ environment: r.col_environment, environments: r.col_environments }, { env: r.suite_env });
+    }
     let report_url = null;
     if (r.report_path && fs.existsSync(r.report_path)) {
       // Use lower-case comparison to handle Windows case-insensitive paths
@@ -1426,9 +1507,17 @@ router.delete('/runs/:id', auth, async (req, res) => {
   if (run.status === 'running') return res.status(400).json({ error: 'Cannot delete a run that is currently in progress' });
 
   if (req.query.delete_files === 'true') {
-    // Hard delete — wipe disk files then remove the record
-    if (run.result_dir && fs.existsSync(run.result_dir)) {
-      try { fs.rmSync(run.result_dir, { recursive: true, force: true }); } catch (_) {}
+    // Hard delete — wipe stored results then remove the record. Everything under
+    // result_dir has been S3-only since the resultsStore.js migration (no local file ever
+    // exists, not even transiently) — the old fs.rmSync-only version left every hard-deleted
+    // run's JTL/report/PDF orphaned in S3 forever, since result_dir there is a path-SHAPED
+    // string, not a real directory (fs.existsSync was always false, silently no-opping).
+    if (run.result_dir) {
+      try {
+        const orgSlugDel = await resolveOrgSlugForProject(run.project_id);
+        const del = await resultsStore.deleteAll(run.result_dir, orgSlugDel);
+        if (!del.ok && !del.skipped) console.error('[Execution] S3 delete failed for run', run.id, ':', del.error?.message);
+      } catch (e) { console.error('[Execution] Result cleanup failed for run', run.id, ':', e.message); }
     }
     await db.prepare('DELETE FROM execution_runs WHERE id = ?').run(run.id);
     res.json({ deleted: true, archived: false, id: run.id });
@@ -1457,6 +1546,17 @@ router.get('/runs/:id/heal-status', auth, async (req, res) => {
   res.json(result);
 });
 
+// Restores a project's workspace (script/config/testData/results) if the S3 sweep reclaimed
+// it since the last access. Most routes below serve from the DB-cached report_data/report
+// columns first and only fall back to these local files when that cache is empty — so this
+// is a rare cold path in practice, not something every report view pays for.
+async function hydrateProjectWorkspace(projectId, userId) {
+  try {
+    const proj = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(projectId);
+    if (proj?.folder_path) await require('./git').ensureGitWorkspaceHydrated(proj.folder_path, projectId, userId);
+  } catch (e) { console.error('[Execution] Workspace hydrate failed for project', projectId, ':', e.message); }
+}
+
 router.get('/runs/:id/report-data', auth, async (req, res) => {
   const run = await db.prepare(`
     SELECT r.*, s.name as suite_name
@@ -1466,8 +1566,8 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
-  if (run.engine !== 'jmeter') return res.status(400).json({ error: 'Custom analytics only available for JMeter runs' });
 
+  const engine = run.engine || 'jmeter';
   const storedLogs = JSON.parse(run.logs || '[]');
 
   // ── serve from DB cache if available ──────────────────────────────────────
@@ -1487,9 +1587,11 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
     } catch (_) { /* corrupt cache — fall through to disk */ }
   }
 
-  // ── fall back to disk, then cache the result ───────────────────────────────
-  const jtlPath = run.result_dir ? path.join(run.result_dir, 'results.jtl') : null;
-  if (!jtlPath || !fs.existsSync(jtlPath)) {
+  // ── fall back to S3, then cache the result ───────────────────────────────
+  const resultsFilename = engine === 'k6' ? 'results.json' : 'results.jtl';
+  const orgSlug0 = run.result_dir ? await resolveOrgSlugForProject(run.project_id) : null;
+  const jtlText = run.result_dir ? await resultsStore.readText(run.result_dir, orgSlug0, resultsFilename) : null;
+  if (!jtlText) {
     return res.status(404).json({
       error: 'not_cached',
       message: 'Report data is not available. Re-sync results from the CI pipeline to regenerate.',
@@ -1505,8 +1607,9 @@ router.get('/runs/:id/report-data', auth, async (req, res) => {
     started_at:  run.started_at,
     finished_at: run.finished_at,
   };
-  const parsed = parseJtl(jtlPath, runMeta);
-  if (!parsed) return res.status(400).json({ error: 'JTL file contains no data rows' });
+  const { parseK6Content } = require('../utils/parseK6');
+  const parsed = engine === 'k6' ? parseK6Content(jtlText, runMeta) : parseJtlContent(jtlText, runMeta);
+  if (!parsed) return res.status(400).json({ error: `${resultsFilename} contains no data rows` });
 
   // Backfill cache so next request is instant
   try {
@@ -1535,15 +1638,16 @@ router.get('/runs/:id/export-pdf', auth, async (req, res) => {
     try { reportData = JSON.parse(run.report_data); } catch (_) {}
   }
   if (!reportData) {
-    const jtlPath = run.result_dir ? path.join(run.result_dir, 'results.jtl') : null;
-    if (!jtlPath || !fs.existsSync(jtlPath)) {
+    const orgSlug1 = run.result_dir ? await resolveOrgSlugForProject(run.project_id) : null;
+    const jtlText = run.result_dir ? await resultsStore.readText(run.result_dir, orgSlug1, 'results.jtl') : null;
+    if (!jtlText) {
       return res.status(404).json({ error: 'JTL results file not found and no cached report data available' });
     }
     const runMeta = {
       run_id: run.id, suite_name: run.suite_name || 'Unknown', engine: run.engine,
       status: run.status, started_at: run.started_at, finished_at: run.finished_at,
     };
-    reportData = parseJtl(jtlPath, runMeta);
+    reportData = parseJtlContent(jtlText, runMeta);
     if (!reportData) return res.status(400).json({ error: 'JTL file contains no data rows' });
     // Backfill cache
     try { await db.prepare('UPDATE execution_runs SET report_data=? WHERE id=?').run(JSON.stringify(reportData), run.id); } catch (_) {}
@@ -1568,17 +1672,12 @@ router.get('/runs/:id/download-report', auth, async (req, res) => {
   `).get(req.params.id);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!await ownsProject(req.userId, run.project_id)) return res.status(403).json({ error: 'Forbidden' });
+  if (!run.result_dir) return res.status(404).json({ error: 'No results recorded for this run' });
 
-  // Prefer deriving reportDir from report_path (exact stored path)
-  let reportDir;
-  if (run.report_path) {
-    reportDir = path.dirname(run.report_path);
-  } else {
-    reportDir = path.join(run.result_dir, 'report');
-  }
-
-  if (!reportDir || !fs.existsSync(reportDir)) {
-    return res.status(404).json({ error: `Report directory not found: ${reportDir}` });
+  const orgSlug = await resolveOrgSlugForProject(run.project_id);
+  const reportFiles = await resultsStore.listFiles(run.result_dir, orgSlug, 'report');
+  if (!reportFiles.length) {
+    return res.status(404).json({ error: `Report directory not found for run ${run.id}` });
   }
 
   const runNum = (run.result_dir.match(/Run_(\d+)/) || [])[1] || run.id;
@@ -1590,12 +1689,17 @@ router.get('/runs/:id/download-report', auth, async (req, res) => {
   const archive = new ZipArchive({ zlib: { level: 6 } });
   archive.on('error', err => { console.error('Archive error:', err); res.status(500).end(); });
   archive.pipe(res);
-  archive.directory(reportDir, false);
+  for (const relPath of reportFiles) {
+    const buf = await resultsStore.readFile(run.result_dir, orgSlug, relPath);
+    if (buf) archive.append(buf, { name: relPath.replace(/^report\//, '') });
+  }
   archive.finalize();
 });
 
 // ── Patch jmeter.properties to enable latency + bytes recording ──────────────
 router.post('/jmeter/enable-latency', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
@@ -1653,6 +1757,8 @@ router.post('/jmeter/enable-latency', auth, async (req, res) => {
 
 // ── Check whether jmeter.properties already has latency props set ─────────────
 router.get('/jmeter/latency-status', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
 
@@ -1687,6 +1793,8 @@ router.get('/jmeter/latency-status', auth, async (req, res) => {
 
 // ── Pull JMeter Docker image ─────────────────────────────────────────────────
 router.post('/jmeter/pull-image', auth, async (req, res) => {
+  // RETIRED — local/native test execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local test execution has been retired. Run tests via the CI pipeline instead.' });
   const cfgRow = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId);
   const savedCfg = cfgRow ? JSON.parse(cfgRow.config_json || '{}') : {};
   const image = (req.body.image || savedCfg.jmeter_docker_image || 'justb4/jmeter:latest').trim();

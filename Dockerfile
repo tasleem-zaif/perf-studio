@@ -1,5 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# PerfStudio — All-in-one Docker image
+# PerfStudio — All-in-one Docker image (undocumented/legacy deployment path)
+#
+# ⚠ The documented deployment model is DIRECT (a plain Node.js process, no
+# containers) — see docs/DEPLOYMENT.md. This image still builds and works but is
+# no longer the recommended/documented way to run Peako.
 #
 # Contains:
 #   • Node.js 20        (backend API + frontend SSR)

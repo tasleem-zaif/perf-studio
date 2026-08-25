@@ -1,0 +1,32 @@
+flowchart TB
+    subgraph SA["Super Admin (platform-wide)"]
+        direction TB
+        SA1[Create / manage organizations] --> SA1d[Organizations CRUD]
+        SA2[Invite org admins] --> SA2d[Email invite with token]
+        SA3[Suspend / activate users] --> SA3d[User management]
+        SA4[Configure platform SMTP] --> SA4d[Global SMTP settings]
+        SA5[CRUD projects in own org] --> SA5d[Projects]
+    end
+
+    subgraph OA["Org Admin (per organization)"]
+        direction TB
+        OA1[Configure AI key] --> OA1d[OpenAI / Claude API key]
+        OA2[Set up git integration<br/>remote URL, PAT] --> OA2d[Git config per project]
+        OA3[Push to main branch directly] --> OA3d[No PR required]
+        OA4[Merge PRs from users] --> OA4d[PR lifecycle management]
+        OA5[Invite & assign users to projects] --> OA5d[Project assignments]
+        OA6[Generate CI YAML for<br/>admin workspace] --> OA6d["peako-workspaces/&lt;org&gt;/&lt;Project&gt;/admin/"]
+    end
+
+    subgraph RU["Regular User (per assigned project)"]
+        direction TB
+        RU1[Access only assigned projects] --> RU1d[project_assignments table]
+        RU2[Upload test data<br/>own collection + env] --> RU2d[CSV per collection + env]
+        RU3[Configure own URLs] --> RU3d[collection_env_config table]
+        RU4[Create & run test plans] --> RU4d[Test suites + execution]
+        RU5[Push to users/name branch] --> RU5d[No direct main access]
+        RU6[Generate CI YAML to<br/>own workspace] --> RU6d["peako-workspaces/&lt;org&gt;/&lt;Project&gt;/&lt;user&gt;/"]
+        RU7[Raise PR to main] --> RU7d[Via Peako or Git UI]
+    end
+
+    SA --> OA --> RU

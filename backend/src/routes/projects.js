@@ -140,6 +140,10 @@ router.delete('/:id', async (req, res) => {
 
     // Capture git config BEFORE deleting from DB — CASCADE will delete it
     const gitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(project.id);
+    // Resolve org slug BEFORE deleting the project row — the background backup below
+    // runs after the DELETE, by which point a projectId-based lookup would find nothing.
+    const { resolveOrgSlugForProject } = require('../utils/projectFolders');
+    const orgSlugForBackup = await resolveOrgSlugForProject(project.id);
 
     // Delete from DB immediately and respond — git cleanup + folder backup run in background
     await db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
@@ -203,7 +207,7 @@ router.delete('/:id', async (req, res) => {
           ? gitCfg.git_root          // git workspace (already cleaned of project subfolder above)
           : project.folder_path;    // fallback: plain project folder (no git)
 
-        await backupAndDeleteProjectFolder(backupPath, project.name, project.id);
+        await backupAndDeleteProjectFolder(backupPath, project.name, project.id, orgSlugForBackup, project.user_id);
         console.log(`[Projects] Backup created for "${project.name}"`);
       } catch (e) {
         console.error('[Projects] Backup/delete folder failed:', e.message);
@@ -218,27 +222,45 @@ router.delete('/:id', async (req, res) => {
 router.post('/:id/ensure-folders', async (req, res) => {
   const project = await db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
   if (!project) return res.status(404).json({ error: 'Project not found — please refresh the page and try again.' });
-  const folderPath = ensureProjectFolders(project.name, project.id, project.uuid || project.environment);
+  const folderPath = await ensureProjectFolders(project.name, project.id);
   await db.prepare('UPDATE projects SET folder_path = ? WHERE id = ?').run(folderPath, req.params.id);
   res.json({ ok: true, folder_path: folderPath });
 });
 
 // ── GET /backups — list all project backup ZIPs (admin only) ─────────────────
+// Local BACKUPS_ROOT holds SSH-mode backups (unchanged); PAT-mode backups live only in S3
+// (backupS3Workspace in projectFolders.js) — merge both into one listing.
 router.get('/backups', async (req, res) => {
   const caller = await getCaller(req.userId);
   if (!['org_admin', 'super_admin'].includes(caller?.role)) {
     return res.status(403).json({ error: 'Admin only' });
   }
   try {
-    if (!fs.existsSync(BACKUPS_ROOT)) return res.json({ backups: [] });
-    const files = fs.readdirSync(BACKUPS_ROOT)
-      .filter(f => f.endsWith('.zip'))
-      .map(f => {
-        const stat = fs.statSync(path.join(BACKUPS_ROOT, f));
-        return { filename: f, size_bytes: stat.size, created_at: stat.mtime.toISOString() };
-      })
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    res.json({ backups: files, backups_dir: BACKUPS_ROOT });
+    let localFiles = [];
+    if (fs.existsSync(BACKUPS_ROOT)) {
+      localFiles = fs.readdirSync(BACKUPS_ROOT)
+        .filter(f => f.endsWith('.zip'))
+        .map(f => {
+          const stat = fs.statSync(path.join(BACKUPS_ROOT, f));
+          return { filename: f, size_bytes: stat.size, created_at: stat.mtime.toISOString(), source: 'local' };
+        });
+    }
+
+    let s3Files = [];
+    try {
+      const s3Sync = require('../utils/s3Sync');
+      const orgRow = caller.org_id ? await db.prepare('SELECT slug FROM organizations WHERE id = ?').get(caller.org_id) : null;
+      const orgSlug = orgRow?.slug || 'unassigned';
+      const baseKey = s3Sync.toKey(path.join(BACKUPS_ROOT, '__probe__'), orgSlug);
+      const prefix = baseKey ? path.posix.dirname(baseKey) : null;
+      if (prefix) {
+        const keys = await s3Sync.listAllKeys(prefix);
+        s3Files = keys.filter(k => k.endsWith('.zip')).map(k => ({ filename: path.posix.basename(k), size_bytes: null, created_at: null, source: 's3' }));
+      }
+    } catch (_) {}
+
+    const backups = [...localFiles, ...s3Files].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    res.json({ backups, backups_dir: BACKUPS_ROOT });
   } catch (e) {
     res.status(500).json({ error: `Failed to list project backups: ${e.message}. The backups directory may be inaccessible.` });
   }
@@ -254,8 +276,22 @@ router.get('/backups/:filename', async (req, res) => {
   const safe = path.basename(req.params.filename);
   if (!safe.endsWith('.zip')) return res.status(400).json({ error: 'Invalid filename' });
   const filePath = path.join(BACKUPS_ROOT, safe);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Backup not found' });
-  res.download(filePath, safe);
+  if (fs.existsSync(filePath)) return res.download(filePath, safe);
+
+  // Not a local (SSH-mode) backup — check S3 (PAT-mode backup)
+  try {
+    const s3Sync = require('../utils/s3Sync');
+    const orgRow = caller.org_id ? await db.prepare('SELECT slug FROM organizations WHERE id = ?').get(caller.org_id) : null;
+    const orgSlug = orgRow?.slug || 'unassigned';
+    const baseKey = s3Sync.toKey(path.join(BACKUPS_ROOT, safe), orgSlug);
+    const res_ = baseKey ? await s3Sync.getBuffer(baseKey) : { ok: false };
+    if (!res_.ok) return res.status(404).json({ error: 'Backup not found' });
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}"`);
+    res.setHeader('Content-Type', 'application/zip');
+    return res.send(res_.data);
+  } catch (e) {
+    return res.status(500).json({ error: `Failed to fetch backup: ${e.message}` });
+  }
 });
 
 // GET /projects/:id/registry-token — org's npm registry token, for local/CI use

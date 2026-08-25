@@ -68,6 +68,8 @@ router.get('/runs/:runId', async (req, res) => {
 
 // ── POST /:id/run — trigger pipeline run with SSE streaming ───────────────────
 router.post('/:id/run', auth, async (req, res) => {
+  // RETIRED — internal sequential pipeline execution is no longer supported; CI-pipeline execution only.
+  return res.status(410).json({ error: 'Local pipeline execution has been retired. Run tests via the CI pipeline instead.' });
   if (!await ownsProject(req.userId, req.params.projectId)) return res.status(404).json({ error: 'Project not found' });
 
   const pipeline = await db.prepare('SELECT * FROM pipeline_configs WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
@@ -177,7 +179,7 @@ router.post('/:id/run', auth, async (req, res) => {
 
       // Parse JTL now so Analytics never needs to read from disk later
       const jtlPath    = result.jtlPath || null;
-      const stepSuite  = await db.prepare('SELECT name FROM test_suites WHERE id = ?').get(step.suite_id);
+      const stepSuite  = await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(step.suite_id, req.userId);
       const cachedData = jtlPath ? parseJtl(jtlPath, {
         run_id: execRunId, suite_name: stepSuite?.name || step.name,
         engine: stepEngine, started_at: stepsResult[i].started_at,

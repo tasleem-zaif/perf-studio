@@ -368,7 +368,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
  * @param {number} userId
  * @param {number} projectId
  * @param {object} runData  — the same object returned by /runs/:id/report-data
- * @param {string} pdfPath  — path to generated PDF (may be null)
+ * @param {string|Buffer} pdfPath  — local path (legacy) OR the PDF as an in-memory Buffer (may be null)
  * @param {string} reportDir — path to JMeter HTML report directory (may be null)
  */
 async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, reportDir) {
@@ -386,11 +386,12 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
     // Build attachments
     const attachments = [];
 
-    if (pdfPath && fs.existsSync(pdfPath)) {
+    const pdfIsBuffer = Buffer.isBuffer(pdfPath);
+    if (pdfIsBuffer || (pdfPath && fs.existsSync(pdfPath))) {
       attachments.push({
         filename: `${(runData.meta?.suite_name || 'Analytics').replace(/[^a-zA-Z0-9_-]/g, '_')}_Report.pdf`,
-        path: pdfPath,
         contentType: 'application/pdf',
+        ...(pdfIsBuffer ? { content: pdfPath } : { path: pdfPath }),
       });
     }
 
@@ -782,4 +783,4 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
   }
 }
 
-module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients };
+module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients, createTransport };

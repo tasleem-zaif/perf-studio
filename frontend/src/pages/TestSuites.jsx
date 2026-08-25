@@ -162,11 +162,27 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     } finally { setGenerating(null); }
   }
 
-  function download(suite, type) {
-    const a = dlRef.current;
-    a.href = `/api/projects/${project.id}/test-suites/${suite.id}/download/${type}`;
-    a.download = '';
-    a.click();
+  async function download(suite, type) {
+    try {
+      const token = localStorage.getItem('ps_token');
+      const res = await fetch(`/api/projects/${project.id}/test-suites/${suite.id}/download/${type}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        let msg = `Download failed (${res.status})`;
+        try { const j = await res.json(); msg = j.error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = dlRef.current;
+      a.href = url;
+      a.download = `${suite.name}.${type}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast(e.message || 'Download failed', 'error');
+    }
   }
 
   function openEdit(s) {
@@ -357,16 +373,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
               <label className="form-label">Engine</label>
               <CustomSelect
                 value={form.engine}
-                onChange={e => { if (e.target.value !== 'k6') setForm(f => ({ ...f, engine: e.target.value })); }}
+                onChange={e => setForm(f => ({ ...f, engine: e.target.value }))}
               >
                 <option value="jmeter">Apache JMeter (.jmx)</option>
-                <option value="k6" disabled>Grafana K6 (.js) — Coming Soon</option>
+                <option value="k6">Grafana K6 (.js)</option>
               </CustomSelect>
-              {form.engine === 'k6' && (
-                <div style={{ marginTop: 6, fontSize: 11, color: '#b45309', display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <i className="ti ti-clock" style={{ fontSize: 11 }}/> K6 support is coming soon. Please use Apache JMeter for now.
-                </div>
-              )}
             </div>
           </div>
 

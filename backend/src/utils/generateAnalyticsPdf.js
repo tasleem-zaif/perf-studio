@@ -588,11 +588,11 @@ async function generateAnalyticsPdf(data, runNum, res) {
   }
 }
 
-// ── email helper — saves PDF to a temp file and returns the path ──────────────
-async function generateAnalyticsPdfToFile(data, runNum, destPath) {
-  const pdf = await renderPdf(data, runNum);
-  require('fs').writeFileSync(destPath, pdf);
-  return destPath;
+// ── returns the rendered PDF as an in-memory Buffer — no disk I/O at all ──────
+// Callers that need it durably stored write the buffer via resultsStore.writeFile()
+// themselves (keeps storage concerns out of the renderer).
+async function generateAnalyticsPdfBuffer(data, runNum) {
+  return renderPdf(data, runNum);
 }
 
-module.exports = { generateAnalyticsPdf, generateAnalyticsPdfToFile };
+module.exports = { generateAnalyticsPdf, generateAnalyticsPdfBuffer };

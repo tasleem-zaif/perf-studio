@@ -1,4 +1,19 @@
 require('dotenv').config();
+
+// ── Boot-time S3 enforcement (GDPR: zero local disk) ──────────────────────────
+// This app's zero-local-disk guarantee (PAT-mode git storage, run results/artifacts,
+// and SSH-mode's tmpfs workspaces surviving a restart) depends entirely on S3 being
+// configured — see PROJECT_MAP.md's "S3 migration" section. Refuse to start rather than
+// silently writing customer data onto this server's disk.
+const S3_SYNC_ENABLED_AT_BOOT = String(process.env.S3_SYNC_ENABLED || '').toLowerCase() === 'true';
+if (!S3_SYNC_ENABLED_AT_BOOT || !process.env.S3_BUCKET) {
+  console.error(
+    '[Boot] Refusing to start: S3_SYNC_ENABLED=true and S3_BUCKET are both required. ' +
+    'This deployment stores all customer data (git workspaces, run results, artifacts) via S3 only.'
+  );
+  process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -85,6 +100,16 @@ if (process.env.NODE_ENV === 'production') {
   }
 }
 
+async function start() {
+  const { assertBucketReachable, warnIfInsecureCredentials } = require('./utils/s3Sync');
+  warnIfInsecureCredentials();
+  try {
+    await assertBucketReachable();
+  } catch (error) {
+    console.error('[Boot] Refusing to start:', error.message);
+    process.exit(1);
+  }
+
 app.listen(PORT, () => {
   console.log(`PerfStudio API running on http://localhost:${PORT}`);
 
@@ -107,18 +132,31 @@ app.listen(PORT, () => {
   setImmediate(async () => {
     try {
       const db = require('./db');
-      const { getUserProjectPath, isAdminWorkspace } = require('./utils/projectFolders');
+      const { getUserProjectPath, isAdminRole } = require('./utils/projectFolders');
       const { updateCollectionConfigs } = require('./utils/configWriter');
+
+      const { resolveOrgSlugForProject } = require('./utils/projectFolders');
+      const gitEngine = require('./utils/gitEngine');
+      async function isSshModeStartup(userId, projectId) {
+        const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+        return (identity?.auth_method || 'pat') === 'ssh';
+      }
 
       const projects = await db.prepare('SELECT p.*, u.role as user_role FROM projects p JOIN users u ON u.id = p.user_id').all();
 
       for (const proj of projects) {
         try {
-          const projectFolderPath = await getUserProjectPath(proj.user_id, proj.user_role, proj.name);
-          if (isAdminWorkspace(projectFolderPath)) continue;
+          const projectFolderPath = await getUserProjectPath(proj.user_id, proj.user_role, proj.name, proj.id);
+          if (isAdminRole(proj.user_role)) continue;
+          const isSSH = await isSshModeStartup(proj.user_id, proj.id);
+          if (!isSSH) {
+            const orgSlug = await resolveOrgSlugForProject(proj.id);
+            const session = await gitEngine.openSession(require('path').dirname(projectFolderPath), orgSlug);
+            if (!session.hadState) continue;
+          }
           const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
           for (const col of collections) {
-            updateCollectionConfigs(col.id, projectFolderPath);
+            updateCollectionConfigs(col.id, projectFolderPath, proj.user_id);
           }
         } catch (_) {}
       }
@@ -129,13 +167,20 @@ app.listen(PORT, () => {
         for (const proj of allProjects) {
           if (proj.user_id === user.id) continue;
           try {
-            const projectFolderPath = await getUserProjectPath(user.id, user.role, proj.name);
-            if (isAdminWorkspace(projectFolderPath)) continue;
-            const fs = require('fs');
-            if (!fs.existsSync(projectFolderPath)) continue;
+            const projectFolderPath = await getUserProjectPath(user.id, user.role, proj.name, proj.id);
+            if (isAdminRole(user.role)) continue;
+            const isSSH = await isSshModeStartup(user.id, proj.id);
+            if (isSSH) {
+              const fs = require('fs');
+              if (!fs.existsSync(projectFolderPath)) continue;
+            } else {
+              const orgSlug = await resolveOrgSlugForProject(proj.id);
+              const session = await gitEngine.openSession(require('path').dirname(projectFolderPath), orgSlug);
+              if (!session.hadState) continue;
+            }
             const collections = await db.prepare('SELECT id FROM collections WHERE project_id = ?').all(proj.id);
             for (const col of collections) {
-              updateCollectionConfigs(col.id, projectFolderPath);
+              updateCollectionConfigs(col.id, projectFolderPath, user.id);
             }
           } catch (_) {}
         }
@@ -146,4 +191,25 @@ app.listen(PORT, () => {
       console.error('[Startup] Config regeneration error:', e.message);
     }
   });
+
+  // ── S3 workspace reclaim sweep ────────────────────────────────────────────
+  // Reclaims local disk for workspaces that were confirmed synced to S3 (see
+  // workspaceLifecycle.js's markWorkspaceSyncedAfterPush) and have sat untouched past the
+  // cooldown window. Deliberately a periodic sweep, not something tied to the push itself —
+  // that's what keeps a push immediately followed by another action on the same project from
+  // ever paying a rehydration cost. No-op entirely while S3_SYNC_ENABLED is unset.
+  if (String(process.env.S3_SYNC_ENABLED || '').toLowerCase() === 'true') {
+    const { sweepStaleWorkspaces } = require('./utils/workspaceLifecycle');
+    const SWEEP_INTERVAL_MS = Number(process.env.S3_SWEEP_INTERVAL_MS) || 30 * 60 * 1000;
+    setInterval(() => {
+      sweepStaleWorkspaces().then(({ swept, skipped }) => {
+        if (swept.length) console.log(`[S3Sweep] Reclaimed ${swept.length} workspace(s):`, swept);
+        if (skipped.length) console.log(`[S3Sweep] Skipped ${skipped.length}:`, skipped.map(s => s.reason).join(', '));
+      }).catch(e => console.error('[S3Sweep] Error:', e.message));
+    }, SWEEP_INTERVAL_MS);
+  }
 });
+}
+
+start();
+

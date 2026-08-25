@@ -1,8 +1,10 @@
 # Peako — Production Deployment Manual
 
-**Version:** 1.1  
-**Stack:** Node.js 22 · React (Vite) · PostgreSQL 16 · JMeter · K6  
+**Version:** 1.2
+**Stack:** Node.js 22 · React (Vite) · PostgreSQL 16
 **Maintained by:** Quarks Technosoft
+
+**Deployment model: direct (bare-metal/VM), no containers.** The application runs as a plain Node.js process on the host, managed by systemd. There is no Docker deployment path documented here.
 
 ---
 
@@ -10,17 +12,16 @@
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Server Requirements](#2-server-requirements)
-3. [Method A — Docker (Recommended)](#3-method-a--docker-recommended)
-4. [Method B — Manual (No Docker)](#4-method-b--manual-no-docker)
-5. [Environment Variables Reference](#5-environment-variables-reference)
-6. [Database](#6-database)
-7. [Nginx Reverse Proxy](#7-nginx-reverse-proxy)
-8. [SSL / HTTPS](#8-ssl--https)
-9. [Running as a System Service](#9-running-as-a-system-service)
-10. [First Login & Initial Setup](#10-first-login--initial-setup)
-11. [Backup & Restore](#11-backup--restore)
-12. [Upgrades](#12-upgrades)
-13. [Troubleshooting](#13-troubleshooting)
+3. [Deployment Steps](#3-deployment-steps)
+4. [Environment Variables Reference](#4-environment-variables-reference)
+5. [Database](#5-database)
+6. [Nginx Reverse Proxy](#6-nginx-reverse-proxy)
+7. [SSL / HTTPS](#7-ssl--https)
+8. [Running as a System Service](#8-running-as-a-system-service)
+9. [First Login & Initial Setup](#9-first-login--initial-setup)
+10. [Backup & Restore](#10-backup--restore)
+11. [Upgrades](#11-upgrades)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -33,17 +34,22 @@ Browser
 Nginx (port 80/443)          ← optional but recommended
   │
   ▼
-Node.js Backend (port 3001)  ← serves API + built React frontend
+Node.js Backend (port 3001)  ← runs directly on the host via systemd
+                                serves API + built React frontend
   │
   ├── PostgreSQL 16   (separate service — DATABASE_URL)
-  ├── Projects        (/app/projects)
-  ├── Git workspaces  (/app/git-workspaces)
-  └── Backups         (/app/backups)
+  ├── AWS S3 (or compatible)  (MANDATORY — see below)
+  ├── Projects        (/opt/perfstudio/projects — legacy/admin files only)
+  ├── Git workspaces  (/opt/perfstudio/git-workspaces — SSH-mode only, ephemeral)
+  └── Backups         (/opt/perfstudio/backups)
 ```
 
-- The backend serves **both** the API (`/api/*`) and the built React frontend (static files).
-- No separate frontend server is needed in production.
-- PostgreSQL is a **required external service** — run it as a Docker Compose service (default), a managed Postgres instance, or a self-hosted server. Project files, scripts, and results still live on disk.
+- The backend serves **both** the API (`/api/*`) and the built React frontend (static files) from a single Node.js process.
+- No separate frontend server, container runtime, or orchestrator is required.
+- PostgreSQL is a **required external service** — a self-installed server on the same host or a separate host, or a managed Postgres instance (RDS, Cloud SQL, etc.).
+- **⚠ AWS S3 (or an S3-compatible store) is also a required external service — the app refuses to boot without it.** `backend/src/index.js` calls `assertBucketReachable()` at startup and exits the process if `S3_SYNC_ENABLED`/`S3_BUCKET` aren't set or the bucket isn't reachable. This is a GDPR-driven, zero-local-disk design: all git workspace data (PAT-auth mode) and all test-run results (JTL, HTML report, PDF) live in S3 only, never on local disk.
+- **SSH-auth-mode git workspaces are the one thing that still touches local disk** (`/opt/perfstudio/git-workspaces`), since `isomorphic-git` has no SSH transport and this path still uses the real `git` binary against a real directory. To keep this ephemeral (no customer data persisted to physical disk, per the same GDPR requirement), mount it as a real Linux `tmpfs` (RAM-backed) filesystem rather than leaving it on normal disk — see §3, Step 10.
+- **⚠ Test execution itself is CI-only.** JMeter/K6 do not run on this server at all — local/native test-execution routes are retired (HTTP 410). A real test run is triggered against an external CI provider (GitHub Actions, GitLab CI, or Bitbucket Pipelines), which is where JMeter/K6 actually execute; this server only orchestrates the trigger and pulls results back afterward. **One of GitHub/GitLab/Bitbucket is therefore effectively a required external dependency too**, not optional — see §2.
 
 ---
 
@@ -59,11 +65,11 @@ Node.js Backend (port 3001)  ← serves API + built React frontend
 | Node.js | 22+ |
 | Git | Any recent version |
 
-### Recommended (for teams running JMeter tests)
+### Recommended
 | Resource | Requirement |
 |---|---|
 | CPU | 4 vCPU |
-| RAM | 8 GB |
+| RAM | 8 GB (add headroom for the tmpfs git-workspaces mount — see §3, Step 10) |
 | Disk | 50 GB SSD |
 
 ### Ports to open in firewall
@@ -74,142 +80,18 @@ Node.js Backend (port 3001)  ← serves API + built React frontend
 | 443 | HTTPS (Nginx) |
 | 3001 | Backend (only if not using Nginx) |
 
----
-
-## 3. Method A — Docker (Recommended)
-
-This is the simplest deployment. One container includes Node.js, JMeter, K6, Git, and the built frontend.
-
-### Step 1 — Install Docker
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-Verify:
-```bash
-docker --version
-docker compose version
-```
-
-### Step 2 — Get the source code
-
-```bash
-git clone https://bitbucket.org/qtsolv/PerfStudio.git
-cd PerfStudio
-```
-
-### Step 3 — Create the environment file
-
-```bash
-cp backend/.env backend/.env.docker
-```
-
-Edit `backend/.env.docker` and fill in the required values:
-
-```bash
-nano backend/.env.docker
-```
-
-Minimum required content:
-
-```env
-NODE_ENV=production
-PORT=3001
-
-# Generate with: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-JWT_SECRET=REPLACE_WITH_GENERATED_SECRET
-
-# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-ENCRYPTION_KEY=REPLACE_WITH_GENERATED_KEY
-
-# Your server's public URL (used in invite/reset emails)
-FRONTEND_URL=http://YOUR_SERVER_IP_OR_DOMAIN:3001
-CORS_ORIGIN=http://YOUR_SERVER_IP_OR_DOMAIN:3001
-
-# Postgres connection — points at the `postgres` service in docker-compose.yml
-DATABASE_URL=postgresql://postgres:postgres@postgres:5432/perf_studio
-
-# Storage paths inside the container
-PROJECTS_ROOT=/app/projects
-BACKUPS_ROOT=/app/backups
-```
-
-> Change the Postgres username/password from the `postgres`/`postgres` default before exposing this to a network you don't fully trust — update both `docker-compose.yml`'s `postgres` service environment and `DATABASE_URL` to match.
-
-Generate the secrets:
-```bash
-# JWT_SECRET
-node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-
-# ENCRYPTION_KEY
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-### Step 4 — Start with Docker Compose (recommended)
-
-`docker-compose.yml` at the repo root already defines both services — a `postgres:16-alpine` database and the all-in-one app container — wired together via `DATABASE_URL`. This is the simplest path and the one actually exercised in this repo:
-
-```bash
-docker compose --env-file backend/.env.docker up -d --build
-```
-
-This takes 5–10 minutes on first build (downloads JMeter, K6, Java) and also pulls/starts Postgres.
-
-> **Important — schema is not auto-applied.** Neither the app container's startup nor the `postgres` service runs `schema.sql` automatically (no `docker-entrypoint-initdb.d` mount, no migration step in the app's boot sequence). On a **fresh** Postgres volume, run the migration once before the app can serve real requests:
-> ```bash
-> docker compose exec PerfStudio node backend/src/db/migrate.js
-> ```
-> Safe to re-run any time (idempotent `CREATE TABLE IF NOT EXISTS`) — re-run it after every upgrade that adds new tables/columns to `schema.sql`.
-
-### Step 5 (alternative) — Plain `docker run`, without Compose
-
-Only use this if you specifically don't want Compose managing Postgres. You must run Postgres yourself and point `DATABASE_URL` at it:
-
-```bash
-docker build -t perfstudio:latest .
-
-docker run -d --name perfstudio-pg --restart unless-stopped \
-  -e POSTGRES_DB=perf_studio -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-  -v perfstudio_pg_data:/var/lib/postgresql/data \
-  postgres:16-alpine
-
-docker run -d \
-  --name perfstudio \
-  --restart unless-stopped \
-  -p 3001:3001 \
-  --link perfstudio-pg:postgres \
-  --env-file backend/.env.docker \
-  -v perfstudio_projects:/app/projects \
-  -v perfstudio_git:/app/git-workspaces \
-  -v perfstudio_backups:/app/backups \
-  perfstudio:latest
-```
-
-(`--link` gives the app container a `postgres` hostname resolving to the DB container, matching the `DATABASE_URL` above — on a real deployment prefer a user-defined Docker network over `--link`, which is deprecated in modern Docker.)
-
-### Step 6 — Verify it is running
-
-```bash
-docker ps
-curl http://localhost:3001/api/health
-```
-
-Expected response: `{"status":"ok","ts":"..."}`
-
-### Step 7 — View logs
-
-```bash
-docker logs -f perfstudio
-```
+### External services (in addition to the server itself)
+| Service | Required? | Purpose |
+|---|---|---|
+| PostgreSQL 16 | **Required** | System of record |
+| AWS S3 (or S3-compatible, e.g. MinIO) | **Required — boot fails without it** | All git workspace data + all test-run results (GDPR zero-local-disk design) |
+| GitHub, GitLab, or Bitbucket | **Effectively required** | Test execution is CI-only — JMeter/K6 run on the CI provider's runner, not this server |
+| SMTP provider | Optional but expected | Invites, password reset, run alerts |
+| OpenAI and/or Anthropic | Optional | Auto-heal diagnosis, AI-assisted fixes — degrades gracefully if unset, since script generation itself is deterministic |
 
 ---
 
-## 4. Method B — Manual (No Docker)
-
-Use this if you do not want Docker, or you are deploying on a managed VM.
+## 3. Deployment Steps
 
 ### Step 1 — Install Node.js 22
 
@@ -226,41 +108,7 @@ sudo apt-get install -y git
 git --version
 ```
 
-### Step 3 — Install Java 17 (required by JMeter)
-
-```bash
-sudo apt-get install -y openjdk-17-jdk-headless
-java -version
-```
-
-### Step 4 — Install Apache JMeter 5.6.3
-
-```bash
-wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz -O /tmp/jmeter.tgz
-sudo mkdir -p /opt/jmeter
-sudo tar -xzf /tmp/jmeter.tgz -C /opt/
-sudo mv /opt/apache-jmeter-5.6.3/* /opt/jmeter/
-rm /tmp/jmeter.tgz
-
-# Add to PATH
-echo 'export PATH=$PATH:/opt/jmeter/bin' >> ~/.bashrc
-source ~/.bashrc
-
-jmeter --version
-```
-
-### Step 5 — Install K6
-
-```bash
-curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-  | sudo tee /etc/apt/sources.list.d/k6.list
-sudo apt-get update
-sudo apt-get install -y k6
-k6 version
-```
-
-### Step 5b — Install PostgreSQL 16
+### Step 3 — Install PostgreSQL 16
 
 ```bash
 sudo apt-get install -y postgresql-16
@@ -272,23 +120,27 @@ sudo -u postgres psql -c "CREATE USER perfstudio WITH PASSWORD 'CHANGE_ME';"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE perf_studio TO perfstudio;"
 ```
 
-(Skip this step and use a managed Postgres instance instead if you have one — just note its connection string for Step 9.)
+(Skip this step and use a managed Postgres instance instead if you have one — just note its connection string for Step 7.)
 
-### Step 6 — Get the source code
+### Step 4 — Set up your S3 bucket (or S3-compatible store)
+
+The app will not start without this — see §1. Create a small S3 bucket and an IAM user/role scoped to it (`s3:GetObject`/`PutObject`/`DeleteObject`/`ListBucket`/`HeadBucket`), or stand up a self-hosted S3-compatible store (e.g. MinIO installed directly on a host, not via a container) if you don't want to use AWS. Note the bucket name, region, and (if not using an instance/IAM role) access key/secret for Step 7.
+
+### Step 5 — Get the source code
 
 ```bash
 git clone https://bitbucket.org/qtsolv/PerfStudio.git /opt/perfstudio
 cd /opt/perfstudio
 ```
 
-### Step 7 — Install backend dependencies
+### Step 6 — Install backend dependencies
 
 ```bash
 cd /opt/perfstudio/backend
 npm install --omit=dev
 ```
 
-### Step 8 — Build the frontend
+### Step 7 — Build the frontend
 
 ```bash
 cd /opt/perfstudio/frontend
@@ -302,10 +154,19 @@ Copy the built frontend to where the backend serves it:
 cp -r /opt/perfstudio/frontend/dist /opt/perfstudio/backend/public
 ```
 
-### Step 9 — Create the environment file
+### Step 8 — Create the environment file
 
 ```bash
-cp /opt/perfstudio/backend/.env /opt/perfstudio/backend/.env.production
+cp /opt/perfstudio/backend/.env.example /opt/perfstudio/backend/.env.production
+```
+
+Generate the two required secrets:
+```bash
+# JWT_SECRET (48 random bytes = 96 hex chars)
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+
+# ENCRYPTION_KEY (32 random bytes = 64 hex chars)
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
 Edit `/opt/perfstudio/backend/.env.production`:
@@ -325,12 +186,18 @@ DATABASE_URL=postgresql://perfstudio:CHANGE_ME@localhost:5432/perf_studio
 PROJECTS_ROOT=/opt/perfstudio/projects
 BACKUPS_ROOT=/opt/perfstudio/backups
 
-JMETER_BIN=/opt/jmeter/bin/jmeter
-K6_BIN=/usr/bin/k6
-EXECUTION_MODE=native
+# ── REQUIRED — the app will not boot without a reachable S3 bucket ──
+# There is no way to disable this in production; all git workspace data (PAT-auth)
+# and all test-run results live in S3 only (GDPR zero-local-disk requirement).
+S3_SYNC_ENABLED=true
+S3_BUCKET=your-bucket-name
+S3_REGION=your-region
+# Leave blank on AWS with an instance/IAM role attached; set explicitly otherwise:
+# S3_ACCESS_KEY_ID=
+# S3_SECRET_ACCESS_KEY=
 ```
 
-### Step 10 — Create data directories and apply the database schema
+### Step 9 — Create data directories and apply the database schema
 
 ```bash
 mkdir -p /opt/perfstudio/projects
@@ -342,6 +209,21 @@ cd /opt/perfstudio/backend
 node src/db/migrate.js
 ```
 
+### Step 10 (recommended) — Mount `git-workspaces` as tmpfs
+
+SSH-auth-mode git workspaces are the one thing still written to local disk (PAT-auth is fully S3-backed). To keep this ephemeral and RAM-backed — consistent with the app's zero-physical-disk design — mount it as a real Linux tmpfs filesystem instead of leaving it on normal disk. Add to `/etc/fstab` (size to your expected concurrent SSH-mode workspace count — ~200MB each is a reasonable planning figure):
+
+```
+tmpfs /opt/perfstudio/git-workspaces tmpfs size=6g,mode=1777 0 0
+```
+
+Then mount it:
+```bash
+sudo mount /opt/perfstudio/git-workspaces
+```
+
+Contents are lost on reboot by design — `workspaceLifecycle.js` lazily re-hydrates any workspace from S3/the git remote on next access, so this is a cold-start cost, not data loss. If you'd rather keep it on normal persistent disk (simpler, but customer data then persists to physical disk between reboots), skip this step — the directory created in Step 9 works fine as a plain directory too.
+
 ### Step 11 — Start the backend
 
 ```bash
@@ -351,12 +233,7 @@ NODE_ENV=production node src/index.js
 
 A `super_admin` account (`admin@perfstudio.com` / `Admin@123`) is seeded automatically on first boot if the `users` table has none yet — no separate seed command needed.
 
-Or in background:
-
-```bash
-nohup NODE_ENV=production node src/index.js > /opt/perfstudio/backend.log 2>&1 &
-echo "Backend PID: $!"
-```
+For a real deployment, don't run it in the foreground like this — set it up as a systemd service (§8) so it survives reboots and restarts on crash.
 
 ### Step 12 — Verify
 
@@ -364,11 +241,13 @@ echo "Backend PID: $!"
 curl http://localhost:3001/api/health
 ```
 
+Expected response: `{"status":"ok","ts":"..."}`
+
 ---
 
-## 5. Environment Variables Reference
+## 4. Environment Variables Reference
 
-File location: `backend/.env`
+File location: `backend/.env.production` (or whatever path your systemd unit's `EnvironmentFile` points at — see §8)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -379,11 +258,14 @@ File location: `backend/.env`
 | `FRONTEND_URL` | Yes | `http://localhost:5173` | Public URL — used in invite and password reset emails |
 | `CORS_ORIGIN` | Yes | `http://localhost:5173` | Allowed CORS origin. Set same as FRONTEND_URL. |
 | `DATABASE_URL` | **Yes** | — | PostgreSQL connection string, e.g. `postgresql://user:pass@host:5432/perf_studio` |
-| `PROJECTS_ROOT` | No | `../projects` | Directory for project files and test scripts |
-| `BACKUPS_ROOT` | No | `../backups` | Directory for database backups |
-| `JMETER_BIN` | No | auto-detected | Full path to `jmeter` binary |
-| `K6_BIN` | No | auto-detected | Full path to `k6` binary |
-| `EXECUTION_MODE` | No | `docker` | Set to `native` if JMeter/K6 are installed directly |
+| `S3_SYNC_ENABLED` | **Yes — must be `true`** | — | The app calls `assertBucketReachable()` at boot and exits the process if this isn't `true` with a reachable `S3_BUCKET`. No production configuration exists without S3. |
+| `S3_BUCKET` | **Yes** | — | Target S3 bucket name |
+| `S3_REGION` | Recommended | — | AWS region for the S3 client |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | No | — | Explicit credentials; omit on AWS hosting to use the instance/task IAM role instead (preferred) |
+| `S3_ENDPOINT` | No | — | Only for a self-hosted S3-compatible endpoint (e.g. MinIO) instead of real AWS S3 |
+| `PROJECTS_ROOT` | No | `../projects` | Directory for legacy/admin project files only — not where scripts/results live anymore |
+| `BACKUPS_ROOT` | No | `../backups` | Directory for project-delete ZIP backups |
+| `JMETER_BIN` / `K6_BIN` / `EXECUTION_MODE` | **Vestigial — no effect** | — | Local/native test execution is retired (every route returns HTTP 410); these env vars are read by confirmed-dead code paths only |
 
 ### Generate secrets
 
@@ -397,9 +279,9 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 ---
 
-## 6. Database
+## 5. Database
 
-This application uses **PostgreSQL 16**, connected via `DATABASE_URL`. It's an external service — run it as the `postgres` service in `docker-compose.yml` (default), a self-installed server (Method B, Step 5b), or a managed Postgres instance (RDS, Cloud SQL, etc.).
+This application uses **PostgreSQL 16**, connected via `DATABASE_URL`. It's an external service — a self-installed server (§3, Step 3) or a managed Postgres instance (RDS, Cloud SQL, etc.).
 
 - **Schema**: `backend/src/db/schema.sql`, applied by `node src/db/migrate.js` — idempotent `CREATE TABLE IF NOT EXISTS`, safe to re-run, does not touch existing data.
 - **Super admin seeding**: `backend/src/db/index.js` checks for an existing `super_admin` row every time the backend boots and inserts one if none exists — no separate seed command needed, and it never overwrites an existing super admin.
@@ -416,10 +298,6 @@ This application uses **PostgreSQL 16**, connected via `DATABASE_URL`. It's an e
 ### Inspect the database
 
 ```bash
-# Using the Postgres container directly (Docker Compose deployment)
-docker exec -it perf_studio_pg psql -U postgres -d perf_studio
-
-# Or, if you have the psql client installed locally and DATABASE_URL is reachable:
 psql "$DATABASE_URL"
 
 # List tables
@@ -437,7 +315,7 @@ SELECT org_id, plan, max_users, max_projects, status, expires_at FROM org_licens
 
 ---
 
-## 7. Nginx Reverse Proxy
+## 6. Nginx Reverse Proxy
 
 Nginx is recommended so you can:
 - Use port 80/443 instead of 3001
@@ -512,7 +390,7 @@ sudo systemctl restart nginx
 
 ### Step 4 — Update FRONTEND_URL and CORS_ORIGIN
 
-In `backend/.env`:
+In `backend/.env.production`:
 ```env
 FRONTEND_URL=http://YOUR_DOMAIN_OR_IP
 CORS_ORIGIN=http://YOUR_DOMAIN_OR_IP
@@ -522,7 +400,7 @@ Restart the backend after this change.
 
 ---
 
-## 8. SSL / HTTPS
+## 7. SSL / HTTPS
 
 ### Using Let's Encrypt (free, recommended)
 
@@ -535,7 +413,7 @@ sudo certbot --nginx -d your-domain.com
 
 Certbot automatically edits your Nginx config to add HTTPS and sets up auto-renewal.
 
-After SSL is set up, update `.env`:
+After SSL is set up, update `.env.production`:
 ```env
 FRONTEND_URL=https://your-domain.com
 CORS_ORIGIN=https://your-domain.com
@@ -553,7 +431,7 @@ sudo systemctl status certbot.timer
 
 ---
 
-## 9. Running as a System Service
+## 8. Running as a System Service
 
 This keeps the backend running after reboot and restarts it if it crashes.
 
@@ -574,7 +452,7 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/perfstudio/backend
-EnvironmentFile=/opt/perfstudio/backend/.env
+EnvironmentFile=/opt/perfstudio/backend/.env.production
 ExecStart=/usr/bin/node src/index.js
 Restart=always
 RestartSec=5
@@ -612,7 +490,7 @@ sudo systemctl restart perfstudio
 
 ---
 
-## 10. First Login & Initial Setup
+## 9. First Login & Initial Setup
 
 1. Open the app in your browser: `http://YOUR_SERVER_IP_OR_DOMAIN`
 2. Log in with the default super admin:
@@ -625,24 +503,22 @@ sudo systemctl restart perfstudio
 
 ---
 
-## 11. Backup & Restore
+## 10. Backup & Restore
 
 ### Backup
 
-The entire application state is in:
+The application's real data lives in two places:
 1. **PostgreSQL database** (users, orgs, licenses, projects, configs, run history) — dumped with `pg_dump`, not a file copy
-2. `projects/` directory — test scripts, generated JMX/JS files, test data
-3. `git-workspaces/` directory — local git clones
+2. **AWS S3 (or compatible)** — all git workspace data (PAT-auth mode) and all test-run results (JTL, HTML report, PDF). This is the primary content backup surface; **S3 bucket versioning/backup/replication is a DevOps-owned responsibility of the bucket itself** (e.g. S3 Versioning, Cross-Region Replication, or a scheduled `aws s3 sync` to a secondary bucket) — Peako does not orchestrate this itself.
+
+`git-workspaces/` and `projects/` are **no longer meaningful backup targets**: `git-workspaces/` is either fully S3-backed (PAT-auth) or an ephemeral tmpfs mount (SSH-auth, if you set that up in §3 Step 10 — RAM-backed, intentionally lost on reboot and re-hydrated from S3/the git remote on next access) — copying it captures nothing durable. `projects/` only holds legacy/admin-only files unrelated to the S3-backed workflow.
 
 ```bash
 # Create a timestamped backup directory
 BACKUP_DIR="/opt/perfstudio/backups/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
-# Backup database — Docker Compose deployment
-docker exec perf_studio_pg pg_dump -U postgres perf_studio | gzip > "$BACKUP_DIR/perf_studio.sql.gz"
-
-# Backup database — Method B (Postgres on the host)
+# Backup database
 pg_dump "$DATABASE_URL" | gzip > "$BACKUP_DIR/perf_studio.sql.gz"
 
 # Backup project files
@@ -659,32 +535,28 @@ crontab -e
 
 Add:
 ```cron
-0 2 * * * docker exec perf_studio_pg pg_dump -U postgres perf_studio | gzip > /opt/perfstudio/backups/db_$(date +\%Y\%m\%d).sql.gz
+0 2 * * * pg_dump "$DATABASE_URL" | gzip > /opt/perfstudio/backups/db_$(date +\%Y\%m\%d).sql.gz
 ```
 
 ### Restore
 
 ```bash
 # Stop the backend first
-sudo systemctl stop perfstudio    # or: docker compose stop PerfStudio
+sudo systemctl stop perfstudio
 
-# Restore database — Docker Compose deployment (drops and recreates first)
-gunzip -c /opt/perfstudio/backups/20260101_020000/perf_studio.sql.gz | \
-  docker exec -i perf_studio_pg psql -U postgres -d perf_studio
-
-# Restore database — Method B (Postgres on the host)
+# Restore database
 gunzip -c /opt/perfstudio/backups/20260101_020000/perf_studio.sql.gz | psql "$DATABASE_URL"
 
 # Restore projects
 cp -r /opt/perfstudio/backups/20260101_020000/projects /opt/perfstudio/
 
 # Start the backend
-sudo systemctl start perfstudio   # or: docker compose start PerfStudio
+sudo systemctl start perfstudio
 ```
 
 ---
 
-## 12. Upgrades
+## 11. Upgrades
 
 ### Step 1 — Pull latest code
 
@@ -717,20 +589,11 @@ node src/db/migrate.js       # idempotent — only adds what's missing
 sudo systemctl restart perfstudio
 ```
 
-Unlike the old SQLite setup, schema changes are **not** applied automatically on startup — always re-run `migrate.js` after pulling code that touches `schema.sql`, before restarting.
-
-### Docker Compose upgrade
-
-```bash
-cd /opt/perfstudio
-git pull origin main
-docker compose --env-file backend/.env.docker up -d --build
-docker compose exec PerfStudio node backend/src/db/migrate.js
-```
+Schema changes are **not** applied automatically on startup — always re-run `migrate.js` after pulling code that touches `schema.sql`, before restarting.
 
 ---
 
-## 13. Troubleshooting
+## 12. Troubleshooting
 
 ### Backend not starting
 
@@ -751,20 +614,32 @@ sudo kill $(sudo lsof -ti:3001)
 curl -v http://localhost:3001/api/health
 ```
 
+### Backend exits immediately after "Refusing to start" in the logs
+
+This means S3 isn't configured or isn't reachable — the app performs a boot-time check (`assertBucketReachable()`) and will not start without it.
+
+```bash
+# Check the actual error
+sudo journalctl -u perfstudio -n 20 --no-pager
+
+# Common causes:
+# - S3_SYNC_ENABLED is not exactly "true", or S3_BUCKET is blank
+# - Wrong S3_REGION for the bucket
+# - Credentials don't have s3:HeadBucket / s3:ListBucket permission on this bucket
+# - S3_ENDPOINT is set for a real AWS bucket (only set this for a self-hosted S3-compatible store)
+```
+
 ### Database connection errors
 
 ```bash
 # "relation \"users\" does not exist" — schema was never applied to this Postgres instance
 cd /opt/perfstudio/backend && node src/db/migrate.js
-# (Docker Compose): docker compose exec PerfStudio node backend/src/db/migrate.js
 
 # "ECONNREFUSED" / "could not connect to server" — Postgres isn't reachable at DATABASE_URL
-docker ps | grep postgres          # is the postgres container running/healthy?
-docker compose logs postgres       # check its own startup logs
-psql "$DATABASE_URL" -c "SELECT 1;"  # test the connection string directly
+sudo systemctl status postgresql            # is it running?
+psql "$DATABASE_URL" -c "SELECT 1;"         # test the connection string directly
 
-# "password authentication failed" — DATABASE_URL doesn't match the postgres service's
-# POSTGRES_USER/POSTGRES_PASSWORD in docker-compose.yml (or the role you created in Method B)
+# "password authentication failed" — DATABASE_URL doesn't match the role/password you created in §3, Step 3
 ```
 
 ### Frontend shows blank page
@@ -787,18 +662,6 @@ eval "$(ssh-agent -s)"
 
 # Test SSH connection to GitHub
 ssh -T git@github.com
-```
-
-### JMeter not found
-
-```bash
-# Verify JMeter is in PATH
-which jmeter
-jmeter --version
-
-# If not found, set JMETER_BIN in .env
-echo "JMETER_BIN=/opt/jmeter/bin/jmeter" >> /opt/perfstudio/backend/.env
-sudo systemctl restart perfstudio
 ```
 
 ### Check running services

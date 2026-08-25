@@ -1,7 +1,13 @@
 const fs = require('fs');
 
 function readCsv(filePath, maxRows = 500) {
-  const content = fs.readFileSync(filePath, 'utf8');
+  return readCsvContent(fs.readFileSync(filePath, 'utf8'), maxRows);
+}
+
+/** Same as readCsv, but from already-fetched text/Buffer (e.g. a multer memoryStorage buffer,
+ * or content read from an in-memory gitEngine session). */
+function readCsvContent(content, maxRows = 500) {
+  if (Buffer.isBuffer(content)) content = content.toString('utf8');
   const lines = content.split(/\r?\n/).filter(l => l.trim());
   if (!lines.length) return { headers: [], rows: [], totalRows: 0 };
   const headers = parseCsvLine(lines[0]);
@@ -10,11 +16,16 @@ function readCsv(filePath, maxRows = 500) {
 }
 
 function writeCsv(filePath, headers, rows) {
+  fs.writeFileSync(filePath, buildCsvContent(headers, rows), 'utf8');
+}
+
+/** Same as writeCsv, but returns the CSV text instead of writing to a local file. */
+function buildCsvContent(headers, rows) {
   const lines = [
     headers.map(escapeCsvCell).join(','),
     ...rows.map(row => row.map(escapeCsvCell).join(',')),
   ];
-  fs.writeFileSync(filePath, lines.join('\n'), 'utf8');
+  return lines.join('\n');
 }
 
 function parseCsvLine(line) {
@@ -45,4 +56,4 @@ function escapeCsvCell(val) {
   return s;
 }
 
-module.exports = { readCsv, writeCsv };
+module.exports = { readCsv, writeCsv, readCsvContent, buildCsvContent };
