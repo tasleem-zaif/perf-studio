@@ -82,12 +82,16 @@ test('parseK6Content produces the same shape as parseJtlContent for equivalent d
   assert.equal(k6Result.errors[0].response_code, '500');
 });
 
-test('parseK6Content sums data_sent/data_received into aggregate summary bytes only', () => {
+test('parseK6Content sums data_sent/data_received into aggregate summary bytes, and also buckets them into the timeline (Resources tab bandwidth chart)', () => {
   const result = parseK6Content(buildFixture(), {});
   assert.equal(result.summary.total_bytes_sent, 512);
   assert.equal(result.summary.total_bytes_received, 2048);
   // Per-endpoint byte breakdown is deliberately not attempted (unreliable tagging across k6 versions)
   assert.equal(result.by_api[0].avg_bytes, 0);
+
+  const bucket0 = result.timeline.find(t => t.second === 0);
+  assert.equal(bucket0.bytes_sent, 512);
+  assert.equal(bucket0.bytes_received, 2048);
 });
 
 test('parseK6Content buckets vus samples into timeline threads', () => {

@@ -176,14 +176,29 @@ function buildTrendAnalysisSectionHtml(trendData) {
   </div>`;
 }
 
+// "K6 - Stress Test Plan" / "JMeter - Load Test Plan" / "K6 Test Plan" (type unknown) /
+// "Performance Test Plan" (engine unknown, e.g. a multi-step pipeline email) — lets the
+// recipient tell engine + load-profile apart at a glance without opening the attachment.
+function buildEngineLabel(meta) {
+  const engineName = meta?.engine === 'k6' ? 'K6' : meta?.engine === 'jmeter' ? 'JMeter' : null;
+  const testType = meta?.test_type ? meta.test_type.charAt(0).toUpperCase() + meta.test_type.slice(1) : '';
+  if (!engineName) return 'Performance Test Plan';
+  return `${engineName}${testType ? ` - ${testType}` : ''} Test Plan`;
+}
+
 function deriveFailureReason(runData) {
   const s = runData.summary || {};
   if (!s.total_requests || s.total_requests === 0) {
-    return 'No requests were executed. The JMeter process may have failed to start, the test script is invalid, or the CI pipeline failed to patch the JMX file before execution.';
+    return runData.meta?.engine === 'k6'
+      ? 'No requests were executed. The k6 process may have failed to start, the test script has a runtime error, or the CI pipeline failed to produce results.json before validation.'
+      : 'No requests were executed. The JMeter process may have failed to start, the test script is invalid, or the CI pipeline failed to patch the JMX file before execution.';
   }
-  if (runData.rule_violations && runData.rule_violations.length > 0) {
-    const errCount = runData.rule_violations.filter(v => v.rule?.severity === 'error').length;
-    return `${runData.rule_violations.length} performance rule${runData.rule_violations.length > 1 ? 's' : ''} violated (${errCount} error-level threshold${errCount !== 1 ? 's' : ''}). See the Breached Rules section below.`;
+  // Only error-severity breaches make the run FAILED (matches ruleEvaluator.js's own
+  // pass/fail semantics) — a warning-only breach gets its own "PASSED WITH WARNINGS"
+  // verdict in buildEmailBody instead of landing here.
+  const errorViolations = (runData.rule_violations || []).filter(v => v.rule?.severity === 'error');
+  if (errorViolations.length > 0) {
+    return `${errorViolations.length} error-level performance rule${errorViolations.length > 1 ? 's' : ''} breached. See Rule Thresholds below.`;
   }
   const errRate = s.total_requests > 0 ? (s.total_failed / s.total_requests) * 100 : 0;
   if (errRate > 0) {
@@ -198,6 +213,10 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
   const s = runData.summary || {};
 
   const suiteName = m.suite_name || 'Test Plan';
+  const engineLabel = buildEngineLabel(m);
+  // Short form for the header pill — the full "K6 - Stress Test Plan" reads fine inline in the
+  // greeting sentence below but is too long for an uppercase badge (e.g. "K6 · STRESS").
+  const engineBadge = engineLabel.replace(' - ', ' · ').replace(/ Test Plan$/, '');
   const startedAt = m.started_at ? new Date(m.started_at).toLocaleString() : '—';
   const durationS = m.duration_s != null && m.duration_s > 0 ? `${m.duration_s}s` : '—';
   const status    = (m.status || 'completed').toUpperCase();
@@ -223,17 +242,35 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
     return `${n} B`;
   };
 
-  const rulesPassed = !runData.rule_violations || runData.rule_violations.length === 0;
-  const isSuccess   = !isFailed && rulesPassed;
-  const verdictBg   = isSuccess ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)';
-  const verdictBdr  = isSuccess ? '#22c55e' : '#ef4444';
-  const verdictIcon = isSuccess ? '✅' : '❌';
-  const verdictStatus = isSuccess ? 'PASSED' : 'FAILED';
-  const verdictText = isFailed && rulesPassed
-    ? deriveFailureReason(runData)
-    : rulesPassed
-      ? 'All performance rules passed'
-      : `${(runData.rule_violations||[]).length} rule(s) violated`;
+  // rule_results (added alongside rule_violations) carries EVERY evaluated rule with a
+  // 3-state status, so the report can show "these thresholds were checked and passed"
+  // instead of only ever listing failures. Older/not-yet-updated callers only provide
+  // rule_violations (breaches only) — synthesize an equivalent list from that so the verdict
+  // logic below still works, just without "met" rows to display.
+  const ruleResults = (runData.rule_results && runData.rule_results.length)
+    ? runData.rule_results
+    : (runData.rule_violations || []).map(v => ({ ...v, status: v.rule?.severity === 'error' ? 'breached' : 'warning' }));
+  const errorBreaches = ruleResults.filter(r => r.status === 'breached');
+  const warnBreaches  = ruleResults.filter(r => r.status === 'warning');
+
+  // Only an error-severity breach (or an HTTP-level failure) fails the run — matches
+  // ruleEvaluator.js's own pass/fail semantics, which the email used to ignore (any
+  // warning-severity breach used to flip the whole run to FAILED here).
+  const verdictLevel = (isFailed || errorBreaches.length > 0) ? 'failed' : (warnBreaches.length > 0 ? 'warning' : 'passed');
+  const verdictColors = {
+    passed:  { bg: 'rgba(34,197,94,0.12)',  bdr: '#22c55e', icon: '✅' },
+    warning: { bg: 'rgba(245,158,11,0.12)', bdr: '#f59e0b', icon: '⚠️' },
+    failed:  { bg: 'rgba(239,68,68,0.12)',  bdr: '#ef4444', icon: '❌' },
+  }[verdictLevel];
+  const verdictBg   = verdictColors.bg;
+  const verdictBdr  = verdictColors.bdr;
+  const verdictIcon = verdictColors.icon;
+  const verdictStatus = verdictLevel === 'passed' ? 'PASSED' : verdictLevel === 'warning' ? 'PASSED WITH WARNINGS' : 'FAILED';
+  const verdictText = verdictLevel === 'passed'
+    ? (ruleResults.length ? 'All performance rules passed' : 'No performance rules configured')
+    : verdictLevel === 'warning'
+      ? `${warnBreaches.length} warning-level threshold${warnBreaches.length > 1 ? 's' : ''} exceeded — see Rule Thresholds below`
+      : null; // FAILED gets the full Failure Reason box below instead of a one-line subtitle
 
   const greeting = recipientName ? `Dear ${recipientName},` : 'Dear Team,';
 
@@ -271,6 +308,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
           <span style="display:inline-block;background:#22c55e;color:#fff;font-weight:900;font-size:18px;width:36px;height:36px;line-height:36px;text-align:center;border-radius:8px;vertical-align:middle;margin-right:10px;">P</span>
           <span style="color:#f0f3fa;font-size:17px;font-weight:800;vertical-align:middle;">Peako</span>
           <span style="color:#7a8eaa;font-size:12px;margin-left:10px;vertical-align:middle;">Test Execution Report</span>
+          <span style="display:inline-block;margin-left:10px;font-size:10px;font-weight:700;letter-spacing:.4px;color:#58a6ff;background:rgba(88,166,255,0.12);border:1px solid rgba(88,166,255,0.3);border-radius:10px;padding:3px 8px;vertical-align:middle;text-transform:uppercase;">${engineBadge}</span>
         </td>
       </tr>
     </table>
@@ -280,7 +318,7 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
   <div style="padding:22px 24px 0;">
     <p style="color:#f0f3fa;font-size:14px;margin:0 0 6px;">${greeting}</p>
     <p style="color:#b8c4d8;font-size:13px;line-height:1.6;margin:0 0 18px;">
-      Your test plan <strong style="color:#f0f3fa;">${suiteName}</strong> was executed on
+      Your <strong style="color:#f0f3fa;">${engineLabel}</strong> - <strong style="color:#f0f3fa;">${suiteName}</strong> was executed on
       <strong style="color:#f0f3fa;">${startedAt}</strong>${durationS !== '—' ? ` (Duration: <strong style="color:#f0f3fa;">${durationS}</strong>)` : ''}.
       Below is the analytics summary. Full report is attached.
     </p>
@@ -289,36 +327,41 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
     <div style="background:${verdictBg};border:1px solid ${verdictBdr};border-radius:8px;padding:12px 16px;margin-bottom:12px;">
       <span style="font-size:16px;margin-right:8px;">${verdictIcon}</span>
       <span style="font-weight:700;color:${verdictBdr};font-size:13px;">Status: ${verdictStatus}</span>
-      ${isSuccess ? `<span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>` : ''}
+      ${verdictText ? `<span style="color:#b8c4d8;font-size:12px;margin-left:12px;">${verdictText}</span>` : ''}
     </div>
-    ${isFailed ? `
+    ${verdictLevel === 'failed' ? `
     <!-- Failure reason -->
     <div style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.25);border-radius:8px;padding:12px 16px;margin-bottom:12px;">
       <div style="font-size:11px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;">Failure Reason</div>
       <div style="font-size:13px;color:#e6edf3;line-height:1.6;">${deriveFailureReason(runData)}</div>
     </div>` : ''}
 
-    ${!rulesPassed ? `
-    <!-- Rule violations detail -->
-    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
-      <div style="font-weight:700;color:#ef4444;font-size:13px;margin-bottom:10px;">⚠ Breached Rules</div>
+    ${ruleResults.length > 0 ? `
+    <!-- Rule thresholds detail — every configured rule, not just breaches, so a clean run
+         shows "N thresholds checked and passed" instead of an empty section. -->
+    <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
+      <div style="font-weight:700;color:#f0f3fa;font-size:13px;margin-bottom:10px;">📏 Rule Thresholds</div>
       <table style="width:100%;border-collapse:collapse;font-size:12px;">
         <tr style="background:rgba(0,0,0,0.2);">
           <th style="padding:6px 10px;text-align:left;color:#8b949e;font-weight:600;">Metric</th>
           <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Threshold</th>
           <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Actual Value</th>
-          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Severity</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Status</th>
         </tr>
-        ${(runData.rule_violations||[]).map(v => {
-          const sevColor = v.rule?.severity === 'error' ? '#ef4444' : '#f59e0b';
-          const thresholdLabel = v.rule?.operator === 'between'
-            ? `between ${v.rule.value_min}–${v.rule.value_max} ${v.rule.unit}`
-            : `${v.rule?.operator || ''} ${v.rule?.value || ''} ${v.rule?.unit || ''}`;
+        ${ruleResults.map(r => {
+          const st = r.status === 'met'
+            ? { color: '#22c55e', label: 'MET' }
+            : r.status === 'warning'
+              ? { color: '#f59e0b', label: 'WARNING' }
+              : { color: '#ef4444', label: 'BREACHED' };
+          const thresholdLabel = r.thresholdLabel || (r.rule?.operator === 'between'
+            ? `between ${r.rule.value_min}–${r.rule.value_max} ${r.rule.unit}`
+            : `${r.rule?.operator || ''} ${r.rule?.value || ''} ${r.rule?.unit || ''}`);
           return `<tr style="border-top:1px solid rgba(255,255,255,0.05);">
-            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">${v.rule?.metric || 'Unknown'}</td>
+            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">${r.rule?.metric || 'Unknown'}</td>
             <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${thresholdLabel}</td>
-            <td style="padding:7px 10px;text-align:center;color:#ef4444;font-weight:700;font-family:monospace;">${v.actual ?? '—'} ${v.rule?.unit || ''}</td>
-            <td style="padding:7px 10px;text-align:center;"><span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:${sevColor}22;color:${sevColor};border:1px solid ${sevColor};">${(v.rule?.severity||'error').toUpperCase()}</span></td>
+            <td style="padding:7px 10px;text-align:center;color:${st.color};font-weight:700;font-family:monospace;">${r.actual ?? '—'} ${r.rule?.unit || ''}</td>
+            <td style="padding:7px 10px;text-align:center;"><span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:${st.color}22;color:${st.color};border:1px solid ${st.color};">${st.label}</span></td>
           </tr>`;
         }).join('')}
       </table>
@@ -417,17 +460,18 @@ async function sendAlertEmail(runId, userId, projectId, runData, pdfPath, report
 
     const transport = createTransport(cfg);
     const suiteName = runData.meta?.suite_name || 'Test Plan';
-    const subject   = `[Peako] ${suiteName} — Test Execution Report`;
+    const engineLabel = buildEngineLabel(runData.meta);
+    const subject   = `[Peako] ${engineLabel} - ${suiteName} — Execution Report`;
 
     for (const recipient of recipients) {
       const html = buildEmailBody(runData, orgName, recipient.name, reportDir, trendData);
       const s = runData.summary || {};
       const plainText = [
-        `Peako — Test Execution Report`,
+        `Peako — ${engineLabel} Execution Report`,
         ``,
         `Hello ${recipient.name || 'Team'},`,
         ``,
-        `Your test plan "${suiteName}" has completed.`,
+        `Your ${engineLabel} - "${suiteName}" has completed.`,
         `Status: ${(runData.meta?.status || 'completed').toUpperCase()}`,
         ``,
         `Summary:`,

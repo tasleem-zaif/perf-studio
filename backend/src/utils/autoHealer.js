@@ -12,6 +12,7 @@ const { parseK6Content } = require('./parseK6');
 const { extractK6VarRefs, extractK6DefinedVars, extractK6Hostnames } = require('./analyzeK6Script');
 const s3Sync = require('./s3Sync');
 const resultsStore = require('./resultsStore');
+const gitEngine = require('./gitEngine');
 
 // Auto-heal gets exactly 1 automatic attempt — if it doesn't fix the run, the "Custom Heal"
 // button (which lets the user supply a targeted instruction) is the intended next step
@@ -567,6 +568,35 @@ async function validateEndpoints(hostnames) {
   return results;
 }
 
+// scriptPath (test_suites.jmx_path/js_path) is only a real disk path for SSH-mode
+// workspaces. PAT-mode workspaces (the normal setup for a CI-triggered run — see
+// ciPipeline.js's pushJmxAndTriggerGitHub for the identical fix) store it as a path
+// RELATIVE to the project's gitEngine session root instead, so fs.existsSync(scriptPath)
+// always returned false there and the AI diagnosis was handed "(script file not found)"
+// regardless of engine — this was never actually about JMeter vs k6.
+async function readScriptContent(run, suite, scriptPath) {
+  if (!scriptPath) return '';
+  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(suite.user_id, run.project_id);
+  const isSSH = (identity?.auth_method || 'pat') === 'ssh';
+
+  if (isSSH) {
+    return fs.existsSync(scriptPath) ? fs.readFileSync(scriptPath, 'utf8') : '';
+  }
+  try {
+    const gitCfg  = await db.prepare('SELECT git_root FROM git_configs WHERE project_id = ?').get(run.project_id);
+    const projRow = await db.prepare('SELECT folder_path FROM projects WHERE id = ?').get(run.project_id);
+    const root    = gitCfg?.git_root || projRow?.folder_path;
+    if (!root) return '';
+    const orgSlug = await resolveOrgSlugForProject(run.project_id);
+    const session = await gitEngine.openSession(root, orgSlug);
+    const full    = path.posix.join(session.dir, scriptPath.replace(/\\/g, '/'));
+    return session.fs.existsSync(full) ? session.fs.readFileSync(full, 'utf8') : '';
+  } catch (e) {
+    console.warn('[AutoHeal] Could not read script from PAT-mode session:', e.message);
+    return '';
+  }
+}
+
 // ── Build rich diagnostic context (async for DNS checks) ─────────────────────
 async function buildContext(run, suite) {
   const isK6 = run.engine === 'k6';
@@ -583,8 +613,7 @@ async function buildContext(run, suite) {
   const jmeterLog = (await resultsStore.readText(run.result_dir, orgSlug, 'jmeter.log')) || '';
 
   const scriptPath    = run.engine === 'jmeter' ? suite.jmx_path : suite.js_path;
-  const scriptContent = scriptPath && fs.existsSync(scriptPath)
-    ? fs.readFileSync(scriptPath, 'utf8') : '';
+  const scriptContent = await readScriptContent(run, suite, scriptPath);
 
   // All run log lines (errors + warns + info) for full picture
   const runLogs = (JSON.parse(run.logs || '[]'))

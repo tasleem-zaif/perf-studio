@@ -1553,11 +1553,25 @@ async function wireOwnerDataIntoCaller(projectId, userId, isSSH, mode) {
   const remap = (p) => remapOwnerPath(p, ownerGitDir, callerGitDir);
 
   if (mode === 'full') {
-    await db.prepare('DELETE FROM test_suites WHERE project_id = ? AND user_id = ?').run(projectId, userId);
-    await db.prepare('DELETE FROM collection_env_config WHERE project_id = ? AND user_id = ?').run(projectId, userId);
-    await db.prepare('DELETE FROM test_data_files WHERE project_id = ? AND user_id = ?').run(projectId, userId);
-    await db.prepare('DELETE FROM rules WHERE project_id = ? AND user_id = ?').run(projectId, userId);
-    await db.prepare('DELETE FROM collections WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+    // 'full' is meant for a brand-new caller who has NOTHING yet under this project (their
+    // first-ever pull) — a clean wipe-then-copy is safe there since there's nothing to lose.
+    // It must NEVER fire for a caller who already has their own collections/suites/rules/test
+    // data: this used to run unconditionally, so a caller who already had real work of their
+    // own (their own API sources, test plans) got it silently DELETED every time they clicked
+    // "Pull from main" again, then replaced with a fresh copy of the project owner's data —
+    // a real data-loss incident, not a hypothetical. Downgrade to the same additive
+    // (merge-without-deleting) semantics /sync already uses whenever the caller has any
+    // existing data at all.
+    const existing = await db.prepare('SELECT COUNT(*) AS c FROM collections WHERE project_id = ? AND user_id = ?').get(projectId, userId);
+    if (Number(existing?.c) > 0) {
+      mode = 'additive';
+    } else {
+      await db.prepare('DELETE FROM test_suites WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+      await db.prepare('DELETE FROM collection_env_config WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+      await db.prepare('DELETE FROM test_data_files WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+      await db.prepare('DELETE FROM rules WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+      await db.prepare('DELETE FROM collections WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+    }
   }
 
   // ── Rules ────────────────────────────────────────────────────────────────────
@@ -1681,7 +1695,15 @@ router.post('/pull', async (req, res) => {
   const { isSSH, remoteUrl, sshEnv, cleanup: sshCleanup } = await getAuth(cfg, caller.id, req.params.projectId);
   try {
     const gitDir = getUserWorkspace(proj, caller);
-    const branch = getBranchForUser(caller, cfg);
+    // Every other route in this file (commit/push/sync) resolves the caller's branch as
+    // `identity?.branch_name || getBranchForUser(...)` — this one skipped the saved identity
+    // and always recomputed the default `users/<name>` pattern. For any user who set a custom
+    // branch name (e.g. "feature/jane-k6"), that default doesn't exist on the remote, so this
+    // route treated their real, existing branch as "not found" and fell into the bootstrap path
+    // (create a new branch off origin/main) — silently switching them onto a near-empty branch
+    // instead of pulling into the one they actually work on.
+    const identity = await db.prepare('SELECT * FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(req.userId, req.params.projectId);
+    const branch = identity?.branch_name || getBranchForUser(caller, cfg);
 
     if (!isSSH) {
       const orgSlug = await resolveOrgSlugForProject(req.params.projectId);

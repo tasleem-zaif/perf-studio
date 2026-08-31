@@ -127,6 +127,58 @@ test('mode "additive": re-running does not duplicate what already matches, and l
   assert.equal(pullerRules.length, 2, 'response_time (already had) + error_rate (newly added)');
 });
 
+test('mode "full" no longer wipes a caller who already has their own data — downgrades to additive instead (regression: this deleted the caller\'s own collections/suites/rules/test-data every single time "Pull from main" ran, not just on a genuinely first-ever pull with nothing to lose)', async () => {
+  const owner2 = await db.prepare(
+    "INSERT INTO users (email, name, password_hash, role, status) VALUES (?, ?, ?, 'user', 'active')"
+  ).run(`data-wiring-owner2-${Date.now()}@example.com`, 'Data Wiring Owner 2', 'x');
+  const owner2Id = owner2.lastInsertRowid;
+
+  const caller2 = await db.prepare(
+    "INSERT INTO users (email, name, password_hash, role, status) VALUES (?, ?, ?, 'user', 'active')"
+  ).run(`data-wiring-caller2-${Date.now()}@example.com`, 'Data Wiring Caller 2', 'x');
+  const caller2Id = caller2.lastInsertRowid;
+
+  const p2 = await db.prepare('INSERT INTO projects (user_id, name, environment) VALUES (?, ?, ?)')
+    .run(owner2Id, 'Data Wiring Full-Mode Guard Project', 'Default');
+  const project2Id = p2.lastInsertRowid;
+
+  await db.prepare(`INSERT INTO collections (project_id, user_id, name, json_content, environment)
+    VALUES (?, ?, ?, ?, ?)`).run(project2Id, owner2Id, 'Owner Collection', '[]', 'Default');
+
+  // Caller ALREADY has their own, unrelated collection/rule/suite — simulating a real user with
+  // real existing work clicking "Pull from main" again, not a brand-new user's very first pull.
+  const callerOwnCol = await db.prepare(`INSERT INTO collections (project_id, user_id, name, json_content, environment)
+    VALUES (?, ?, ?, ?, ?)`).run(project2Id, caller2Id, 'My Real Work', '[]', 'Default');
+  const callerOwnColId = callerOwnCol.lastInsertRowid;
+  await db.prepare(`INSERT INTO rules (project_id, user_id, metric, operator, value, unit, severity)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`).run(project2Id, caller2Id, 'Throughput', '<', '50', 'req/s', 'error');
+  await db.prepare(`INSERT INTO test_suites (project_id, user_id, name, test_type, collection_id, engine, config_json, env)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(project2Id, caller2Id, 'My Suite', 'load', callerOwnColId, 'k6', '{}', 'Default');
+
+  // Simulate /pull's actual call — mode 'full', even though the caller has real existing data.
+  await wireOwnerDataIntoCaller(project2Id, caller2Id, false, 'full');
+
+  const stillThere = await db.prepare('SELECT * FROM collections WHERE id = ?').get(callerOwnColId);
+  assert.ok(stillThere, 'the caller\'s own pre-existing collection must survive a "full" pull');
+  assert.equal(stillThere.name, 'My Real Work');
+
+  const callerRules = await db.prepare('SELECT * FROM rules WHERE project_id = ? AND user_id = ?').all(project2Id, caller2Id);
+  assert.ok(callerRules.some(r => r.metric === 'Throughput'), 'caller\'s own rule must survive');
+
+  const callerSuites = await db.prepare('SELECT * FROM test_suites WHERE project_id = ? AND user_id = ?').all(project2Id, caller2Id);
+  assert.ok(callerSuites.some(s => s.name === 'My Suite'), 'caller\'s own test suite must survive');
+
+  const mergedCollections = await db.prepare('SELECT * FROM collections WHERE project_id = ? AND user_id = ?').all(project2Id, caller2Id);
+  assert.ok(mergedCollections.some(c => c.name === 'Owner Collection'), 'owner\'s collection should still be merged in');
+  assert.equal(mergedCollections.length, 2, 'My Real Work (preserved) + Owner Collection (merged in) — nothing wiped, nothing duplicated');
+
+  await db.prepare('DELETE FROM test_suites WHERE project_id = ?').run(project2Id);
+  await db.prepare('DELETE FROM rules WHERE project_id = ?').run(project2Id);
+  await db.prepare('DELETE FROM collections WHERE project_id = ?').run(project2Id);
+  await db.prepare('DELETE FROM projects WHERE id = ?').run(project2Id);
+  await db.prepare('DELETE FROM users WHERE id IN (?, ?)').run(owner2Id, caller2Id);
+});
+
 test('mode "full": no-op (returns null) when the caller IS the canonical owner', async () => {
   const result = await wireOwnerDataIntoCaller(projectId, ownerId, false, 'full');
   assert.equal(result, null);

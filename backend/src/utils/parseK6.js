@@ -8,9 +8,10 @@ const fs = require('fs');
 // a Point sample like { type:'Point', metric:'http_req_duration', data:{ time, value, tags:{...} } }.
 // `http_req_duration` Points are the per-request record — tags.name/status/expected_response map
 // onto JMeter's label/responseCode/success. k6 has no per-request analog of JMeter's separate
-// Latency/Connect/bytes columns, so latency reuses elapsed, connect is 0, and bytes are only
-// summed in aggregate (data_sent/data_received are not reliably tagged per-endpoint across k6
-// versions, so no per-`by_api` byte breakdown is attempted).
+// Latency/Connect/bytes columns, so latency reuses elapsed, connect is 0, and per-`by_api` byte
+// breakdown is skipped (data_sent/data_received aren't reliably tagged per-endpoint across k6
+// versions). They ARE bucketed into the per-second `timeline` (matched by timestamp, same as
+// the vus->threads bucketing below) so the Resources tab's bandwidth chart still renders.
 
 function pct(arr, p) {
   if (!arr.length) return 0;
@@ -55,6 +56,8 @@ function parseK6Content(content, runMeta = {}) {
 
   const durationPoints = [];
   const vusPoints = [];
+  const bytesSentPoints = [];
+  const bytesReceivedPoints = [];
 
   for (const p of points) {
     if (p.type !== 'Point' || !p.data) continue;
@@ -64,9 +67,13 @@ function parseK6Content(content, runMeta = {}) {
       if (ts < minTs) minTs = ts;
       if (ts > maxTs) maxTs = ts;
     } else if (p.metric === 'data_sent') {
-      bytesSent += p.data.value || 0;
+      const v = p.data.value || 0;
+      bytesSent += v;
+      bytesSentPoints.push({ ts, value: v });
     } else if (p.metric === 'data_received') {
-      bytesReceived += p.data.value || 0;
+      const v = p.data.value || 0;
+      bytesReceived += v;
+      bytesReceivedPoints.push({ ts, value: v });
     } else if (p.metric === 'vus') {
       vusPoints.push({ ts, value: p.data.value });
     }
@@ -158,6 +165,19 @@ function parseK6Content(content, runMeta = {}) {
     if (!timelineMap[sec]) continue; // only bucket VUs into seconds that actually had requests
     vusByBucket[sec] = Math.max(vusByBucket[sec] || 0, vp.value || 0);
   }
+  // Same bucketing as VUs above — data_sent/data_received are their own Point stream (not
+  // tagged per-request), so they're matched to the request timeline by timestamp second
+  // rather than summed only into the run-wide total (bytesSent/bytesReceived above).
+  for (const bp of bytesSentPoints) {
+    const sec = Math.floor((bp.ts - minTs) / 1000);
+    if (!timelineMap[sec]) continue;
+    timelineMap[sec].bytesSent = (timelineMap[sec].bytesSent || 0) + bp.value;
+  }
+  for (const bp of bytesReceivedPoints) {
+    const sec = Math.floor((bp.ts - minTs) / 1000);
+    if (!timelineMap[sec]) continue;
+    timelineMap[sec].bytesReceived = (timelineMap[sec].bytesReceived || 0) + bp.value;
+  }
   const timeline = Object.entries(timelineMap)
     .sort(([a], [b]) => parseInt(a) - parseInt(b))
     .map(([sec, d]) => ({
@@ -166,8 +186,8 @@ function parseK6Content(content, runMeta = {}) {
       avg_rt:       parseFloat((d.elapsed.reduce((a, b) => a + b, 0) / d.elapsed.length).toFixed(1)),
       avg_latency:  parseFloat((d.elapsed.reduce((a, b) => a + b, 0) / d.elapsed.length).toFixed(1)),
       avg_connect:  0,
-      bytes_received: 0,
-      bytes_sent:     0,
+      bytes_received: d.bytesReceived || 0,
+      bytes_sent:     d.bytesSent || 0,
       threads:        vusByBucket[sec] || 0,
       errors:         d.errors,
       error_rate:     parseFloat(((d.errors / d.count) * 100).toFixed(1)),
@@ -192,7 +212,7 @@ function parseK6Content(content, runMeta = {}) {
 /**
  * Lightweight metrics-only parse for rule evaluation — mirrors ruleEvaluator.js's
  * parseJtlMetrics/parseJtlMetricsFromContent shape without building the full report.
- * Returns { total, pass, fail, error_rate, avg_response_time, p90, p95, throughput }.
+ * Returns { total, pass, fail, error_rate, avg_response_time, p90, p95, p99, throughput }.
  */
 function parseK6Metrics(resultsJsonPath) {
   if (!resultsJsonPath || !fs.existsSync(resultsJsonPath)) return null;
@@ -233,6 +253,7 @@ function parseK6MetricsFromContent(content) {
     avg_response_time: avgRt,
     p90:               pctOf(90),
     p95:               pctOf(95),
+    p99:               pctOf(99),
     throughput:        total / durationSec,
   };
 }

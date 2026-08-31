@@ -292,7 +292,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       try {
         const { data } = await api.get(`/execution/runs/${runId}/heal-status`);
         setHealState(data);
-        const done = ['healed', 'failed', 'exhausted', 'no_errors', 'infra_error'].includes(data.status);
+        const done = ['healed', 'failed', 'exhausted', 'no_errors', 'infra_error', 'capacity_threshold'].includes(data.status);
         if (done) {
           clearInterval(healPollRef.current);
           healPollRef.current = null;
@@ -311,7 +311,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       try {
         const { data } = await api.get(`/projects/${selectedProjectId}/ci/runs/${runId}/heal-status`);
         setCiHealStates(prev => ({ ...prev, [runId]: data }));
-        const done = ['healed', 'failed', 'exhausted', 'infra_error'].includes(data.status);
+        const done = ['healed', 'failed', 'exhausted', 'infra_error', 'capacity_threshold'].includes(data.status);
         if (done) {
           clearInterval(ciHealPollRef.current[runId]);
           delete ciHealPollRef.current[runId];
@@ -1049,13 +1049,13 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                 (exhausted/failed/infra_error), regardless of whether this particular
                                 row is itself a heal-run — a run's own heal attempts exhausting is
                                 exactly when a manual "Heal Again" retry needs to be offered. */}
-                            {(['failed','failure'].includes(r.status) || ['exhausted','failed','infra_error'].includes(healStatus)) &&
+                            {(['failed','failure'].includes(r.status) || ['exhausted','failed','infra_error','capacity_threshold'].includes(healStatus)) &&
                               !healActive && (
                               <button className="btn-secondary btn-sm"
                                 style={{ padding: '2px 8px', fontSize: 11, color: '#dc2626', borderColor: '#fca5a5' }}
                                 onClick={() => setCiManualHeal(prev => ({ ...prev, [r.id]: { showing: true, text: '', loading: false } }))}>
                                 <i className="ti ti-heart-rate-monitor" style={{ fontSize: 11 }}/>
-                                {['failed','exhausted','infra_error'].includes(healStatus) ? ' Heal Again' : ' Heal'}
+                                {['failed','exhausted','infra_error','capacity_threshold'].includes(healStatus) ? ' Heal Again' : ' Heal'}
                               </button>
                             )}
                           </div>
@@ -1133,7 +1133,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                           {(ciHealStates[r.id]?.status || r.heal_status) && (() => {
                             const hs = ciHealStates[r.id] || { status: r.heal_status, heal_ci_run_id: r.heal_ci_run_id, heal_summary: r.heal_summary, logs: [] };
                             const isActive = ['pending','diagnosing','applying_fix','rerunning','rerunning_full'].includes(hs.status);
-                            const accentColor = hs.status === 'healed' ? '#16a34a' : hs.status === 'infra_error' ? '#f59e0b' : isActive ? 'var(--accent)' : '#dc2626';
+                            const accentColor = hs.status === 'healed' ? '#16a34a' : ['infra_error','capacity_threshold'].includes(hs.status) ? '#f59e0b' : isActive ? 'var(--accent)' : '#dc2626';
                             const hasDetails = hs.logs?.length > 0 || (hs.status === 'exhausted' && hs.heal_summary);
                             // Defaults to expanded (undefined !== true) so a heal in progress or a
                             // freshly-loaded exhausted run still shows details right away — collapsing
@@ -1155,6 +1155,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                                     {hs.status === 'failed'         && 'Could not fix automatically'}
                                     {hs.status === 'exhausted'      && 'Auto-heal attempt unsuccessful — use "Heal Again" below for a targeted retry'}
                                     {hs.status === 'infra_error'    && 'Server/infrastructure failure — script changes cannot fix this'}
+                                    {hs.status === 'capacity_threshold' && 'Capacity/SLA threshold breach — not a script defect, see details below'}
                                   </div>
                                   {hasDetails && (
                                     <button className="btn-secondary btn-sm"
@@ -1630,7 +1631,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       {healState && (
         <div className="card" style={{ marginBottom: '20px', borderLeft: `3px solid ${
           healState.status === 'healed'                        ? 'var(--accent2)' :
-          healState.status === 'infra_error'                   ? 'var(--warn)' :
+          ['infra_error','capacity_threshold'].includes(healState.status) ? 'var(--warn)' :
           healState.status === 'failed' || healState.status === 'exhausted' ? 'var(--danger)' :
           'var(--accent)'
         }` }}>
@@ -1642,10 +1643,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
             }`} style={{
               fontSize: '18px',
               color: healState.status === 'healed'     ? 'var(--accent2)' :
-                     healState.status === 'infra_error'  ? 'var(--warn)' :
+                     ['infra_error','capacity_threshold'].includes(healState.status) ? 'var(--warn)' :
                      healState.status === 'failed' || healState.status === 'exhausted' ? 'var(--danger)' :
                      'var(--accent)',
-              animation: !['healed','failed','exhausted','no_errors'].includes(healState.status) ? 'spin 1s linear infinite' : 'none',
+              animation: !['healed','failed','exhausted','no_errors','infra_error','capacity_threshold'].includes(healState.status) ? 'spin 1s linear infinite' : 'none',
             }} />
             <div style={{ flex: 1 }}>
               <div style={{ fontWeight: 600, fontSize: '13px' }}>
@@ -1658,6 +1659,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 {healState.status === 'failed'        && 'Could not automatically fix the issue'}
                 {healState.status === 'exhausted'     && 'Auto-heal attempt unsuccessful — re-run the test to try again'}
                 {healState.status === 'no_errors'     && 'No errors detected — healing not needed'}
+                {healState.status === 'capacity_threshold' && 'Capacity/SLA threshold breach — not a script defect, see details below'}
                 {healState.status === 'infra_error'   && 'Server/infrastructure failure — script changes cannot fix this'}
               </div>
               {healState.heal_run_id && (

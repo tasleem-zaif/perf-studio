@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const db = require('../db');
 const { evaluateRulesFromContent } = require('./ruleEvaluator');
 
-let userId, projectId, ruleId;
+let userId, projectId, ruleId, p95RuleId, p99RuleId;
 
 before(async () => {
   const email = `ruleeval-k6-test-${Date.now()}@example.com`;
@@ -24,10 +24,26 @@ before(async () => {
     "INSERT INTO rules (project_id, user_id, metric, operator, value, unit, severity) VALUES (?, ?, 'Error Rate', '>', '10', '%', 'error')"
   ).run(projectId, userId);
   ruleId = r.lastInsertRowid;
+
+  // Exact metric label Rules.jsx's UI creates (METRIC_CONFIG key 'Latency P95') — regression
+  // coverage for the bug where this label had no METRIC_MAP entry and was silently skipped.
+  const r2 = await db.prepare(
+    "INSERT INTO rules (project_id, user_id, metric, operator, value, unit, severity) VALUES (?, ?, 'Latency P95', '>', '2000', 'ms', 'error')"
+  ).run(projectId, userId);
+  p95RuleId = r2.lastInsertRowid;
+
+  // Same label-mapping regression, for 'Latency P99' — Rules.jsx's METRIC_CONFIG offers this
+  // too (frontend/src/pages/Rules.jsx:14), and it had the identical missing-METRIC_MAP-entry
+  // bug (worse, even: parseJtlMetricsFromContent/parseK6MetricsFromContent never computed a
+  // p99 value at all until this fix).
+  const r3 = await db.prepare(
+    "INSERT INTO rules (project_id, user_id, metric, operator, value, unit, severity) VALUES (?, ?, 'Latency P99', '>', '2000', 'ms', 'error')"
+  ).run(projectId, userId);
+  p99RuleId = r3.lastInsertRowid;
 });
 
 after(async () => {
-  await db.prepare('DELETE FROM rules WHERE id = ?').run(ruleId);
+  await db.prepare('DELETE FROM rules WHERE id IN (?, ?, ?)').run(ruleId, p95RuleId, p99RuleId);
   await db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
   await db.prepare('DELETE FROM users WHERE id = ?').run(userId);
 });
@@ -68,4 +84,19 @@ test('evaluateRulesFromContent defaults to jmeter (engine omitted) — unchanged
 test('evaluateRulesFromContent(engine="jmeter") explicit matches the default', async () => {
   const result = await evaluateRulesFromContent(projectId, jtlFixture, userId, 'jmeter');
   assert.equal(result.passed, false);
+});
+
+test('a "Latency P95" rule (the exact label the Rule Engine UI creates) is actually evaluated, not silently skipped', async () => {
+  const result = await evaluateRulesFromContent(projectId, k6Fixture, userId, 'k6');
+  const p95Result = result.results.find(r => r.rule.metric === 'Latency P95');
+  assert.ok(p95Result, 'expected a "Latency P95" rule to appear in results — it must not be dropped by an unrecognized metric name');
+  // All k6Fixture latencies are well under the 2000ms threshold, so it should show as met.
+  assert.equal(p95Result.status, 'met');
+});
+
+test('a "Latency P99" rule (also offered by the Rule Engine UI) is actually evaluated, not silently skipped', async () => {
+  const result = await evaluateRulesFromContent(projectId, k6Fixture, userId, 'k6');
+  const p99Result = result.results.find(r => r.rule.metric === 'Latency P99');
+  assert.ok(p99Result, 'expected a "Latency P99" rule to appear in results — it must not be dropped by an unrecognized metric name');
+  assert.equal(p99Result.status, 'met');
 });

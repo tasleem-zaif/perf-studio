@@ -69,6 +69,7 @@ function parseJtlMetricsFromContent(content) {
     avg_response_time: avgRt,                         // ms
     p90:              pct(90),                        // ms
     p95:              pct(95),                        // ms
+    p99:              pct(99),                        // ms
     throughput:       total / durationSec,            // req/s
   };
 }
@@ -81,6 +82,19 @@ const METRIC_MAP = {
   'error rate':         'error_rate',
   'p90':                'p90',
   'p95':                'p95',
+  'p99':                'p99',
+  // Rules.jsx's METRIC_CONFIG (frontend/src/pages/Rules.jsx:9-16) actually offers 7 metrics,
+  // not just the 4 that were mapped here before — 'Latency P95'/'Latency P99' use this exact
+  // "Latency P<n>" label. Without an entry here, evaluateRulesFromMetrics's `if (!key) continue;`
+  // silently skipped the rule on every run — it never showed as breached OR met, it just never
+  // got evaluated at all. This bit 'Latency P95' first (fixed earlier) and then 'Latency P99'
+  // (fixed here) — same bug, different metric. NOTE: 'CPU Usage' and 'Memory Usage' (the other
+  // two METRIC_CONFIG options) have NO entry here and can't get one yet — neither JMeter's JTL
+  // nor k6's results carry any resource-usage data; a rule using either metric will always be
+  // silently skipped the same way until real CPU/memory sampling is added during test execution.
+  'latency p95':        'p95',
+  'latency p90':        'p90',
+  'latency p99':        'p99',
   'throughput':         'throughput',
   'tps':                'throughput',
 };
@@ -134,15 +148,19 @@ async function evaluateRulesFromMetrics(projectId, metrics, userId) {
 
   if (!rules || rules.length === 0) {
     // No rules defined — pass/fail determined by raw JTL fail count only
-    return { passed: null, violations: [], metrics: null, noRules: true };
+    return { passed: null, violations: [], results: [], metrics: null, noRules: true };
   }
 
   if (!metrics) {
     // Can't parse JTL — no verdict
-    return { passed: null, violations: [], metrics: null, noRules: false };
+    return { passed: null, violations: [], results: [], metrics: null, noRules: false };
   }
 
   const violations = [];
+  // Every rule that has an evaluable metric, whether it was breached or not — lets the
+  // report show "these N thresholds were checked and passed" instead of only ever
+  // listing failures (silence on success reads as "nothing was checked", not "all clear").
+  const results = [];
 
   for (const rule of rules) {
     const key = metricKey(rule.metric);
@@ -161,14 +179,26 @@ async function evaluateRulesFromMetrics(projectId, metrics, userId) {
     }
 
     const breached = compare(actual, rule.operator, threshold, thresholdMin, thresholdMax);
+    const thresholdLabel = rule.operator === 'between'
+      ? `between ${rule.value_min}–${rule.value_max}${rule.unit}`
+      : `${rule.operator} ${rule.value}${rule.unit}`;
+    const actualRounded = parseFloat(actual.toFixed(2));
+
+    results.push({
+      rule,
+      actual: actualRounded,
+      thresholdLabel,
+      // 'breached' (error-severity, fails the run) / 'warning' (warn-severity, flagged but
+      // doesn't fail the run) / 'met' (not breached at all).
+      status: !breached ? 'met' : (rule.severity === 'error' ? 'breached' : 'warning'),
+      label: `${rule.metric} ${thresholdLabel} (actual: ${actualRounded}${rule.unit})`,
+    });
+
     if (breached) {
-      const thresholdLabel = rule.operator === 'between'
-        ? `between ${rule.value_min}–${rule.value_max}${rule.unit}`
-        : `${rule.operator} ${rule.value}${rule.unit}`;
       violations.push({
         rule,
-        actual: parseFloat(actual.toFixed(2)),
-        label: `${rule.metric} ${thresholdLabel} (actual: ${actual.toFixed(2)}${rule.unit})`,
+        actual: actualRounded,
+        label: `${rule.metric} ${thresholdLabel} (actual: ${actualRounded}${rule.unit})`,
       });
     }
   }
@@ -177,7 +207,7 @@ async function evaluateRulesFromMetrics(projectId, metrics, userId) {
   const errorViolations = violations.filter(v => v.rule.severity === 'error');
   const passed = errorViolations.length === 0;
 
-  return { passed, violations, metrics, noRules: false };
+  return { passed, violations, results, metrics, noRules: false };
 }
 
 module.exports = { evaluateRules, evaluateRulesFromContent, parseJtlMetrics, parseJtlMetricsFromContent };

@@ -935,7 +935,7 @@ export default function Analytics({ project, collection, collections, onCollecti
     setRunsError('');
     api.get('/execution/runs', { params: { project_id: project.id, include_archived: includeArchived ? 'true' : 'false' } })
       .then(({ data: d }) => {
-        let list = (d.runs || []).filter(r => r.engine === 'jmeter');
+        let list = d.runs || [];
         if (collection?.id) list = list.filter(r => String(r.collection_id) === String(collection.id));
         if (env) list = list.filter(r => r.suite_env === env);
         // Sort by run number extracted from result_dir descending so the dropdown
@@ -959,7 +959,7 @@ export default function Analytics({ project, collection, collections, onCollecti
                     syncPollRef.current = null;
                     setSyncingCi(false);
                   }
-                  let plist = (pd.runs || []).filter(r => r.engine === 'jmeter');
+                  let plist = pd.runs || [];
                   if (collection?.id) plist = plist.filter(r => String(r.collection_id) === String(collection.id));
                   if (env) plist = plist.filter(r => r.suite_env === env);
                   plist.sort((a, b) => {
@@ -1155,12 +1155,12 @@ export default function Analytics({ project, collection, collections, onCollecti
           ) : (
             <>
               {runs.filter(r => !r.archived).length === 0 && !showArchived ? (
-                <div style={{ fontSize:13, color:D.textSec }}>No JMeter runs found for this project.</div>
+                <div style={{ fontSize:13, color:D.textSec }}>No runs found for this project.</div>
               ) : (
                 <CustomSelect value={selectedId} onChange={e=>{ setSelectedId(e.target.value); setActiveTab('summary'); }} style={{ width:'100%', maxWidth:520 }}>
                   <option value="">— Select a run —</option>
                   {runs.filter(r => !r.archived).map(r => (
-                    <option key={r.id} value={r.id}>{`${getRunLabel(r)} — ${new Date(r.started_at).toLocaleString()}`}</option>
+                    <option key={r.id} value={r.id}>{`[${r.engine === 'k6' ? 'K6' : 'JMeter'}] ${getRunLabel(r)} — ${new Date(r.started_at).toLocaleString()}`}</option>
                   ))}
                 </CustomSelect>
               )}
@@ -1171,7 +1171,7 @@ export default function Analytics({ project, collection, collections, onCollecti
                   {runs.filter(r => r.archived).map(r => (
                     <div key={r.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0', borderBottom:'1px solid rgba(107,114,128,0.15)', gap:8 }}>
                       <span style={{ fontSize:12, color:D.textSec }}>
-                        {getRunLabel(r)} — {new Date(r.started_at).toLocaleString()}
+                        [{r.engine === 'k6' ? 'K6' : 'JMeter'}] {getRunLabel(r)} — {new Date(r.started_at).toLocaleString()}
                       </span>
                       <button
                         onClick={() => handleRestore(r.id)}
@@ -1234,8 +1234,8 @@ export default function Analytics({ project, collection, collections, onCollecti
       {!selectedId && !loadingData && (
         <div className="empty">
           <i className="ti ti-chart-bar" style={{ fontSize:40, color:D.textTer, marginBottom:10 }} />
-          <div className="empty-title" style={{ color:D.textSec }}>Select a JMeter run to view analytics</div>
-          <div className="empty-desc" style={{ color:D.textTer }}>7 report sections: Summary · Dashboard · Transactions · Trends · Resources · Errors · Logs</div>
+          <div className="empty-title" style={{ color:D.textSec }}>Select a run to view analytics</div>
+          <div className="empty-desc" style={{ color:D.textTer }}>6 report sections: Summary · Dashboard · Transactions · Trends · Resources · Errors</div>
         </div>
       )}
 

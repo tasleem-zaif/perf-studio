@@ -1378,7 +1378,18 @@ function buildK6Request(ep, index, ctx) {
   lines.push(`    },`);
   lines.push(`  });`);
   lines.push(`  check(${resVar}, { '${name.replace(/'/g, "\\'")} status is 2xx/3xx': (r) => r.status >= 200 && r.status < 400 });`);
-  for (const { varName, jsonPath, sourceLocation } of (sourceFields || [])) {
+  // Same fallback as buildSamplerXml: when no confirmed correlation rule exists yet for
+  // this login endpoint (e.g. pre-run hasn't been re-run since upgrading), still emit a
+  // default extractor from capturedFields/tokenVar — otherwise the Authorization header
+  // fallback above references a variable this endpoint never declares.
+  const fieldsToExtract = (sourceFields && sourceFields.length)
+    ? sourceFields
+    : (isLogin
+        ? (capturedFields && Object.keys(capturedFields).length
+            ? Object.values(capturedFields)
+            : [{ varName: 'accessToken', jsonPath: '$.accessToken' }])
+        : []);
+  for (const { varName, jsonPath, sourceLocation } of fieldsToExtract) {
     if (sourceLocation === 'header') {
       lines.push(`  const ${varName} = ${k6HeaderAccessor(resVar, jsonPath)};`);
     } else if (sourceLocation === 'cookie') {
@@ -1422,12 +1433,29 @@ function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules,
     endurance: `scenarios: { endurance: { executor: 'constant-arrival-rate', rate: THREADS, timeUnit: '1s', duration: DURATION + 's', preAllocatedVUs: THREADS } }`,
   };
 
-  const thresholds = (rules || []).map(r => {
-    if (r.metric === 'Response Time') return `    http_req_duration: ['p(95)<${r.value}']`;
-    if (r.metric === 'Error Rate') return `    http_req_failed: ['rate<${parseFloat(r.value) / 100}']`;
-    if (r.metric === 'Throughput') return `    http_reqs: ['rate>${r.value}']`;
-    return null;
-  }).filter(Boolean).join(',\n');
+  // k6-native thresholds embedded in the script itself — a secondary, informational layer
+  // (k6's own exit code / CLI "✓/✗ thresholds" output). Peako's own post-run rule evaluation
+  // (ruleEvaluator.js, engine-agnostic) is the authoritative PASS/FAIL source for both engines
+  // regardless of what's generated here; this only keeps k6's native reporting in sync with it.
+  // Grouped by k6 metric name rather than one line per rule — 'Response Time', 'Latency P95',
+  // and 'Latency P99' all target http_req_duration, and duplicate object keys in a JS literal
+  // silently overwrite each other, so multiple rules on the same k6 metric must merge into one
+  // threshold ARRAY instead of colliding lines.
+  const thresholdsByK6Metric = {};
+  const pushThreshold = (k6Metric, expr) => (thresholdsByK6Metric[k6Metric] = thresholdsByK6Metric[k6Metric] || []).push(expr);
+  for (const r of (rules || [])) {
+    if (r.metric === 'Response Time' || r.metric === 'Avg Response Time' || r.metric === 'Average Response Time') pushThreshold('http_req_duration', `avg<${r.value}`);
+    else if (r.metric === 'Error Rate') pushThreshold('http_req_failed', `rate<${parseFloat(r.value) / 100}`);
+    else if (r.metric === 'Throughput') pushThreshold('http_reqs', `rate>${r.value}`);
+    else if (r.metric === 'Latency P95') pushThreshold('http_req_duration', `p(95)<${r.value}`);
+    else if (r.metric === 'Latency P99') pushThreshold('http_req_duration', `p(99)<${r.value}`);
+    // 'CPU Usage'/'Memory Usage' have no k6 (or JMeter) metric equivalent — no resource-usage
+    // data exists in k6's results, so there's nothing to threshold here; falls through and
+    // is silently omitted, same as ruleEvaluator.js's own METRIC_MAP gap for these two.
+  }
+  const thresholds = Object.entries(thresholdsByK6Metric)
+    .map(([metric, exprs]) => `    ${metric}: [${exprs.map(e => `'${e}'`).join(', ')}]`)
+    .join(',\n');
 
   // CSV — k6 has no per-request "variable" concept like JMeter's CSVDataSet, so the
   // current VU/iteration's row is destructured into bare variables matching each column
@@ -1446,6 +1474,17 @@ function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules,
     csvImportLines = `import { SharedArray } from 'k6/data';\nimport papaparse from 'https://jslib.k6.io/papaparse/5.1.1/index.js';`;
     csvSetupLines = `const testData = new SharedArray('testData', function () {\n  return papaparse.parse(open('${filePath}'), { header: true, skipEmptyLines: true }).data;\n});`;
   }
+
+  // Same fallback chain as buildJmxTemplate: a real collection_env_config URL wins,
+  // otherwise fall back to whatever host the endpoints themselves resolve to via
+  // {{var}} — so this never silently generates a script with an empty host just
+  // because the env config's `urls` array hasn't caught up yet.
+  const configuredUrl = (cfg.urls || []).find(u => u?.url);
+  const fallbackHost = configuredUrl ? null : endpoints
+    .map(ep => resolveEndpointHost(ep.url || ep.path || '', variables))
+    .find(Boolean);
+  const { protocol: resolvedProtocol = 'https', url: resolvedServer = '', port: resolvedPort = '443' } =
+    configuredUrl || fallbackHost || { protocol: cfg.protocol, url: cfg.url, port: cfg.port };
 
   const loginEp = endpoints.find(isLoginEp) || null;
   const capturedFields = loginEp ? detectCapturedFields(preRunData, loginEp) : {};
@@ -1507,9 +1546,9 @@ function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules,
   lines.push(`const THREADS  = parseInt(__ENV.THREADS  || '${vusers}');`);
   lines.push(`const RAMP_UP  = parseInt(__ENV.RAMP_UP  || '${rampup}');`);
   lines.push(`const DURATION = parseInt(__ENV.DURATION || '${duration}');`);
-  lines.push(`const PROTOCOL = __ENV.PROTOCOL || '${cfg.protocol || 'https'}';`);
-  lines.push(`const URL      = __ENV.URL      || '${cfg.url || ''}';`);
-  lines.push(`const PORT     = __ENV.PORT     || '${cfg.port || '443'}';`);
+  lines.push(`const PROTOCOL = __ENV.PROTOCOL || '${resolvedProtocol || 'https'}';`);
+  lines.push(`const URL      = __ENV.URL      || '${resolvedServer || ''}';`);
+  lines.push(`const PORT     = __ENV.PORT     || '${resolvedPort || '443'}';`);
   lines.push('const BASE_URL = `${PROTOCOL}://${URL}:${PORT}`;');
   lines.push('');
   lines.push(`export const options = {`);

@@ -107,6 +107,50 @@ test('with no correlationRules and no CSV, generation still succeeds (backward c
   assert.doesNotThrow(() => assertValidK6Syntax(script));
 });
 
+test('login endpoint with no confirmed correlation rules yet still gets a default accessToken extractor (regression: was a ReferenceError at k6 runtime — node --check cannot catch it since the bad reference sits inside a reachable function body, so this needs a value-level assertion)', () => {
+  const script = generate([]); // baseline: no correlationRules confirmed at all
+  const extractorPos = script.indexOf('const accessToken = res0.json()');
+  const usagePos = script.indexOf('Bearer ${accessToken}');
+  assert.ok(extractorPos !== -1, 'expected a default accessToken extractor even with zero correlation rules');
+  assert.ok(usagePos !== -1 && extractorPos < usagePos, 'the extractor must be declared before Authorization header interpolates it');
+});
+
+test('BASE_URL resolves from cfg.urls[] even when the legacy bare protocol/url/port fields are empty (regression: was an empty host, e.g. https://:443/...)', () => {
+  const cfgWithUrlsArray = {
+    protocol: '', url: '', port: '', variables: {},
+    urls: [{ protocol: 'https', url: 'api.qa.example.com', port: '443' }],
+    correlationRules: [],
+  };
+  const script = buildK6Template(suite, null, null, cfgWithUrlsArray, endpoints, [], preRunData, 'load');
+  assert.ok(script.includes("const URL      = __ENV.URL      || 'api.qa.example.com';"), 'expected the host resolved from cfg.urls[0].url, not the empty bare cfg.url field');
+});
+
+test('k6 thresholds cover Latency P95/P99 (not just Response Time/Error Rate/Throughput) and merge onto one http_req_duration array instead of colliding object keys', () => {
+  const rules = [
+    { metric: 'Response Time', operator: '<', value: '500', unit: 'ms', severity: 'error' },
+    { metric: 'Latency P95', operator: '>', value: '2000', unit: 'ms', severity: 'error' },
+    { metric: 'Latency P99', operator: '>', value: '3000', unit: 'ms', severity: 'error' },
+    { metric: 'Error Rate', operator: '>', value: '1', unit: '%', severity: 'error' },
+    { metric: 'Throughput', operator: '<', value: '50', unit: 'req/s', severity: 'error' },
+    { metric: 'CPU Usage', operator: '>', value: '80', unit: '%', severity: 'error' },
+  ];
+  const script = buildK6Template(suite, null, null, { ...baseCfg, correlationRules: [] }, endpoints, rules, preRunData, 'load');
+
+  // One merged http_req_duration array with all three duration-based expressions — not three
+  // separate (colliding, last-wins) object keys.
+  const durationLineMatch = script.match(/http_req_duration:\s*\[([^\]]*)\]/);
+  assert.ok(durationLineMatch, 'expected a single http_req_duration thresholds array');
+  assert.ok(durationLineMatch[1].includes('avg<500'), 'Response Time should produce an avg<N expression');
+  assert.ok(durationLineMatch[1].includes('p(95)<2000'), 'Latency P95 must be included');
+  assert.ok(durationLineMatch[1].includes('p(99)<3000'), 'Latency P99 must be included');
+  assert.equal((script.match(/http_req_duration:/g) || []).length, 1, 'http_req_duration must appear exactly once, not once per rule');
+
+  assert.ok(script.includes("http_req_failed: ['rate<0.01']"));
+  assert.ok(script.includes("http_reqs: ['rate>50']"));
+  // CPU Usage has no k6 metric equivalent — silently omitted, not a crash.
+  assert.doesNotThrow(() => assertValidK6Syntax(script));
+});
+
 test('a field generator rewrites a recorded literal with no correlation source into a k6 expression', () => {
   const generatorRules = [{
     targetEndpointIndex: 1, targetLocation: 'body', targetKey: '$.item', value: 'widget', generator: 'timestamp',

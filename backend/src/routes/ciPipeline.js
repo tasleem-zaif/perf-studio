@@ -1054,6 +1054,7 @@ ${scriptList || '      # (no generated scripts yet)'}
 
 jobs:
   jmeter:
+    name: PerfStudio \${{ inputs.engine }} Test
     runs-on: ubuntu-latest
 
     steps:
@@ -1137,17 +1138,25 @@ jobs:
           SCRIPT="\${{ inputs.script_path }}"
           [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
           mkdir -p reports
+          # grafana/k6 image runs as a non-root user — the bind-mounted dir must be
+          # world-writable or k6 silently fails to write /output/results.json.
+          chmod 777 reports
           K6_MODE_ARGS="--duration \${{ inputs.k6_duration }}s"
           if [ -n "\${{ inputs.k6_iterations }}" ] && [ "\${{ inputs.k6_iterations }}" != "0" ]; then
             K6_MODE_ARGS="--iterations \${{ inputs.k6_iterations }}"
           fi
+          set +e
           docker run --rm \\
             -v "\${{ github.workspace }}":/workspace \\
             -v "\${{ github.workspace }}/reports":/output \\
             ${k6Image} \\
             run "/workspace/\$SCRIPT" \\
             --out json=/output/results.json \\
-            --vus "\${{ inputs.k6_vus }}" \$K6_MODE_ARGS || true
+            --vus "\${{ inputs.k6_vus }}" \$K6_MODE_ARGS
+          echo "k6 docker exit code: \$?"
+          set -e
+          echo "=== reports/ contents ==="
+          ls -la reports/ 2>/dev/null || echo "reports/ directory missing"
 
       - name: Validate results (JMeter)
         if: \${{ inputs.engine != 'k6' }}
@@ -2280,16 +2289,30 @@ pipelines:
         }
       }
 
-      // Always write a trigger-info file so every pipeline run gets a clean commit
-      // with the test name as the message — this is what Bitbucket shows as the pipeline title.
+      // runLabel/triggerFile are used for the commit message below (all providers — this commit
+      // is what actually persists any newly-generated script content before push, regardless of
+      // provider) and again further down for Bitbucket's own commit-message/pipeline-title use.
       const runLabel = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
       const triggerFile = path.join(wsRoot, '.peako', 'last-run.json');
-      fs.mkdirSync(path.dirname(triggerFile), { recursive: true });
-      fs.writeFileSync(triggerFile, JSON.stringify({
-        triggered_at: new Date().toISOString(),
-        script: script_name || '',
-        users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
-      }, null, 2), 'utf8');
+      if (provider === 'bitbucket') {
+        // Bitbucket Pipelines triggers off a push, unlike GitHub (workflow_dispatch API) /
+        // GitLab (pipeline trigger token) — so unlike those, it needs a GUARANTEED non-empty
+        // commit even when the script itself hasn't changed since the last trigger. This
+        // trigger-info file exists purely to make that commit non-empty and to give it a
+        // meaningful message (shown as the pipeline title in Bitbucket's UI). This write used
+        // to happen unconditionally for every provider — meaning it got committed into every
+        // GitHub/GitLab user's OWN branch too, on every single trigger, for no reason. Since
+        // every user's own copy of `.peako/last-run.json` differs (different timestamp/script
+        // every run), that guaranteed a merge conflict in this one file the next time ANY
+        // GitHub/GitLab user did "Sync with main" — from an unnecessary side effect, not a real
+        // content conflict.
+        fs.mkdirSync(path.dirname(triggerFile), { recursive: true });
+        fs.writeFileSync(triggerFile, JSON.stringify({
+          triggered_at: new Date().toISOString(),
+          script: script_name || '',
+          users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
+        }, null, 2), 'utf8');
+      }
       await git2.add('.');
       try { await git2.commit(`Peako Performance Test: ${runLabel} [auto]`); } catch (ce) {
         if (!ce.message.includes('nothing to commit') && !ce.message.includes('nothing added')) throw ce;
@@ -2719,17 +2742,24 @@ pipelines:
         }
       }
 
-      // Always write a trigger-info file so every pipeline run gets a clean commit with the
-      // test name as the message — same as the SSH branch.
+      // runLabelPat/triggerContent are used for the commit message below (all providers) and
+      // again further down for Bitbucket's own commit-message/pipeline-title use. The actual
+      // trigger-info FILE, though, is written to the session only for Bitbucket — see the SSH
+      // branch's matching comment above for why: Bitbucket triggers off a push and needs a
+      // guaranteed non-empty commit, GitHub/GitLab don't. Writing it unconditionally used to
+      // commit this into every GitHub/GitLab user's OWN branch on every trigger, guaranteeing a
+      // merge conflict in this one file the next time they synced with main.
       const runLabelPat = (script_name || '').replace(/\.(jmx|js|yml)$/i, '').replace(/\\/g, '/').split('/').pop() || 'test';
       const triggerContent = JSON.stringify({
         triggered_at: new Date().toISOString(),
         script: script_name || '',
         users: jmeter_users, rampup: jmeter_rampup, duration: jmeter_duration,
       }, null, 2);
-      const triggerFull = path.posix.join(session.dir, '.peako', 'last-run.json');
-      session.fs.mkdirSync(path.posix.dirname(triggerFull), { recursive: true });
-      session.fs.writeFileSync(triggerFull, triggerContent, 'utf8');
+      if (provider === 'bitbucket') {
+        const triggerFull = path.posix.join(session.dir, '.peako', 'last-run.json');
+        session.fs.mkdirSync(path.posix.dirname(triggerFull), { recursive: true });
+        session.fs.writeFileSync(triggerFull, triggerContent, 'utf8');
+      }
 
       await gitEngine.addAll(session);
       const stagedStatus = await gitEngine.status(session);
@@ -3436,9 +3466,10 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
     const hasReport  = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
 
+    const suiteRow0 = suiteId ? await db.prepare('SELECT name, test_type FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId) : null;
     const reportData = jtlText ? parseResultsContent(jtlText, {
-      suite_name: suiteId ? (await db.prepare('SELECT name FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId))?.name : (run.script_name || 'CI Run'),
-      engine, started_at: run.started_at,
+      suite_name: suiteRow0?.name || (run.script_name || 'CI Run'),
+      engine, started_at: run.started_at, test_type: suiteRow0?.test_type || null,
     }) : null;
 
     const totalRequests = reportData?.summary?.total_requests || 0;
@@ -3478,13 +3509,11 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       setImmediate(async () => {
         try {
           const { sendAlertEmail } = require('../utils/emailUtils');
-          const suiteName0 = suiteId
-            ? ((await db.prepare('SELECT name FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId))?.name || run.script_name || 'CI Run')
-            : (run.script_name || 'CI Run');
+          const suiteName0 = suiteRow0?.name || run.script_name || 'CI Run';
           const zeroErrors = [{ type: 'Zero Samples', message: `${engine === 'k6' ? 'k6' : 'JMeter'} produced 0 requests. The test plan may be malformed${engine === 'jmeter' ? ' or all thread groups are disabled' : ''}.` }];
           if (zeroBbLogs) zeroErrors.push({ type: 'info', message: `Bitbucket pipeline output:\n${zeroBbLogs}` });
           await sendAlertEmail(null, healUserId0, projectId, {
-            meta: { suite_name: suiteName0, engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+            meta: { suite_name: suiteName0, engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider, test_type: suiteRow0?.test_type || null },
             summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
             by_api: [], timeline: [],
             errors: zeroErrors,
@@ -3508,18 +3537,19 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         autoViolations = autoRuleResult?.violations || [];
       } catch (_) {}
     }
-    if (reportData) reportData.rule_violations = autoViolations;
+    if (reportData) { reportData.rule_violations = autoViolations; reportData.rule_results = autoRuleResult?.results || []; }
 
-    const suiteLookup = suiteId ? await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(suiteId, effectiveUserId) : null;
     const emailData = {
       ...(reportData || {
-        meta: { suite_name: suiteLookup?.name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'completed' },
+        meta: { suite_name: suiteRow0?.name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'completed', test_type: suiteRow0?.test_type || null },
         summary: { total_requests: 0, total_success: 0, total_failed: 0, avg_response_time: 0, overall_tps: 0 },
         by_api: [], timeline: [], errors: [],
       }),
       rule_violations: autoViolations,
+      rule_results: autoRuleResult?.results || [],
     };
-    if (suiteLookup?.name) emailData.meta.suite_name = suiteLookup.name;
+    if (suiteRow0?.name) emailData.meta.suite_name = suiteRow0.name;
+    if (suiteRow0?.test_type) emailData.meta.test_type = suiteRow0.test_type;
 
     // Fire rule violation alert immediately — before PDF generation so it arrives early
     if (autoViolations.length > 0) {
@@ -4073,12 +4103,13 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
         const pdfName = `Analytics_CI_Run_${runNum}.pdf`;
 
         // Parse with the full parser (timeline, errors, bytes/latency/connect where available)
-        const suite = await db.prepare('SELECT name FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1) AND user_id = ?').get(`%${path.basename(resultDir)}%`, effectiveUserId);
+        const suite = await db.prepare('SELECT name, test_type FROM test_suites WHERE id = (SELECT suite_id FROM execution_runs WHERE result_dir LIKE ? LIMIT 1) AND user_id = ?').get(`%${path.basename(resultDir)}%`, effectiveUserId);
         reportData = parseResultsContentSync(jtlText, {
           suite_name: suite?.name || run.script_name || 'CI Run',
           engine,
           started_at: run.started_at,
           status: 'completed',
+          test_type: suite?.test_type || null,
         });
         if (reportData) {
           // Genuinely nothing to show — no request trace at all. Mark no_results
@@ -4092,7 +4123,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
                 try {
                   const { sendAlertEmail } = require('../utils/emailUtils');
                   await sendAlertEmail(null, effectiveUserId, req.params.projectId, {
-                    meta: { suite_name: run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider },
+                    meta: { suite_name: suite?.name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'failed', ci_provider: run.provider, test_type: suite?.test_type || null },
                     summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0 },
                     by_api: [], timeline: [],
                     errors: [{ type: 'Zero Samples', message: `${engine === 'k6' ? 'k6' : 'JMeter'} produced 0 requests. The test plan may be malformed${engine === 'jmeter' ? ' or all thread groups are disabled' : ''}.` }],
@@ -4111,6 +4142,7 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
               const { evaluateRulesFromContent } = require('../utils/ruleEvaluator');
               ruleResult = await evaluateRulesFromContent(req.params.projectId, jtlText, effectiveUserId, engine);
               reportData.rule_violations = ruleResult?.violations || [];
+              reportData.rule_results = ruleResult?.results || [];
             } catch (_) {}
 
             if (engine === 'jmeter') {
@@ -4171,20 +4203,22 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
       try {
         const { sendAlertEmail, sendRuleViolationEmail } = require('../utils/emailUtils');
         const emailData = reportData || {
-          meta: { suite_name: run.script_name || 'CI Run', engine, started_at: run.started_at, duration_s: 0, status: 'completed' },
+          meta: { suite_name: run.script_name || 'CI Run', engine, started_at: run.started_at, duration_s: 0, status: 'completed', test_type: suite?.test_type || null },
           summary: { total_requests: 0, total_success: 0, total_failed: 0, error_rate: 0, avg_response_time: 0, overall_tps: 0, p90: 0, p95: 0 },
-          by_api: [], timeline: [], errors: [], rule_violations: [],
+          by_api: [], timeline: [], errors: [], rule_violations: [], rule_results: [],
         };
         // Use the actual suite name from the test_suites table (syncSuiteId resolved above)
         let resolvedSuiteName = emailData.meta.suite_name;
         if (syncSuiteId) {
-          const sRow = await db.prepare('SELECT name FROM test_suites WHERE id = ? AND user_id = ?').get(syncSuiteId, effectiveUserId);
+          const sRow = await db.prepare('SELECT name, test_type FROM test_suites WHERE id = ? AND user_id = ?').get(syncSuiteId, effectiveUserId);
           if (sRow?.name) { emailData.meta.suite_name = sRow.name; resolvedSuiteName = sRow.name; }
+          if (sRow?.test_type) emailData.meta.test_type = sRow.test_type;
         }
         emailData.meta.run_id = newRunId;
         // Reuse violations already evaluated before PDF generation
         const violations = reportData?.rule_violations || [];
         emailData.rule_violations = violations;
+        emailData.rule_results = reportData?.rule_results || [];
         // Send rule violation email first (as soon as violations are known, before full report)
         if (violations.length > 0) {
           const proj = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
@@ -4382,8 +4416,9 @@ async function generateHealSummary(ciRunId) {
   // "Attempt 1" with nothing in between reads as a bug, not as cross-session continuity.
   const logs = await db.prepare('SELECT * FROM ci_auto_heal_logs WHERE ci_run_id = ? ORDER BY attempt ASC').all(ciRunId);
   if (!logs.length) return 'Auto-heal exhausted — no attempt logs found.';
-  const run = await db.prepare('SELECT provider FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
+  const run = await db.prepare('SELECT provider, engine FROM ci_pipeline_runs WHERE id = ?').get(ciRunId);
   const providerLabel = { github: 'GitHub Actions', gitlab: 'GitLab CI', bitbucket: 'Bitbucket Pipelines' }[run?.provider] || 'CI';
+  const isJmeterRun = (run?.engine || 'jmeter') !== 'k6';
   const lines = [`Auto-heal exhausted after ${logs.length} attempt(s). The script could not be automatically fixed.\n`];
   logs.forEach((log, i) => {
     lines.push(`Attempt ${i + 1}:`);
@@ -4395,7 +4430,9 @@ async function generateHealSummary(ciRunId) {
   const last = logs[logs.length - 1];
   if (last?.diagnosis) {
     lines.push(`Remaining issue: ${last.diagnosis}`);
-    lines.push(`\nRecommendation: Review the script manually. Check that ${providerLabel} pipeline variables (jmeter_users, jmeter_rampup, jmeter_duration) are injected, all ThreadGroup elements have enabled="true", and the target host is reachable from the CI runner.`);
+    lines.push(isJmeterRun
+      ? `\nRecommendation: Review the script manually. Check that ${providerLabel} pipeline variables (jmeter_users, jmeter_rampup, jmeter_duration) are injected, all ThreadGroup elements have enabled="true", and the target host is reachable from the CI runner.`
+      : `\nRecommendation: Review the script manually. Check that ${providerLabel} pipeline variables (k6_vus, k6_duration, k6_iterations) are injected, the script's default function has no syntax/runtime errors, and the target host is reachable from the CI runner.`);
   }
   return lines.join('\n');
 }
@@ -4695,15 +4732,24 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
   }
 
   // Dispatch workflow_dispatch (try filename → full path → numeric ID)
+  // Always send both engines' inputs (the workflow YAML's per-step `if: inputs.engine == 'k6'`
+  // conditions decide which set is actually used, same as the normal /trigger route does) —
+  // this used to only ever send jmeter_* keys, so a k6 heal re-run always silently fell back
+  // to the workflow's k6 input DEFAULTS (10 VUs / 300s / 0 iterations) instead of the intended
+  // 1-VU quick-verify or the original run's real params.
   const dispatchBody = {
     ref: baseBranch,
     inputs: {
+      engine:          originalCiRun.engine || 'jmeter',
       script_name:     scriptFile,
       script_path:     healCanonical.scriptRepoPath || '',
       jmeter_users:    String(mergedVars.jmeter_users    || mergedVars.JMETER_USERS    || HEAL_CI_VUSERS),
       jmeter_rampup:   String(mergedVars.jmeter_rampup   || mergedVars.JMETER_RAMPUP   || HEAL_CI_RAMPUP),
       jmeter_loops:    String(mergedVars.jmeter_loops    || mergedVars.JMETER_LOOPS    || '-1'),
       jmeter_duration: String(mergedVars.jmeter_duration || mergedVars.JMETER_DURATION || HEAL_CI_DURATION),
+      k6_vus:          String(mergedVars.k6_vus        || mergedVars.K6_VUS        || HEAL_CI_VUSERS),
+      k6_duration:     String(mergedVars.k6_duration    ?? mergedVars.K6_DURATION    ?? '0'),
+      k6_iterations:   String(mergedVars.k6_iterations  || mergedVars.K6_ITERATIONS  || HEAL_CI_LOOPS),
       branch:          targetRef,
     },
   };
@@ -4852,6 +4898,27 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     const lid = await logCiHealAttempt(ciRunId, attemptNum, `Infrastructure/server failure: ${ctx.errorClass.summary}`, '', 'no_fix');
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('infra_error', lid);
     setCiHealStatus(ciRunId, 'infra_error');
+    return;
+  }
+
+  // A run whose ONLY problems are capacity/SLA-shaped rule breaches (Throughput, response
+  // time, P90/P95) with zero actual request failures isn't a script defect — every request
+  // succeeded, it just didn't hit the target rate/latency. Editing script logic can't make a
+  // server handle more load or respond faster (and for a stress/spike test, hitting a ceiling
+  // is often the expected, useful finding, not a bug) — so skip the AI script-rewrite attempt
+  // entirely and say so plainly, instead of burning an AI call for an inevitable "no_fix".
+  // Error Rate is deliberately excluded — that DOES indicate real request failures that a
+  // script fix might address.
+  const CAPACITY_METRICS = new Set(['response time', 'avg response time', 'average response time', 'p90', 'p95', 'latency p90', 'latency p95', 'throughput', 'tps']);
+  const isCapacityBreach = (ctx.jtl.totalFail === 0) && (ctx.ruleViolations || []).length > 0
+    && ctx.ruleViolations.every(v => CAPACITY_METRICS.has((v.rule?.metric || '').toLowerCase()));
+  if (isCapacityBreach) {
+    const summary = ctx.ruleViolations.map(v => v.label).join('; ');
+    const lid = await logCiHealAttempt(ciRunId, attemptNum,
+      `Capacity/SLA threshold breach, not a script defect: ${summary}. Every request completed successfully — this isn't something a script edit can fix. Either treat it as a valid finding (this is what a ${suite.test_type || 'load'} test is for), or deliberately raise virtual users/duration and re-run if you want to probe further.`,
+      '', 'no_fix');
+    await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('capacity_threshold', lid);
+    setCiHealStatus(ciRunId, 'capacity_threshold');
     return;
   }
 

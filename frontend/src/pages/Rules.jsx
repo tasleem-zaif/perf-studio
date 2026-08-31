@@ -6,12 +6,21 @@ import CustomSelect from '../components/CustomSelect';
 import api from '../api';
 
 // ── Metric config — drives operator list and unit automatically ───────────────
+// Operators are deliberately restricted per metric to whichever single direction actually
+// means "this is a problem" for that metric — not left open to both directions. ruleEvaluator.js
+// treats "operator + value" as the literal breach condition (breached = `actual OP value`),
+// so an open-ended metric like latency (where a user might naturally think in terms of "must
+// stay under X to pass") can silently get configured backwards — e.g. "Latency P99 < 500ms"
+// reads to the evaluator as "error whenever P99 drops BELOW 500ms", the opposite of the
+// intended "error when it's too slow". Response Time/Latency P95/P99 are "higher is worse"
+// metrics, same as Error Rate/CPU/Memory — only Throughput is "lower is worse", which is why
+// it alone keeps the </<=/between direction.
 const METRIC_CONFIG = {
-  'Response Time': { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '500'  },
+  'Response Time': { unit: 'ms',    operators: ['>','>=','between'],          min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '500'  },
   'Error Rate':    { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 1,   eg: '5',    egMin: '2',   egMax: '10'   },
   'Throughput':    { unit: 'req/s', operators: ['<','<=','between'],          min: 0, max: 100000, step: 10,  eg: '50',   egMin: '20',  egMax: '100'  },
-  'Latency P95':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '1000' },
-  'Latency P99':   { unit: 'ms',    operators: ['>','>=','<','<=','between'], min: 0, max: 30000,  step: 100, eg: '1000', egMin: '500', egMax: '2000' },
+  'Latency P95':   { unit: 'ms',    operators: ['>','>=','between'],          min: 0, max: 30000,  step: 50,  eg: '500',  egMin: '200', egMax: '1000' },
+  'Latency P99':   { unit: 'ms',    operators: ['>','>=','between'],          min: 0, max: 30000,  step: 100, eg: '1000', egMin: '500', egMax: '2000' },
   'CPU Usage':     { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 5,   eg: '80',   egMin: '50',  egMax: '90'   },
   'Memory Usage':  { unit: '%',     operators: ['>','>=','between'],          min: 0, max: 100,    step: 5,   eg: '80',   egMin: '50',  egMax: '90'   },
 };
