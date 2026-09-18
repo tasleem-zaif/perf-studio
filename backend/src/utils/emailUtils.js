@@ -6,6 +6,7 @@ const path       = require('path');
 const fs         = require('fs');
 const os         = require('os');
 const { decrypt } = require('./encryption');
+const { buildDisplaySteps } = require('./stressAnalysis');
 
 const db = require('../db');
 
@@ -365,6 +366,152 @@ function buildEmailBody(runData, orgName, recipientName, reportDir, trendData) {
           </tr>`;
         }).join('')}
       </table>
+    </div>` : ''}
+
+    ${(runData.stress_analysis?.steps?.length > 0) ? `
+    <!-- Stress test step breakdown — showcases every concurrency level actually tested, not
+         just a single pass/fail (a stress test's whole point is finding WHERE it breaks), but
+         collapses consecutive clean levels into one summary row (buildDisplaySteps) instead of
+         one row per level — a 500-user run still has a fixed, small number of DISCRETE steps
+         (STRESS_STEPS), so this stays a short table regardless of how high VUsers goes; only
+         the breaking point (if any) gets its own highlighted row. Full per-level detail is a
+         job for the attached report/Analytics, not this summary. -->
+    <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
+      <div style="font-weight:700;color:#f0f3fa;font-size:13px;margin-bottom:10px;">🔥 Stress Test — Step Breakdown</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr style="background:rgba(0,0,0,0.2);">
+          <th style="padding:6px 10px;text-align:left;color:#8b949e;font-weight:600;">Steps</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Concurrency</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Avg Response</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Error Rate</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Throughput</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Status</th>
+        </tr>
+        ${buildDisplaySteps(runData.stress_analysis.steps, runData.stress_analysis.breakingPoint).map(row => {
+          if (row.type === 'range') {
+            return `<tr style="border-top:1px solid rgba(255,255,255,0.05);">
+              <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">Steps ${row.stepIndexFrom + 1}–${row.stepIndexTo + 1}</td>
+              <td style="padding:7px 10px;text-align:center;color:#e6edf3;font-family:monospace;">${row.fromThreads}–${row.toThreads} users</td>
+              <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">avg ${fmt(row.avgResponseTime)}</td>
+              <td style="padding:7px 10px;text-align:center;color:${row.maxErrorRate > 0 ? '#ef4444' : '#8b949e'};font-family:monospace;">max ${row.maxErrorRate.toFixed(2)}%</td>
+              <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">up to ${row.maxThroughput.toFixed(2)} TPS</td>
+              <td style="padding:7px 10px;text-align:center;"><span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#22c55e22;color:#22c55e;border:1px solid #22c55e;">OK</span></td>
+            </tr>`;
+          }
+          const s = row.step;
+          const st = row.isBreakingPoint ? { color: '#ef4444', label: 'BREAKING POINT' } : { color: '#22c55e', label: 'OK' };
+          return `<tr style="border-top:1px solid rgba(255,255,255,0.05);">
+            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">Step ${row.stepIndex + 1}</td>
+            <td style="padding:7px 10px;text-align:center;color:#e6edf3;font-family:monospace;">${s.threads} users</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${fmt(s.avg_response_time)}</td>
+            <td style="padding:7px 10px;text-align:center;color:${s.error_rate > 0 ? '#ef4444' : '#8b949e'};font-family:monospace;">${s.error_rate.toFixed(2)}%</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${s.throughput.toFixed(2)} TPS</td>
+            <td style="padding:7px 10px;text-align:center;"><span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:${st.color}22;color:${st.color};border:1px solid ${st.color};">${st.label}</span></td>
+          </tr>`;
+        }).join('')}
+      </table>
+      <div style="margin-top:10px;font-size:12px;color:#b8c4d8;line-height:1.6;">
+        ${runData.stress_analysis.breakingPoint
+          ? (runData.stress_analysis.breakingPoint.reason === 'rule'
+              ? `⚠ <strong style="color:#ef4444;">Breaking point: ${runData.stress_analysis.breakingPoint.step.threads} concurrent users</strong> — ${runData.stress_analysis.breakingPoint.metric} rule breached (${runData.stress_analysis.breakingPoint.thresholdLabel}, actual: ${runData.stress_analysis.breakingPoint.actual}).`
+              : `⚠ <strong style="color:#ef4444;">Breaking point: ${runData.stress_analysis.breakingPoint.step.threads} concurrent users</strong> — throughput plateaued (only ${runData.stress_analysis.breakingPoint.growthPct}% gain vs. the previous step at ${runData.stress_analysis.breakingPoint.previousThroughput} TPS) despite concurrency increasing. No rule was configured to catch this directly — this is the fallback saturation signal.`)
+          : `✅ No breaking point found — the system handled every tested level cleanly, up to ${runData.stress_analysis.steps[runData.stress_analysis.steps.length - 1]?.threads || '—'} concurrent users. Consider raising Virtual Users on the next run to keep probing further.`}
+      </div>
+    </div>` : ''}
+
+    ${(runData.spike_analysis?.cycles) ? `
+    <!-- Spike test baseline/peak/recovery — a spike test's real question isn't "where's the
+         breaking point" (that's Stress), it's "did it survive EVERY burst, and did it actually
+         come back to normal EVERY time." Every peak and every recovery window is checked
+         individually (not averaged) so a problem on only one spike, or recovery that degrades
+         across repeated cycles, is never masked — see spikeAnalysis.js's overall-verdict
+         logic. The verdict genuinely varies with the result (good/warning/critical). -->
+    <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
+      <div style="font-weight:700;color:#f0f3fa;font-size:13px;margin-bottom:10px;">⚡ Spike Test — Baseline / Peak / Recovery${runData.spike_analysis.spikeCount > 1 ? ` (${runData.spike_analysis.spikeCount} spikes)` : ''}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr style="background:rgba(0,0,0,0.2);">
+          <th style="padding:6px 10px;text-align:left;color:#8b949e;font-weight:600;">Phase</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Concurrency</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Avg Response</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Error Rate</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Throughput</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Status</th>
+        </tr>
+        ${(() => {
+          const multi = runData.spike_analysis.spikeCount > 1;
+          const okBadge = '<span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#22c55e22;color:#22c55e;border:1px solid #22c55e;">OK</span>';
+          const warnBadge = (label) => `<span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b;">${label}</span>`;
+          const errBadge = (label) => `<span style="padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#ef444422;color:#ef4444;border:1px solid #ef4444;">${label}</span>`;
+          const row = (label, s, badge) => `
+          <tr style="border-top:1px solid rgba(255,255,255,0.05);">
+            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">${label}</td>
+            <td style="padding:7px 10px;text-align:center;color:#e6edf3;font-family:monospace;">${s.threads} users</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${fmt(s.avg_response_time)}</td>
+            <td style="padding:7px 10px;text-align:center;color:${s.error_rate > 0 ? '#ef4444' : '#8b949e'};font-family:monospace;">${s.error_rate.toFixed(2)}%</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${s.throughput.toFixed(2)} TPS</td>
+            <td style="padding:7px 10px;text-align:center;">${badge}</td>
+          </tr>`;
+          let html = row('Baseline (before)', runData.spike_analysis.baseline_before, okBadge);
+          for (const c of runData.spike_analysis.cycles) {
+            const peakLabel = multi ? `Peak #${c.index}` : 'Peak';
+            const recoveryLabel = multi ? `Recovery #${c.index}` : 'Recovery (after)';
+            const peakBadge = c.peakVerdict.level === 'error' ? errBadge('ERROR') : c.peakVerdict.level === 'warning' ? warnBadge('WARNING') : okBadge;
+            const recoveryBadge = c.recoveryCheck.recovered ? okBadge : warnBadge('NOT RECOVERED');
+            html += row(peakLabel, c.peak, peakBadge) + row(recoveryLabel, c.recovery, recoveryBadge);
+          }
+          return html;
+        })()}
+      </table>
+      ${(() => {
+        const level = runData.spike_analysis.overall.level;
+        const style = level === 'good' ? { color: '#22c55e', icon: '✅' }
+          : level === 'critical' ? { color: '#ef4444', icon: '🔴' }
+          : { color: '#f59e0b', icon: '⚠️' };
+        return `<div style="margin-top:10px;font-size:12px;color:#b8c4d8;line-height:1.6;">
+          ${style.icon} <strong style="color:${style.color};">${runData.spike_analysis.overall.message}</strong>
+          ${runData.spike_analysis.usedFallbackRules ? '<br/><span style="color:#8b949e;font-size:11px;">Peaks evaluated against built-in default thresholds (no Error Rate/Response Time rule configured for this project).</span>' : ''}
+        </div>`;
+      })()}
+    </div>` : ''}
+
+    ${(runData.endurance_analysis?.applicable) ? `
+    <!-- Endurance test early/late degradation-over-time — unlike Stress/Spike, the load shape
+         here is deliberately simple (same as Load Test); the whole point is watching whether
+         performance drifts across a long, steady run. Verdict genuinely varies with the
+         result — see enduranceAnalysis.js. -->
+    <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px 16px;margin-bottom:20px;">
+      <div style="font-weight:700;color:#f0f3fa;font-size:13px;margin-bottom:10px;">🕐 Endurance Test — Early vs Late</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr style="background:rgba(0,0,0,0.2);">
+          <th style="padding:6px 10px;text-align:left;color:#8b949e;font-weight:600;">Window</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Avg Response</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Error Rate</th>
+          <th style="padding:6px 10px;text-align:center;color:#8b949e;font-weight:600;">Throughput</th>
+        </tr>
+        ${[
+          { label: 'Early (first 20%)', s: runData.endurance_analysis.early },
+          { label: 'Late (last 20%)', s: runData.endurance_analysis.late },
+        ].map(({ label, s }) => `
+          <tr style="border-top:1px solid rgba(255,255,255,0.05);">
+            <td style="padding:7px 10px;color:#e6edf3;font-weight:600;">${label}</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${fmt(s.avg_response_time)}</td>
+            <td style="padding:7px 10px;text-align:center;color:${s.error_rate > 0 ? '#ef4444' : '#8b949e'};font-family:monospace;">${s.error_rate.toFixed(2)}%</td>
+            <td style="padding:7px 10px;text-align:center;color:#8b949e;font-family:monospace;">${s.throughput.toFixed(2)} TPS</td>
+          </tr>`).join('')}
+      </table>
+      ${(() => {
+        const level = runData.endurance_analysis.overall.level;
+        const style = level === 'good' ? { color: '#22c55e', icon: '✅' }
+          : level === 'critical' ? { color: '#ef4444', icon: '🔴' }
+          : { color: '#f59e0b', icon: '⚠️' };
+        return `<div style="margin-top:10px;font-size:12px;color:#b8c4d8;line-height:1.6;">
+          ${style.icon} <strong style="color:${style.color};">${runData.endurance_analysis.overall.message}</strong>
+          ${runData.endurance_analysis.usedFallbackRules ? '<br/><span style="color:#8b949e;font-size:11px;">Late window evaluated against built-in default thresholds (no Error Rate/Response Time rule configured for this project).</span>' : ''}
+        </div>`;
+      })()}
+    </div>` : (runData.meta?.test_type === 'endurance' && runData.endurance_analysis?.overall?.level === 'unknown') ? `
+    <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:12px;color:#8b949e;">
+      🕐 <strong style="color:#f0f3fa;">Endurance Test</strong> — ${runData.endurance_analysis.overall.message}
     </div>` : ''}
   </div>
 
@@ -827,4 +974,4 @@ async function sendRuleViolationEmail(runId, userId, projectId, violations, suit
   }
 }
 
-module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients, createTransport };
+module.exports = { sendAlertEmail, sendBreachAlertEmail, sendRuleViolationEmail, getAlertConfig, getRecipients, createTransport, buildEmailBody };

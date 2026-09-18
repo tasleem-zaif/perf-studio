@@ -20,13 +20,6 @@ const { K6_CRYPTO_TRANSFORMS } = require('../utils/transforms');
 
 const DEFAULT_CONFIG = { protocol: 'https', url: '', port: '443', threads: 50, rampup: 30, loop: 1, duration: 300 };
 
-const THREAD_GROUPS = {
-  load:      'org.apache.jmeter.threads.ThreadGroup',
-  stress:    'kg.apc.jmeter.threads.UltimateThreadGroup',
-  spike:     'kg.apc.jmeter.threads.arrivals.ArrivalsThreadGroup',
-  endurance: 'kg.apc.jmeter.threads.ConcurrencyThreadGroup',
-};
-
 router.use(auth);
 
 router.get('/', async (req, res) => {
@@ -215,7 +208,7 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   const testType = suite.test_type || 'load';
   const safeName = suite.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-  const identity = await db.prepare('SELECT auth_method FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
+  const identity = await db.prepare('SELECT auth_method, branch_name FROM user_git_configs WHERE user_id = ? AND project_id = ?').get(userId, projectId);
   const isSSH = (identity?.auth_method || 'pat') === 'ssh';
   const { resolveOrgSlugForProject, cleanName, getUserProjectPath, getCollectionPath, isAdminRole } = require('../utils/projectFolders');
   const orgSlug = await resolveOrgSlugForProject(projectId);
@@ -224,7 +217,7 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
   // the project-wide folder_path (that's whoever last ran /init, almost always the org admin) —
   // otherwise every user's generated scripts end up inside the admin's main-branch workspace
   // instead of their own users/<name> branch, ahead of any PR merge.
-  const callerUser = await db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+  const callerUser = await db.prepare('SELECT role, name FROM users WHERE id = ?').get(userId);
   const callerRole = callerUser?.role;
 
   // Admin's own workspace tracks main directly — scripts only ever land there via a real git
@@ -244,6 +237,19 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
     let patSession = null;
     if (!isSSH) {
       patSession = await gitEngine.openSession(gitDir, orgSlug);
+      // This session is a SINGLE shared, persisted resource per (workspace, user) — other
+      // requests (CI trigger's base-branch workflow push, /generate-yaml's own base-branch
+      // commit) legitimately switch it to `main` temporarily and can leave it there. Pin it
+      // to the user's OWN branch before writing anything, rather than trusting whatever
+      // branch the session happens to currently be on — otherwise the generated script lands
+      // on `main` as an untracked stray file, which then makes every later checkout of the
+      // user's real branch fail with a confusing "branch already exists" conflict.
+      const ownBranch = identity?.branch_name || require('../routes/git').getBranchForUser({ role: callerRole, name: callerUser?.name || 'user' }, {});
+      try {
+        await gitEngine.checkoutSafe(patSession, ownBranch);
+      } catch (e) {
+        console.warn(`[generateScriptForSuite] Could not checkout own branch "${ownBranch}" before writing script — continuing on whatever branch the session is currently on:`, e.message);
+      }
       for (const f of testDataFiles) {
         // f.path is stored as "<ProjectName>/<Collection>/<Env>/testData/<file>" for PAT-mode
         // uploads (see testData.js) — resolve it directly against the session's content root.
@@ -295,9 +301,18 @@ async function generateScriptForSuite(userId, projectId, suiteId, reqPreRunData)
       if (!up.ok && !up.skipped) console.error('[TestSuites] S3 sync failed for', filePath, ':', up.error?.message);
     }
 
-    // Update DB
+    // Update DB — clear the OTHER engine's path field, not just set this one. A suite whose
+    // engine was switched after already generating once (e.g. JMeter → k6, same suite id)
+    // otherwise keeps a stale jmx_path forever alongside the new js_path. Every consumer
+    // across the codebase (CI trigger's script selection, the auto-push file copy, YAML
+    // generation) resolves "which script for this suite" via `jmx_path || js_path` — with
+    // both set, that always silently picks the stale JMeter file even for a k6 suite, which
+    // is exactly what sent a .jmx file into a k6 CI run ("could not load JS test... Unexpected
+    // token <"). Keeping the two fields mutually exclusive is what actually fixes every one of
+    // those call sites at once, instead of auditing and engine-gating each of them individually.
     const updateField = engine === 'jmeter' ? 'jmx_path' : 'js_path';
-    await db.prepare(`UPDATE test_suites SET ${updateField}=?, status='generated' WHERE id=? AND user_id=?`).run(filePath || filename, suiteId, userId);
+    const clearField  = engine === 'jmeter' ? 'js_path'  : 'jmx_path';
+    await db.prepare(`UPDATE test_suites SET ${updateField}=?, ${clearField}=NULL, status='generated' WHERE id=? AND user_id=?`).run(filePath || filename, suiteId, userId);
 
     if (suite.collection_id) setImmediate(async () => { await updateCollectionConfigs(suite.collection_id); });
     return { ok: true, filename, path: filePath };
@@ -489,6 +504,185 @@ function constantTimerXml(delayMs, testname) {
     `        </ConstantTimer>`,
     `        <hashTree/>`,
   ].join('\n');
+}
+
+// Stress test plan — a staircase up to `vusers` (the same shape as k6's stress executor:
+// STRESS_STEPS discrete levels, each held for `duration` after a `rampup`-second ramp, then
+// one shared ramp-down), using UltimateThreadGroup (jpgc-casutg plugin — already bundled in
+// the JMeter Docker image, see Dockerfile) since stock ThreadGroup can't stage concurrency.
+//
+// UltimateThreadGroup row semantics (5 columns per row): Start Threads Count (threads to
+// ADD on top of whatever's already running — NOT a new total), Initial Delay (seconds from
+// test start), Startup Time (ramp duration for this row's threads), Hold Load For (how long
+// this row's threads stay up once ramped), Shutdown Time (ramp-down duration once the hold
+// ends). Rows overlap by design: to keep step i's threads alive until the whole test's shared
+// end time (so the staircase accumulates instead of each step tearing down before the next
+// starts), step i's Hold Load For is stretched to cover every later step too — every row's
+// (delay + startup + hold) lands on the same T_end, so they all ramp down together in the
+// final `shutdownTime` seconds.
+function buildUltimateThreadGroupXml(vusers, duration) {
+  const STRESS_STEPS = 5;
+  const SHUTDOWN_S = 30;
+  // `duration` is the TOTAL staircase time (matching what's shown everywhere else in the UI
+  // as "Duration"), divided evenly across the steps — NOT each step's own full duration,
+  // which would silently multiply the configured test length by STRESS_STEPS (a real bug: a
+  // 300s-configured stress test actually ran 28 minutes before this fix, since every one of
+  // the 5 steps got its own full 300s hold on top of its own full ramp-up).
+  //
+  // The per-step TRANSITION time is a small, fixed fraction of that step's own budget — NOT
+  // a user-supplied `rampup` value at all (the parameter is accepted but intentionally
+  // unused: the UI blocks/hides Ramp-up for stress tests entirely, since "one overall ramp"
+  // isn't a meaningful concept for a staircase — see TestSuites.jsx/Runner.jsx). Letting
+  // rampup act as even a ceiling here previously meant a value "similar in size to
+  // duration/STRESS_STEPS" (the common case, e.g. the 30s default against a 100s/5-step test)
+  // consumed the step's ENTIRE budget as ramp with zero hold — one continuous ramp, no real
+  // plateau to analyze. Deriving the transition purely from duration/vusers guarantees at
+  // least 75% of every step's budget goes to holding, regardless of what a caller passes.
+  const stepBudget = duration / STRESS_STEPS;
+  const stepRamp = Math.max(5, Math.round(stepBudget * 0.2));
+  const tEnd = STRESS_STEPS * stepBudget; // == duration, by construction
+
+  const rows = [];
+  let cumulative = 0;
+  for (let i = 1; i <= STRESS_STEPS; i++) {
+    const target = i === STRESS_STEPS ? vusers : Math.round(vusers * i / STRESS_STEPS);
+    const delay = Math.round((i - 1) * stepBudget);
+    const hold = Math.max(0, Math.round(tEnd - delay - stepRamp));
+    rows.push({ startCount: target - cumulative, delay, startup: Math.round(stepRamp), hold, shutdown: SHUTDOWN_S });
+    cumulative = target;
+  }
+
+  const L = [];
+  L.push(`      <kg.apc.jmeter.threads.UltimateThreadGroup guiclass="kg.apc.jmeter.threads.UltimateThreadGroupGui" testclass="kg.apc.jmeter.threads.UltimateThreadGroup" testname="Stress Thread Group">`);
+  L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
+  L.push(`          <boolProp name="LoopController.continue_forever">true</boolProp>`);
+  L.push(`          <intProp name="LoopController.loops">-1</intProp>`);
+  L.push(`        </elementProp>`);
+  L.push(`        <collectionProp name="ultimatethreadgroupdata">`);
+  rows.forEach((r, idx) => {
+    L.push(`          <collectionProp name="${idx}">`);
+    L.push(`            <stringProp name="0">${r.startCount}</stringProp>`);
+    L.push(`            <stringProp name="1">${r.delay}</stringProp>`);
+    L.push(`            <stringProp name="2">${r.startup}</stringProp>`);
+    L.push(`            <stringProp name="3">${r.hold}</stringProp>`);
+    L.push(`            <stringProp name="4">${r.shutdown}</stringProp>`);
+    L.push(`          </collectionProp>`);
+  });
+  L.push(`        </collectionProp>`);
+  L.push(`      </kg.apc.jmeter.threads.UltimateThreadGroup>`);
+  return L.join('\n');
+}
+
+// How many spike cycles fit meaningfully in `duration` — a single spike only proves the
+// system survives ONE burst and comes back once; repeating it is what actually catches
+// cumulative degradation a single cycle can't (a connection pool or cache that doesn't fully
+// release, a slow leak that only shows up after the 2nd/3rd burst). Fixed at generation time
+// (like STRESS_STEPS) rather than recomputed from a CI-trigger-time duration override — the
+// CI patcher rescales the TIMING of whatever cycle count was baked in, exactly like it
+// already does for stress's fixed 5 steps, rather than trying to change the row/stage count
+// after the fact. A short duration doesn't get enough room per cycle for a real ramp+peak+
+// recovery, so it falls back to a single spike.
+function computeSpikeCount(duration) {
+  if (duration >= 300) return Math.min(10, 3 + Math.floor((duration - 300) / 600));
+  if (duration >= 120) return 2;
+  return 1;
+}
+
+// The user can explicitly choose how many spikes to run (stored in the suite's own
+// config_json — no schema change needed, same pattern collection/env-specific overrides
+// already use). computeSpikeCount(duration) is only the SUGGESTED default shown in the UI;
+// an explicit choice always wins. Reads the RAW per-suite config_json (not the merged
+// project/env `cfg`) since this is suite-specific, never something a global/project config
+// should be able to override.
+function resolveSpikeCount(suite, duration) {
+  try {
+    const raw = JSON.parse(suite?.config_json || '{}').spike_count;
+    const n = parseInt(raw, 10);
+    if (Number.isInteger(n) && n >= 1 && n <= 10) return n;
+  } catch { /* fall through to the suggested default */ }
+  return computeSpikeCount(duration);
+}
+
+// Spike test plan — sudden burst(s) then recovery, NOT a staircase: baseline traffic, a fast
+// jump to full concurrency, a short hold at peak, a fast drop back to baseline, repeated
+// computeSpikeCount(duration) times, then a final baseline hold to observe recovery. Reuses
+// UltimateThreadGroup (same plugin as stress) — one baseline row (spans the whole test) plus
+// one additional row per spike cycle, additive: each spike row's threads stack on top of the
+// baseline, and dropping back to baseline is simply that row shutting itself down before the
+// next cycle's gap begins.
+//
+// No rampup parameter, same reasoning as buildUltimateThreadGroupXml: the UI blocks/hides
+// Ramp-up for spike tests entirely — a spike is fast BY DEFINITION, there's no meaningful
+// "ramp-up seconds" to tune here either.
+//
+// Phase split must match buildK6Template's spike executor and the CI patcher's
+// patch_spike_thread_group EXACTLY — all three implement the identical shape:
+//   - Single spike (short duration): 20% baseline -> ~3%(min 5s) ramp -> 15% peak -> ~3% ramp
+//     -> remainder baseline/recovery (~42%, deliberately the largest phase).
+//   - Multiple spikes: each cycle gets a fixed ~3%(min 5s) ramp / ~8%(min 5s) peak / ~3% ramp;
+//     the REMAINING time after all cycles' ramps+peaks is split evenly across the gaps before,
+//     between, and after every spike — so every baseline/recovery window is comparable in
+//     size, and the FINAL one (the real recovery signal) is never left short-changed just
+//     because there were more cycles.
+function buildSpikeThreadGroupXml(vusers, duration, spikeCount) {
+  const SHUTDOWN_S = 30;
+  const baselineUsers = Math.max(1, Math.round(vusers * 0.10));
+  const spikeAdd = Math.max(0, vusers - baselineUsers);
+  const baselineStartup = 5;
+  const baselineHold = Math.max(0, duration - baselineStartup);
+
+  const rows = [
+    // Row 1: baseline traffic, present for essentially the whole test (before, every peak,
+    // AND every recovery window all include it) — shares the same end-of-test shutdown tail
+    // convention as the stress staircase.
+    { startCount: baselineUsers, delay: 0, startup: baselineStartup, hold: baselineHold, shutdown: SHUTDOWN_S },
+  ];
+
+  if (spikeCount === 1) {
+    // Original single-spike formula, unchanged.
+    const beforeS = Math.round(duration * 0.20);
+    const rampS = Math.max(5, Math.round(duration * 0.03));
+    const peakS = Math.round(duration * 0.15);
+    // Row 2: the spike itself — starts at `beforeS`, ramps up fast, holds briefly at the
+    // ADDED concurrency (baseline + this row's threads = full vusers), then ramps back down
+    // fast via its OWN shutdown — finishing exactly when the recovery window begins, well
+    // before row 1's much-later end-of-test shutdown.
+    rows.push({ startCount: spikeAdd, delay: beforeS, startup: rampS, hold: peakS, shutdown: rampS });
+  } else {
+    const rampS = Math.max(5, Math.round(duration * 0.03));
+    const peakS = Math.max(5, Math.round(duration * 0.08));
+    const nonBaselinePerCycle = 2 * rampS + peakS;
+    const totalBaseline = Math.max(0, duration - spikeCount * nonBaselinePerCycle);
+    const gapS = Math.round(totalBaseline / (spikeCount + 1));
+    let t = 0;
+    for (let i = 0; i < spikeCount; i++) {
+      t += gapS;
+      rows.push({ startCount: spikeAdd, delay: t, startup: rampS, hold: peakS, shutdown: rampS });
+      t += rampS + peakS + rampS;
+    }
+    // The final gap (from the last spike's end to `duration`) is whatever remains — by
+    // construction, approximately `gapS` too, same as every other gap.
+  }
+
+  const L = [];
+  L.push(`      <kg.apc.jmeter.threads.UltimateThreadGroup guiclass="kg.apc.jmeter.threads.UltimateThreadGroupGui" testclass="kg.apc.jmeter.threads.UltimateThreadGroup" testname="Spike Thread Group">`);
+  L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
+  L.push(`          <boolProp name="LoopController.continue_forever">true</boolProp>`);
+  L.push(`          <intProp name="LoopController.loops">-1</intProp>`);
+  L.push(`        </elementProp>`);
+  L.push(`        <collectionProp name="ultimatethreadgroupdata">`);
+  rows.forEach((r, idx) => {
+    L.push(`          <collectionProp name="${idx}">`);
+    L.push(`            <stringProp name="0">${r.startCount}</stringProp>`);
+    L.push(`            <stringProp name="1">${r.delay}</stringProp>`);
+    L.push(`            <stringProp name="2">${r.startup}</stringProp>`);
+    L.push(`            <stringProp name="3">${r.hold}</stringProp>`);
+    L.push(`            <stringProp name="4">${r.shutdown}</stringProp>`);
+    L.push(`          </collectionProp>`);
+  });
+  L.push(`        </collectionProp>`);
+  L.push(`      </kg.apc.jmeter.threads.UltimateThreadGroup>`);
+  return L.join('\n');
 }
 
 // Extractor for a value sourced from a RESPONSE HEADER rather than the JSON body (e.g. a
@@ -1009,7 +1203,7 @@ function buildSamplerXml(ep, isLogin, tokenVar, csvCols, csvValueMap, hostVars, 
   return lines.join('\n');
 }
 
-function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preRunData) {
+function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preRunData, testType) {
   // Accept single file or array for backward compat
   if (!Array.isArray(testDataFiles)) testDataFiles = testDataFiles ? [testDataFiles] : [];
 
@@ -1199,26 +1393,40 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
   L.push(listenerXml('Aggregate Report', 'StatVisualizer'));
   L.push(`      <hashTree/>`);
 
-  // Thread Group
-  L.push(`      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group">`);
-  L.push(`        <stringProp name="ThreadGroup.num_threads">\${THREADS}</stringProp>`);
-  L.push(`        <stringProp name="ThreadGroup.ramp_time">\${RAMP_UP}</stringProp>`);
-  L.push(`        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>`);
-  L.push(`        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>`);
-  if (iterMode === 'loops') {
-    L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
-    L.push(`          <stringProp name="LoopController.loops">\${LOOP_COUNT}</stringProp>`);
-    L.push(`          <boolProp name="LoopController.continue_forever">false</boolProp>`);
-    L.push(`        </elementProp>`);
+  // Thread Group — stress gets a staircase (UltimateThreadGroup); every other type keeps the
+  // flat, CI-input-patchable ThreadGroup (${THREADS}/${RAMP_UP}/${DURATION}/${LOOP_COUNT} are
+  // placeholder text overwritten by patch_jmx.py at CI-trigger time, not real JMeter properties
+  // — see ciPipeline.js's "Patch JMX parameters" step). NOTE: the stress staircase's row values
+  // are computed here from the test plan's saved vusers/rampup/duration at GENERATION time, not
+  // as patchable placeholders — patch_jmx.py only knows how to rewrite the single named props a
+  // flat ThreadGroup uses, not UltimateThreadGroup's row schedule. To change a stress plan's
+  // load shape, edit the test plan and re-generate the script, rather than overriding at
+  // CI-trigger time the way you can for Load.
+  if (testType === 'stress') {
+    L.push(buildUltimateThreadGroupXml(vusers, duration));
+  } else if (testType === 'spike') {
+    L.push(buildSpikeThreadGroupXml(vusers, duration, resolveSpikeCount(suite, duration)));
   } else {
-    L.push(`        <boolProp name="ThreadGroup.scheduler">true</boolProp>`);
-    L.push(`        <stringProp name="ThreadGroup.duration">\${DURATION}</stringProp>`);
-    L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
-    L.push(`          <intProp name="LoopController.loops">-1</intProp>`);
-    L.push(`          <boolProp name="LoopController.continue_forever">true</boolProp>`);
-    L.push(`        </elementProp>`);
+    L.push(`      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group">`);
+    L.push(`        <stringProp name="ThreadGroup.num_threads">\${THREADS}</stringProp>`);
+    L.push(`        <stringProp name="ThreadGroup.ramp_time">\${RAMP_UP}</stringProp>`);
+    L.push(`        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>`);
+    L.push(`        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>`);
+    if (iterMode === 'loops') {
+      L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
+      L.push(`          <stringProp name="LoopController.loops">\${LOOP_COUNT}</stringProp>`);
+      L.push(`          <boolProp name="LoopController.continue_forever">false</boolProp>`);
+      L.push(`        </elementProp>`);
+    } else {
+      L.push(`        <boolProp name="ThreadGroup.scheduler">true</boolProp>`);
+      L.push(`        <stringProp name="ThreadGroup.duration">\${DURATION}</stringProp>`);
+      L.push(`        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">`);
+      L.push(`          <intProp name="LoopController.loops">-1</intProp>`);
+      L.push(`          <boolProp name="LoopController.continue_forever">true</boolProp>`);
+      L.push(`        </elementProp>`);
+    }
+    L.push(`      </ThreadGroup>`);
   }
-  L.push(`      </ThreadGroup>`);
   L.push(`      <hashTree>`);
 
   // HTTP Request Defaults — every sampler sets its own domain/port/protocol explicitly
@@ -1286,7 +1494,7 @@ function buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preR
 }
 
 function generateJmx(userId, suite, collection, testDataFiles, cfg, endpoints, rules, preRunData, testType) {
-  return buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preRunData);
+  return buildJmxTemplate(suite, collection, testDataFiles, cfg, endpoints, preRunData, testType);
 }
 
 // Builds one k6 http.*() call + its check() + any correlation extractors, from the same
@@ -1411,26 +1619,79 @@ function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules,
   const vusers = suite.vusers || 50;
   const rampup = suite.rampup || 30;
   const duration = suite.duration || 300;
+  const spikeCount = testType === 'spike' ? resolveSpikeCount(suite, duration) : 0;
 
   // All executor configs reference the top-level constants (THREADS, DURATION, RAMP_UP)
   // which are read from __ENV so they can be overridden at run time:
   //   k6 run --env THREADS=100 --env DURATION=600 --env RAMP_UP=60 script.js
+
+  // Stress: a staircase up to the ceiling (THREADS) — STRESS_STEPS discrete steps, ending
+  // exactly at THREADS, then ramping back down. DURATION is the TOTAL staircase time (matching
+  // what's shown everywhere else in the UI as "Duration"), divided evenly across the steps —
+  // NOT each step's own full duration, which would silently multiply the configured test
+  // length by STRESS_STEPS (a real bug: a 300s-configured stress test actually ran 28 minutes
+  // before this fix, since every one of the 5 steps got its own full 300s hold on top of its
+  // own full ramp-up). RAMP_UP is clamped to each step's own share of that budget so a large
+  // Ramp-up value can't blow the total out either — if RAMP_UP alone exceeds a step's share,
+  // that step becomes a continuous ramp with no hold plateau, which is an expected, harmless
+  // degenerate case for a very short Duration or very large Ramp-up, not an error.
+  // Stage targets/timings stay k6 runtime expressions so `k6 run --env THREADS=... --env
+  // RAMP_UP=... --env DURATION=...` overrides still work exactly like every other executor.
+  const STRESS_STEPS = 5;
+  const stressStageLines = [];
+  for (let i = 1; i <= STRESS_STEPS; i++) {
+    const targetExpr = i === STRESS_STEPS ? 'THREADS' : `Math.round(THREADS * ${i} / ${STRESS_STEPS})`;
+    stressStageLines.push(`      { duration: STEP_RAMP + 's', target: ${targetExpr} }`);
+    stressStageLines.push(`      { duration: STEP_HOLD + 's', target: ${targetExpr} }`);
+  }
+  stressStageLines.push(`      { duration: '30s', target: 0 }`);
+
+  // ramping-vus, not ramping-arrival-rate: THREADS means "concurrent virtual users"
+  // everywhere else in this app (Load/Stress/Endurance) — arrival-rate mixed that up with
+  // "requests/sec" and used an unexplained `THREADS * 5` multiplier that also silently
+  // ignored DURATION entirely (the whole shape was a hardcoded 60s regardless of what was
+  // configured). Baseline -> spike -> baseline (repeated spikeCount times) -> final baseline,
+  // respecting the actual configured Duration. spikeCount is fixed at generation time (see
+  // computeSpikeCount) so a stage count computed here always matches what
+  // buildSpikeThreadGroupXml/patch_spike_thread_group build for the same duration.
+  let spikeStageLines;
+  if (spikeCount === 1) {
+    spikeStageLines = [
+      `      { duration: '5s', target: SPIKE_BASELINE }`,
+      `      { duration: Math.max(0, SPIKE_BEFORE_S - 5) + 's', target: SPIKE_BASELINE }`,
+      `      { duration: SPIKE_RAMP_S + 's', target: THREADS }`,
+      `      { duration: SPIKE_PEAK_S + 's', target: THREADS }`,
+      `      { duration: SPIKE_RAMP_S + 's', target: SPIKE_BASELINE }`,
+      `      { duration: SPIKE_AFTER_S + 's', target: SPIKE_BASELINE }`,
+      `      { duration: '30s', target: 0 }`,
+    ];
+  } else if (spikeCount > 1) {
+    spikeStageLines = [
+      `      { duration: '5s', target: SPIKE_BASELINE }`,
+      `      { duration: Math.max(0, SPIKE_GAP_S - 5) + 's', target: SPIKE_BASELINE }`,
+    ];
+    for (let i = 0; i < spikeCount; i++) {
+      spikeStageLines.push(`      { duration: SPIKE_RAMP_S + 's', target: THREADS }`);
+      spikeStageLines.push(`      { duration: SPIKE_PEAK_S + 's', target: THREADS }`);
+      spikeStageLines.push(`      { duration: SPIKE_RAMP_S + 's', target: SPIKE_BASELINE }`);
+      // A gap follows every spike, including the last — that final one IS the recovery
+      // window the whole test is meant to validate.
+      spikeStageLines.push(`      { duration: SPIKE_GAP_S + 's', target: SPIKE_BASELINE }`);
+    }
+    spikeStageLines.push(`      { duration: '30s', target: 0 }`);
+  }
+
   const executorConfigs = {
     load:      `scenarios: { load:      { executor: 'constant-vus',       vus: THREADS, duration: DURATION + 's' } }`,
-    stress:    `scenarios: { stress:    { executor: 'ramping-vus', startVUs: 0, stages: [
-      { duration: RAMP_UP + 's', target: Math.round(THREADS / 2) },
-      { duration: DURATION + 's', target: THREADS },
-      { duration: RAMP_UP + 's', target: THREADS * 2 },
-      { duration: DURATION + 's', target: THREADS * 2 },
-      { duration: '30s', target: 0 }
-    ] } }`,
-    spike:     `scenarios: { spike:     { executor: 'ramping-arrival-rate', startRate: 1, timeUnit: '1s', preAllocatedVUs: THREADS * 2, stages: [
-      { duration: '10s', target: 1 },
-      { duration: '10s', target: THREADS * 5 },
-      { duration: '30s', target: THREADS * 5 },
-      { duration: '10s', target: 1 }
-    ] } }`,
-    endurance: `scenarios: { endurance: { executor: 'constant-arrival-rate', rate: THREADS, timeUnit: '1s', duration: DURATION + 's', preAllocatedVUs: THREADS } }`,
+    stress:    `scenarios: { stress:    { executor: 'ramping-vus', startVUs: 0, stages: [\n${stressStageLines.join(',\n')}\n    ] } }`,
+    spike:     spikeStageLines ? `scenarios: { spike:     { executor: 'ramping-vus', startVUs: 0, stages: [\n${spikeStageLines.join(',\n')}\n    ] } }` : undefined,
+    // constant-vus, not constant-arrival-rate: THREADS means "concurrent virtual users"
+    // everywhere else in this app — arrival-rate mixed that up with "requests/sec", the same
+    // bug spike's old ramping-arrival-rate executor had. Endurance's load SHAPE is identical
+    // to Load Test (ramp to THREADS, hold for DURATION) — the only thing that makes it an
+    // endurance test is running it for a long DURATION and watching for degradation over
+    // time, which is an analysis-layer concern (enduranceAnalysis.js), not a different script.
+    endurance: `scenarios: { endurance: { executor: 'constant-vus', vus: THREADS, duration: DURATION + 's' } }`,
   };
 
   // k6-native thresholds embedded in the script itself — a secondary, informational layer
@@ -1546,6 +1807,41 @@ function buildK6Template(suite, collection, testDataFile, cfg, endpoints, rules,
   lines.push(`const THREADS  = parseInt(__ENV.THREADS  || '${vusers}');`);
   lines.push(`const RAMP_UP  = parseInt(__ENV.RAMP_UP  || '${rampup}');`);
   lines.push(`const DURATION = parseInt(__ENV.DURATION || '${duration}');`);
+  if (testType === 'stress') {
+    // Each step's own ramp+hold budget — DURATION divided across all steps, so the total
+    // staircase time (before the final 30s ramp-down) equals DURATION, not DURATION *
+    // STRESS_STEPS. STEP_RAMP is a small, fixed fraction of that budget (at most 20%, at
+    // least 5s), NOT derived from RAMP_UP at all — RAMP_UP means "one overall ramp to reach
+    // full concurrency", a concept that doesn't apply to a staircase (the UI blocks/hides
+    // Ramp-up for stress tests entirely; see TestSuites.jsx/Runner.jsx). Using RAMP_UP as even
+    // a ceiling here previously meant a value "similar in size to DURATION/STRESS_STEPS" (the
+    // common case, e.g. the 30s default against a 100s/5-step test) consumed the step's entire
+    // budget as ramp with zero hold — one continuous ramp, no real plateau to analyze.
+    lines.push(`const STEP_S    = Math.round(DURATION / ${STRESS_STEPS});`);
+    lines.push(`const STEP_RAMP = Math.max(5, Math.round(STEP_S * 0.2));`);
+    lines.push(`const STEP_HOLD = Math.max(0, STEP_S - STEP_RAMP);`);
+  }
+  if (testType === 'spike') {
+    // Baseline -> fast jump to full THREADS -> short peak hold -> fast drop back to baseline,
+    // repeated spikeCount times -> long baseline hold (recovery window). NOT derived from
+    // RAMP_UP, same reasoning as stress: a spike is fast by definition, so Ramp-up is
+    // blocked/hidden in the UI for spike tests too. spikeCount itself is fixed at generation
+    // time (see computeSpikeCount) — only the proportions below are runtime expressions, so a
+    // CI-trigger-time Duration override still rescales correctly without changing the number
+    // of stages. Must stay in lockstep with buildSpikeThreadGroupXml (JMeter) and the CI
+    // patcher's patch_spike_thread_group — all three implement the identical shape.
+    lines.push(`const SPIKE_BASELINE = Math.max(1, Math.round(THREADS * 0.10));`);
+    if (spikeCount === 1) {
+      lines.push(`const SPIKE_BEFORE_S = Math.round(DURATION * 0.20);`);
+      lines.push(`const SPIKE_RAMP_S   = Math.max(5, Math.round(DURATION * 0.03));`);
+      lines.push(`const SPIKE_PEAK_S   = Math.round(DURATION * 0.15);`);
+      lines.push(`const SPIKE_AFTER_S  = Math.max(0, DURATION - SPIKE_BEFORE_S - SPIKE_RAMP_S - SPIKE_PEAK_S - SPIKE_RAMP_S);`);
+    } else {
+      lines.push(`const SPIKE_RAMP_S = Math.max(5, Math.round(DURATION * 0.03));`);
+      lines.push(`const SPIKE_PEAK_S = Math.max(5, Math.round(DURATION * 0.08));`);
+      lines.push(`const SPIKE_GAP_S  = Math.max(0, Math.round((DURATION - ${spikeCount} * (2 * SPIKE_RAMP_S + SPIKE_PEAK_S)) / ${spikeCount + 1}));`);
+    }
+  }
   lines.push(`const PROTOCOL = __ENV.PROTOCOL || '${resolvedProtocol || 'https'}';`);
   lines.push(`const URL      = __ENV.URL      || '${resolvedServer || ''}';`);
   lines.push(`const PORT     = __ENV.PORT     || '${resolvedPort || '443'}';`);
@@ -1573,3 +1869,5 @@ module.exports = router;
 module.exports.generateScriptForSuite = generateScriptForSuite;
 module.exports.buildJmxTemplate = buildJmxTemplate;
 module.exports.buildK6Template = buildK6Template;
+module.exports.computeSpikeCount = computeSpikeCount;
+module.exports.resolveSpikeCount = resolveSpikeCount;

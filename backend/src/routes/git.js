@@ -2212,7 +2212,12 @@ router.post('/branch', async (req, res) => {
       const existsOnRemote = !!(remoteInfo.refs?.heads && branchName.split('/').reduce((o, seg) => o?.[seg], remoteInfo.refs.heads));
 
       if (branchSummary.all.includes(branchName)) {
-        await gitEngine.checkout(session, branchName);
+        // checkoutSafe, not checkout: this shared session can legitimately be parked on a
+        // different branch by another request (a base-branch CI-config commit, etc.) — a
+        // plain checkout then throws CheckoutConflictError over whatever got left behind,
+        // surfacing here as a confusing "Failed to create user branch" even though the
+        // branch already exists and there's nothing to create.
+        await gitEngine.checkoutSafe(session, branchName);
         if (!existsOnRemote) {
           await gitEngine.push(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
           await gitEngine.persistSession(session, gitRoot, orgSlug);

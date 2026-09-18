@@ -3,6 +3,16 @@ import api from '../api';
 import { useToast } from '../hooks/useToast';
 import CustomSelect from '../components/CustomSelect';
 
+// A suite's jmx_path/js_path should be mutually exclusive (the backend now clears the other
+// field on every generate), but existing suites generated before that fix — or any suite whose
+// engine was switched — can still carry a stale path from the OTHER engine. Resolving by
+// `jmx_path || js_path` unconditionally picks the JMeter path whenever both are present,
+// which is exactly what sent a .jmx file into a k6 CI run ("could not load JS test... Unexpected
+// token <"). Always prefer the path matching the suite's actual engine.
+function scriptPathForSuite(s) {
+  return s.engine === 'k6' ? (s.js_path || s.jmx_path || '') : (s.jmx_path || s.js_path || '');
+}
+
 export default function Runner({ projects, activeProject, activeCollection, activeEnv, onNav, suitesVersion }) {
   const { toast } = useToast();
   const [suites, setSuites] = useState([]);           // all generated suites for project
@@ -402,6 +412,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciScriptName,   setCiScriptName]   = useState('');
   const [ciScriptPath,   setCiScriptPath]   = useState('');
   const [ciSuiteEngine,  setCiSuiteEngine]  = useState('jmeter');
+  const [ciSuiteTestType, setCiSuiteTestType] = useState('load');
   const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300, iter_mode: 'duration' });
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
@@ -517,9 +528,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
         // Pass only the active param; set the other to -1 so JMeter ignores it
         jmeter_duration: ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : -1,
         jmeter_loops:    ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : -1,
-        // k6 uses the same VUsers/Duration/Loops fields the UI already collects — just
-        // routed under k6's own variable names so the generated pipeline picks them up.
+        // k6 uses the same VUsers/Ramp-up/Duration/Loops fields the UI already collects —
+        // just routed under k6's own variable names so the generated pipeline picks them up.
         k6_vus:        ciVars.jmeter_users,
+        k6_rampup:     ciVars.jmeter_rampup,
         k6_duration:   ciVars.iter_mode === 'duration' ? ciVars.jmeter_duration : 0,
         k6_iterations: ciVars.iter_mode === 'loops'    ? ciVars.jmeter_loops    : 0,
         auto_heal: ciAutoHeal ? 1 : 0,
@@ -842,11 +854,11 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                         value={ciScriptName}
                         onChange={e => {
                           const selected = suites.find(s => {
-                            const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                            const file = (scriptPathForSuite(s)).replace(/\\/g, '/');
                             return file.split('/').pop() === e.target.value;
                           });
                           if (selected) {
-                            const file = (selected.jmx_path || selected.js_path || '').replace(/\\/g, '/');
+                            const file = (scriptPathForSuite(selected)).replace(/\\/g, '/');
                             // Content inside the repo always starts with <ProjectName>/<Collection>/<Env>/...,
                             // repeating the project name a second time after the workspace-bucket segment(s)
                             // that precede it on local disk (git-workspaces/<Project>/<actor>/... normally, or
@@ -864,6 +876,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                             setCiScriptName(fileName);
                             setCiScriptPath(relPath);
                             setCiSuiteEngine(selected.engine || 'jmeter');
+                            setCiSuiteTestType(selected.test_type || 'load');
                             // Pre-fill load parameters from the saved test suite configuration
                             setCiVars(v => ({
                               ...v,
@@ -878,7 +891,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                       >
                         <option value="">— Select a test plan —</option>
                         {suites.filter(s => s.jmx_path || s.js_path).map(s => {
-                          const file = (s.jmx_path || s.js_path || '').replace(/\\/g, '/');
+                          const file = (scriptPathForSuite(s)).replace(/\\/g, '/');
                           const fileName = file.split('/').pop();
                           return <option key={s.id} value={fileName}>{s.name}</option>;
                         })}
@@ -901,7 +914,26 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   </div>
                   <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label" style={{ fontSize: 11 }}>Ramp-up (secs)</label>
-                    <input type="number" value={ciVars.jmeter_rampup} min={0} onChange={e => setCiVars(v => ({ ...v, jmeter_rampup: e.target.value }))} placeholder="30" />
+                    <input
+                      type="number"
+                      value={ciVars.jmeter_rampup}
+                      min={0}
+                      onChange={e => setCiVars(v => ({ ...v, jmeter_rampup: e.target.value }))}
+                      placeholder="30"
+                      disabled={ciSuiteTestType === 'stress' || ciSuiteTestType === 'spike'}
+                    />
+                    {ciSuiteTestType === 'stress' && (
+                      <div style={{ fontSize: 10, color: '#64748b', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <i className="ti ti-sparkles" style={{ fontSize: 10, color: '#4338ca' }} />
+                        Auto-calculated from Users &amp; Duration
+                      </div>
+                    )}
+                    {ciSuiteTestType === 'spike' && (
+                      <div style={{ fontSize: 10, color: '#64748b', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <i className="ti ti-sparkles" style={{ fontSize: 10, color: '#4338ca' }} />
+                        Auto-calculated — sudden burst by design
+                      </div>
+                    )}
                   </div>
                   <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label" style={{ fontSize: 11 }}>Iteration Mode</label>
@@ -914,6 +946,12 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                     <div className="form-group" style={{ margin: 0 }}>
                       <label className="form-label" style={{ fontSize: 11 }}>Duration (secs)</label>
                       <input type="number" value={ciVars.jmeter_duration} min={1} onChange={e => setCiVars(v => ({ ...v, jmeter_duration: e.target.value }))} placeholder="300" />
+                      {ciSuiteTestType === 'endurance' && Number(ciVars.jmeter_duration) < 6000 && (
+                        <div style={{ fontSize: 10, color: '#b45309', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <i className="ti ti-alert-triangle" style={{ fontSize: 10 }} />
+                          Below 1h40m (6000s) — behaves like a Load Test, no degradation-over-time signal
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="form-group" style={{ margin: 0 }}>

@@ -109,23 +109,128 @@ else:
     else:
         print("  No absolute paths to fix")
 
-content = sp(content, "ThreadGroup.num_threads", users)
-content = sp(content, "ThreadGroup.ramp_time", rampup)
+def patch_ultimate_thread_group(xml, vusers, duration):
+    # Mirrors buildUltimateThreadGroupXml() in testSuites.js EXACTLY (same 5-step
+    # staircase formula) -- a stress test's schedule is baked as literal row numbers at
+    # script-generation time, not as \${__P(...)} properties like the flat ThreadGroup,
+    # so overriding VUsers/Duration at CI-trigger time means recomputing every row here
+    # rather than a simple property-value substitution. No rampup parameter: the step
+    # transition is derived purely from vusers/duration, never a user-supplied ramp-up --
+    # see buildUltimateThreadGroupXml's matching comment for why (Ramp-up is blocked/hidden
+    # in the UI for stress tests entirely).
+    steps = 5
+    shutdown_s = 30
+    step_budget = duration / steps
+    step_ramp = max(5, round(step_budget * 0.2))
+    t_end = steps * step_budget
 
-if use_duration:
-    print("  Mode: Duration " + duration + "s")
-    content = sp(content, "ThreadGroup.scheduler", "true")
-    content = sp(content, "ThreadGroup.duration", duration)
-    content = sp(content, "LoopController.loops", "-1")
-    if 'name="ThreadGroup.duration"' not in content:
-        content = content.replace("</ThreadGroup>",
-            '<stringProp name="ThreadGroup.duration">' + duration + '</stringProp>\\n'
-            '<boolProp name="ThreadGroup.scheduler">true</boolProp>\\n</ThreadGroup>')
-        print("  INJECTED duration+scheduler")
+    rows = []
+    cumulative = 0
+    for i in range(1, steps + 1):
+        target = vusers if i == steps else round(vusers * i / steps)
+        delay = round((i - 1) * step_budget)
+        hold = max(0, round(t_end - delay - step_ramp))
+        rows.append((target - cumulative, delay, round(step_ramp), hold, shutdown_s))
+        cumulative = target
+
+    row_re = re.compile(
+        r'(<collectionProp name="\\d+">\\s*<stringProp name="0">)\\d+(</stringProp>\\s*'
+        r'<stringProp name="1">)\\d+(</stringProp>\\s*<stringProp name="2">)\\d+(</stringProp>\\s*'
+        r'<stringProp name="3">)\\d+(</stringProp>\\s*<stringProp name="4">)\\d+(</stringProp>\\s*</collectionProp>)'
+    )
+    row_iter = iter(rows)
+    def repl(m):
+        r = next(row_iter)
+        return (m.group(1) + str(r[0]) + m.group(2) + str(r[1]) + m.group(3) + str(r[2])
+                + m.group(4) + str(r[3]) + m.group(5) + str(r[4]) + m.group(6))
+    new_xml, n = row_re.subn(repl, xml)
+    print("  RESCALED " + str(n) + " UltimateThreadGroup row(s) -> VUsers=" + str(vusers) + " Duration=" + str(duration))
+    return new_xml
+
+def patch_spike_thread_group(xml, vusers, duration):
+    # Mirrors buildSpikeThreadGroupXml() in testSuites.js EXACTLY (same baseline/ramp/peak/
+    # ramp/recovery phase split, including the multi-spike formula for 2-3 cycles) -- same
+    # reasoning as patch_ultimate_thread_group above: the schedule is baked as literal
+    # numbers, not \${__P(...)} properties, and there's no rampup parameter since Ramp-up is
+    # blocked/hidden in the UI for spike tests too.
+    #
+    # spike_count is NOT recomputed from the override duration -- it's read from however many
+    # rows already exist in the file (baked in at generation time from the suite's SAVED
+    # duration, same as STRESS_STEPS always being 5 regardless of override). Only the TIMING
+    # within that fixed row count rescales here; the row count itself never changes on a
+    # trigger-time override, exactly like stress.
+    row_re = re.compile(
+        r'(<collectionProp name="\\d+">\\s*<stringProp name="0">)\\d+(</stringProp>\\s*'
+        r'<stringProp name="1">)\\d+(</stringProp>\\s*<stringProp name="2">)\\d+(</stringProp>\\s*'
+        r'<stringProp name="3">)\\d+(</stringProp>\\s*<stringProp name="4">)\\d+(</stringProp>\\s*</collectionProp>)'
+    )
+    existing_row_count = len(row_re.findall(xml))
+    spike_count = max(1, existing_row_count - 1)
+
+    baseline_users = max(1, round(vusers * 0.10))
+    spike_add = max(0, vusers - baseline_users)
+    baseline_startup = 5
+    baseline_hold = max(0, duration - baseline_startup)
+    shutdown_s = 30
+
+    rows = [(baseline_users, 0, baseline_startup, baseline_hold, shutdown_s)]
+
+    if spike_count == 1:
+        before_s = round(duration * 0.20)
+        ramp_s = max(5, round(duration * 0.03))
+        peak_s = round(duration * 0.15)
+        rows.append((spike_add, before_s, ramp_s, peak_s, ramp_s))
+    else:
+        ramp_s = max(5, round(duration * 0.03))
+        peak_s = max(5, round(duration * 0.08))
+        non_baseline_per_cycle = 2 * ramp_s + peak_s
+        total_baseline = max(0, duration - spike_count * non_baseline_per_cycle)
+        gap_s = round(total_baseline / (spike_count + 1))
+        t = 0
+        for _ in range(spike_count):
+            t += gap_s
+            rows.append((spike_add, t, ramp_s, peak_s, ramp_s))
+            t += ramp_s + peak_s + ramp_s
+
+    row_iter = iter(rows)
+    def repl(m):
+        r = next(row_iter)
+        return (m.group(1) + str(r[0]) + m.group(2) + str(r[1]) + m.group(3) + str(r[2])
+                + m.group(4) + str(r[3]) + m.group(5) + str(r[4]) + m.group(6))
+    new_xml, n = row_re.subn(repl, xml)
+    print("  RESCALED " + str(n) + " spike UltimateThreadGroup row(s) (" + str(spike_count) + " spike(s)) -> VUsers=" + str(vusers) + " Duration=" + str(duration))
+    return new_xml
+
+if "UltimateThreadGroup" in content:
+    # Stress/spike test plan -- the staircase/spike row values, not ThreadGroup.num_threads/
+    # ramp_time/duration (those properties don't exist on this element), carry the load
+    # profile. Distinguished by testname -- both use the same plugin element, just a
+    # different row count/shape.
+    if use_duration:
+        if 'testname="Spike Thread Group"' in content:
+            content = patch_spike_thread_group(content, int(users), int(duration))
+        else:
+            content = patch_ultimate_thread_group(content, int(users), int(duration))
+    else:
+        print("  WARN: stress/spike test (UltimateThreadGroup) needs Duration mode - loops override skipped")
 else:
-    print("  Mode: Loops " + loops)
-    content = sp(content, "ThreadGroup.scheduler", "false")
-    content = sp(content, "LoopController.loops", loops)
+    content = sp(content, "ThreadGroup.num_threads", users)
+    content = sp(content, "ThreadGroup.ramp_time", rampup)
+
+    if use_duration:
+        print("  Mode: Duration " + duration + "s")
+        content = sp(content, "ThreadGroup.scheduler", "true")
+        content = sp(content, "ThreadGroup.duration", duration)
+        content = sp(content, "LoopController.loops", "-1")
+        if 'name="ThreadGroup.duration"' not in content:
+            content = content.replace("</ThreadGroup>",
+                '<stringProp name="ThreadGroup.duration">' + duration + '</stringProp>\\n'
+                '<boolProp name="ThreadGroup.scheduler">true</boolProp>\\n</ThreadGroup>')
+            print("  INJECTED duration+scheduler")
+    else:
+        print("  Mode: Loops " + loops)
+        content = sp(content, "ThreadGroup.scheduler", "false")
+        content = sp(content, "LoopController.loops", loops)
 
 with open(script, "w") as f:
     f.write(content)
@@ -140,6 +245,237 @@ print("Patch complete")
 // '.../.PerfStudio/patch_jmx.py'" failures. Base64 avoids all YAML-indentation /
 // shell-quoting hazards of inlining raw Python source into a `run:` block.
 const PATCHER_PY_B64 = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8').toString('base64');
+
+// Builds the .github/workflows/*.yml content — a single source of truth shared by
+// /generate-yaml and /trigger's per-run auto-regen (mirroring how bitbucket-pipelines.yml
+// is already always regenerated fresh on every trigger, not just written once). Keeping this
+// as one function is exactly what the patch_jmx.py duplication fix above was about: a
+// hand-copied second copy of this ~200-line template is precisely the kind of place a future
+// fix lands on one copy and not the other.
+function buildGithubWorkflowYaml({ dockerImage, k6Image, defaultScript, userBranch, scriptList }) {
+  return `# ============================================================
+# PerfStudio — GitHub Actions Performance Test Pipeline
+# Generated by PerfStudio on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
+# ============================================================
+
+name: PerfStudio Performance Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: 'Test engine (jmeter or k6)'
+        required: false
+        default: 'jmeter'
+      script_name:
+        description: 'Script filename — JMX or k6 JS (relative to repo root)'
+        required: true
+        default: '${defaultScript}'
+      script_path:
+        description: 'Full relative path to script (overrides script_name if set)'
+        required: false
+        default: ''
+      jmeter_users:
+        description: 'Number of virtual users'
+        required: true
+        default: '10'
+      jmeter_rampup:
+        description: 'Ramp-up period in seconds'
+        required: true
+        default: '30'
+      jmeter_loops:
+        description: 'Number of iterations (used when not duration mode)'
+        required: true
+        default: '1'
+      jmeter_duration:
+        description: 'Test duration in seconds'
+        required: true
+        default: '300'
+      k6_vus:
+        description: 'k6: number of virtual users'
+        required: false
+        default: '10'
+      k6_rampup:
+        description: 'k6: ramp-up period in seconds (stress/spike/endurance profiles)'
+        required: false
+        default: '30'
+      k6_duration:
+        description: 'k6: test duration in seconds (used when k6_iterations is 0)'
+        required: false
+        default: '300'
+      k6_iterations:
+        description: 'k6: total iterations (0 = use k6_duration instead)'
+        required: false
+        default: '0'
+      branch:
+        description: 'Branch containing the test scripts (user workspace branch)'
+        required: false
+        default: '${userBranch}'
+
+# Available test scripts:
+${scriptList || '      # (no generated scripts yet)'}
+
+jobs:
+  jmeter:
+    name: PerfStudio \${{ inputs.engine }} Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: \${{ inputs.branch || github.ref_name }}
+
+      - name: Patch JMX parameters
+        if: \${{ inputs.engine != 'k6' }}
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          echo "Patching \$SCRIPT  users=\${{ inputs.jmeter_users }} rampup=\${{ inputs.jmeter_rampup }} duration=\${{ inputs.jmeter_duration }}"
+          mkdir -p .PerfStudio
+          echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
+          python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\${{ inputs.jmeter_users }}" "\${{ inputs.jmeter_rampup }}" "\${{ inputs.jmeter_loops }}" "\${{ inputs.jmeter_duration }}"
+          echo "=== ThreadGroup after patch ==="
+          grep -A 30 "ThreadGroup" "\$SCRIPT" | head -50
+          echo "=== HTTP Samplers ==="
+          grep -c "HTTPSamplerProxy\|HTTPSampler" "\$SCRIPT" || echo "0 samplers found"
+          echo "=== Enabled elements ==="
+          grep "enabled=" "\$SCRIPT" | head -10
+
+      - name: Cache CI Docker image
+        if: \${{ inputs.engine != 'k6' }}
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache
+          key: docker-perf-\${{ runner.os }}
+          restore-keys: docker-perf-
+
+      - name: Load cached image or pull
+        if: \${{ inputs.engine != 'k6' }}
+        run: |
+          if [ -f /tmp/docker-cache/perf-image.tar ]; then
+            echo "Loading cached image..."
+            docker load -i /tmp/docker-cache/perf-image.tar
+          else
+            echo "Pulling ${dockerImage} (first run on this runner)..."
+            docker pull ${dockerImage}
+            mkdir -p /tmp/docker-cache
+            docker save ${dockerImage} -o /tmp/docker-cache/perf-image.tar
+          fi
+
+      - name: Verify patch and CSV files
+        if: \${{ inputs.engine != 'k6' }}
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          echo "=== ThreadGroup after patch ==="
+          grep -E "num_threads|ramp_time|scheduler|duration|continue_forever|LoopController.loops" "\$SCRIPT" || echo "WARN: no matches found"
+          echo "=== CSV paths in JMX ==="
+          grep -i "CSV_PATH\\|Argument.value.*testData\\|filename.*CSV\\|CSVDataSet" "\$SCRIPT" | head -10
+          echo "=== CSV files in workspace ==="
+          TESTDATA="\$(grep -o 'Argument.value>[^<]*testData' \$SCRIPT | head -1 | sed 's/Argument.value>//')"
+          [ -n "\$TESTDATA" ] && ls -la "\$TESTDATA/" 2>/dev/null || echo "testData dir: \$TESTDATA (checking /workspace prefix)"
+          ls -la "/workspace/projects/Demo1/Demo1_API_Collection/QA/testData/" 2>/dev/null || echo "Path not found"
+
+      - name: Run JMeter
+        if: \${{ inputs.engine != 'k6' }}
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          mkdir -p reports
+          docker run --rm \\
+            -v "\${{ github.workspace }}":/workspace \\
+            -v "\${{ github.workspace }}/reports":/output \\
+            ${dockerImage} \\
+            jmeter \\
+            -n -t "/workspace/\$SCRIPT" \\
+            -j /output/jmeter.log \\
+            -l /output/results.jtl \\
+            -e -o /output/html || true
+          echo "=== JMeter Log (last 50 lines) ==="
+          tail -50 reports/jmeter.log 2>/dev/null || echo "No jmeter.log found"
+
+      - name: Run k6
+        if: \${{ inputs.engine == 'k6' }}
+        run: |
+          SCRIPT="\${{ inputs.script_path }}"
+          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
+          mkdir -p reports
+          # grafana/k6 image runs as a non-root user — the bind-mounted dir must be
+          # world-writable or k6 silently fails to write /output/results.json.
+          chmod 777 reports
+          # --env, not --vus/--duration: k6 discards a script's own options.scenarios
+          # ENTIRELY whenever CLI-level --vus/--duration are also passed ("cli level
+          # configuration overrode scenarios configuration entirely") — every generated k6
+          # script (load/spike/stress/endurance) defines its load profile as a scenario, so
+          # those flags silently flattened every one of them into one constant-VUs run, no
+          # ramp, no steps. The script already reads THREADS/RAMP_UP/DURATION from __ENV
+          # (see testSuites.js's buildK6Template), so passing them as --env lets the script's
+          # own scenario definition run exactly as generated, uncontested — the k6-side
+          # equivalent of the JMeter stress path's UltimateThreadGroup staircase.
+          K6_MODE_ARGS="--env THREADS=\${{ inputs.k6_vus }} --env RAMP_UP=\${{ inputs.k6_rampup }} --env DURATION=\${{ inputs.k6_duration }}"
+          if [ -n "\${{ inputs.k6_iterations }}" ] && [ "\${{ inputs.k6_iterations }}" != "0" ]; then
+            # No iteration-count executor exists in any generated k6 script yet (every one is
+            # duration-based) — --vus/--iterations necessarily overrides scenarios here, same
+            # pre-existing gap as before this fix; only the duration-mode path above is fixed.
+            K6_MODE_ARGS="--vus \${{ inputs.k6_vus }} --iterations \${{ inputs.k6_iterations }}"
+          fi
+          set +e
+          docker run --rm \\
+            -v "\${{ github.workspace }}":/workspace \\
+            -v "\${{ github.workspace }}/reports":/output \\
+            ${k6Image} \\
+            run "/workspace/\$SCRIPT" \\
+            --out json=/output/results.json \\
+            \$K6_MODE_ARGS
+          echo "k6 docker exit code: \$?"
+          set -e
+          echo "=== reports/ contents ==="
+          ls -la reports/ 2>/dev/null || echo "reports/ directory missing"
+
+      - name: Validate results (JMeter)
+        if: \${{ inputs.engine != 'k6' }}
+        run: |
+          JTL="reports/results.jtl"
+          [ ! -f "\$JTL" ] && echo "ERROR: results.jtl not found" && exit 1
+          TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
+          echo "Total requests: \$TOTAL"
+          [ "\$TOTAL" -le 0 ] && echo "ERROR: 0 requests executed - check thread group config" && exit 1
+          # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
+          # results sync to notice. Header-based column lookup since JMeter's CSV field
+          # order isn't guaranteed fixed.
+          SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
+          if [ -n "\$SUCCESS_COL" ]; then
+            FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
+            echo "Failed requests: \$FAILED / \$TOTAL"
+            if [ "\$FAILED" -eq "\$TOTAL" ]; then
+              echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
+              exit 1
+            fi
+          else
+            echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
+          fi
+          echo "Validation passed: \$TOTAL requests"
+
+      - name: Validate results (k6)
+        if: \${{ inputs.engine == 'k6' }}
+        run: |
+          RESULTS="reports/results.json"
+          if [ ! -s "\$RESULTS" ]; then
+            echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
+            exit 1
+          fi
+          echo "Validation passed: results.json present"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perfstudio-report-\${{ github.run_number }}
+          path: reports/
+          retention-days: 7
+`;
+}
 
 // Mirrors git.js's safeCheckout/parseCheckoutConflictPaths (duplicated rather than
 // shared across route files, consistent with this codebase's existing convention —
@@ -874,6 +1210,7 @@ variables:
   JMETER_LOOPS: "1"
   JMETER_DURATION: "300"
   K6_VUS: "10"
+  K6_RAMPUP: "30"
   K6_DURATION: "300"
   K6_ITERATIONS: "0"${gitlabSshVars}
 
@@ -893,9 +1230,13 @@ run_jmeter:
     - mkdir -p reports
     - |
       if [ "\$ENGINE" = "k6" ]; then
-        K6_MODE_ARGS="--duration \${K6_DURATION}s"
+        # --env, not --vus/--duration: k6 discards a script's own options.scenarios entirely
+        # whenever CLI-level --vus/--duration are also passed, flattening every generated
+        # profile (load/spike/stress/endurance) into one constant-VUs run — see the GitHub
+        # Actions workflow's matching k6 step for the full explanation.
+        K6_MODE_ARGS="--env THREADS=\${K6_VUS} --env RAMP_UP=\${K6_RAMPUP} --env DURATION=\${K6_DURATION}"
         if [ -n "\$K6_ITERATIONS" ] && [ "\$K6_ITERATIONS" != "0" ]; then
-          K6_MODE_ARGS="--iterations \$K6_ITERATIONS"
+          K6_MODE_ARGS="--vus \${K6_VUS} --iterations \$K6_ITERATIONS"
         fi
         docker run --rm \\
           -v "\$CI_PROJECT_DIR":/workspace \\
@@ -903,7 +1244,7 @@ run_jmeter:
           ${k6Image} \\
           run "/workspace/\${SCRIPT_PATH:-\${SCRIPT_NAME}}" \\
           --out json=/output/results.json \\
-          --vus "\${K6_VUS}" \$K6_MODE_ARGS
+          \$K6_MODE_ARGS
       else
         docker run --rm \\
           -v "\$CI_PROJECT_DIR":/workspace \\
@@ -994,272 +1335,14 @@ run_jmeter:
       return `      # ${s.name}: ${relPath}`;
     }).join('\n');
 
-    const githubYaml = `# ============================================================
-# PerfStudio — GitHub Actions Performance Test Pipeline
-# Generated by PerfStudio on ${new Date().toISOString().slice(0, 19).replace('T', ' ')}
-# ============================================================
+    const githubYaml = buildGithubWorkflowYaml({ dockerImage, k6Image, defaultScript, userBranch, scriptList });
 
-name: PerfStudio Performance Test
-
-on:
-  workflow_dispatch:
-    inputs:
-      engine:
-        description: 'Test engine (jmeter or k6)'
-        required: false
-        default: 'jmeter'
-      script_name:
-        description: 'Script filename — JMX or k6 JS (relative to repo root)'
-        required: true
-        default: '${defaultScript}'
-      script_path:
-        description: 'Full relative path to script (overrides script_name if set)'
-        required: false
-        default: ''
-      jmeter_users:
-        description: 'Number of virtual users'
-        required: true
-        default: '10'
-      jmeter_rampup:
-        description: 'Ramp-up period in seconds'
-        required: true
-        default: '30'
-      jmeter_loops:
-        description: 'Number of iterations (used when not duration mode)'
-        required: true
-        default: '1'
-      jmeter_duration:
-        description: 'Test duration in seconds'
-        required: true
-        default: '300'
-      k6_vus:
-        description: 'k6: number of virtual users'
-        required: false
-        default: '10'
-      k6_duration:
-        description: 'k6: test duration in seconds (used when k6_iterations is 0)'
-        required: false
-        default: '300'
-      k6_iterations:
-        description: 'k6: total iterations (0 = use k6_duration instead)'
-        required: false
-        default: '0'
-      branch:
-        description: 'Branch containing the test scripts (user workspace branch)'
-        required: false
-        default: '${userBranch}'
-
-# Available test scripts:
-${scriptList || '      # (no generated scripts yet)'}
-
-jobs:
-  jmeter:
-    name: PerfStudio \${{ inputs.engine }} Test
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: \${{ inputs.branch || github.ref_name }}
-
-      - name: Patch JMX parameters
-        if: \${{ inputs.engine != 'k6' }}
-        run: |
-          SCRIPT="\${{ inputs.script_path }}"
-          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
-          echo "Patching \$SCRIPT  users=\${{ inputs.jmeter_users }} rampup=\${{ inputs.jmeter_rampup }} duration=\${{ inputs.jmeter_duration }}"
-          mkdir -p .PerfStudio
-          echo '${PATCHER_PY_B64}' | base64 -d > .PerfStudio/patch_jmx.py
-          python3 .PerfStudio/patch_jmx.py "\$SCRIPT" "\${{ inputs.jmeter_users }}" "\${{ inputs.jmeter_rampup }}" "\${{ inputs.jmeter_loops }}" "\${{ inputs.jmeter_duration }}"
-          echo "=== ThreadGroup after patch ==="
-          grep -A 30 "ThreadGroup" "\$SCRIPT" | head -50
-          echo "=== HTTP Samplers ==="
-          grep -c "HTTPSamplerProxy\|HTTPSampler" "\$SCRIPT" || echo "0 samplers found"
-          echo "=== Enabled elements ==="
-          grep "enabled=" "\$SCRIPT" | head -10
-
-      - name: Cache CI Docker image
-        if: \${{ inputs.engine != 'k6' }}
-        uses: actions/cache@v4
-        with:
-          path: /tmp/docker-cache
-          key: docker-perf-\${{ runner.os }}
-          restore-keys: docker-perf-
-
-      - name: Load cached image or pull
-        if: \${{ inputs.engine != 'k6' }}
-        run: |
-          if [ -f /tmp/docker-cache/perf-image.tar ]; then
-            echo "Loading cached image..."
-            docker load -i /tmp/docker-cache/perf-image.tar
-          else
-            echo "Pulling ${dockerImage} (first run on this runner)..."
-            docker pull ${dockerImage}
-            mkdir -p /tmp/docker-cache
-            docker save ${dockerImage} -o /tmp/docker-cache/perf-image.tar
-          fi
-
-      - name: Verify patch and CSV files
-        if: \${{ inputs.engine != 'k6' }}
-        run: |
-          SCRIPT="\${{ inputs.script_path }}"
-          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
-          echo "=== ThreadGroup after patch ==="
-          grep -E "num_threads|ramp_time|scheduler|duration|continue_forever|LoopController.loops" "\$SCRIPT" || echo "WARN: no matches found"
-          echo "=== CSV paths in JMX ==="
-          grep -i "CSV_PATH\\|Argument.value.*testData\\|filename.*CSV\\|CSVDataSet" "\$SCRIPT" | head -10
-          echo "=== CSV files in workspace ==="
-          TESTDATA="\$(grep -o 'Argument.value>[^<]*testData' \$SCRIPT | head -1 | sed 's/Argument.value>//')"
-          [ -n "\$TESTDATA" ] && ls -la "\$TESTDATA/" 2>/dev/null || echo "testData dir: \$TESTDATA (checking /workspace prefix)"
-          ls -la "/workspace/projects/Demo1/Demo1_API_Collection/QA/testData/" 2>/dev/null || echo "Path not found"
-
-      - name: Run JMeter
-        if: \${{ inputs.engine != 'k6' }}
-        run: |
-          SCRIPT="\${{ inputs.script_path }}"
-          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
-          mkdir -p reports
-          docker run --rm \\
-            -v "\${{ github.workspace }}":/workspace \\
-            -v "\${{ github.workspace }}/reports":/output \\
-            ${dockerImage} \\
-            jmeter \\
-            -n -t "/workspace/\$SCRIPT" \\
-            -j /output/jmeter.log \\
-            -l /output/results.jtl \\
-            -e -o /output/html || true
-          echo "=== JMeter Log (last 50 lines) ==="
-          tail -50 reports/jmeter.log 2>/dev/null || echo "No jmeter.log found"
-
-      - name: Run k6
-        if: \${{ inputs.engine == 'k6' }}
-        run: |
-          SCRIPT="\${{ inputs.script_path }}"
-          [ -z "\$SCRIPT" ] && SCRIPT="\${{ inputs.script_name }}"
-          mkdir -p reports
-          # grafana/k6 image runs as a non-root user — the bind-mounted dir must be
-          # world-writable or k6 silently fails to write /output/results.json.
-          chmod 777 reports
-          K6_MODE_ARGS="--duration \${{ inputs.k6_duration }}s"
-          if [ -n "\${{ inputs.k6_iterations }}" ] && [ "\${{ inputs.k6_iterations }}" != "0" ]; then
-            K6_MODE_ARGS="--iterations \${{ inputs.k6_iterations }}"
-          fi
-          set +e
-          docker run --rm \\
-            -v "\${{ github.workspace }}":/workspace \\
-            -v "\${{ github.workspace }}/reports":/output \\
-            ${k6Image} \\
-            run "/workspace/\$SCRIPT" \\
-            --out json=/output/results.json \\
-            --vus "\${{ inputs.k6_vus }}" \$K6_MODE_ARGS
-          echo "k6 docker exit code: \$?"
-          set -e
-          echo "=== reports/ contents ==="
-          ls -la reports/ 2>/dev/null || echo "reports/ directory missing"
-
-      - name: Validate results (JMeter)
-        if: \${{ inputs.engine != 'k6' }}
-        run: |
-          JTL="reports/results.jtl"
-          [ ! -f "\$JTL" ] && echo "ERROR: results.jtl not found" && exit 1
-          TOTAL=\$(( \$(wc -l < "\$JTL") - 1 ))
-          echo "Total requests: \$TOTAL"
-          [ "\$TOTAL" -le 0 ] && echo "ERROR: 0 requests executed - check thread group config" && exit 1
-          # Fail the job immediately on 100% error rate — don't wait for PerfStudio's own
-          # results sync to notice. Header-based column lookup since JMeter's CSV field
-          # order isn't guaranteed fixed.
-          SUCCESS_COL=\$(head -1 "\$JTL" | tr -d '"' | tr ',' '\\n' | grep -nx 'success' | head -1 | cut -d: -f1)
-          if [ -n "\$SUCCESS_COL" ]; then
-            FAILED=\$(tail -n +2 "\$JTL" | awk -F',' -v col="\$SUCCESS_COL" '{gsub(/"/,"",\$col)} \$col!="true"{c++} END{print c+0}')
-            echo "Failed requests: \$FAILED / \$TOTAL"
-            if [ "\$FAILED" -eq "\$TOTAL" ]; then
-              echo "ERROR: 100% of requests failed (\$FAILED/\$TOTAL) - failing the job so CI history reflects this immediately"
-              exit 1
-            fi
-          else
-            echo "WARN: could not locate 'success' column in JTL header - skipping error-rate check"
-          fi
-          echo "Validation passed: \$TOTAL requests"
-
-      - name: Validate results (k6)
-        if: \${{ inputs.engine == 'k6' }}
-        run: |
-          RESULTS="reports/results.json"
-          if [ ! -s "\$RESULTS" ]; then
-            echo "ERROR: results.json not found or empty — k6 may have crashed before producing output."
-            exit 1
-          fi
-          echo "Validation passed: results.json present"
-
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: perfstudio-report-\${{ github.run_number }}
-          path: reports/
-          retention-days: 7
-`;
-
-    // Write Python patcher as a separate committed file — avoids heredoc/YAML nesting issues
-    const patcherPy = `# PerfStudio JMX parameter patcher
-# Usage: python3 patch_jmx.py <script> <users> <rampup> <loops> <duration>
-import re, sys
-
-script, users, rampup, loops, duration = sys.argv[1:6]
-use_duration = duration != "-1" and int(duration) > 0
-
-with open(script, "r", encoding="utf-8") as f:
-    content = f.read()
-
-def sp(xml, name, val):
-    pat = r'(<(?:string|int|long|bool)Prop\\s+name="' + re.escape(name) + r'">)[^<]*'
-    new, n = re.subn(pat, r'\\g<1>' + str(val), xml)
-    print(("  SET " if n else "  WARN ") + name + "=" + str(val))
-    return new
-
-# Fix absolute local paths -> CI workspace paths
-# Strips Windows paths up to and including git-workspaces/<project>/<user>/
-# so JMeter finds files relative to /workspace (the Docker-mounted repo root).
-path_pattern = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\][^/\\\\]+[/\\\\]'
-fixed_content, path_fixes = re.subn(path_pattern, '/workspace/', content)
-if path_fixes:
-    fixed_content = fixed_content.replace('\\\\', '/')
-    content = fixed_content
-    print("  FIXED " + str(path_fixes) + " absolute path(s) -> /workspace/")
-else:
-    # Fallback: old single-level structure git-workspaces/<user>/
-    path_pattern_old = r'[A-Za-z]:[/\\\\][^\\'\\'"<>]*?git-workspaces[/\\\\][^/\\\\]+[/\\\\]'
-    fixed_content, path_fixes = re.subn(path_pattern_old, '/workspace/', content)
-    if path_fixes:
-        fixed_content = fixed_content.replace('\\\\', '/')
-        content = fixed_content
-        print("  FIXED " + str(path_fixes) + " absolute path(s) (old structure) -> /workspace/")
-    else:
-        print("  No absolute paths to fix")
-
-content = sp(content, "ThreadGroup.num_threads", users)
-content = sp(content, "ThreadGroup.ramp_time", rampup)
-
-if use_duration:
-    print("  Mode: Duration " + duration + "s")
-    content = sp(content, "ThreadGroup.scheduler", "true")
-    content = sp(content, "ThreadGroup.duration", duration)
-    content = sp(content, "LoopController.loops", "-1")
-    if 'name="ThreadGroup.duration"' not in content:
-        content = content.replace("</ThreadGroup>",
-            '<stringProp name="ThreadGroup.duration">' + duration + '</stringProp>\\n'
-            '<boolProp name="ThreadGroup.scheduler">true</boolProp>\\n</ThreadGroup>')
-        print("  INJECTED duration+scheduler")
-else:
-    print("  Mode: Loops " + loops)
-    content = sp(content, "ThreadGroup.scheduler", "false")
-    content = sp(content, "LoopController.loops", loops)
-
-with open(script, "w") as f:
-    f.write(content)
-print("Patch complete")
-`;
+    // Write Python patcher as a separate committed file — avoids heredoc/YAML nesting issues.
+    // Reuses BB_PATCHER_PY (the same source the base64-embedded copy comes from) instead of
+    // duplicating the literal — two copies of this script previously had to be hand-kept in
+    // sync, and the UltimateThreadGroup handling above was exactly the kind of fix that's
+    // trivial to apply to one copy and forget on the other.
+    const patcherPy = BB_PATCHER_PY;
 
     try {
       const workflowDir = path.join(gitRoot, '.github', 'workflows');
@@ -1496,9 +1579,14 @@ pipelines:
         const autoCommitBranch = gitCfg?.base_branch || baseBranch;
         const session = await gitEngine.openSession(gitRoot, orgSlug);
         if (!session.hadState) throw new Error('Git workspace has not been initialized yet — go to Configuration → Git and initialize/clone first.');
+        // Restored before persisting below — this session is shared with every other request
+        // against this workspace (script generation, /trigger, "Save Settings"), all of which
+        // assume it's parked on the caller's OWN branch; committing here to autoCommitBranch
+        // (main) must never leave it stranded there for the next unrelated request.
+        const _originalBranchForYaml = await gitEngine.currentBranch(session).catch(() => null);
 
         try {
-          await gitEngine.checkout(session, autoCommitBranch);
+          await gitEngine.checkoutSafe(session, autoCommitBranch);
         } catch {
           try {
             await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: autoCommitBranch, token: rawToken });
@@ -1556,6 +1644,15 @@ pipelines:
           await gitEngine.commit(session, 'ci: add Peako Performance Test workflow [auto]', callerRow.name, callerRow.email);
           await gitEngine.push(session, { url: gitCfg.remote_url, ref: autoCommitBranch, token: rawToken });
           pushMessage = ` Committed and pushed to ${autoCommitBranch} automatically.`;
+        }
+        // Restore whatever branch this shared session was on before we touched it — see the
+        // comment where _originalBranchForYaml was captured above.
+        if (_originalBranchForYaml && _originalBranchForYaml !== autoCommitBranch) {
+          try {
+            await gitEngine.checkoutSafe(session, _originalBranchForYaml);
+          } catch (restoreErr) {
+            console.warn(`[generate-yaml] Could not restore session to "${_originalBranchForYaml}" after committing CI config — it will stay on "${autoCommitBranch}" until the next operation fixes it:`, restoreErr.message);
+          }
         }
         // Flush the whole session (working tree + .git) back to S3 — atomically, awaited,
         // before responding. Fixes the earlier bug where the S3 mirror was a fire-and-forget
@@ -1841,7 +1938,7 @@ router.post('/trigger', async (req, res) => {
   };
 
   const { provider, script_name, script_path, jmeter_users, jmeter_rampup, jmeter_loops, jmeter_duration,
-          k6_vus, k6_duration, k6_iterations,
+          k6_vus, k6_rampup, k6_duration, k6_iterations,
           auto_heal = 0, auto_heal_mode = 'auto', auto_heal_instruction = '' } = req.body;
   if (!provider) return res.status(400).json({ error: 'provider required (gitlab or github)' });
 
@@ -1890,6 +1987,7 @@ router.post('/trigger', async (req, res) => {
     jmeter_loops:    String(jmeter_loops    || 1),
     jmeter_duration: String(jmeter_duration || 300),
     k6_vus:        String(k6_vus        || 10),
+    k6_rampup:     String(k6_rampup     || 30),
     k6_duration:   String(k6_duration   || 300),
     k6_iterations: String(k6_iterations || 0),
   };
@@ -2238,20 +2336,20 @@ pipelines:
         }
       }
 
-      // Ensure .PerfStudio/patch_jmx.py is present on the branch being pushed/dispatched —
-      // for EVERY provider, not just Bitbucket. It's normally committed to main via
-      // /generate-yaml, but a user's branch may have been created before that, or may
-      // never have merged it in, leaving GitHub Actions unable to find it at checkout
-      // ("python3: can't open file '.../.PerfStudio/patch_jmx.py'").
+      // Always (re)write .PerfStudio/patch_jmx.py to the CURRENT patcher, for EVERY provider,
+      // not just Bitbucket — Bitbucket's pipeline (and GitLab, and a stale/never-merged
+      // GitHub branch) read this loose file directly, so an "only if missing" write left
+      // whatever version was first committed frozen there forever, silently outliving any
+      // later backend fix to the patcher (e.g. the UltimateThreadGroup staircase-rescaling
+      // support above). GitHub Actions itself always overwrites it from the workflow's own
+      // embedded (and now auto-regenerated) base64 blob before running, so this write is
+      // belt-and-suspenders there, but load-bearing for Bitbucket/GitLab.
       try {
         const _patcherDir = path.join(wsRoot, '.PerfStudio');
         const _patcherPath = path.join(_patcherDir, 'patch_jmx.py');
-        if (!fs.existsSync(_patcherPath)) {
-          fs.mkdirSync(_patcherDir, { recursive: true });
-          fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
-          s3Sync.uploadFile(_patcherPath, triggerOrgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', _patcherPath, ':', up.error?.message); });
-          console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing)');
-        }
+        fs.mkdirSync(_patcherDir, { recursive: true });
+        fs.writeFileSync(_patcherPath, BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
+        s3Sync.uploadFile(_patcherPath, triggerOrgSlug).then(up => { if (!up.ok && !up.skipped) console.error('[CIPipeline] S3 sync failed for', _patcherPath, ':', up.error?.message); });
       } catch (e) {
         console.warn('[CI trigger] patch_jmx.py ensure failed:', e.message);
       }
@@ -2470,8 +2568,14 @@ pipelines:
 
       // Land on targetRef BEFORE writing anything new — same ordering trick /generate-yaml
       // uses to avoid ever needing the SSH path's stash/checkout-conflict dance.
+      // checkoutSafe, not checkout: this shared session can be parked on a different branch
+      // by another request (a base-branch CI-config commit that didn't switch back, a script
+      // generation that landed there) — a plain checkout then throws CheckoutConflictError
+      // over the stray content, which this exact catch used to misdiagnose as "branch doesn't
+      // exist" and try to recreate, colliding with the real branch and surfacing a confusing
+      // "already exists" error instead of the actual problem.
       try {
-        await gitEngine.checkout(session, targetRef);
+        await gitEngine.checkoutSafe(session, targetRef);
       } catch {
         try {
           await gitEngine.fetchRemote(session, { url: gitCfg.remote_url, ref: targetRef, token: patToken, username: patUsername });
@@ -2706,17 +2810,13 @@ pipelines:
         }
       }
 
-      // Ensure .PerfStudio/patch_jmx.py is present on the branch being pushed/dispatched.
-      let patcherContent;
+      // Always (re)write .PerfStudio/patch_jmx.py to the CURRENT patcher — same reason as the
+      // SSH branch's matching block above (Bitbucket/GitLab read this loose file directly; an
+      // "only if missing" write left it frozen at whatever version was first committed).
+      const patcherContent = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
       const patcherFull = path.posix.join(session.dir, '.PerfStudio', 'patch_jmx.py');
-      if (session.fs.existsSync(patcherFull)) {
-        patcherContent = session.fs.readFileSync(patcherFull);
-      } else {
-        patcherContent = Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8');
-        session.fs.mkdirSync(path.posix.dirname(patcherFull), { recursive: true });
-        session.fs.writeFileSync(patcherFull, patcherContent);
-        console.log('[CI trigger] .PerfStudio/patch_jmx.py written (was missing, PAT mode)');
-      }
+      session.fs.mkdirSync(path.posix.dirname(patcherFull), { recursive: true });
+      session.fs.writeFileSync(patcherFull, patcherContent);
 
       // Copy the JMX/JS file to its canonical repo path — PAT-mode scripts are generated
       // into this exact same session (testSuites.js's PAT branch opens a gitEngine session at
@@ -2887,6 +2987,129 @@ pipelines:
     });
   }
 
+  // ── Push the regenerated GitHub Actions workflow to the BASE branch ────────────────────
+  // GitHub's workflow_dispatch API always resolves the workflow DEFINITION (including
+  // whichever patch_jmx.py blob it has embedded) from `ref: baseBranch2` in the dispatch call
+  // below — never from targetRef, which for a non-admin user is their OWN personal branch.
+  // The auto-push above (JMX/testData/patcher) intentionally lands on targetRef; writing the
+  // regenerated workflow file there too was a real bug in an earlier version of this fix — it
+  // never reached the branch GitHub actually reads the workflow from, so trigger-time
+  // overrides kept silently doing nothing no matter how correct the patcher itself was. This
+  // mirrors exactly what /generate-yaml does on first CI setup: commit straight to base_branch.
+  if (provider === 'github') {
+    try {
+      const { resolveUserFolder: _ghResolveUF, resolveOrgSlugForProject: _ghResolveOrgUF, resolveWorkspaceRoot: _ghResolveWSRoot } = require('../utils/projectFolders');
+      const _ghGitCfg = await db.prepare('SELECT * FROM git_configs WHERE project_id = ?').get(req.params.projectId);
+      if (_ghGitCfg?.is_initialized && _ghGitCfg?.remote_url) {
+        const _ghOrgSlug = await _ghResolveOrgUF(req.params.projectId);
+        const _ghUserFolder = await _ghResolveUF(req.userId);
+        const _ghProjectRow = await db.prepare('SELECT name FROM projects WHERE id = ?').get(req.params.projectId);
+        const _ghCleanProject = (_ghProjectRow?.name || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+        // Same root /generate-yaml computes for its own base-branch commit — reusing it keeps
+        // this hitting the SAME persisted gitEngine session state instead of a disconnected one.
+        const _ghGitRoot = _ghResolveWSRoot(_ghCleanProject, _ghUserFolder, _ghOrgSlug);
+        const _ghAutoBranch = _ghGitCfg.base_branch || baseBranch2;
+
+        const _ghSession = await gitEngine.openSession(_ghGitRoot, _ghOrgSlug);
+        // This is the SAME persisted session (same S3 key) other requests reuse — anything
+        // else that opens it later (e.g. Test Plans' "Generate Script", which writes into
+        // whatever branch the session already happens to be on, without pinning one first)
+        // would otherwise silently land on whatever branch we leave it on. Capture it now so
+        // we can restore it below instead of stranding every later request on `_ghAutoBranch`.
+        const _ghOriginalBranch = await gitEngine.currentBranch(_ghSession).catch(() => null);
+        if (!_ghSession.hadState) {
+          console.warn('[CI trigger] GitHub base-branch session has no prior state — run "Generate YAML" once to initialize it; skipping auto-regen for this trigger.');
+        } else if (!effectiveGithubToken) {
+          console.warn('[CI trigger] No GitHub token configured — skipping base-branch workflow regen (dispatch will use whatever is already on the base branch).');
+        } else {
+          try {
+            await gitEngine.checkout(_ghSession, _ghAutoBranch);
+          } catch {
+            try {
+              await gitEngine.fetchRemote(_ghSession, { url: _ghGitCfg.remote_url, ref: _ghAutoBranch, token: effectiveGithubToken });
+              await gitEngine.checkout(_ghSession, _ghAutoBranch, { create: true, startRef: `refs/remotes/origin/${_ghAutoBranch}` });
+            } catch {
+              await gitEngine.checkout(_ghSession, _ghAutoBranch, { create: true });
+            }
+          }
+
+          const _ghPreSync = await gitEngine.status(_ghSession);
+          const _ghPreserved = new Map();
+          for (const relPath of _ghPreSync.modified) {
+            try { _ghPreserved.set(relPath, _ghSession.fs.readFileSync(path.posix.join(_ghSession.dir, relPath))); } catch {}
+          }
+          try {
+            await gitEngine.fetchRemote(_ghSession, { url: _ghGitCfg.remote_url, ref: _ghAutoBranch, token: effectiveGithubToken });
+            try {
+              await gitEngine.merge(_ghSession, `refs/remotes/origin/${_ghAutoBranch}`, callerRow2?.name, callerRow2?.email, 'sync with remote before CI trigger', { fastForwardOnly: true });
+            } catch {
+              await gitEngine.resetHardToRef(_ghSession, _ghAutoBranch, `refs/remotes/origin/${_ghAutoBranch}`);
+            }
+          } catch (fetchErr2) {
+            console.warn('[CI trigger] GitHub base-branch sync failed (continuing with local session state):', fetchErr2.message);
+          }
+          for (const [relPath, content] of _ghPreserved) {
+            const full = path.posix.join(_ghSession.dir, relPath);
+            _ghSession.fs.mkdirSync(path.posix.dirname(full), { recursive: true });
+            _ghSession.fs.writeFileSync(full, content);
+          }
+
+          const _gcRow4 = await db.prepare('SELECT config_json FROM global_config WHERE user_id = ?').get(req.userId)
+            || await db.prepare(`SELECT gc.config_json FROM global_config gc JOIN users u ON u.id = gc.user_id WHERE u.role IN ('org_admin','super_admin') ORDER BY gc.user_id LIMIT 1`).get();
+          const _gcParsed4 = JSON.parse(_gcRow4?.config_json || '{}');
+          const _dockerImage4 = (_gcParsed4.jmeter_docker_image || 'tasleemzaif/perfstudio:latest').trim();
+          const _k6Image4 = (_gcParsed4.k6_docker_image || process.env.K6_DOCKER_IMAGE || 'grafana/k6:latest').trim();
+          const _ghSuites3 = await db.prepare('SELECT name, jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ?').all(req.params.projectId, req.userId);
+          const _ghDefScript3 = _ghSuites3.length ? path.basename(_ghSuites3[0].jmx_path || _ghSuites3[0].js_path || 'test.jmx') : 'test.jmx';
+          const _ghScriptList3 = _ghSuites3.map(s => {
+            const relPath = s.jmx_path
+              ? path.relative(_ghGitRoot, s.jmx_path).replace(/\\/g, '/')
+              : path.relative(_ghGitRoot, s.js_path || '').replace(/\\/g, '/');
+            return `      # ${s.name}: ${relPath}`;
+          }).join('\n');
+          const _workflowFile3 = cfg?.github_workflow_file || 'perf-test.yml';
+          const _githubYaml3 = buildGithubWorkflowYaml({
+            dockerImage: _dockerImage4, k6Image: _k6Image4, defaultScript: _ghDefScript3,
+            userBranch: ghUserBranch, scriptList: _ghScriptList3,
+          }).replace(/\r\n/g, '\n');
+
+          const _ghWfFull = path.posix.join(_ghSession.dir, '.github', 'workflows', _workflowFile3);
+          _ghSession.fs.mkdirSync(path.posix.dirname(_ghWfFull), { recursive: true });
+          _ghSession.fs.writeFileSync(_ghWfFull, _githubYaml3, 'utf8');
+
+          const _ghPatcherFull = path.posix.join(_ghSession.dir, '.PerfStudio', 'patch_jmx.py');
+          _ghSession.fs.mkdirSync(path.posix.dirname(_ghPatcherFull), { recursive: true });
+          _ghSession.fs.writeFileSync(_ghPatcherFull, Buffer.from(BB_PATCHER_PY.replace(/\r\n/g, '\n'), 'utf8'));
+
+          await gitEngine.addAll(_ghSession);
+          const _ghStatus = await gitEngine.status(_ghSession);
+          if (!_ghStatus.isClean()) {
+            await gitEngine.commit(_ghSession, 'ci: refresh Peako Performance Test workflow [auto]', callerRow2?.name, callerRow2?.email);
+            await gitEngine.push(_ghSession, { url: _ghGitCfg.remote_url, ref: _ghAutoBranch, token: effectiveGithubToken });
+            console.log(`[CI trigger] .github/workflows/${_workflowFile3} regenerated and pushed to base branch "${_ghAutoBranch}"`);
+          }
+
+          // Restore whatever branch this shared session was on before we touched it — leaving
+          // it parked on the base branch corrupts every later request that reuses this same
+          // session assuming it's on the user's own branch (this exact regression happened:
+          // a subsequent "Generate Script" call wrote its output onto main, untracked, which
+          // then made the next /trigger's checkout of the user's branch fail with a confusing
+          // "branch already exists" error).
+          if (_ghOriginalBranch && _ghOriginalBranch !== _ghAutoBranch) {
+            try {
+              await gitEngine.checkout(_ghSession, _ghOriginalBranch);
+            } catch (restoreErr) {
+              console.warn(`[CI trigger] Could not restore session to "${_ghOriginalBranch}" after base-branch workflow push — it will stay on "${_ghAutoBranch}" until the next operation fixes it:`, restoreErr.message);
+            }
+          }
+          await gitEngine.persistSession(_ghSession, _ghGitRoot, _ghOrgSlug);
+        }
+      }
+    } catch (e) {
+      console.warn('[CI trigger] GitHub workflow base-branch regen/push failed (continuing — dispatch will use whatever is already on the base branch):', e.message);
+    }
+  }
+
   try {
     // ── GitLab trigger ─────────────────────────────────────────────────────
     if (provider === 'gitlab') {
@@ -2909,6 +3132,7 @@ pipelines:
       params.append('variables[JMETER_LOOPS]',    String(jmeter_loops || 1));
       params.append('variables[JMETER_DURATION]', String(jmeter_duration || 300));
       params.append('variables[K6_VUS]',          String(k6_vus || 10));
+      params.append('variables[K6_RAMPUP]',       String(k6_rampup || 30));
       params.append('variables[K6_DURATION]',     String(k6_duration || 300));
       params.append('variables[K6_ITERATIONS]',   String(k6_iterations || 0));
 
@@ -2972,6 +3196,7 @@ pipelines:
           jmeter_loops:    String(jmeter_loops || 1),
           jmeter_duration: String(jmeter_duration || 300),
           k6_vus:          String(k6_vus || 10),
+          k6_rampup:       String(k6_rampup || 30),
           k6_duration:     String(k6_duration || 300),
           k6_iterations:   String(k6_iterations || 0),
           // Tell the workflow which branch to checkout for scripts/data.
@@ -3466,7 +3691,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     const reportPath = path.join(resultDir, 'report', 'index.html'); // display-label string only
     const hasReport  = await resultsStore.exists(resultDir, orgSlug, 'report/index.html');
 
-    const suiteRow0 = suiteId ? await db.prepare('SELECT name, test_type FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId) : null;
+    const suiteRow0 = suiteId ? await db.prepare('SELECT name, test_type, vusers, duration, config_json FROM test_suites WHERE id=? AND user_id = ?').get(suiteId, effectiveUserId) : null;
     const reportData = jtlText ? parseResultsContent(jtlText, {
       suite_name: suiteRow0?.name || (run.script_name || 'CI Run'),
       engine, started_at: run.started_at, test_type: suiteRow0?.test_type || null,
@@ -3539,6 +3764,64 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
     }
     if (reportData) { reportData.rule_violations = autoViolations; reportData.rule_results = autoRuleResult?.results || []; }
 
+    // Stress-only: per-step breaking-point analysis, computed from the timeline data every
+    // engine already parses — see stressAnalysis.js for the rule-breach/throughput-plateau
+    // detection logic. `autoRuleResult.results` already embeds each rule's own row (`.rule`),
+    // so this needs no separate rules query.
+    if (reportData && suiteRow0?.test_type === 'stress') {
+      try {
+        const { analyzeStressRun } = require('../utils/stressAnalysis');
+        const stressRules = (autoRuleResult?.results || []).map(r => r.rule);
+        // Prefer the ACTUAL trigger-time values this run executed with (ciVars/ciUsers/ciDur,
+        // already parsed above from run.variables) over the suite's saved defaults — a
+        // trigger-time override changes the real step schedule, and the known-window analysis
+        // below needs the schedule that actually ran, not what the suite happened to be saved
+        // with. Falls back to the suite's own vusers/duration when the run has no override.
+        const stressVusers = Number(
+          (engine === 'k6' ? ciVars.k6_vus : ciUsers) || suiteRow0.vusers
+        );
+        const stressDuration = Number(
+          (engine === 'k6' ? ciVars.k6_duration : ciDur) || suiteRow0.duration
+        );
+        reportData.stress_analysis = analyzeStressRun(reportData.timeline, stressRules, { vusers: stressVusers, duration: stressDuration });
+      } catch (e) {
+        console.error('[Auto-sync] Stress breaking-point analysis failed:', e.message);
+      }
+    }
+
+    // Spike-only: baseline/peak/recovery analysis — see spikeAnalysis.js. Same
+    // trigger-time-values-over-saved-defaults reasoning as the stress block above.
+    if (reportData && suiteRow0?.test_type === 'spike') {
+      try {
+        const { analyzeSpikeRun } = require('../utils/spikeAnalysis');
+        const { resolveSpikeCount } = require('./testSuites');
+        const spikeRules = (autoRuleResult?.results || []).map(r => r.rule);
+        const spikeVusers = Number((engine === 'k6' ? ciVars.k6_vus : ciUsers) || suiteRow0.vusers);
+        const spikeDuration = Number((engine === 'k6' ? ciVars.k6_duration : ciDur) || suiteRow0.duration);
+        // The user's explicitly-chosen spike count (if any) lives in the suite's own
+        // config_json — the analysis must use whatever count actually generated the schedule,
+        // not silently re-derive its own guess from duration.
+        const spikeCount = resolveSpikeCount(suiteRow0, spikeDuration);
+        reportData.spike_analysis = analyzeSpikeRun(reportData.timeline, spikeRules, { vusers: spikeVusers, duration: spikeDuration, spikeCount });
+      } catch (e) {
+        console.error('[Auto-sync] Spike baseline/peak/recovery analysis failed:', e.message);
+      }
+    }
+
+    // Endurance-only: early/late degradation-over-time analysis — see enduranceAnalysis.js.
+    // Same trigger-time-values-over-saved-defaults reasoning as stress/spike above.
+    if (reportData && suiteRow0?.test_type === 'endurance') {
+      try {
+        const { analyzeEnduranceRun } = require('../utils/enduranceAnalysis');
+        const enduranceRules = (autoRuleResult?.results || []).map(r => r.rule);
+        const enduranceVusers = Number((engine === 'k6' ? ciVars.k6_vus : ciUsers) || suiteRow0.vusers);
+        const enduranceDuration = Number((engine === 'k6' ? ciVars.k6_duration : ciDur) || suiteRow0.duration);
+        reportData.endurance_analysis = analyzeEnduranceRun(reportData.timeline, enduranceRules, { vusers: enduranceVusers, duration: enduranceDuration });
+      } catch (e) {
+        console.error('[Auto-sync] Endurance degradation-over-time analysis failed:', e.message);
+      }
+    }
+
     const emailData = {
       ...(reportData || {
         meta: { suite_name: suiteRow0?.name || run.script_name || 'CI Run', engine, started_at: run.started_at, status: 'completed', test_type: suiteRow0?.test_type || null },
@@ -3547,6 +3830,7 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       }),
       rule_violations: autoViolations,
       rule_results: autoRuleResult?.results || [],
+      stress_analysis: reportData?.stress_analysis || null,
     };
     if (suiteRow0?.name) emailData.meta.suite_name = suiteRow0.name;
     if (suiteRow0?.test_type) emailData.meta.test_type = suiteRow0.test_type;
@@ -4144,6 +4428,52 @@ router.post('/runs/:runId/sync-results', async (req, res) => {
               reportData.rule_violations = ruleResult?.violations || [];
               reportData.rule_results = ruleResult?.results || [];
             } catch (_) {}
+
+            // Stress-only: same per-step breaking-point analysis as autoSyncCiRun — see
+            // stressAnalysis.js.
+            if (suite?.test_type === 'stress') {
+              try {
+                const { analyzeStressRun } = require('../utils/stressAnalysis');
+                const stressRules = (ruleResult?.results || []).map(r => r.rule);
+                // See autoSyncCiRun's matching comment — prefer the run's actual trigger-time
+                // override values over the suite's saved defaults.
+                const stressVusers = Number((engine === 'k6' ? ciVars2.k6_vus : ciUsers2) || suite.vusers);
+                const stressDuration = Number((engine === 'k6' ? ciVars2.k6_duration : ciDur2) || suite.duration);
+                reportData.stress_analysis = analyzeStressRun(reportData.timeline, stressRules, { vusers: stressVusers, duration: stressDuration });
+              } catch (e) {
+                console.error('[CI Sync] Stress breaking-point analysis failed:', e.message);
+              }
+            }
+
+            // Spike-only: same baseline/peak/recovery analysis as autoSyncCiRun — see
+            // spikeAnalysis.js.
+            if (suite?.test_type === 'spike') {
+              try {
+                const { analyzeSpikeRun } = require('../utils/spikeAnalysis');
+                const { resolveSpikeCount } = require('./testSuites');
+                const spikeRules = (ruleResult?.results || []).map(r => r.rule);
+                const spikeVusers = Number((engine === 'k6' ? ciVars2.k6_vus : ciUsers2) || suite.vusers);
+                const spikeDuration = Number((engine === 'k6' ? ciVars2.k6_duration : ciDur2) || suite.duration);
+                const spikeCount = resolveSpikeCount(suite, spikeDuration);
+                reportData.spike_analysis = analyzeSpikeRun(reportData.timeline, spikeRules, { vusers: spikeVusers, duration: spikeDuration, spikeCount });
+              } catch (e) {
+                console.error('[CI Sync] Spike baseline/peak/recovery analysis failed:', e.message);
+              }
+            }
+
+            // Endurance-only: same early/late degradation-over-time analysis as autoSyncCiRun
+            // — see enduranceAnalysis.js.
+            if (suite?.test_type === 'endurance') {
+              try {
+                const { analyzeEnduranceRun } = require('../utils/enduranceAnalysis');
+                const enduranceRules = (ruleResult?.results || []).map(r => r.rule);
+                const enduranceVusers = Number((engine === 'k6' ? ciVars2.k6_vus : ciUsers2) || suite.vusers);
+                const enduranceDuration = Number((engine === 'k6' ? ciVars2.k6_duration : ciDur2) || suite.duration);
+                reportData.endurance_analysis = analyzeEnduranceRun(reportData.timeline, enduranceRules, { vusers: enduranceVusers, duration: enduranceDuration });
+              } catch (e) {
+                console.error('[CI Sync] Endurance degradation-over-time analysis failed:', e.message);
+              }
+            }
 
             if (engine === 'jmeter') {
               const { generateAnalyticsPdfBuffer } = require('../utils/generateAnalyticsPdf');
@@ -4748,6 +5078,7 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
       jmeter_loops:    String(mergedVars.jmeter_loops    || mergedVars.JMETER_LOOPS    || '-1'),
       jmeter_duration: String(mergedVars.jmeter_duration || mergedVars.JMETER_DURATION || HEAL_CI_DURATION),
       k6_vus:          String(mergedVars.k6_vus        || mergedVars.K6_VUS        || HEAL_CI_VUSERS),
+      k6_rampup:       String(mergedVars.k6_rampup      || mergedVars.K6_RAMPUP      || HEAL_CI_RAMPUP),
       k6_duration:     String(mergedVars.k6_duration    ?? mergedVars.K6_DURATION    ?? '0'),
       k6_iterations:   String(mergedVars.k6_iterations  || mergedVars.K6_ITERATIONS  || HEAL_CI_LOOPS),
       branch:          targetRef,
@@ -5232,3 +5563,5 @@ router.get('/runs/:runId/heal-status', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.BB_PATCHER_PY = BB_PATCHER_PY;
+module.exports.buildGithubWorkflowYaml = buildGithubWorkflowYaml;

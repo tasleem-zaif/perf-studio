@@ -16,6 +16,16 @@ const TEST_TYPES = [
 
 const DEFAULT_FORM = { name: '', test_type: 'load', collection_id: '', env: '', test_data_ids: [], engine: 'jmeter', config: {}, vusers: 50, rampup: 30, iter_mode: 'duration', loops: 1, duration: 300 };
 
+// Mirrors computeSpikeCount() in backend/src/routes/testSuites.js EXACTLY — this is only the
+// SUGGESTED default shown in the UI; the user's explicit choice (form.config.spike_count)
+// always wins once set. Duplicated rather than fetched, since it's a pure 3-line function of
+// a value the form already has locally.
+function suggestedSpikeCount(duration) {
+  if (duration >= 300) return Math.min(10, 3 + Math.floor((duration - 300) / 600));
+  if (duration >= 120) return 2;
+  return 1;
+}
+
 // Must match simpleHash in ai.js exactly
 function simpleHash(str) {
   let hash = 0;
@@ -39,6 +49,11 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   const [ownCollections, setOwnCollections] = useState(project?.collections || []);
   const [filterCollectionId, setFilterCollectionId] = useState('');
   const [filterEnv,          setFilterEnv]          = useState('');
+  // Stress-test rule suggestion (Phase 4) — existing rule metrics for this project, so the
+  // banner only offers rules that aren't already configured, and doesn't re-prompt every time
+  // once the user has (or already had) relevant coverage.
+  const [existingRuleMetrics, setExistingRuleMetrics] = useState(new Set());
+  const [addingSuggestedRules, setAddingSuggestedRules] = useState(false);
   const dlRef = useRef(null);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
@@ -66,6 +81,17 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   useEffect(() => {
     if (project) { loadSuites(); loadTestDataFiles(); }
   }, [project?.id, filterCollectionId, filterEnv]);
+
+  // Refresh known rule metrics whenever the create/edit modal opens, so the stress-test rule
+  // suggestion banner reflects what's actually configured right now, not stale state from a
+  // previous visit to this page.
+  useEffect(() => {
+    if (modal && project) {
+      api.get(`/projects/${project.id}/rules`)
+        .then(r => setExistingRuleMetrics(new Set((r.data.rules || []).map(x => (x.metric || '').toLowerCase()))))
+        .catch(() => {});
+    }
+  }, [modal, project?.id]);
 
   // Load test data filtered by collection + env.
   // When called from inside the modal, pass the modal's form values directly
@@ -192,6 +218,29 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
     setForm({ name: s.name, test_type: s.test_type, collection_id: s.collection_id || '', env: s.env || '', test_data_ids: dataIds, engine: s.engine, config: JSON.parse(s.config_json || '{}'), vusers: s.vusers || 50, rampup: s.rampup || 30, iter_mode: s.iter_mode || 'duration', loops: s.loops || 1, duration: s.duration || 300 });
     setError(''); setModal(s);
     loadTestDataFiles();
+  }
+
+  // Stress-test rule suggestion (Phase 4) — pre-filled, editable-after-the-fact rules a
+  // performance engineer would reach for on a stress plan specifically: a more lenient Error
+  // Rate than Load's (some degradation under stress is expected — the question is whether it
+  // stays controlled) and a Response Time ceiling. Only creates whichever of the two isn't
+  // already configured, so re-clicking (or opening another stress plan later) is a no-op.
+  const STRESS_SUGGESTED_RULES = [
+    { metric: 'Error Rate',    operator: '>', value: '5',    unit: '%',  severity: 'warning' },
+    { metric: 'Response Time', operator: '>', value: '2000', unit: 'ms', severity: 'error' },
+  ];
+  async function addSuggestedStressRules() {
+    setAddingSuggestedRules(true);
+    try {
+      const toAdd = STRESS_SUGGESTED_RULES.filter(r => !existingRuleMetrics.has(r.metric.toLowerCase()));
+      for (const r of toAdd) {
+        await api.post(`/projects/${project.id}/rules`, r);
+      }
+      setExistingRuleMetrics(prev => new Set([...prev, ...toAdd.map(r => r.metric.toLowerCase())]));
+      toast(`Added ${toAdd.length} rule${toAdd.length === 1 ? '' : 's'} for this stress plan — review/adjust anytime in Rule Engine.`, 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to add suggested rules', 'error');
+    } finally { setAddingSuggestedRules(false); }
   }
 
   const typeInfo = t => TEST_TYPES.find(x => x.value === t) || TEST_TYPES[0];
@@ -381,6 +430,18 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
             </div>
           </div>
 
+          {form.test_type === 'stress' && !existingRuleMetrics.has('error rate') && !existingRuleMetrics.has('response time') && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', marginBottom: 12, borderRadius: 8, background: 'rgba(226,75,74,0.08)', border: '1px solid rgba(226,75,74,0.3)' }}>
+              <i className="ti ti-flame" style={{ color: '#e24b4a', fontSize: 16, flexShrink: 0 }} />
+              <div style={{ flex: 1, fontSize: 12.5 }}>
+                A stress test's whole point is finding where it breaks — add an Error Rate + Response Time rule so the report can actually flag it.
+              </div>
+              <button type="button" className="btn-secondary btn-sm" disabled={addingSuggestedRules} onClick={addSuggestedStressRules} style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>
+                {addingSuggestedRules ? 'Adding…' : 'Add Suggested Rules'}
+              </button>
+            </div>
+          )}
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <div className="form-group">
               <label className="form-label">Collection</label>
@@ -496,7 +557,25 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
             </div>
             <div className="form-group">
               <label className="form-label">Ramp-up (secs)</label>
-              <input type="number" value={form.rampup} onChange={e => setForm(f => ({ ...f, rampup: +e.target.value }))} min="0" />
+              <input
+                type="number"
+                value={form.rampup}
+                onChange={e => setForm(f => ({ ...f, rampup: +e.target.value }))}
+                min="0"
+                disabled={form.test_type === 'stress' || form.test_type === 'spike'}
+              />
+              {form.test_type === 'stress' && (
+                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <i className="ti ti-sparkles" style={{ fontSize: 11, color: '#4338ca' }} />
+                  Auto-calculated from Users &amp; Duration — creates step-wise ramps automatically
+                </div>
+              )}
+              {form.test_type === 'spike' && (
+                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <i className="ti ti-sparkles" style={{ fontSize: 11, color: '#4338ca' }} />
+                  Auto-calculated — a spike is a sudden burst by design, not a gradual ramp
+                </div>
+              )}
             </div>
             <div className="form-group">
               <label className="form-label">Iteration Mode</label>
@@ -509,7 +588,35 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
           <div className="form-group">
             <label className="form-label">{form.iter_mode === 'duration' ? 'Duration (seconds)' : 'Number of Loops'}</label>
             <input type="number" value={form.iter_mode === 'duration' ? form.duration : form.loops} onChange={e => setForm(f => form.iter_mode === 'duration' ? { ...f, duration: +e.target.value } : { ...f, loops: +e.target.value })} min="1" />
+            {form.test_type === 'endurance' && form.iter_mode === 'duration' && form.duration < 6000 && (
+              <div style={{ fontSize: 11, color: '#b45309', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <i className="ti ti-alert-triangle" style={{ fontSize: 11 }} />
+                Below 1h40m (6000s), this behaves like a Load Test — no degradation-over-time signal in the report
+              </div>
+            )}
           </div>
+          {form.test_type === 'spike' && (
+            <div className="form-group">
+              <label className="form-label">Number of Spikes</label>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                placeholder={`Suggested: ${suggestedSpikeCount(form.duration)}`}
+                value={form.config?.spike_count ?? ''}
+                onChange={e => {
+                  const raw = e.target.value;
+                  setForm(f => ({ ...f, config: { ...f.config, spike_count: raw === '' ? undefined : +raw } }));
+                }}
+              />
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <i className="ti ti-sparkles" style={{ fontSize: 11, color: '#4338ca' }} />
+                {form.config?.spike_count
+                  ? `Suggested for ${form.duration}s: ${suggestedSpikeCount(form.duration)} — your choice overrides it`
+                  : `Leave blank to use the suggested ${suggestedSpikeCount(form.duration)} based on Duration`}
+              </div>
+            </div>
+          )}
 
           <div className="modal-footer">
             <button className="btn-secondary" onClick={() => setModal(null)}>Cancel</button>
