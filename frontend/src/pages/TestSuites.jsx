@@ -54,7 +54,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
   // once the user has (or already had) relevant coverage.
   const [existingRuleMetrics, setExistingRuleMetrics] = useState(new Set());
   const [addingSuggestedRules, setAddingSuggestedRules] = useState(false);
-  const dlRef = useRef(null);
   const firstRender = useRef(true);
   const { confirm, confirmState, handleConfirm, handleCancel } = useConfirm();
   const { toast } = useToast();
@@ -180,35 +179,12 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
       // shows up in the "Run Test" dropdown after a hard browser refresh.
       if (onAfterSave) onAfterSave();
       const ext = suite.engine === 'jmeter' ? '.jmx' : '.js';
-      toast(`Script ${wasGenerated ? 're-generated' : 'generated'} successfully — ${suite.name}${ext} is ready to download`, 'success');
+      toast(`Script ${wasGenerated ? 're-generated' : 'generated'} successfully — ${suite.name}${ext} is ready`, 'success');
     } catch (e) {
       const msg = e.response?.data?.error || 'Generation failed';
       setGenError(prev => ({ ...prev, [suite.id]: msg }));
       toast(msg, 'error');
     } finally { setGenerating(null); }
-  }
-
-  async function download(suite, type) {
-    try {
-      const token = localStorage.getItem('ps_token');
-      const res = await fetch(`/api/projects/${project.id}/test-suites/${suite.id}/download/${type}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        let msg = `Download failed (${res.status})`;
-        try { const j = await res.json(); msg = j.error || msg; } catch {}
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = dlRef.current;
-      a.href = url;
-      a.download = `${suite.name}.${type}`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      toast(e.message || 'Download failed', 'error');
-    }
   }
 
   function openEdit(s) {
@@ -255,8 +231,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
 
   return (
     <div className="page fade-in">
-      <a ref={dlRef} style={{ display: 'none' }} />
-
       {/* Filter bar: API Source → Environment */}
       <div style={{ display:'flex', alignItems:'flex-end', gap:16, padding:'12px 16px', background:'var(--color-background-secondary)', border:'1px solid var(--color-border-secondary)', borderRadius:10, marginBottom:16 }}>
         <i className="ti ti-filter" style={{ color:'var(--accent)', fontSize:15, flexShrink:0, marginBottom:4 }} />
@@ -373,12 +347,6 @@ export default function TestSuites({ project, collection, env, envs, onEnvChange
                     <button className="btn-primary btn-sm" onClick={() => generate(s)}>
                       <i className="ti ti-sparkles" />{hasScript ? 'Re-generate Script' : 'Generate Script'}
                     </button>
-                    {hasScript && s.engine === 'jmeter' && s.jmx_path && (
-                      <button className="btn-secondary btn-sm" onClick={() => download(s, 'jmx')}><i className="ti ti-download" />.jmx</button>
-                    )}
-                    {hasScript && s.engine === 'k6' && s.js_path && (
-                      <button className="btn-secondary btn-sm" onClick={() => download(s, 'js')}><i className="ti ti-download" />.js</button>
-                    )}
                   </div>
                 )}
               </div>

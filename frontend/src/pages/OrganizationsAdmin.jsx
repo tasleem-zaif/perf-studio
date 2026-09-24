@@ -8,13 +8,14 @@ import ConfirmModal from '../components/ConfirmModal';
 import SMTPConfigPanel from '../components/SMTPConfigPanel';
 
 const PLAN_META = {
-  trial:      { label: 'Trial',      color: '#d97706', bg: 'rgba(217,119,6,0.12)' },
-  starter:    { label: 'Starter',    color: '#2563eb', bg: 'rgba(37,99,235,0.12)' },
-  growth:     { label: 'Growth',     color: '#7c3aed', bg: 'rgba(124,58,237,0.12)' },
-  business:   { label: 'Business',   color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
-  enterprise: { label: 'Enterprise', color: '#475569', bg: 'rgba(71,85,105,0.12)' },
+  trial:            { label: 'Trial',            color: '#d97706', bg: 'rgba(217,119,6,0.12)' },
+  professional:     { label: 'Professional',     color: '#2563eb', bg: 'rgba(37,99,235,0.12)' },
+  business:         { label: 'Business',         color: '#7c3aed', bg: 'rgba(124,58,237,0.12)' },
+  enterprise:       { label: 'Enterprise',       color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
+  enterprise_plus:  { label: 'Enterprise Plus',  color: '#475569', bg: 'rgba(71,85,105,0.12)' },
 };
-const PLAN_ORDER = ['trial', 'starter', 'growth', 'business', 'enterprise'];
+const PLAN_ORDER = ['trial', 'professional', 'business', 'enterprise', 'enterprise_plus'];
+const DURATION_MONTH_OPTIONS = [1, 2, 3, 6, 12];
 const INDUSTRIES = ['Technology', 'Finance', 'Healthcare', 'Retail', 'Education', 'Manufacturing', 'Other'];
 
 function tabBtnStyle(active) {
@@ -77,9 +78,11 @@ function ExpiryText({ license }) {
   return <span>{license.daysRemaining}d left</span>;
 }
 
+function orUnlimited(v, suffix = '') { return v === null || v === undefined ? 'Custom' : `${v}${suffix}`; }
+
 function PlanCardPicker({ plans, value, onChange }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '12px' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(170px, 1fr))', gap: '12px' }}>
       {PLAN_ORDER.filter(p => plans[p]).map(p => {
         const meta = PLAN_META[p];
         const d = plans[p];
@@ -96,9 +99,18 @@ function PlanCardPicker({ plans, value, onChange }) {
               </div>
             )}
             <PlanBadge plan={p} />
-            <div style={{ marginTop: '8px', fontSize: '13px' }}>{d.maxUsers === null ? 'Unlimited' : d.maxUsers} users</div>
-            <div style={{ fontSize: '13px' }}>{d.maxProjects === null ? 'Unlimited' : d.maxProjects} projects</div>
-            <div style={{ marginTop: '4px', fontSize: '12px', color: 'var(--accent)' }}>{d.trialDays}-day trial</div>
+            <div style={{ marginTop: '8px', fontSize: '12px', fontWeight: 700, color: 'var(--color-text-primary)' }}>
+              {d.monthlyPrice === null ? 'Custom pricing' : d.monthlyPrice === 0 ? 'Free' : `~$${d.monthlyPrice}/mo`}
+            </div>
+            <div style={{ fontSize: '13px' }}>{orUnlimited(d.maxUsers)} users</div>
+            <div style={{ fontSize: '13px' }}>{orUnlimited(d.maxProjects)} projects</div>
+            <div style={{ fontSize: '13px' }}>{orUnlimited(d.vuhPerMonth)} VUH/mo</div>
+            <div style={{ fontSize: '13px' }}>{orUnlimited(d.maxVUs)} max VUs</div>
+            <div style={{ fontSize: '13px' }}>
+              {d.maxTestDurationMin === null ? 'Custom' : d.maxTestDurationMin >= 60 ? `${d.maxTestDurationMin / 60}h` : `${d.maxTestDurationMin}min`} max duration
+            </div>
+            <div style={{ fontSize: '13px' }}>{orUnlimited(d.maxConcurrentTests)} concurrent tests</div>
+            <div style={{ marginTop: '4px', fontSize: '12px', color: 'var(--accent)' }}>{d.trialDays}-day default window</div>
           </div>
         );
       })}
@@ -273,28 +285,88 @@ function OrgEditDetailsTab({ org, onSaved }) {
 }
 
 /* ── License & Limits tab ────────────────────────────────────────────────── */
+function addMonthsIso(months) {
+  const d = new Date();
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+
+const ENTERPRISE_PLUS_FIELDS = [
+  { key: 'maxUsers',           label: 'Max users' },
+  { key: 'maxProjects',        label: 'Max projects' },
+  { key: 'totalVuh',           label: 'Total VUH' },
+  { key: 'maxVUs',             label: 'Max VUs per test' },
+  { key: 'maxTestDurationMin', label: 'Max test duration (min)' },
+  { key: 'maxConcurrentTests', label: 'Max concurrent tests' },
+];
+
 function OrgLicenseTab({ org, license, plans, onChanged }) {
   const { toast } = useToast();
   const [draftPlan, setDraftPlan] = useState(license?.plan || 'trial');
   const [draftExpiry, setDraftExpiry] = useState(license?.expiresAt ? license.expiresAt.slice(0, 10) : '');
+  const [draftMonths, setDraftMonths] = useState(license?.durationMonths || 1);
+  const [customFields, setCustomFields] = useState({});
   const [saving, setSaving] = useState(false);
+  const [topUpAmount, setTopUpAmount] = useState('');
+  const [toppingUp, setToppingUp] = useState(false);
 
   useEffect(() => {
     setDraftPlan(license?.plan || 'trial');
     setDraftExpiry(license?.expiresAt ? license.expiresAt.slice(0, 10) : '');
-  }, [org.id, license?.plan, license?.expiresAt]);
+    setDraftMonths(license?.durationMonths || 1);
+    setCustomFields({
+      maxUsers: license?.maxUsers ?? '', maxProjects: license?.maxProjects ?? '',
+      totalVuh: license?.totalVuh ?? '', maxVUs: license?.maxVUs ?? '',
+      maxTestDurationMin: license?.maxTestDurationMin ?? '', maxConcurrentTests: license?.maxConcurrentTests ?? '',
+    });
+  }, [org.id, license?.plan, license?.expiresAt, license?.durationMonths]);
+
+  const isTrial = draftPlan === 'trial';
+  const isEnterprisePlus = draftPlan === 'enterprise_plus';
+  const planDefaults = plans[draftPlan] || {};
+  const previewVuh = isEnterprisePlus ? null
+    : isTrial ? planDefaults.vuhPerMonth
+    : (planDefaults.vuhPerMonth || 0) * (draftMonths || 1);
+
+  function pickMonths(n) {
+    setDraftMonths(n);
+    setDraftExpiry(addMonthsIso(n));
+  }
 
   async function save() {
     setSaving(true);
     try {
       const body = { plan: draftPlan };
       if (draftExpiry) body.expiresAt = new Date(draftExpiry).toISOString();
+      if (isEnterprisePlus) {
+        for (const f of ENTERPRISE_PLUS_FIELDS) {
+          const v = customFields[f.key];
+          if (v === '' || v === undefined) { toast(`${f.label} is required for Enterprise Plus`, 'error'); setSaving(false); return; }
+          body[f.key] = Number(v);
+        }
+      } else if (!isTrial) {
+        body.durationMonths = draftMonths;
+      }
       const { data } = await api.put(`/licenses/${org.id}`, body);
       toast('License updated', 'success');
       onChanged(data.license);
     } catch (e) {
       toast(e.response?.data?.error || 'Failed to update license', 'error');
     } finally { setSaving(false); }
+  }
+
+  async function addVuh() {
+    const amt = Number(topUpAmount);
+    if (!amt || amt <= 0) { toast('Enter a positive VUH amount', 'error'); return; }
+    setToppingUp(true);
+    try {
+      const { data } = await api.post(`/licenses/${org.id}/vuh/topup`, { amount: amt });
+      toast(`Added ${amt} VUH`, 'success');
+      onChanged(data.license);
+      setTopUpAmount('');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Top-up failed', 'error');
+    } finally { setToppingUp(false); }
   }
 
   return (
@@ -304,29 +376,78 @@ function OrgLicenseTab({ org, license, plans, onChanged }) {
         <StatCard icon="ti-users" label="Users" value={`${license?.userCount ?? 0} / ${license?.maxUsers ?? '∞'}`} />
         <StatCard icon="ti-folder" label="Projects" value={`${license?.projectCount ?? 0} / ${license?.maxProjects ?? '∞'}`} />
         <StatCard icon="ti-hourglass" label="Expires" value={license ? <ExpiryText license={license} /> : '—'} />
+        <StatCard icon="ti-bolt" label="VUH" value={`${(license?.consumedVuh ?? 0).toFixed(0)} / ${license?.totalVuh ?? 0}`} />
+        <StatCard icon="ti-player-play" label="Running tests" value={`${license?.runningTestsCount ?? 0} / ${license?.maxConcurrentTests ?? '∞'}`} />
       </div>
 
       <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '12px' }}>Change plan</div>
       <PlanCardPicker plans={plans} value={draftPlan} onChange={setDraftPlan} />
 
-      <div style={{ marginTop: '20px', padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px' }}>
-        <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>License Expiry Date</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+      {isEnterprisePlus ? (
+        <div style={{ marginTop: '20px', padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>Enterprise Plus — custom terms (all required)</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '10px', marginBottom: '14px' }}>
+            {ENTERPRISE_PLUS_FIELDS.map(f => (
+              <div key={f.key} className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label" style={{ fontSize: '11px' }}>{f.label}</label>
+                <input type="number" min="0" value={customFields[f.key] ?? ''}
+                  onChange={e => setCustomFields(c => ({ ...c, [f.key]: e.target.value }))}
+                  placeholder="Custom value" />
+              </div>
+            ))}
+          </div>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>License Expiry Date</div>
           <input type="date" value={draftExpiry} onChange={e => setDraftExpiry(e.target.value)} style={{ maxWidth: '180px' }} />
-          <button onClick={() => setDraftExpiry('')} style={{ background: 'none', border: 'none', color: 'var(--accent)', fontSize: '12px', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
-            Clear (use plan default)
-          </button>
-          {!draftExpiry && (
-            <span style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginLeft: 'auto' }}>
-              Will use the {PLAN_META[draftPlan]?.label} plan's default trial window from today
-            </span>
-          )}
         </div>
-      </div>
+      ) : (
+        <div style={{ marginTop: '20px', padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px' }}>
+          {!isTrial && (
+            <>
+              <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>
+                License Duration <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>(drives VUH allocation: {planDefaults.vuhPerMonth}/mo)</span>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '14px', flexWrap: 'wrap' }}>
+                {DURATION_MONTH_OPTIONS.map(n => (
+                  <button key={n} onClick={() => pickMonths(n)} className={draftMonths === n ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}>
+                    {n} {n === 1 ? 'month' : 'months'}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>License Expiry Date</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <input type="date" value={draftExpiry} onChange={e => setDraftExpiry(e.target.value)} style={{ maxWidth: '180px' }} />
+            <button onClick={() => setDraftExpiry('')} style={{ background: 'none', border: 'none', color: 'var(--accent)', fontSize: '12px', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+              Clear (use plan default)
+            </button>
+            <span style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginLeft: 'auto' }}>
+              {isTrial
+                ? `Will use the Trial plan's ${planDefaults.trialDays}-day default window from today, ${previewVuh} VUH`
+                : `Allocates ${previewVuh?.toFixed(0)} VUH for ${draftMonths} month(s)${!draftExpiry ? ` — expires ${addMonthsIso(draftMonths)}` : ''}`}
+            </span>
+          </div>
+        </div>
+      )}
 
       <button className="btn-primary" onClick={save} disabled={saving} style={{ marginTop: '16px' }}>
         {saving ? <span className="spinner" /> : <i className="ti ti-check" />} Save License
       </button>
+
+      <div style={{ marginTop: '24px', padding: '16px', background: 'var(--color-background-secondary)', border: '1px solid var(--color-border-secondary)', borderRadius: '8px', maxWidth: '480px' }}>
+        <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '6px' }}>Add VUH</div>
+        <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', marginBottom: '10px' }}>
+          Additive top-up on top of the current allocation ({license?.totalVuh ?? 0} VUH total). Expires with the
+          license — a plan/duration change above resets the pool and forfeits any unused balance, top-ups included.
+        </div>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <input type="number" min="1" value={topUpAmount} onChange={e => setTopUpAmount(e.target.value)}
+            placeholder="e.g. 500" style={{ flex: 1 }} />
+          <button className="btn-secondary" onClick={addVuh} disabled={toppingUp || !topUpAmount}>
+            {toppingUp ? <span className="spinner" /> : <i className="ti ti-plus" />} Add VUH
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

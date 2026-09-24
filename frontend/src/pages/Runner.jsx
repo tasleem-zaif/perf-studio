@@ -414,6 +414,7 @@ export default function Runner({ projects, activeProject, activeCollection, acti
   const [ciSuiteEngine,  setCiSuiteEngine]  = useState('jmeter');
   const [ciSuiteTestType, setCiSuiteTestType] = useState('load');
   const [ciVars,         setCiVars]         = useState({ jmeter_users: 10, jmeter_rampup: 30, jmeter_loops: 1, jmeter_duration: 300, iter_mode: 'duration' });
+  const [orgLicense,    setOrgLicense]     = useState(null);
   const [ciTriggering,   setCiTriggering]   = useState(false);
   const [ciRuns,         setCiRuns]         = useState([]);
   const [ciPolling,      setCiPolling]      = useState(null); // runId being polled
@@ -461,6 +462,23 @@ export default function Runner({ projects, activeProject, activeCollection, acti
 
   const [runTab, setRunTab] = useState('ci-pipeline'); // 'single' | 'ci-pipeline' — declared here so useEffect below can reference it
 
+  // Client-side estimate only — mirrors the /ci/trigger backend check well enough to warn
+  // before submitting, but the backend (project OWNER's org, locked row) is the real gate.
+  const vuhPreflight = orgLicense ? (() => {
+    const vus = Number(ciVars.jmeter_users) || 0;
+    const isLoop = ciVars.iter_mode === 'loops';
+    const durationSec = isLoop ? null : (Number(ciVars.jmeter_duration) || 0) + (Number(ciVars.jmeter_rampup) || 0);
+    const estimatedVuh = isLoop ? null : (vus * durationSec) / 3600;
+    const availableVuh = orgLicense.availableVuh ?? 0;
+    const overVus = orgLicense.maxVUs !== null && vus > orgLicense.maxVUs;
+    const overDuration = !isLoop && orgLicense.maxTestDurationMin !== null && durationSec > orgLicense.maxTestDurationMin * 60;
+    const overConcurrent = orgLicense.maxConcurrentTests !== null && orgLicense.runningTestsCount >= orgLicense.maxConcurrentTests;
+    const overVuh = !isLoop && estimatedVuh !== null && estimatedVuh > availableVuh;
+    const noVuhAtAll = isLoop && availableVuh <= 0;
+    return { vus, isLoop, durationSec, estimatedVuh, availableVuh, overVus, overDuration, overConcurrent, overVuh, noVuhAtAll,
+      blocked: overVus || overDuration || overConcurrent || overVuh || noVuhAtAll };
+  })() : null;
+
   useEffect(() => {
     if (!selectedProjectId) { setCiConfig(null); setCiRuns([]); return; }
     // Re-fetch every time the CI Pipeline tab becomes active so freshly-saved configs are picked up
@@ -472,6 +490,10 @@ export default function Runner({ projects, activeProject, activeCollection, acti
       else if (data.config?.gitlab_enabled) setCiProvider('gitlab');
     }).catch(() => {});
     api.get(`/projects/${selectedProjectId}/ci/runs`).then(({ data }) => setCiRuns(data.runs || [])).catch(() => {});
+    // Own-org license snapshot for the pre-flight VUH/limit estimate below — an approximation
+    // (this user's own org, not necessarily the project OWNER's org in a cross-org-assignment
+    // edge case); the backend's /ci/trigger check is the real, authoritative gate either way.
+    api.get('/licenses/mine').then(({ data }) => setOrgLicense(data.license)).catch(() => setOrgLicense(null));
   }, [selectedProjectId, runTab]);
 
   // Background refresh for the CI Run History list. pollCiStatus()/startCiHealPolling()
@@ -961,6 +983,26 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                   )}
                 </div>
 
+                {/* ── VUH / limit pre-flight estimate ── */}
+                {orgLicense && vuhPreflight && (
+                  <div style={{
+                    padding: '10px 12px', borderRadius: 8, fontSize: 11.5,
+                    background: vuhPreflight.blocked ? 'rgba(239,68,68,0.08)' : 'rgba(37,99,235,0.06)',
+                    border: `1px solid ${vuhPreflight.blocked ? 'rgba(239,68,68,0.3)' : 'var(--color-border-secondary)'}`,
+                  }}>
+                    {vuhPreflight.isLoop ? (
+                      <div>Loop mode — this run will auto-stop once it would exceed your organization's remaining VUH or plan duration limit, whichever comes first.</div>
+                    ) : (
+                      <div>Estimated <strong>{vuhPreflight.estimatedVuh.toFixed(1)} VUH</strong> for this run — <strong>{vuhPreflight.availableVuh.toFixed(1)} VUH</strong> available.</div>
+                    )}
+                    {vuhPreflight.overVus && <div style={{ color: 'var(--danger)', marginTop: 4 }}><i className="ti ti-alert-triangle" /> {vuhPreflight.vus} VUs exceeds your plan's per-test limit of {orgLicense.maxVUs}.</div>}
+                    {vuhPreflight.overDuration && <div style={{ color: 'var(--danger)', marginTop: 4 }}><i className="ti ti-alert-triangle" /> Duration exceeds your plan's per-test limit of {orgLicense.maxTestDurationMin} minutes.</div>}
+                    {vuhPreflight.overConcurrent && <div style={{ color: 'var(--danger)', marginTop: 4 }}><i className="ti ti-alert-triangle" /> {orgLicense.runningTestsCount} test(s) already running — your plan allows {orgLicense.maxConcurrentTests} concurrent.</div>}
+                    {vuhPreflight.overVuh && <div style={{ color: 'var(--danger)', marginTop: 4 }}><i className="ti ti-alert-triangle" /> Not enough VUH left for this run. Ask your administrator to top up.</div>}
+                    {vuhPreflight.noVuhAtAll && <div style={{ color: 'var(--danger)', marginTop: 4 }}><i className="ti ti-alert-triangle" /> No VUH left — ask your administrator to top up before running.</div>}
+                  </div>
+                )}
+
                 {/* ── Auto Heal toggle ── */}
                 <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4,
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -987,7 +1029,9 @@ export default function Runner({ projects, activeProject, activeCollection, acti
                 </div>
 
                 <div style={{ marginTop: 14 }}>
-                  <button className="btn-primary" onClick={triggerCiPipeline} disabled={ciTriggering || !ciScriptName || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}>
+                  <button className="btn-primary" onClick={triggerCiPipeline}
+                    disabled={ciTriggering || !ciScriptName || vuhPreflight?.blocked || (!ciConfig?.gitlab_enabled && !ciConfig?.github_enabled && !ciConfig?.bitbucket_enabled)}
+                    title={vuhPreflight?.blocked ? 'Blocked by your organization\'s license limits — see the notice above' : undefined}>
                     {ciTriggering
                       ? <><span className="spinner"/> Triggering…</>
                       : <><i className="ti ti-send"/> Trigger {ciProvider === 'gitlab' ? 'GitLab' : ciProvider === 'github' ? 'GitHub Actions' : 'Bitbucket'} Pipeline</>}

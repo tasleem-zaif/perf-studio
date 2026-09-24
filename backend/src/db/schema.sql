@@ -665,3 +665,86 @@ CREATE INDEX IF NOT EXISTS idx_rules_project_user                 ON rules(proje
 CREATE INDEX IF NOT EXISTS idx_test_suites_project_user           ON test_suites(project_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_test_data_files_project_user       ON test_data_files(project_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_collection_env_config_project_user ON collection_env_config(project_id, user_id);
+
+-- ── VUH metering ────────────────────────────────────────────────────────────
+-- Plan tiers renamed to match the new pricing sheet (old -> new): starter -> professional,
+-- growth -> business, business -> enterprise, enterprise -> enterprise_plus. trial unchanged.
+-- Must be a single CASE-based UPDATE, not four sequential UPDATEs — the old names form a
+-- rename cycle (business is both a source and a target), so any row-visible-to-later-statement
+-- approach would double-rename rows a prior statement in the same script already touched. A
+-- single UPDATE evaluates every row's CASE against its pre-statement value, so this is safe
+-- to run exactly once — and a no-op (matches nothing) on every re-run after that.
+UPDATE org_licenses SET plan = CASE plan
+  WHEN 'starter'    THEN 'professional'
+  WHEN 'growth'     THEN 'business'
+  WHEN 'business'   THEN 'enterprise'
+  WHEN 'enterprise' THEN 'enterprise_plus'
+  ELSE plan
+END
+WHERE plan IN ('starter', 'growth', 'business', 'enterprise');
+
+-- Total/consumed VUH pool per org. total_vuh is set from the assigned plan's vuhPerMonth x
+-- the chosen license duration (see utils/license.js) and is NOT cumulative across renewals —
+-- setOrgPlan() resets both columns on every plan/duration save, matching "unused VUH is
+-- forfeited at renewal", not rolled over.
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS total_vuh              NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS consumed_vuh           NUMERIC(14,2) DEFAULT 0;
+-- Per-org copies of the plan's per-test/concurrency ceilings (not just read from PLAN_DEFAULTS)
+-- so Enterprise Plus's custom values and any standard-plan override both flow through the
+-- same columns the enforcement code reads, same pattern as the existing max_users/max_projects.
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS max_vus                INTEGER;
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS max_test_duration_min  INTEGER;
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS max_concurrent_tests   INTEGER;
+-- Number of months the current license period covers; drives the VUH renewal calculation
+-- and lets the UI re-show the duration that was actually chosen (a raw expires_at date alone
+-- doesn't round-trip back to "3 months" cleanly). NULL for Enterprise Plus's fully custom terms.
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS duration_months        INTEGER;
+
+-- Append-only audit trail for every VUH movement: a reservation taken before a CI run is
+-- dispatched, its later commit (actual VUH once the run finishes) or release (run never
+-- started / abandoned), and manual adjustments (top-ups, renewal forfeiture). Nothing here
+-- is ever deleted or updated except a reservation's own status/actual_vuh as it resolves —
+-- this is the record the org-admin/super-admin ledger view and support disputes read from.
+CREATE TABLE IF NOT EXISTS vuh_ledger (
+  id                SERIAL PRIMARY KEY,
+  org_id            INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  project_id        INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  execution_run_id  INTEGER REFERENCES execution_runs(id) ON DELETE SET NULL,
+  ci_run_id         INTEGER,
+  kind              TEXT NOT NULL,              -- 'reservation' | 'adjustment'
+  status            TEXT,                        -- reservation only: 'open' | 'committed' | 'released'
+  vusers            INTEGER,
+  duration_seconds  INTEGER,
+  reserved_vuh      NUMERIC(14,2),
+  actual_vuh        NUMERIC(14,2),
+  reason            TEXT,
+  created_by        INTEGER REFERENCES users(id),
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vuh_ledger_org       ON vuh_ledger(org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuh_ledger_open_res  ON vuh_ledger(org_id, status) WHERE kind = 'reservation' AND status = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vuh_ledger_ci_run_reservation
+  ON vuh_ledger(ci_run_id) WHERE kind = 'reservation' AND ci_run_id IS NOT NULL;
+
+-- Backfill the new limit/VUH columns for orgs that existed before this migration — the
+-- ALTER TABLEs above only gave them bare defaults (0 / NULL), which would block every one
+-- of their CI triggers outright (0 VUH available) until a Super Admin happened to open their
+-- license and re-save it. Mirrors utils/license.js's PLAN_DEFAULTS one-for-one so a fresh
+-- org (via getOrCreateOrgLicense) and a pre-existing one land on identical numbers. Guarded by
+-- duration_months IS NULL AND total_vuh = 0 so this only ever touches a row nobody has
+-- configured yet — once setOrgPlan() saves a real duration_months, this never re-touches it.
+-- enterprise_plus is deliberately left at 0/NULL — there's no computed default for a "custom"
+-- tier; it must be set explicitly per org via the License & Limits UI.
+UPDATE org_licenses SET
+  max_vus = 50, max_test_duration_min = 30, max_concurrent_tests = 1, total_vuh = 50
+  WHERE plan = 'trial' AND duration_months IS NULL AND total_vuh = 0;
+UPDATE org_licenses SET
+  max_vus = 2000, max_test_duration_min = 240, max_concurrent_tests = 3, total_vuh = 1650, duration_months = 1
+  WHERE plan = 'professional' AND duration_months IS NULL AND total_vuh = 0;
+UPDATE org_licenses SET
+  max_vus = 5000, max_test_duration_min = 480, max_concurrent_tests = 5, total_vuh = 6650, duration_months = 1
+  WHERE plan = 'business' AND duration_months IS NULL AND total_vuh = 0;
+UPDATE org_licenses SET
+  max_vus = 25000, max_test_duration_min = 1440, max_concurrent_tests = 15, total_vuh = 20000, duration_months = 1
+  WHERE plan = 'enterprise' AND duration_months IS NULL AND total_vuh = 0;

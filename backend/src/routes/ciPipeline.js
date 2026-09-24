@@ -17,6 +17,23 @@ const db      = require('../db');
 const auth    = require('../middleware/auth');
 const ownsProject = require('../utils/ownsProject');
 const { encrypt, decrypt } = require('../utils/encryption');
+const { reserveVuh, releaseReservationById, attachReservationCiRunId, commitReservation } = require('../utils/license');
+
+// Resolves a CI run's actual VUH and commits it against whatever reservation was taken at
+// trigger time (a no-op if none was — e.g. this codebase predates VUH metering for this run,
+// or it's a quick-verify heal attempt that was never reserved in the first place). Called once
+// a run reaches a terminal state in autoSyncCiRun — never blocks the sync itself on failure.
+async function reconcileVuhForCiRun(ciRunId, executionRunId, { vusers, rampupSec, durationSec, startedAt }) {
+  try {
+    let actualDurationSeconds = Number(durationSec) > 0 ? Number(durationSec) + (Number(rampupSec) || 0) : null;
+    if (!actualDurationSeconds && startedAt) {
+      actualDurationSeconds = Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000);
+    }
+    await commitReservation(ciRunId, { actualVusers: vusers, actualDurationSeconds, executionRunId });
+  } catch (e) {
+    console.warn(`[VUH] Reconciliation failed for CI run #${ciRunId}:`, e.message);
+  }
+}
 const https   = require('https');
 const http    = require('http');
 const path    = require('path');
@@ -1950,6 +1967,61 @@ router.post('/trigger', async (req, res) => {
   // engine drives which CI branch (JMeter vs k6 docker command) runs — resolve from the
   // matched suite by default, but let the caller override explicitly (req.body.engine).
   const engine = req.body.engine || matchedSuite2?.engine || 'jmeter';
+
+  // ── License/VUH gate — before any git/dispatch work starts ──────────────────
+  // Scoped to the PROJECT OWNER's org, not necessarily the triggering user's — an org_admin
+  // can trigger a project they're assigned to but don't own — same scoping
+  // getOrgLicenseStatus() already uses for its user/project counts.
+  const ownerOrgRow = await db.prepare(
+    'SELECT u.org_id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+  ).get(req.params.projectId);
+  const licenseOrgId = ownerOrgRow?.org_id;
+
+  const requestedVusers = Number(engine === 'k6' ? (k6_vus || 10) : (jmeter_users || 10));
+  // Loop/iteration mode is signalled by the frontend sending the OTHER param as -1/0
+  // (Runner.jsx: "Pass only the active param; set the other to -1 so JMeter ignores it").
+  const isLoopMode = engine === 'k6'
+    ? Number(k6_iterations || 0) > 0
+    : !(Number(jmeter_duration) > 0);
+  const requestedDurationSeconds = isLoopMode
+    ? null
+    : Number(engine === 'k6' ? (k6_duration || 300) : jmeter_duration) +
+      Number(engine === 'k6' ? (k6_rampup || 30) : (jmeter_rampup || 30));
+
+  let vuhReservationId = null;
+  let vuhCappedDurationSeconds = null;
+  if (licenseOrgId) {
+    const reservation = await reserveVuh(licenseOrgId, {
+      projectId: Number(req.params.projectId),
+      vusers: requestedVusers,
+      durationSeconds: requestedDurationSeconds,
+      userId: req.userId,
+    });
+    if (!reservation.ok) {
+      const messages = {
+        no_license: 'No license found for your organization.',
+        license_disabled: "Your organization's license is disabled. Contact your administrator.",
+        license_expired: "Your organization's license has expired. Contact your administrator to renew.",
+        max_vus_exceeded: `This test requests ${reservation.requestedVUs} virtual users, exceeding your plan's per-test limit of ${reservation.maxVUs}.`,
+        max_duration_exceeded: `This test's duration exceeds your plan's per-test limit of ${reservation.maxTestDurationMin} minutes.`,
+        max_concurrent_tests_exceeded: `Your organization already has ${reservation.runningCount} test(s) running — your plan allows ${reservation.maxConcurrentTests} concurrent. Wait for one to finish first.`,
+        vuh_exceeded: `Not enough VUH available to run this test (${(reservation.availableVuh ?? 0).toFixed(2)} VUH left, this test needs ${(reservation.requestedVuh ?? 0).toFixed(2)}). Ask your platform administrator to top up your organization's VUH.`,
+      };
+      return res.status(403).json({
+        error: messages[reservation.reason] || "This run is blocked by your organization's license limits.",
+        reason: reservation.reason,
+        ...reservation,
+      });
+    }
+    vuhReservationId = reservation.reservationId;
+    // Loop-mode only: how long the run may run before it would exhaust the org's remaining
+    // VUH (or the plan's max test duration, whichever is tighter). NOTE: this is enforced as
+    // a ledger cap on the RESERVATION today, not yet as an actual mid-run kill-switch on the
+    // running JMeter/k6 process — see PROJECT_MAP.md's VUH section for what's still needed
+    // to wire an actual self-terminating scheduler ceiling into loop-mode scripts.
+    vuhCappedDurationSeconds = reservation.cappedDurationSeconds;
+  }
+
   const ciRunDisplayName = buildRunDirName(
     matchedSuite2?.name || scriptFile2.replace(/\.jmx$|\.js$/, ''),
     engine === 'k6' ? (k6_vus || 10) : jmeter_users, 'duration',
@@ -3161,8 +3233,10 @@ pipelines:
       if (r.status === 201) {
         const run = await db.prepare('INSERT INTO ci_pipeline_runs (project_id, provider, external_id, web_url, status, script_name, run_name, variables, triggered_by, auto_heal, auto_heal_mode, auto_heal_instruction, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(req.params.projectId, 'gitlab', String(r.body.id), r.body.web_url || '', r.body.status || 'pending', script_name, ciRunDisplayName, JSON.stringify(variables), req.userId, auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine);
-        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab' });
+        if (vuhReservationId) await attachReservationCiRunId(vuhReservationId, run.lastInsertRowid);
+        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: r.body.id, web_url: r.body.web_url, status: r.body.status, message: 'Pipeline triggered on GitLab', vuh: vuhCappedDurationSeconds ? { cappedDurationSeconds: vuhCappedDurationSeconds } : undefined });
       }
+      if (vuhReservationId) await releaseReservationById(vuhReservationId);
       return res.status(400).json({ error: `GitLab returned ${r.status}: ${JSON.stringify(r.body)}` });
     }
 
@@ -3316,8 +3390,10 @@ pipelines:
             script_name, ciRunDisplayName, JSON.stringify(variables), req.userId,
             auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine
           );
-        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions' });
+        if (vuhReservationId) await attachReservationCiRunId(vuhReservationId, run.lastInsertRowid);
+        return res.json({ ok: true, run_id: run.lastInsertRowid, run_name: ciRunDisplayName, external_id: latestRun?.id, web_url: latestRun?.html_url || `https://github.com/${cfg.github_repo}/actions`, status: latestRun?.status || 'queued', message: 'Workflow dispatched on GitHub Actions', vuh: vuhCappedDurationSeconds ? { cappedDurationSeconds: vuhCappedDurationSeconds } : undefined });
       }
+      if (vuhReservationId) await releaseReservationById(vuhReservationId);
       return res.status(400).json({ error: `GitHub returned ${r.status}: ${JSON.stringify(r.body)}` });
     }
 
@@ -3367,13 +3443,17 @@ pipelines:
             JSON.stringify(variablesWithBuild), req.userId,
             auto_heal ? 1 : 0, auto_heal_mode, auto_heal_instruction, engine
           );
-        return res.json({ ok: true, run_id: bbRunInsert.lastInsertRowid, run_name: ciRunDisplayName, external_id: pipelineUuid, web_url: `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`, status: 'pending', message: 'Pipeline triggered on Bitbucket Pipelines' });
+        if (vuhReservationId) await attachReservationCiRunId(vuhReservationId, bbRunInsert.lastInsertRowid);
+        return res.json({ ok: true, run_id: bbRunInsert.lastInsertRowid, run_name: ciRunDisplayName, external_id: pipelineUuid, web_url: `https://bitbucket.org/${cfg.bitbucket_workspace}/${cfg.bitbucket_repo_slug}/pipelines/results/${pipelineUuid}`, status: 'pending', message: 'Pipeline triggered on Bitbucket Pipelines', vuh: vuhCappedDurationSeconds ? { cappedDurationSeconds: vuhCappedDurationSeconds } : undefined });
       }
+      if (vuhReservationId) await releaseReservationById(vuhReservationId);
       return res.status(400).json({ error: `Bitbucket returned ${bbResp.status}: ${bbResp.body?.error?.message || JSON.stringify(bbResp.body)}` });
     }
 
+    if (vuhReservationId) await releaseReservationById(vuhReservationId);
     res.status(400).json({ error: `Unknown provider: ${provider}` });
   } catch (e) {
+    if (vuhReservationId) { try { await releaseReservationById(vuhReservationId); } catch (_) {} }
     res.status(500).json({ error: `Trigger failed: ${e.message}` });
   }
 });
@@ -3616,10 +3696,16 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
         const noJtlLogs = [{ type: 'error', message: `${engine === 'k6' ? 'k6' : 'JMeter'} results not uploaded — pipeline failed before the test could produce output.` }];
         if (bbPipeLogs) noJtlLogs.push({ type: 'info', message: `Bitbucket pipeline output:\n${bbPipeLogs}` });
 
-        await db.prepare(`
+        const noJtlInsert = await db.prepare(`
           INSERT INTO execution_runs (project_id, suite_id, engine, status, result_dir, report_path, logs, started_at, finished_at, report_data, ci_run_id, run_vusers, run_rampup, run_duration, run_loops)
           VALUES (?, ?, ?, 'failed', ?, NULL, ?, ?, NOW(), NULL, ?, ?, ?, ?, ?)
         `).run(projectId, suiteId, engine, resultDir, JSON.stringify(noJtlLogs), run.started_at || new Date().toISOString(), run.id, ciUsers, ciRampup, ciDur, ciLoops);
+        // Pipeline failed before producing any output — actual usage was whatever ran before
+        // it died, not the full requested duration. commitReservation charges the real elapsed
+        // time (started_at -> now), refunding the rest of the reservation automatically.
+        await reconcileVuhForCiRun(run.id, noJtlInsert.lastInsertRowid, {
+          vusers: ciUsers, rampupSec: ciRampup, durationSec: null, startedAt: run.started_at,
+        });
 
         const healUserId = effectiveUserId;
         if (run.auto_heal && !run.is_heal_run) {
@@ -3889,6 +3975,17 @@ async function autoSyncCiRun(run, cfg, projectId, userId) {
       run.id, ciUsers, ciRampup, ciDur, ciLoops
     );
     const newRunId = execInsert.lastInsertRowid;
+
+    // Prefer the actually-observed duration (reportData.meta.duration_s, derived from the
+    // real JTL/results timestamps) over the originally-requested ciDur — a healed, early-
+    // stopped, or otherwise-adjusted run's real elapsed time is what actually consumed VUH,
+    // not what was asked for at trigger time. Falls back to requested duration, then to
+    // started_at-based elapsed if neither is available (e.g. loop-mode with no report yet).
+    await reconcileVuhForCiRun(run.id, newRunId, {
+      vusers: ciUsers, rampupSec: ciRampup,
+      durationSec: (reportData?.meta?.duration_s > 0 ? reportData.meta.duration_s : ciDur),
+      startedAt: run.started_at,
+    });
 
     console.log(`[Auto-sync] CI run #${run.id} synced → ${path.basename(resultDir)}`);
 
@@ -5412,12 +5509,50 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   }
 
   // ── Phase 2: Full run with original params ────────────────────────────────
+  // Metered like any normal run — it's a full-scale re-execution on the same external CI
+  // runner a fresh trigger would use, unlike Phase 1's quick-verify (1 VU/1 loop, left
+  // unmetered — see HEAL_VUSERS/HEAL_LOOPS above). Reserved here rather than relying on
+  // autoSyncCiRun's reconciliation alone, so a heal cycle that's out of VUH is blocked
+  // BEFORE dispatching, same as a fresh /trigger call.
   setCiHealStatus(ciRunId, 'rerunning_full');
   const origVarsForFull = (() => { try { return JSON.parse(ciRun.variables || '{}'); } catch { return {}; } })();
+
+  let healReservationId = null;
+  const healOwnerOrgRow = await db.prepare(
+    'SELECT u.org_id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+  ).get(projectId);
+  if (healOwnerOrgRow?.org_id) {
+    const fullVusers = Number(origVarsForFull.engine === 'k6' ? (origVarsForFull.k6_vus || 10) : (origVarsForFull.jmeter_users || 10));
+    const fullIsLoopMode = origVarsForFull.engine === 'k6'
+      ? Number(origVarsForFull.k6_iterations || 0) > 0
+      : !(Number(origVarsForFull.jmeter_duration) > 0);
+    const fullDurationSeconds = fullIsLoopMode ? null :
+      Number(origVarsForFull.engine === 'k6' ? (origVarsForFull.k6_duration || 300) : origVarsForFull.jmeter_duration) +
+      Number(origVarsForFull.engine === 'k6' ? (origVarsForFull.k6_rampup || 30) : (origVarsForFull.jmeter_rampup || 30));
+
+    const healReservation = await reserveVuh(healOwnerOrgRow.org_id, {
+      projectId, vusers: fullVusers, durationSeconds: fullDurationSeconds, userId,
+    });
+    if (!healReservation.ok) {
+      // Quick-verify already passed — the fix is confirmed valid, just can't afford the
+      // full-scale confirmation run. Reported distinctly so it doesn't read as "healed" or
+      // "still failing" when it's actually a licensing block.
+      await logCiHealAttempt(ciRunId, attemptNum,
+        `Fix verified at quick-check level, but the full confirmation run was blocked: ${healReservation.reason} ` +
+        `(insufficient VUH or over a plan limit). Ask your platform administrator to top up VUH or raise the limit, then click "Heal Again".`,
+        '', 'no_fix');
+      await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('vuh_blocked', lid);
+      setCiHealStatus(ciRunId, 'vuh_blocked');
+      return;
+    }
+    healReservationId = healReservation.reservationId;
+  }
+
   let fullResult;
   try {
     fullResult = await pushJmxAndTrigger(userId, projectId, ciRun, origVarsForFull);
   } catch (e) {
+    if (healReservationId) await releaseReservationById(healReservationId);
     // Quick passed — still count as healed
     await db.prepare('UPDATE ci_auto_heal_logs SET result=? WHERE id=?').run('healed', lid);
     setCiHealStatus(ciRunId, 'healed');
@@ -5425,6 +5560,7 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   }
 
   const fullCiRunId = fullResult.ciRunId;
+  if (healReservationId) await attachReservationCiRunId(healReservationId, fullCiRunId);
   await db.prepare('UPDATE ci_pipeline_runs SET heal_ci_run_id=? WHERE id=?').run(fullCiRunId, ciRunId);
 
   const origDurationS = parseInt(origVarsForFull.jmeter_duration || '300', 10);

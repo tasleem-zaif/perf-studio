@@ -208,6 +208,21 @@ app.listen(PORT, () => {
       }).catch(e => console.error('[S3Sweep] Error:', e.message));
     }, SWEEP_INTERVAL_MS);
   }
+
+  // ── VUH stale-reservation sweep ────────────────────────────────────────────
+  // Releases VUH reservations that never got a completion callback (lost webhook, a
+  // status-poll/sync path that errored before reaching commitReservation) within their own
+  // expected runtime + grace window. Always on — unlike the S3 sweep, VUH metering isn't
+  // gated behind an env flag.
+  {
+    const { sweepStaleReservations } = require('./utils/license');
+    const VUH_SWEEP_INTERVAL_MS = Number(process.env.VUH_SWEEP_INTERVAL_MS) || 30 * 60 * 1000;
+    setInterval(() => {
+      sweepStaleReservations()
+        .then(released => { if (released) console.log(`[VUHSweep] Released ${released} stale reservation(s)`); })
+        .catch(e => console.error('[VUHSweep] Error:', e.message));
+    }, VUH_SWEEP_INTERVAL_MS);
+  }
 });
 }
 

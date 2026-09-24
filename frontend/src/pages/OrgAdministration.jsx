@@ -8,6 +8,28 @@ import { projectDirName } from '../utils/displayName';
 import SMTPConfigPanel from '../components/SMTPConfigPanel';
 
 const ROLE_LABELS = { org_admin: 'Org Admin', user: 'User' };
+const PLAN_LABELS = { trial: 'Trial', professional: 'Professional', business: 'Business', enterprise: 'Enterprise', enterprise_plus: 'Enterprise Plus' };
+
+function LimitBar({ used, total, label }) {
+  const unlimited = total === null || total === undefined;
+  const pct = unlimited ? 0 : Math.min(100, total > 0 ? (used / total) * 100 : 0);
+  const danger = !unlimited && pct >= 90;
+  return (
+    <div style={{ marginBottom: '14px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', marginBottom: '4px' }}>
+        <span style={{ color: 'var(--color-text-secondary)' }}>{label}</span>
+        <span style={{ fontWeight: 600, color: danger ? 'var(--danger)' : 'var(--color-text-primary)' }}>
+          {used} / {unlimited ? '∞' : total}
+        </span>
+      </div>
+      {!unlimited && (
+        <div style={{ height: 6, borderRadius: 4, background: 'var(--color-background-secondary)', overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${pct}%`, background: danger ? 'var(--danger)' : 'var(--accent)', borderRadius: 4 }} />
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RoleBadge({ role }) {
   const isAdmin = role === 'org_admin';
@@ -290,6 +312,9 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
         <TabButton active={tab === 'projects'} onClick={() => setTab('projects')}>
           Projects ({projects.length})
         </TabButton>
+        <TabButton active={tab === 'license'} onClick={() => setTab('license')}>
+          License &amp; Limits
+        </TabButton>
       </div>
 
       {/* ── All Users tab ──────────────────────────────────────────────── */}
@@ -458,6 +483,60 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
             </div>
           ))}
         </div>
+      )}
+
+      {/* ── License & Limits tab (read-only — Super Admin sets these) ────── */}
+      {tab === 'license' && (
+        <Card style={{ maxWidth: 640 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>License & Limits</div>
+            <span style={{ padding: '2px 9px', borderRadius: '10px', fontSize: '11px', fontWeight: 700, letterSpacing: '.02em', textTransform: 'uppercase', background: 'rgba(37,99,235,0.08)', color: '#2563eb', border: '1px solid rgba(37,99,235,0.3)' }}>
+              {PLAN_LABELS[license.plan] || license.plan}
+            </span>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 18 }}>
+            Set by your platform administrator — contact them to change your plan or top up VUH.
+          </div>
+
+          <LimitBar used={license.userCount ?? 0} total={license.maxUsers} label="Users" />
+          <LimitBar used={license.projectCount ?? 0} total={license.maxProjects} label="Projects" />
+          <LimitBar used={Math.round(license.consumedVuh ?? 0)} total={license.totalVuh} label="VUH consumed this period" />
+          <LimitBar used={license.runningTestsCount ?? 0} total={license.maxConcurrentTests} label="Running tests right now" />
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12, marginTop: 18 }}>
+            <div style={{ padding: '12px 14px', borderRadius: 8, border: '1px solid var(--color-border-secondary)', background: 'var(--color-background-secondary)' }}>
+              <div className="stat-label">Available VUH</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{(license.availableVuh ?? 0).toFixed(0)}</div>
+            </div>
+            <div style={{ padding: '12px 14px', borderRadius: 8, border: '1px solid var(--color-border-secondary)', background: 'var(--color-background-secondary)' }}>
+              <div className="stat-label">Max VUs per test</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{license.maxVUs ?? '∞'}</div>
+            </div>
+            <div style={{ padding: '12px 14px', borderRadius: 8, border: '1px solid var(--color-border-secondary)', background: 'var(--color-background-secondary)' }}>
+              <div className="stat-label">Max test duration</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>
+                {license.maxTestDurationMin ? (license.maxTestDurationMin >= 60 ? `${license.maxTestDurationMin / 60}h` : `${license.maxTestDurationMin}min`) : '∞'}
+              </div>
+            </div>
+            <div style={{ padding: '12px 14px', borderRadius: 8, border: '1px solid var(--color-border-secondary)', background: 'var(--color-background-secondary)' }}>
+              <div className="stat-label">Expires</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: license.isExpired ? 'var(--danger)' : 'var(--color-text-primary)' }}>
+                {license.isExpired ? 'Expired' : license.expiresAt ? `${license.daysRemaining}d left` : 'No expiry'}
+              </div>
+            </div>
+          </div>
+
+          {(license.vuhUtilizationPct ?? 0) >= 80 && (
+            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '14px 16px', marginTop: 18, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.35)', borderRadius: '10px' }}>
+              <i className="ti ti-alert-triangle" style={{ color: 'var(--warn)', fontSize: 18, marginTop: 1 }} />
+              <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                {license.vuhUtilizationPct >= 100
+                  ? 'VUH is exhausted — new test runs will be blocked until your administrator tops up or renews the license.'
+                  : `${license.vuhUtilizationPct}% of this period's VUH is used. Ask your administrator to top up before it runs out.`}
+              </div>
+            </div>
+          )}
+        </Card>
       )}
 
       {/* Assign users to project modal */}
