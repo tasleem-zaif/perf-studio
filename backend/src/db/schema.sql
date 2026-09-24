@@ -737,14 +737,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vuh_ledger_ci_run_reservation
 -- enterprise_plus is deliberately left at 0/NULL — there's no computed default for a "custom"
 -- tier; it must be set explicitly per org via the License & Limits UI.
 UPDATE org_licenses SET
-  max_vus = 50, max_test_duration_min = 30, max_concurrent_tests = 1, total_vuh = 50
+  max_vus = 50, max_test_duration_min = 30, max_concurrent_tests = 1, total_vuh = 100
   WHERE plan = 'trial' AND duration_months IS NULL AND total_vuh = 0;
 UPDATE org_licenses SET
-  max_vus = 2000, max_test_duration_min = 240, max_concurrent_tests = 3, total_vuh = 1650, duration_months = 1
+  max_vus = 1000, max_test_duration_min = 240, max_concurrent_tests = 3, total_vuh = 8000, duration_months = 1
   WHERE plan = 'professional' AND duration_months IS NULL AND total_vuh = 0;
 UPDATE org_licenses SET
-  max_vus = 5000, max_test_duration_min = 480, max_concurrent_tests = 5, total_vuh = 6650, duration_months = 1
+  max_vus = 8000, max_test_duration_min = 480, max_concurrent_tests = 5, total_vuh = 16000, duration_months = 1
   WHERE plan = 'business' AND duration_months IS NULL AND total_vuh = 0;
 UPDATE org_licenses SET
-  max_vus = 25000, max_test_duration_min = 1440, max_concurrent_tests = 15, total_vuh = 20000, duration_months = 1
+  max_vus = 25000, max_test_duration_min = 1440, max_concurrent_tests = 15, total_vuh = 50000, duration_months = 1
   WHERE plan = 'enterprise' AND duration_months IS NULL AND total_vuh = 0;
+
+-- Retroactive bump (2026-09-24): pricing sheet revised VUH/max-VUs for trial/professional/
+-- business/enterprise. Only touches a row that's still sitting on the OLD default for its
+-- plan (exact match on both total_vuh AND max_vus) — never overwrites an org a Super Admin
+-- already customized away from the plan default via the License & Limits UI. Idempotent: once
+-- applied, no row matches the old values anymore, so a re-run is a no-op.
+UPDATE org_licenses SET total_vuh = 100
+  WHERE plan = 'trial' AND total_vuh = 50 AND max_vus = 50;
+UPDATE org_licenses SET total_vuh = 8000, max_vus = 1000
+  WHERE plan = 'professional' AND total_vuh = 1650 AND max_vus = 2000;
+UPDATE org_licenses SET total_vuh = 16000, max_vus = 8000
+  WHERE plan = 'business' AND total_vuh = 6650 AND max_vus = 5000;
+UPDATE org_licenses SET total_vuh = 50000
+  WHERE plan = 'enterprise' AND total_vuh = 20000 AND max_vus = 25000;

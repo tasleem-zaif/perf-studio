@@ -36,13 +36,13 @@ const { encrypt } = require('./encryption');
 // Admin must supply every one of them explicitly via overrides when assigning it.
 const PLAN_DEFAULTS = {
   trial:            { maxUsers: 2,    maxProjects: 1,  trialDays: 7,
-                       monthlyPrice: 0,    vuhPerMonth: 50,    maxVUs: 50,    maxTestDurationMin: 30,   maxConcurrentTests: 1 },
+                       monthlyPrice: 0,    vuhPerMonth: 100,   maxVUs: 50,    maxTestDurationMin: 30,   maxConcurrentTests: 1 },
   professional:     { maxUsers: 5,    maxProjects: 3,  trialDays: 180,
-                       monthlyPrice: 450,  vuhPerMonth: 1650,  maxVUs: 2000,  maxTestDurationMin: 240,  maxConcurrentTests: 3 },
+                       monthlyPrice: 450,  vuhPerMonth: 8000,  maxVUs: 1000,  maxTestDurationMin: 240,  maxConcurrentTests: 3 },
   business:         { maxUsers: 15,   maxProjects: 10, trialDays: 180,
-                       monthlyPrice: 850,  vuhPerMonth: 6650,  maxVUs: 5000,  maxTestDurationMin: 480,  maxConcurrentTests: 5 },
+                       monthlyPrice: 850,  vuhPerMonth: 16000, maxVUs: 8000,  maxTestDurationMin: 480,  maxConcurrentTests: 5 },
   enterprise:       { maxUsers: 30,   maxProjects: 25, trialDays: 180,
-                       monthlyPrice: 2100, vuhPerMonth: 20000, maxVUs: 25000, maxTestDurationMin: 1440, maxConcurrentTests: 15 },
+                       monthlyPrice: 2100, vuhPerMonth: 50000, maxVUs: 25000, maxTestDurationMin: 1440, maxConcurrentTests: 15 },
   enterprise_plus:  { maxUsers: null, maxProjects: null, trialDays: 180,
                        monthlyPrice: null, vuhPerMonth: null,  maxVUs: null,  maxTestDurationMin: null, maxConcurrentTests: null },
 };
