@@ -375,9 +375,11 @@ router.get('/org-users', auth, async (req, res) => {
   const orgId = caller.role === 'org_admin' ? caller.org_id : req.query.org_id;
   const users = await db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.status,
-      STRING_AGG(pa.project_id::text, ',') as assigned_project_ids
+      STRING_AGG(DISTINCT pa.project_id::text, ',') as assigned_project_ids,
+      BOOL_OR(oar.user_id IS NOT NULL) as ops_alerts_opted_in
     FROM users u
     LEFT JOIN project_assignments pa ON pa.user_id = u.id
+    LEFT JOIN ops_alert_recipients oar ON oar.user_id = u.id
     WHERE u.org_id = ? AND u.role = 'user'
     GROUP BY u.id ORDER BY u.name
   `).all(orgId);
@@ -387,6 +389,7 @@ router.get('/org-users', auth, async (req, res) => {
     assigned_project_ids: u.assigned_project_ids
       ? u.assigned_project_ids.split(',').map(Number)
       : [],
+    ops_alerts_opted_in: !!u.ops_alerts_opted_in,
   }))});
 });
 
@@ -411,6 +414,30 @@ router.put('/assign/:userId', auth, async (req, res) => {
     } catch (_) {}
   }
 
+  res.json({ ok: true });
+});
+
+// Opt a regular user in/out of ops alerts (e.g. stale VUH reservation notices) for their org
+router.put('/ops-alert-recipients/:userId', auth, async (req, res) => {
+  const caller = await db.prepare('SELECT role, org_id FROM users WHERE id = ?').get(req.userId);
+  if (!['super_admin', 'org_admin'].includes(caller.role))
+    return res.status(403).json({ error: 'Forbidden' });
+
+  const userId = Number(req.params.userId);
+  const { opted_in } = req.body;
+  const orgId = caller.role === 'org_admin' ? caller.org_id : req.body.org_id;
+
+  const target = await db.prepare("SELECT org_id FROM users WHERE id = ? AND role = 'user'").get(userId);
+  if (!target || target.org_id !== orgId) return res.status(404).json({ error: 'User not found in your org' });
+
+  if (opted_in) {
+    await db.prepare(`
+      INSERT INTO ops_alert_recipients (org_id, user_id, assigned_by) VALUES (?,?,?)
+      ON CONFLICT (org_id, user_id) DO NOTHING
+    `).run(orgId, userId, req.userId);
+  } else {
+    await db.prepare('DELETE FROM ops_alert_recipients WHERE org_id = ? AND user_id = ?').run(orgId, userId);
+  }
   res.json({ ok: true });
 });
 

@@ -450,7 +450,7 @@ async function releaseReservationById(reservationId) {
  */
 async function sweepStaleReservations() {
   const open = await db.prepare(`
-    SELECT id, org_id, ci_run_id, reserved_vuh, duration_seconds, created_at
+    SELECT id, org_id, ci_run_id, reserved_vuh, duration_seconds, created_at, created_by
     FROM vuh_ledger WHERE kind = 'reservation' AND status = 'open'
   `).all();
 
@@ -471,7 +471,8 @@ async function sweepStaleReservations() {
       await alertOpsFailure('vuh_reservation_stale', `Stale VUH reservation released (org ${row.org_id})`,
         `Reservation #${row.id} for ci_run #${row.ci_run_id} reserved ${row.reserved_vuh} VUH and never received a ` +
         `completion callback within its expected runtime + ${RESERVATION_GRACE_SECONDS / 3600}h grace — released back ` +
-        `to the pool. Usually means a CI status-poll/sync path failed before reaching commitReservation().`);
+        `to the pool. Usually means a CI status-poll/sync path failed before reaching commitReservation().`,
+        { orgId: row.org_id, userId: row.created_by });
     } catch (_) { /* alerting is best-effort, never blocks the sweep */ }
   }
   return released;

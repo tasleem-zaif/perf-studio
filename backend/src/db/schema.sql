@@ -454,6 +454,31 @@ CREATE TABLE IF NOT EXISTS project_assignments (
   UNIQUE(project_id, user_id)
 );
 
+-- Org-admin-managed opt-in list: which regular users additionally receive
+-- user-facing ops alerts (e.g. stale VUH reservations) for their org, on top
+-- of whichever user actually triggered the specific alert.
+CREATE TABLE IF NOT EXISTS ops_alert_recipients (
+  id          SERIAL PRIMARY KEY,
+  org_id      INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  assigned_by INTEGER NOT NULL,
+  created_at  TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(org_id, user_id)
+);
+
+-- In-app feed for infra-only ops alerts (e.g. S3 failures) that have no
+-- owning user/org to email — super_admin-only, read by any super_admin
+-- marks it read for all (single fixed audience, no per-user read state).
+CREATE TABLE IF NOT EXISTS notifications (
+  id         SERIAL PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  details    TEXT,
+  read_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (read_at) WHERE read_at IS NULL;
+
 -- ── Collection Env Config ─────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS collection_env_config (

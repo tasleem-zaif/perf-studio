@@ -8,6 +8,7 @@ import Modal from './components/Modal';
 import ConfirmModal from './components/ConfirmModal';
 import Toast from './components/Toast';
 import ErrorBoundary from './components/ErrorBoundary';
+import NotificationBell from './components/NotificationBell';
 import { useConfirm } from './hooks/useConfirm';
 import { ToastProvider, useToast } from './hooks/useToast';
 import Dashboard from './pages/Dashboard';
@@ -509,6 +510,7 @@ function AppInner() {
 
         {/* Right: Profile + Logout */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {user?.role === 'super_admin' && <NotificationBell />}
           <button className="banner-action-btn" onClick={() => nav('profile')}>
             <i className="ti ti-user-circle" style={{ fontSize: 14 }} />
             {user?.name || 'Profile'}

@@ -1,4 +1,5 @@
-const test = require('node:test');
+require('dotenv').config();
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 // Short rate-limit window so the "suppressed then resumes" case doesn't need a real 5-minute
@@ -7,6 +8,7 @@ process.env.OPS_ALERT_RATE_LIMIT_MS = '50';
 process.env.OPS_ALERT_WEBHOOK_URL = 'https://example.invalid/ops-webhook';
 
 const { alertOpsFailure } = require('./opsAlert');
+const db = require('../db');
 
 function withFakeFetch(fn) {
   const calls = [];
@@ -20,6 +22,18 @@ function withFakeFetch(fn) {
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// alertOpsFailure is deliberately fire-and-forget, so its DB write lands on its own
+// schedule — poll instead of guessing a fixed delay for the real Postgres round-trip.
+async function waitForNotification(kind, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const row = await db.prepare('SELECT * FROM notifications WHERE kind = ?').get(kind);
+    if (row) return row;
+    await wait(25);
+  }
+  return null;
 }
 
 test('alertOpsFailure sends once per kind and rate-limits repeats within the window', async () => {
@@ -53,4 +67,33 @@ test('alertOpsFailure resumes after the rate-limit window and reports suppressed
     assert.equal(calls[1].body.subject, 'C resumed');
     assert.match(calls[1].body.details, /2 additional similar failure\(s\) suppressed/);
   });
+});
+
+test("alertOpsFailure does not let one org's alert rate-limit a different org's alert of the same kind", async () => {
+  await withFakeFetch(async (calls) => {
+    alertOpsFailure('test_kind_org_scope', 'Org A failure', 'details a', { orgId: 111111 });
+    alertOpsFailure('test_kind_org_scope', 'Org B failure', 'details b', { orgId: 222222 });
+    await wait(20);
+    assert.equal(calls.length, 2, 'different orgs should not rate-limit each other for the same kind');
+  });
+});
+
+test('alertOpsFailure with { internal: true } writes an in-app notification instead of emailing', async () => {
+  const kind = `test_internal_${Date.now()}`;
+  await withFakeFetch(async () => {
+    alertOpsFailure(kind, 'Infra failure', 'infra details', { internal: true });
+    const row = await waitForNotification(kind);
+    assert.ok(row, 'expected a notifications row for an internal alert');
+    assert.equal(row.subject, 'Infra failure');
+    await db.prepare('DELETE FROM notifications WHERE kind = ?').run(kind);
+  });
+});
+
+after(async () => {
+  // The first three tests never pass an orgId, so under the new routing they count as
+  // "internal" too and fire-and-forget an insert into `notifications` — wait for those to
+  // land before closing the pool, then sweep up everything this file wrote.
+  await wait(300);
+  await db.prepare("DELETE FROM notifications WHERE kind LIKE 'test_kind_%'").run();
+  await db.pool.end();
 });

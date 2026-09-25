@@ -215,6 +215,17 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
     reloadAll();
   }
 
+  async function toggleOpsAlertRecipient(userId, optedIn) {
+    setOrgUsers(prev => prev.map(u => u.id === userId ? { ...u, ops_alerts_opted_in: optedIn } : u));
+    try {
+      await api.put(`/invites/ops-alert-recipients/${userId}`, { opted_in: optedIn });
+      toast(optedIn ? 'User opted in to ops alerts' : 'User opted out of ops alerts', 'success');
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to update', 'error');
+      reloadAll();
+    }
+  }
+
   if (!license) return <div className="page fade-in" style={{ color: 'var(--color-text-tertiary)' }}>Loading…</div>;
 
   const filteredMembers = members.filter(m => m.status === 'active' &&
@@ -309,6 +320,9 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
         <TabButton active={tab === 'users'} onClick={() => setTab('users')}>
           All Users ({filteredMembers.length})
         </TabButton>
+        <TabButton active={tab === 'alerts'} onClick={() => setTab('alerts')}>
+          Ops Alerts
+        </TabButton>
         <TabButton active={tab === 'projects'} onClick={() => setTab('projects')}>
           Projects ({projects.length})
         </TabButton>
@@ -353,6 +367,33 @@ export default function OrgAdministration({ user, projects = [], onNav, onDelete
                   </button>
                 </>
               )}
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {/* ── Ops Alerts tab ─────────────────────────────────────────────── */}
+      {tab === 'alerts' && (
+        <Card>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Ops alert recipients</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 16 }}>
+            Users opted in here receive an email when a VUH reservation they didn't personally trigger
+            is released as stale for your org. The user who triggered it is always notified automatically.
+          </div>
+          {orgUsers.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--color-text-tertiary)', fontSize: 13 }}>No regular users yet.</div>
+          ) : orgUsers.map(u => (
+            <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', background: 'var(--color-background-secondary)', borderRadius: 8, marginBottom: 8 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{u.name || u.email}</div>
+                <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>{u.email}</div>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+                <input type="checkbox" checked={!!u.ops_alerts_opted_in}
+                  onChange={e => toggleOpsAlertRecipient(u.id, e.target.checked)}
+                  style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
+                Opted in
+              </label>
             </div>
           ))}
         </Card>

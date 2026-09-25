@@ -65,7 +65,8 @@ function reportFailure(op, keyOrDir, error) {
   alertOpsFailure(
     `s3_${op}_failure`,
     `S3 ${op} failed`,
-    `Operation: ${op}\nBucket: ${S3_BUCKET}\nKey/path: ${keyOrDir || '(n/a)'}\nError: ${error?.message || error}`
+    `Operation: ${op}\nBucket: ${S3_BUCKET}\nKey/path: ${keyOrDir || '(n/a)'}\nError: ${error?.message || error}`,
+    { internal: true }
   );
 }
 

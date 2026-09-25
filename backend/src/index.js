@@ -68,6 +68,7 @@ app.use('/api/settings',                               require('./routes/setting
 app.use('/api/runner',                                 require('./routes/runner'));
 app.use('/api/execution',                              require('./routes/execution'));
 app.use('/api/alerts',                                 require('./routes/alerts'));
+app.use('/api/notifications',                          require('./routes/notifications'));
 app.use('/api/invites',                                require('./routes/invites'));
 app.use('/api/projects/:projectId/git',              require('./routes/git'));
 app.use('/api/projects/:projectId/pipelines',        require('./routes/pipelines'));
