@@ -2090,8 +2090,13 @@ router.post('/trigger', async (req, res) => {
   // Build human-readable run_name: {SuiteName}_{N}Users_{D}sDuration (no Run# yet — added on sync)
   const { buildRunDirName } = require('../utils/buildRunName');
   const scriptFile2 = (script_name || '').replace(/\\/g, '/').split('/').pop();
-  const matchedSuite2 = await db.prepare("SELECT id, name, engine FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-    .get(req.params.projectId, req.userId, `%${scriptFile2}`, `%${scriptFile2}`);
+  // Scoped by project only, not user — a test suite belongs to the project, and whoever
+  // triggers a run for it (an org admin, a teammate) is very often NOT whoever originally
+  // generated it. Scoping by user_id here silently missed the suite whenever those differ,
+  // which meant no run-scoped license_token ever got minted below (empty token -> the CI
+  // job's decrypt step correctly refuses, but the run never actually executes).
+  const matchedSuite2 = await db.prepare("SELECT id, name, engine FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+    .get(req.params.projectId, `%${scriptFile2}`, `%${scriptFile2}`);
   // engine drives which CI branch (JMeter vs k6 docker command) runs — resolve from the
   // matched suite by default, but let the caller override explicitly (req.body.engine).
   const engine = req.body.engine || matchedSuite2?.engine || 'jmeter';
@@ -2607,9 +2612,10 @@ pipelines:
       // project.folder_path + script_path which points to the wrong location for new plans.
       if (script_name) {
         const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
+        // Scoped by project only, not user — see the matching comment on matchedSuite2 above.
         const suiteRow   = await db.prepare(
-          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
-        ).get(req.params.projectId, req.userId, `%${scriptFile}`, `%${scriptFile}`);
+          "SELECT jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
 
         // Determine the absolute source path from the suite record
         let srcAbs = suiteRow?.jmx_path || suiteRow?.js_path || '';
@@ -3130,9 +3136,13 @@ pipelines:
       let jmxContent = null;
       if (script_name) {
         const scriptFile = (script_name || '').replace(/\\/g, '/').split('/').pop();
+        // Scoped by project only, not user — see the matching comment on matchedSuite2 above.
+        // This one matters even more here: suiteRow.id gates the encrypt-before-push step
+        // below, so a missed match (triggering user != suite's creating user) used to mean
+        // the pushed copy silently stayed plaintext instead of being encrypted.
         const suiteRow = await db.prepare(
-          "SELECT id, jmx_path, js_path FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
-        ).get(req.params.projectId, req.userId, `%${scriptFile}`, `%${scriptFile}`);
+          "SELECT id, jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1"
+        ).get(req.params.projectId, `%${scriptFile}`, `%${scriptFile}`);
         const srcRel = (suiteRow?.jmx_path || suiteRow?.js_path || '').replace(/\\/g, '/');
         const srcFull = srcRel ? path.posix.join(session.dir, srcRel) : null;
         const canonicalFull = path.posix.join(session.dir, canonicalPaths.scriptRepoPath);
