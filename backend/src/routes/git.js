@@ -36,6 +36,70 @@ const s3Sync = require('../utils/s3Sync');
 const { resolveOrgSlugForProject, resolveWorkspaceRoot, getUserProjectPath } = require('../utils/projectFolders');
 const workspaceLifecycle = require('../utils/workspaceLifecycle');
 const gitEngine = require('../utils/gitEngine');
+const { encryptForPush } = require('../utils/scriptEncryption');
+
+async function resolveOrgIdForProject(projectId) {
+  const row = await db.prepare(
+    'SELECT u.org_id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+  ).get(projectId);
+  return row?.org_id || null;
+}
+
+/**
+ * Right before any push, make sure every one of this project's test scripts that's about to
+ * leave for the real remote is encrypted. Scans all test_suites for the project, resolves each
+ * one's canonical git-tracked path (buildCanonicalRepoPaths, the same helper /trigger uses —
+ * lazy-required from ciPipeline.js, matching this file's existing lazy-require convention for
+ * that same cross-file dependency), and encrypts anything found there that isn't already
+ * ciphertext. Cheap no-op when nothing needs touching — safe to call unconditionally before
+ * every push in this file rather than judging which ones "really" need it, since that judgment
+ * call is exactly how the generic /push action ended up shipping unprotected.
+ */
+async function encryptProjectScriptsBeforePush(projectId, orgId, { session, isSSH, gitDir } = {}) {
+  if (!orgId) return; // no org to key encryption to — same graceful no-op as elsewhere in this feature
+  const suites = await db.prepare(
+    'SELECT id, jmx_path, js_path FROM test_suites WHERE project_id = ? AND (jmx_path IS NOT NULL OR js_path IS NOT NULL) AND (jmx_path != \'\' OR js_path != \'\')'
+  ).all(projectId);
+  if (!suites.length) return;
+
+  const { buildCanonicalRepoPaths } = require('./ciPipeline');
+
+  for (const suite of suites) {
+    const scriptName = suite.jmx_path || suite.js_path;
+    if (!scriptName) continue;
+
+    let repoPath;
+    try {
+      repoPath = (await buildCanonicalRepoPaths(projectId, scriptName, null)).scriptRepoPath;
+    } catch (e) {
+      console.warn(`[GitPushEncrypt] Could not resolve canonical path for suite ${suite.id}:`, e.message);
+      continue;
+    }
+    if (!repoPath) continue;
+
+    try {
+      if (isSSH) {
+        const fullPath = path.join(gitDir, repoPath.replace(/\//g, path.sep));
+        if (!fs.existsSync(fullPath)) continue;
+        const rawExisting = fs.readFileSync(fullPath, 'utf8');
+        const { content, wasEncrypted } = await encryptForPush(rawExisting, {
+          suiteId: suite.id, projectId, orgId, srcRelPath: scriptName, isSSH: true,
+        });
+        if (wasEncrypted) fs.writeFileSync(fullPath, content, 'utf8');
+      } else {
+        const fullPath = path.posix.join(session.dir, repoPath);
+        if (!session.fs.existsSync(fullPath)) continue;
+        const rawExisting = session.fs.readFileSync(fullPath, 'utf8');
+        const { content, wasEncrypted } = await encryptForPush(rawExisting, {
+          suiteId: suite.id, projectId, orgId, srcRelPath: scriptName, isSSH: false,
+        });
+        if (wasEncrypted) session.fs.writeFileSync(fullPath, content, 'utf8');
+      }
+    } catch (e) {
+      console.warn(`[GitPushEncrypt] Failed to encrypt suite ${suite.id} before push:`, e.message);
+    }
+  }
+}
 
 // ── PAT-mode helpers — build the workspace tree inside a gitEngine in-memory session
 // (session.fs is a memfs volume; paths below are posix-style virtual paths, never real
@@ -873,6 +937,7 @@ router.post('/init', async (req, res) => {
         } catch (_) {}
       }
 
+      await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
       await gitEngine.push(session, { url: remoteWithAuth, ref: baseBranch, token: patToken, force: !remoteHasBaseBranch });
       await gitEngine.persistSession(session, gitDir, orgSlug);
 
@@ -1162,6 +1227,8 @@ Performance test project managed by **PerfStudio** — AI-Powered Performance Te
     //    Strategy:
     //      a) If remote already has the base branch: fetch + merge (--allow-unrelated-histories).
     //      b) If remote is empty: force-push to seed it.
+    await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir: gitRoot });
+
     let pushed = false;
     let remoteRefs = '';
     try { remoteRefs = gitExec(['ls-remote', '--heads', remoteWithAuth], gitRoot, sshEnv); } catch {}
@@ -1413,6 +1480,7 @@ router.post('/push', async (req, res) => {
         await gitEngine.merge(session, `origin/${branch}`, userIdentity?.author_name || caller.name, userIdentity?.author_email || caller.email, `Merge origin/${branch}`);
       } catch (_) { /* branch doesn't exist on remote yet — first push, proceed normally */ }
 
+      await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
       await gitEngine.push(session, { url: remoteUrl, ref: branch, token: patToken });
       await gitEngine.verifyPushLanded(session, remoteUrl, branch, patToken);
       await gitEngine.persistSession(session, gitDir, orgSlug);
@@ -1472,6 +1540,7 @@ router.post('/push', async (req, res) => {
       // fetch failed (branch doesn't exist on remote yet) — first push, proceed normally
     }
 
+    await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir });
     gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
     // Confirm the push actually reached the remote before treating anything downstream of it
@@ -1736,6 +1805,7 @@ router.post('/pull', async (req, res) => {
           await gitEngine.checkout(session, branch);
           await gitEngine.merge(session, `origin/${baseBranch}`, caller.name, caller.email, 'Sync with base branch').catch(() => {});
         }
+        await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
         await gitEngine.push(session, { url: remoteUrl, ref: branch, token: patToken });
         await gitEngine.persistSession(session, gitDir, orgSlug);
         await applyBranchProtection({ ...cfg, _featureBranch: true }, branch);
@@ -1802,6 +1872,7 @@ router.post('/pull', async (req, res) => {
 
       // Auto-push to create the remote branch so future pulls work seamlessly
       await disableGcm(git, gitDir);
+      await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir });
       gitExec(['push', '--set-upstream', remoteUrl, branch], gitDir, sshEnv);
 
       // Protect feature branch: no force-push, no deletion (but no PR review required)
@@ -1997,6 +2068,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
       await gitEngine.fetchRemote(session, { url: mergeRemoteUrl, ref: baseBranch, token: patToken });
       await gitEngine.merge(session, `origin/${baseBranch}`, cfg.username || caller.name, cfg.email || caller.email, `Sync ${baseBranch}`).catch(() => {});
       await gitEngine.merge(session, `origin/${pr.from_branch}`, cfg.username || caller.name, cfg.email || caller.email, `Merge PR: ${pr.title}`);
+      await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
       await gitEngine.push(session, { url: mergeRemoteUrl, ref: baseBranch, token: patToken });
       await gitEngine.persistSession(session, gitDir, orgSlug);
     } else {
@@ -2020,6 +2092,7 @@ router.put('/prs/:prId/merge', async (req, res) => {
 
     // Push merged base branch
     await disableGcm(git, gitDir);
+    await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir });
     gitExec(['push', mergeRemoteUrl, baseBranch], gitDir, mergeSshEnv);
     }
 
@@ -2219,6 +2292,7 @@ router.post('/branch', async (req, res) => {
         // branch already exists and there's nothing to create.
         await gitEngine.checkoutSafe(session, branchName);
         if (!existsOnRemote) {
+          await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
           await gitEngine.push(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
           await gitEngine.persistSession(session, gitRoot, orgSlug);
           await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
@@ -2238,6 +2312,7 @@ router.post('/branch', async (req, res) => {
       }
       try { await gitEngine.fetchRemote(session, { url: branchRemoteUrlAuth, ref: baseBranch, token: patToken }); } catch {}
       await gitEngine.checkout(session, branchName, { create: true, startRef: `origin/${baseBranch}` });
+      await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { session, isSSH: false });
       await gitEngine.push(session, { url: branchRemoteUrlAuth, ref: branchName, token: patToken });
       await gitEngine.persistSession(session, gitRoot, orgSlug);
       await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
@@ -2268,6 +2343,7 @@ router.post('/branch', async (req, res) => {
     if (branchSummary.all.includes(branchName)) {
       await safeCheckout(git, gitRoot, branchName);
       if (!existsOnRemote) {
+        await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir: gitRoot });
         gitExec(['push', '--set-upstream', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {});
         await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
         return res.json({ message: `Branch "${branchName}" pushed to remote.`, branch: branchName });
@@ -2289,6 +2365,7 @@ router.post('/branch', async (req, res) => {
 
     // Push branch to remote and apply protection
     await disableGcm(git, gitRoot);
+    await encryptProjectScriptsBeforePush(req.params.projectId, await resolveOrgIdForProject(req.params.projectId), { isSSH: true, gitDir: gitRoot });
     gitExec(['push', '--set-upstream', branchRemoteUrl, branchName], gitRoot, r.sshEnv || {});
     await applyBranchProtection({ ...cfg, _featureBranch: true }, branchName);
 

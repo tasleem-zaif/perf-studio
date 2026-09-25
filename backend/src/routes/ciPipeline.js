@@ -19,7 +19,7 @@ const ownsProject = require('../utils/ownsProject');
 const { encrypt, decrypt } = require('../utils/encryption');
 const { reserveVuh, releaseReservationById, attachReservationCiRunId, commitReservation } = require('../utils/license');
 const jwt = require('jsonwebtoken');
-const { encryptScript } = require('../utils/scriptEncryption');
+const { encryptScript, encryptForPush } = require('../utils/scriptEncryption');
 const { backupPatScriptPlaintext } = require('../utils/scriptContent');
 
 const CI_SCRIPT_TOKEN_SECRET = process.env.CI_SCRIPT_TOKEN_SECRET || process.env.JWT_SECRET;
@@ -646,14 +646,17 @@ async function buildCanonicalRepoPaths(projectId, scriptName, userId) {
   const clean = s => (s || '').replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'Default';
   const scriptFile = (scriptName || '').replace(/\\/g, '/').split('/').pop() || scriptName || '';
   const project    = await db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId);
+  // Scoped by project only, not user — see the matching comment on /trigger's matchedSuite2.
+  // The userId param is kept in this function's signature since callers still pass it (used
+  // elsewhere in those callers), but it's intentionally unused for this lookup now.
   const suite      = scriptFile
     ? await db.prepare(`
-        SELECT ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
+        SELECT ts.id, ts.jmx_path, ts.js_path, ts.env, c.name AS col_name
         FROM test_suites ts
         LEFT JOIN collections c ON c.id = ts.collection_id
-        WHERE ts.project_id = ? AND ts.user_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
+        WHERE ts.project_id = ? AND (ts.jmx_path LIKE ? OR ts.js_path LIKE ?)
         LIMIT 1
-      `).get(projectId, userId, `%${scriptFile}`, `%${scriptFile}`)
+      `).get(projectId, `%${scriptFile}`, `%${scriptFile}`)
     : null;
 
   const projectDir    = clean(project?.name);
@@ -664,6 +667,7 @@ async function buildCanonicalRepoPaths(projectId, scriptName, userId) {
     projectDir,
     collectionDir,
     envDir,
+    suiteId:         suite?.id || null,
     scriptRepoPath:  `${projectDir}/${collectionDir}/${envDir}/script/${scriptFile}`,
     testDataPath:    `${projectDir}/${collectionDir}/${envDir}/testData`,
     resultsPath:     `${projectDir}/${collectionDir}/${envDir}/results`,
@@ -5243,6 +5247,30 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
     }
   }
 
+  // Encrypt the healed script before it's pushed to the real remote — same rule as every other
+  // path that can write into a customer's repo. Peako's own copy (healedJmxContent, just read
+  // above, and the backup written by encryptForPush) stays plaintext for the next heal cycle.
+  let ciScriptTokenForHealBb = null;
+  if (healedJmxContent) {
+    const healOwnerOrgRowBb = await db.prepare(
+      'SELECT u.org_id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+    ).get(projectId);
+    const healLicenseOrgIdBb = healOwnerOrgRowBb?.org_id;
+    if (healLicenseOrgIdBb) {
+      const { content } = await encryptForPush(healedJmxContent.toString('utf8'), {
+        suiteId: healCanonical.suiteId, projectId, orgId: healLicenseOrgIdBb,
+        srcRelPath: jmxDiskPath, isSSH: healIsSSHBb,
+      });
+      healedJmxContent = Buffer.from(content, 'utf8');
+      if (healCanonical.suiteId) {
+        ciScriptTokenForHealBb = jwt.sign(
+          { orgId: healLicenseOrgIdBb, projectId: Number(projectId), suiteId: healCanonical.suiteId },
+          CI_SCRIPT_TOKEN_SECRET, { expiresIn: '60m' }
+        );
+      }
+    }
+  }
+
   // Build multipart file push
   const boundary = 'PeakoHealBoundary9z';
   const fileParts = [];
@@ -5309,6 +5337,10 @@ async function pushJmxAndTriggerBitbucket(userId, projectId, originalCiRun, over
       { key: 'TESTDATA_PATH',  value: healCanonical.testDataPath,    secured: false },
       { key: 'BB_USERNAME',    value: callerRow?.email || cfg.bitbucket_username || '', secured: false },
       { key: 'BB_APP_PASSWORD', value: adminTok, secured: true },
+      // Redeemed once by the pipeline's decrypt step — the pushed .jmx/.js is encrypted
+      // ciphertext, same as any other trigger. Empty when there's no org/suite to key a
+      // token to; the decrypt step fails closed in that case same as a fresh script.
+      { key: 'LICENSE_TOKEN', value: ciScriptTokenForHealBb || '', secured: true },
     ],
   };
   const bbResp = await apiRequest(
@@ -5407,9 +5439,34 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
     }
   }
 
-  // Push fixed JMX to GitHub via Contents API
+  // Encrypt the healed script before it's pushed to the real remote — same rule as every other
+  // path that can write into a customer's repo. Peako's own copy (jmxContent, just read above,
+  // and the backup written by encryptForPush) stays plaintext for the next heal cycle to read.
+  let jmxContentForPush = jmxContent;
+  let ciScriptTokenForHeal = null;
   if (jmxContent) {
-    const base64Content = jmxContent.toString('base64');
+    const healOwnerOrgRow2 = await db.prepare(
+      'SELECT u.org_id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+    ).get(projectId);
+    const healLicenseOrgId = healOwnerOrgRow2?.org_id;
+    if (healLicenseOrgId) {
+      const { content } = await encryptForPush(jmxContent.toString('utf8'), {
+        suiteId: healCanonical.suiteId, projectId, orgId: healLicenseOrgId,
+        srcRelPath: jmxDiskPath, isSSH: healIsSSHPush,
+      });
+      jmxContentForPush = Buffer.from(content, 'utf8');
+      if (healCanonical.suiteId) {
+        ciScriptTokenForHeal = jwt.sign(
+          { orgId: healLicenseOrgId, projectId: Number(projectId), suiteId: healCanonical.suiteId },
+          CI_SCRIPT_TOKEN_SECRET, { expiresIn: '60m' }
+        );
+      }
+    }
+  }
+
+  // Push fixed JMX to GitHub via Contents API
+  if (jmxContentForPush) {
+    const base64Content = jmxContentForPush.toString('base64');
     const repoFilePath  = healCanonical.scriptRepoPath;
     // Get current SHA (required for updates; absent for new files)
     const shaResp = await apiRequest(
@@ -5454,6 +5511,10 @@ async function pushJmxAndTriggerGitHub(userId, projectId, originalCiRun, overrid
       k6_duration:     String(mergedVars.k6_duration    ?? mergedVars.K6_DURATION    ?? '0'),
       k6_iterations:   String(mergedVars.k6_iterations  || mergedVars.K6_ITERATIONS  || HEAL_CI_LOOPS),
       branch:          targetRef,
+      // Redeemed once by the workflow's decrypt step — the pushed .jmx/.js is encrypted
+      // ciphertext, same as any other trigger. Empty when there's no org/suite to key a
+      // token to; the decrypt step fails closed in that case same as a fresh script.
+      license_token:   ciScriptTokenForHeal || '',
     },
   };
   let r = await apiRequest(
@@ -5572,9 +5633,10 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
   }
 
   const scriptFile = (ciRun?.script_name || '').replace(/\\/g, '/').split('/').pop();
+  // Scoped by project only, not user — see the matching comment on /trigger's matchedSuite2.
   const suite = scriptFile
-    ? await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-        .get(projectId, userId, `%${scriptFile}`, `%${scriptFile}`)
+    ? await db.prepare("SELECT * FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+        .get(projectId, `%${scriptFile}`, `%${scriptFile}`)
     : null;
   if (!suite) {
     console.warn(`[CI Heal] No test suite for script "${ciRun?.script_name}"`);
@@ -5751,8 +5813,9 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     try { fs.mkdirSync(fallbackDir, { recursive: true }); } catch (_) {}
     const quickCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(quickCiRunId);
     const quickScriptFile2 = (quickCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
+    // Scoped by project only, not user — see the matching comment on /trigger's matchedSuite2.
     const quickSuite2 = quickScriptFile2
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, userId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${quickScriptFile2}`, `%${quickScriptFile2}`)
       : null;
     const quickCiVars2 = (() => { try { return JSON.parse(quickCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
@@ -5862,8 +5925,9 @@ async function healCycleCI(userId, ciRunId, projectId, options, attemptNum, sess
     try { fs.mkdirSync(fallbackDir2, { recursive: true }); } catch (_) {}
     const fullCiRunRow = await db.prepare('SELECT * FROM ci_pipeline_runs WHERE id = ?').get(fullCiRunId);
     const fullScriptFile2 = (fullCiRunRow?.script_name || '').replace(/\\/g, '/').split('/').pop();
+    // Scoped by project only, not user — see the matching comment on /trigger's matchedSuite2.
     const fullSuite2 = fullScriptFile2
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, userId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1").get(projectId, `%${fullScriptFile2}`, `%${fullScriptFile2}`)
       : null;
     const fullCiVars2 = (() => { try { return JSON.parse(fullCiRunRow?.variables || '{}'); } catch { return {}; } })();
     await db.prepare(`
@@ -5926,9 +5990,10 @@ router.post('/runs/:runId/heal', async (req, res) => {
     // No synced results — create a minimal execution_runs record so healCycleCI can proceed.
     // The AI healer reads the JMX file directly from the test suite; an empty result_dir is fine.
     const scriptFile = (run.script_name || '').replace(/\\/g, '/').split('/').pop();
+    // Scoped by project only, not user — see the matching comment on /trigger's matchedSuite2.
     const suiteRow = scriptFile
-      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND user_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
-          .get(run.project_id, req.userId, `%${scriptFile}`, `%${scriptFile}`)
+      ? await db.prepare("SELECT id FROM test_suites WHERE project_id = ? AND (jmx_path LIKE ? OR js_path LIKE ?) LIMIT 1")
+          .get(run.project_id, `%${scriptFile}`, `%${scriptFile}`)
       : null;
     const resultDir = path.join(os.tmpdir(), `ci_heal_nojtl_${run.id}`);
     fs.mkdirSync(resultDir, { recursive: true });
@@ -5976,3 +6041,4 @@ router.get('/runs/:runId/heal-status', async (req, res) => {
 module.exports = router;
 module.exports.BB_PATCHER_PY = BB_PATCHER_PY;
 module.exports.buildGithubWorkflowYaml = buildGithubWorkflowYaml;
+module.exports.buildCanonicalRepoPaths = buildCanonicalRepoPaths;

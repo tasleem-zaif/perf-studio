@@ -23,6 +23,7 @@
 const crypto = require('crypto');
 const db = require('../db');
 const { encrypt, decrypt } = require('./encryption');
+const { backupPatScriptPlaintext } = require('./scriptContent');
 
 const ALGORITHM = 'aes-256-gcm';
 const FORMAT_PREFIX = 'PSENC1';
@@ -85,4 +86,34 @@ async function decryptScript(payload, orgId) {
   return plaintext.toString('utf8');
 }
 
-module.exports = { getOrCreateOrgScriptKey, encryptScript, decryptScript };
+/**
+ * Shared "is this already protected, and if not, protect it" decision used by every place that's
+ * about to push a script into a customer's git repo — the /trigger route, the generic git panel
+ * actions (git.js), and auto-heal's re-commit. Given whatever content currently sits at a script's
+ * git-tracked location, returns what should actually be written there: passed through unchanged
+ * if it's already PSENC1: ciphertext or there's no org to key a new encryption to (e.g. a project
+ * with no org, an edge case handled the same way everywhere else in this feature), otherwise the
+ * plaintext is backed up (PAT-mode only — see scriptContent.js) and encrypted.
+ *
+ * `srcRelPath` is only used to pick the right file extension for the PAT plaintext backup key —
+ * pass whatever relative/suite-stored path is available, it doesn't need to be exact.
+ */
+async function encryptForPush(rawExisting, { suiteId, projectId, orgId, srcRelPath, isSSH = false }) {
+  if (rawExisting == null) return { content: rawExisting, wasEncrypted: false };
+
+  const alreadyEncrypted = rawExisting.startsWith(FORMAT_PREFIX + ':');
+  if (alreadyEncrypted || !suiteId || !orgId) {
+    return { content: rawExisting, wasEncrypted: false };
+  }
+
+  // PAT-mode has no separate plaintext store outside the session that's about to be pushed, so
+  // back the plaintext up before it's overwritten with ciphertext (SSH-mode already has one — the
+  // real disk file at the suite's own path, untouched by this — so no backup call needed there).
+  if (!isSSH) {
+    await backupPatScriptPlaintext(suiteId, projectId, rawExisting, srcRelPath || '');
+  }
+  const content = await encryptScript(rawExisting, orgId);
+  return { content, wasEncrypted: true };
+}
+
+module.exports = { getOrCreateOrgScriptKey, encryptScript, decryptScript, encryptForPush };
