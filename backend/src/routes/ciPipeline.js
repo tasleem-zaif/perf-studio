@@ -3148,24 +3148,34 @@ pipelines:
         const canonicalFull = path.posix.join(session.dir, canonicalPaths.scriptRepoPath);
 
         let rawExisting = null;
+        let foundAt = 'neither';
         if (srcFull && session.fs.existsSync(srcFull)) {
           rawExisting = session.fs.readFileSync(srcFull, 'utf8');
+          foundAt = 'srcFull';
         } else if (session.fs.existsSync(canonicalFull)) {
           rawExisting = session.fs.readFileSync(canonicalFull, 'utf8');
+          foundAt = 'canonicalFull';
         }
+        console.log(`[CI trigger] PAT script-stage trace — suiteRow.id=${suiteRow?.id} srcFull=${srcFull} srcFullExists=${srcFull ? session.fs.existsSync(srcFull) : 'n/a'} canonicalFull=${canonicalFull} canonicalFullExists=${session.fs.existsSync(canonicalFull)} foundAt=${foundAt} rawExistingLen=${rawExisting?.length ?? 'null'}`);
 
         if (rawExisting != null) {
           const alreadyEncrypted = rawExisting.startsWith('PSENC1:');
           if (!alreadyEncrypted && suiteRow?.id && licenseOrgId) {
             await backupPatScriptPlaintext(suiteRow.id, Number(req.params.projectId), rawExisting, srcRel);
             jmxContent = await encryptScript(rawExisting, licenseOrgId);
+            console.log(`[CI trigger] PAT script-stage — encrypted (alreadyEncrypted=${alreadyEncrypted}, suiteRow.id=${suiteRow?.id}, licenseOrgId=${licenseOrgId})`);
           } else {
             jmxContent = rawExisting;
+            console.log(`[CI trigger] PAT script-stage — passthrough, NOT encrypted (alreadyEncrypted=${alreadyEncrypted}, suiteRow.id=${suiteRow?.id}, licenseOrgId=${licenseOrgId})`);
           }
           session.fs.mkdirSync(path.posix.dirname(canonicalFull), { recursive: true });
           session.fs.writeFileSync(canonicalFull, jmxContent, 'utf8');
           if (srcFull && srcFull !== canonicalFull) session.fs.writeFileSync(srcFull, jmxContent, 'utf8');
+        } else {
+          console.log(`[CI trigger] PAT script-stage — rawExisting is null, nothing written to canonicalFull=${canonicalFull}`);
         }
+      } else {
+        console.log('[CI trigger] PAT script-stage — script_name was falsy, staging block skipped entirely');
       }
 
       // runLabelPat/triggerContent are used for the commit message below (all providers) and
