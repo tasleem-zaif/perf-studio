@@ -72,6 +72,11 @@ app.use('/api/invites',                                require('./routes/invites
 app.use('/api/projects/:projectId/git',              require('./routes/git'));
 app.use('/api/projects/:projectId/pipelines',        require('./routes/pipelines'));
 app.use('/api/projects/:projectId/ci',               require('./routes/ciPipeline'));
+// Not project-scoped and NOT gated by the session-auth middleware other /api routes use above —
+// this is called by a CI runner (GitHub Actions/GitLab CI/Bitbucket Pipelines), which has no
+// user session. It authenticates itself via the short-lived, run-scoped token minted at trigger
+// time instead — see ciPipeline.js's /trigger route and routes/ciScripts.js.
+app.use('/api/ci',                                   require('./routes/ciScripts'));
 
 // Serve generated project files (scripts, test data, HTML reports) for download
 // Mount the entire git-workspaces root so user workspace reports are accessible

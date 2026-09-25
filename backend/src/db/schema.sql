@@ -700,6 +700,14 @@ ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS max_concurrent_tests   INTEGER
 -- doesn't round-trip back to "3 months" cleanly). NULL for Enterprise Plus's fully custom terms.
 ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS duration_months        INTEGER;
 
+-- Per-org AES-256 key (wrapped with the app's master key via utils/encryption.js's
+-- encrypt()/decrypt(), same envelope pattern as organizations.registry_token_enc) used to
+-- encrypt the copy of every generated .jmx/.js script that gets pushed into the customer's
+-- own git repo — see utils/scriptEncryption.js. Generated lazily on first use. Peako's own
+-- working copies (git session content for PAT-mode, local disk + S3 for SSH-mode) are never
+-- encrypted with this key — only the customer-repo-bound copy is.
+ALTER TABLE org_licenses ADD COLUMN IF NOT EXISTS script_key_enc          TEXT;
+
 -- Append-only audit trail for every VUH movement: a reservation taken before a CI run is
 -- dispatched, its later commit (actual VUH once the run finishes) or release (run never
 -- started / abandoned), and manual adjustments (top-ups, renewal forfeiture). Nothing here
