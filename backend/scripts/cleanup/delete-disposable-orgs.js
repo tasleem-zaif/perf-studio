@@ -12,7 +12,9 @@
  *   node scripts/cleanup/delete-disposable-orgs.js --like=S3TestOrg         # dry run, custom prefix
  *   node scripts/cleanup/delete-disposable-orgs.js --like=S3TestOrg --confirm
  */
-require('dotenv').config();
+// Load backend/.env by path (not CWD) so this still finds it when run from inside
+// scripts/cleanup/ instead of from backend/ — see migrate.js for the same pattern.
+require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
 const db = require('../../src/db');
 
 const CONFIRM = process.argv.includes('--confirm');

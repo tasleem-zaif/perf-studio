@@ -15,16 +15,26 @@ async function requireSuperAdmin(req, res, next) {
 }
 
 router.get('/', auth, requireSuperAdmin, async (req, res) => {
-  const notifications = req.query.unread_only === 'true'
-    ? await db.prepare('SELECT * FROM notifications WHERE read_at IS NULL ORDER BY created_at DESC LIMIT 50').all()
-    : await db.prepare('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50').all();
-  const { count } = await db.prepare('SELECT COUNT(*)::int as count FROM notifications WHERE read_at IS NULL').get();
-  res.json({ notifications, unread_count: count });
+  try {
+    const notifications = req.query.unread_only === 'true'
+      ? await db.prepare('SELECT * FROM notifications WHERE read_at IS NULL ORDER BY created_at DESC LIMIT 50').all()
+      : await db.prepare('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50').all();
+    const { count } = await db.prepare('SELECT COUNT(*)::int as count FROM notifications WHERE read_at IS NULL').get();
+    res.json({ notifications, unread_count: count });
+  } catch (e) {
+    console.error('[notifications] GET / failed:', e.message);
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
 });
 
 router.put('/mark-read', auth, requireSuperAdmin, async (req, res) => {
-  await db.prepare('UPDATE notifications SET read_at = NOW() WHERE read_at IS NULL').run();
-  res.json({ ok: true });
+  try {
+    await db.prepare('UPDATE notifications SET read_at = NOW() WHERE read_at IS NULL').run();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[notifications] PUT /mark-read failed:', e.message);
+    res.status(500).json({ error: 'Failed to mark notifications read' });
+  }
 });
 
 module.exports = router;

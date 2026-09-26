@@ -49,7 +49,9 @@ def deployToServer() {
             git stash && \\
             git fetch && \\
             git checkout $GIT_COMMIT && \\
-            cd backend && npm install --omit=dev && cd .. && \\
+            cd backend && npm install --omit=dev && \\
+            node src/db/migrate.js && \\
+            cd .. && \\
             cd frontend && npm install && npm run build && cd .. && \\
             cd backend && pm2 restart perfstudio-backend --update-env  && \\
             pm2 save
